@@ -28,6 +28,7 @@ Flow Map 蒸馏的训练步实现（FlowMapStepMixin）。
 
 import torch
 import torch.nn.functional as F
+import contextlib
 from einops import rearrange
 
 from utils import data_seq_to_patch, logger
@@ -1165,7 +1166,10 @@ class FlowMapStepMixin:
         # 使用 torch.no_grad() 包裹学生前向（不计算学生梯度）
         # 当 retain_grad=True 时，不用 no_grad() 以保留计算图
         grad_context = torch.enable_grad() if retain_grad else torch.no_grad()
-        with grad_context:
+        # 使用 FSDP no_sync() 禁用梯度同步，避免多卡 NCCL 超时
+        # 在 rollout 阶段，多次前向传播不需要同步梯度
+        fsdp_context = self.student.no_sync() if hasattr(self.student, "no_sync") else contextlib.nullcontext()
+        with grad_context, fsdp_context:
             for i in range(num_steps):
                 t_action = action_sigmas[i]
                 r_action = action_sigmas[i + 1]

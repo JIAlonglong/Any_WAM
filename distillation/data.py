@@ -50,6 +50,7 @@ class DataMixin:
                 self.train_loader.sampler.set_epoch(self.train_loader.sampler.epoch + 1)
             self.train_loader_iter = iter(self.train_loader)
             batch = next(self.train_loader_iter)
+            batch = next(self.train_loader_iter)
         return batch
 
     # ==================================================================

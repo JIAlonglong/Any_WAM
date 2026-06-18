@@ -1234,42 +1234,48 @@ class FlowMapStepMixin:
 
     def _dmd_train_step(self, batch):
         """
-        DMD 训练步：更新判别器 + 计算 DMD 梯度。
+        DMD 训练步：计算学生 DMD loss + 更新判别器。
 
-        优化版本：只做一次 rollout，同时用于判别器训练和 DMD 梯度计算。
-        原版本需要两次 rollout（一次无梯度、一次有梯度），开销翻倍。
+        关键顺序约束：
+          - 学生梯度必须在判别器更新之前计算
+          - 因为判别器参数 inplace 更新会破坏计算图
 
         流程：
           1. On-policy rollout（保留计算图）：用学生生成假动作
-          2. DMD 梯度计算：normalize(D(fake) - teacher_score)（先计算，保留计算图）
-          3. 判别器更新：真假样本二分类（使用 detach 后的假动作）
+          2. 判别器前向（非 detach）：构建学生梯度的计算图
+          3. 计算 DMD loss 并 backward 到学生（判别器参数还未被修改）
+          4. 判别器前向（detach 假动作）+ backward + 更新判别器
 
         参数:
             batch: 数据批次
 
         返回:
-            dmd_grad: DMD 梯度 [B, C, F, N, 1]（注入学生 action loss 用）
             d_loss: 判别器 loss（标量，用于日志）
+            dmd_loss: DMD loss（标量，已 backward，用于日志）
         """
-        from discriminator import train_discriminator_step, compute_dmd_gradient
+        from discriminator import train_discriminator_step
 
-        # 1. On-policy rollout（保留计算图，用于后续 DMD 梯度计算）
+        # 1. On-policy rollout（保留计算图）
         fake_action = self._on_policy_rollout(batch, retain_grad=True)
 
-        # 2. DMD 梯度计算（先计算，保留计算图）
-        dmd_grad = compute_dmd_gradient(
-            self.discriminator,
-            fake_actions=fake_action,  # 使用保留计算图的 fake_action
-            video_latent=batch['latents'],
-            text_emb=batch['text_emb'],
-            teacher_score=0.0,
+        # 2. 计算判别器对假动作的打分（非 detach，保留到学生的梯度路径）
+        fake_logits = self.discriminator(
+            fake_action,          # 不 detach！梯度要流回学生
+            batch['latents'],
+            batch['text_emb'],
         )
+        # DMD loss = weight * D(fake)^2
+        # 最大化 D(fake) → 学生生成更"真"的动作
+        dmd_loss = getattr(self.config, 'dmd_weight', 0.1) * (fake_logits ** 2).mean()
 
-        # 3. 判别器更新（使用 detach 后的假动作，不回传梯度到学生）
+        # 3. 先 backward 到学生！此时判别器参数还未被修改
+        dmd_loss.backward()
+
+        # 4. 再更新判别器（detach 假动作，不回传梯度到学生）
         d_loss = train_discriminator_step(
             self.discriminator,
             real_actions=batch['actions'],
-            fake_actions=fake_action.detach(),  # detach 切断到学生模型的梯度
+            fake_actions=fake_action.detach(),
             video_latent=batch['latents'],
             text_emb=batch['text_emb'],
         )
@@ -1277,4 +1283,4 @@ class FlowMapStepMixin:
         self.discriminator_optimizer.step()
         self.discriminator_optimizer.zero_grad()
 
-        return dmd_grad, d_loss.detach()
+        return d_loss.detach(), dmd_loss.detach()

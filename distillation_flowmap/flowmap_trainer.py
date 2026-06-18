@@ -734,14 +734,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
             if use_dmd_now:
                 if self.step >= dmd_warmup_steps + dmd_discriminator_warmup:
-                    # 判别器预热完成：执行完整 DMD 训练（判别器更新 + DMD 梯度注入）
-                    dmd_grad, d_loss_val = self._dmd_train_step(batch)
-                    dmd_grad_norm = dmd_grad.norm().item()
-                    # DMD loss：梯度的 MSE 作为正则项
-                    dmd_loss = dmd_weight * (dmd_grad ** 2).mean()
-                    # 将 DMD loss 加入总 loss（已在 _train_step 中 backward 过，
-                    # 这里需要对 dmd_loss 单独 backward）
-                    dmd_loss.backward()
+                    # 判别器预热完成：执行完整 DMD 训练
+                    # _dmd_train_step 内部已完成：student backward + discriminator update
+                    d_loss_val, dmd_loss_val = self._dmd_train_step(batch)
+                    dmd_grad_norm = dmd_loss_val.item()  # 用 dmd_loss 值代替 grad_norm
                 else:
                     # 判别器预热期间：只训判别器，不注入 DMD 梯度
                     with torch.no_grad():

@@ -68,6 +68,7 @@ def flowmap_inference(
     text_emb,
     empty_emb,
     num_steps=2,
+    action_num_steps=None,
     cfg_scale=5.0,
     num_train_timesteps=1000,
     snr_shift=5.0,
@@ -88,7 +89,8 @@ def flowmap_inference(
         noisy_action:       初始噪声 action [B, C, F, N, 1]，N=每帧动作步数
         text_emb:           文本嵌入 [B, L, D]，L=序列长度，D=嵌入维度
         empty_emb:          空文本嵌入 [B, L, D]（用于 CFG 无条件推理）
-        num_steps:          推理步数（2/4/8/16/50 等）
+        num_steps:          视频推理步数（2/4/8/16/20/50 等）
+        action_num_steps:   动作推理步数（默认与 num_steps 相同，使用 max(num_steps, action_num_steps) 作为统一的循环次数，video 和 action 使用不同的 SNR shift）
         cfg_scale:          CFG（Classifier-Free Guidance）引导强度
         num_train_timesteps: 训练时间步总数（默认 1000）
         snr_shift:          视频的 SNR 偏移系数（默认 5.0，与训练配置一致）
@@ -104,13 +106,17 @@ def flowmap_inference(
     B = noisy_latent.shape[0]
     num_frames = noisy_latent.shape[2]
 
+    # 如果 action_num_steps 未指定，使用与 num_steps 相同的值
+    if action_num_steps is None:
+        action_num_steps = num_steps
+
     # ================================================================
     # 步骤 1: 生成时间步序列
     # ================================================================
-    # 从 1.0（纯噪声）到 0.0（干净数据）均匀采样 num_steps + 1 个点
-    # 例如 num_steps=2 时：[1.0, 0.5, 0.0]，共 3 个点，2 个去噪区间
-    # 例如 num_steps=50 时：[1.0, 0.98, ..., 0.02, 0.0]，共 51 个点，50 个去噪区间
-    sigmas_raw = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64, device=device)
+    # 使用最大步数作为统一的步数，避免复杂的索引计算
+    # video 和 action 使用相同的步数，但应用不同的 SNR shift
+    max_steps = max(num_steps, action_num_steps)
+    sigmas_raw = torch.linspace(1.0, 0.0, max_steps + 1, dtype=torch.float64, device=device)
 
     # ================================================================
     # 步骤 2: 对视频和动作分别应用 SNR shift
@@ -125,8 +131,8 @@ def flowmap_inference(
     # ================================================================
     # 将 sigma（0~1 范围）转换为训练时间步（0~1000 范围）
     # 例如 sigma=0.5 → timestep=500
-    video_timesteps = video_sigmas * num_train_timesteps    # [num_steps + 1]
-    action_timesteps = action_sigmas * num_train_timesteps  # [num_steps + 1]
+    video_timesteps = video_sigmas * num_train_timesteps    # [max_steps + 1]
+    action_timesteps = action_sigmas * num_train_timesteps  # [max_steps + 1]
 
     # ================================================================
     # 步骤 4: 初始化当前 latent 和 action
@@ -138,9 +144,8 @@ def flowmap_inference(
     # ================================================================
     # 步骤 5: 逐步去噪推理
     # ================================================================
-    # 遍历每一对相邻时间步 (t_i, t_{i+1})
-    # t_i 是当前噪声水平，t_{i+1} 是目标噪声水平（更低）
-    for i in range(num_steps):
+    # 使用统一的步数循环，video 和 action 使用相同的步数但不同的时间步
+    for i in range(max_steps):
         # 当前时间步 t 和目标时间步 r
         t_video = video_timesteps[i]
         r_video = video_timesteps[i + 1]

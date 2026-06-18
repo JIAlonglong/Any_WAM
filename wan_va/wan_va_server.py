@@ -76,6 +76,7 @@ class VA_Server:
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, "enable_offload", False)
         self.num_steps = getattr(job_config, "num_steps", 2)
+        self.action_num_steps = getattr(job_config, "action_num_steps", None)
 
         # ------------------------------------------------------------------
         # 1. Load pretrained components (VAE, text encoder, tokenizer)
@@ -762,6 +763,7 @@ class VA_Server:
                 text_emb=text_emb,
                 empty_emb=empty_emb,
                 num_steps=self.num_steps,
+                action_num_steps=self.action_num_steps,
                 cfg_scale=self.job_config.guidance_scale,
                 **self.flowmap_kwargs,
             )
@@ -826,6 +828,8 @@ def run(args):
         config.checkpoint_path = args.checkpoint_path
     if args.num_steps is not None:
         config.num_steps = args.num_steps
+    if args.action_num_steps is not None:
+        config.action_num_steps = args.action_num_steps
     if args.save_root is not None:
         config.save_root = args.save_root
 
@@ -879,7 +883,13 @@ def main():
         "--num-steps",
         type=int,
         default=2,
-        help="Number of FlowMap inference steps (2-50, default: 2).",
+        help="Number of FlowMap inference steps for video (2-50, default: 2).",
+    )
+    parser.add_argument(
+        "--action-num-steps",
+        type=int,
+        default=None,
+        help="Number of FlowMap inference steps for action (default: same as --num-steps).",
     )
     parser.add_argument(
         "--save-root",

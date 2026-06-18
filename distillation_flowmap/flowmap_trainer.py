@@ -238,11 +238,23 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # 确定学生模型的初始化路径（从检查点恢复或从教师初始化）
         resume_path = getattr(config, "resume_from_path", None)
         resume_step = getattr(config, "resume_from_step", None)
+        self._is_lora_resume = False  # 标记是否从 LoRA checkpoint 恢复
+
         if resume_path is not None:
             # 从指定路径恢复
             student_path = os.path.join(resume_path, "online_student", "transformer")
             target_path = os.path.join(resume_path, "target_student", "transformer")
             self.step = resume_step if resume_step is not None else 0
+            # 检查是否是 LoRA checkpoint
+            student_config_path = os.path.join(student_path, "config.json")
+            if os.path.exists(student_config_path):
+                import json
+                with open(student_config_path) as f:
+                    ckpt_config = json.load(f)
+                if ckpt_config.get('use_lora', False):
+                    self._is_lora_resume = True
+                    if config.rank == 0:
+                        logger.info(f"Detected LoRA checkpoint, will load base model from teacher and apply LoRA adapters")
             if config.rank == 0:
                 logger.info(f"Resuming from path: {resume_path}")
                 logger.info(f"  Online student: {student_path}")
@@ -257,6 +269,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 config.output_dir, "checkpoints", f"step_{resume_step}",
                 "target_student", "transformer")
             self.step = resume_step
+            # 检查是否是 LoRA checkpoint
+            student_config_path = os.path.join(student_path, "config.json")
+            if os.path.exists(student_config_path):
+                import json
+                with open(student_config_path) as f:
+                    ckpt_config = json.load(f)
+                if ckpt_config.get('use_lora', False):
+                    self._is_lora_resume = True
+                    if config.rank == 0:
+                        logger.info(f"Detected LoRA checkpoint, will load base model from teacher and apply LoRA adapters")
             if config.rank == 0:
                 logger.info(f"Resuming from step {resume_step}")
                 logger.info(f"  Online student: {student_path}")
@@ -267,8 +289,14 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             target_path = teacher_path
 
         # 2. 在线学生（trainable）：正在训练的模型
-        logger.info("Loading online student (trainable) ...")
-        self.student = load_transformer(student_path, torch_dtype=torch.float32, torch_device="cpu")
+        # 如果从 LoRA checkpoint 恢复，需要先加载基座模型，再加载 LoRA adapter
+        if self._is_lora_resume:
+            logger.info("Loading online student from LoRA checkpoint ...")
+            logger.info("  Step 1: Loading base model from teacher ...")
+            self.student = load_transformer(teacher_path, torch_dtype=torch.float32, torch_device="cpu")
+        else:
+            logger.info("Loading online student (trainable) ...")
+            self.student = load_transformer(student_path, torch_dtype=torch.float32, torch_device="cpu")
         apply_ac(self.student)  # 应用激活检查点（节省显存）
         self.student = self.student.to(self.dtype)
 
@@ -298,6 +326,24 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 self.student.print_trainable_parameters()
             logger.info(f"LoRA enabled: rank={config.lora_rank}, alpha={config.lora_alpha}")
 
+            # 如果从 LoRA checkpoint 恢复，加载 LoRA adapter 权重
+            if self._is_lora_resume:
+                logger.info("  Step 2: Loading LoRA adapter weights from checkpoint ...")
+                from safetensors.torch import load_file as safetensors_load_file
+                adapter_path = os.path.join(student_path, "diffusion_pytorch_model.safetensors")
+                if os.path.exists(adapter_path):
+                    adapter_state = safetensors_load_file(adapter_path)
+                    # 加载 adapter 权重（包括 lora_A, lora_B, delta_emb_gate 等）
+                    missing, unexpected = self.student.load_state_dict(adapter_state, strict=False)
+                    if config.rank == 0:
+                        logger.info(f"  Loaded {len(adapter_state)} adapter parameters")
+                        if missing:
+                            logger.warning(f"  Missing keys: {len(missing)}")
+                        if unexpected:
+                            logger.warning(f"  Unexpected keys: {len(unexpected)}")
+                else:
+                    logger.warning(f"  Adapter weights not found: {adapter_path}")
+
         # Cast entire model (including LoRA parameters) to uniform dtype
         # before FSDP wrapping. FSDP requires all original parameters to
         # have the same dtype; LoRA parameters default to float32, which
@@ -318,8 +364,14 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info("Student model compiled.")
 
         # 3. 目标学生（EMA, frozen）：在线学生的指数移动平均副本
-        logger.info("Loading target student (EMA, frozen) ...")
-        self.target_student = load_transformer(target_path, torch_dtype=self.dtype, torch_device="cpu")
+        # 如果从 LoRA checkpoint 恢复，需要先加载基座模型，再加载 LoRA adapter
+        if self._is_lora_resume:
+            logger.info("Loading target student from LoRA checkpoint ...")
+            logger.info("  Step 1: Loading base model from teacher ...")
+            self.target_student = load_transformer(teacher_path, torch_dtype=self.dtype, torch_device="cpu")
+        else:
+            logger.info("Loading target student (EMA, frozen) ...")
+            self.target_student = load_transformer(target_path, torch_dtype=self.dtype, torch_device="cpu")
         self.target_student = self.target_student.to(self.dtype)
 
         # 为目标学生模型添加 Flow Map 能力（与学生模型相同的改造）
@@ -328,8 +380,30 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             self.target_student, gate_value=config.gate_value, deltatime_type=config.deltatime_type)
         self.target_student = patch_model_forward(self.target_student)
 
-        # LoRA：目标学生也需要添加 LoRA adapter（EMA 在 adapter 参数上进行）
-        if self.use_lora:
+        # 如果从 LoRA checkpoint 恢复，为目标学生也添加 LoRA 并加载权重
+        if self._is_lora_resume and self.use_lora:
+            logger.info("  Step 2: Adding LoRA to target student ...")
+            target_lora_config = LoraConfig(
+                r=config.lora_rank,
+                lora_alpha=config.lora_alpha,
+                target_modules=config.lora_target_modules,
+                lora_dropout=getattr(config, 'lora_dropout', 0.0),
+                bias='none',
+            )
+            self.target_student = get_peft_model(self.target_student, target_lora_config, adapter_name='default')
+
+            # 加载目标学生的 LoRA adapter 权重
+            target_adapter_path = os.path.join(target_path, "diffusion_pytorch_model.safetensors")
+            if os.path.exists(target_adapter_path):
+                from safetensors.torch import load_file as safetensors_load_file
+                target_adapter_state = safetensors_load_file(target_adapter_path)
+                missing, unexpected = self.target_student.load_state_dict(target_adapter_state, strict=False)
+                if config.rank == 0:
+                    logger.info(f"  Loaded {len(target_adapter_state)} target adapter parameters")
+            else:
+                logger.warning(f"  Target adapter weights not found: {target_adapter_path}")
+        elif self.use_lora:
+            # 非 LoRA 恢复模式：正常为目标学生添加 LoRA
             target_lora_config = LoraConfig(
                 r=config.lora_rank,
                 lora_alpha=config.lora_alpha,
@@ -387,16 +461,23 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             inner_dim = self.student.num_attention_heads * self.student.attention_head_dim
             text_dim = self.student.condition_embedder.text_embedder.linear_1.in_features
 
+            # 注意：action_latent_channels 应该是 action_dim（动作维度），
+            # 因为判别器接收的是原始动作 [B, C, F, N, 1]，其中 C = action_dim
+            # 判别器保持 float32 精度（与学生模型的 bfloat16 分开）
+            # 在 forward 方法中会将输入转换为 float32
+            # 注意：video_latent_channels 应该是 VAE 的输出通道数（48），不是 transformer 的 inner_dim
+            # 注意：max_text_tokens 应该是 512（T5 编码器的序列长度），不是默认的 77
             self.discriminator = ActionDiscriminator(
                 action_dim=config.action_dim,
-                action_latent_channels=inner_dim,
-                video_latent_channels=inner_dim,
+                action_latent_channels=config.action_dim,  # 使用 action_dim 而非 inner_dim
+                video_latent_channels=48,  # VAE 输出通道数（in_channels）
                 text_dim=text_dim,
                 hidden_dim=getattr(config, 'dmd_hidden_dim', 256),
                 num_layers=getattr(config, 'dmd_num_layers', 4),
                 num_heads=getattr(config, 'dmd_num_heads', 8),
                 dropout=getattr(config, 'dmd_dropout', 0.1),
-            ).to(self.device)
+                max_text_tokens=512,  # T5 编码器的序列长度
+            ).to(self.device)  # 保持 float32，不转换 dtype
             self.discriminator.train()
 
             self.discriminator_optimizer = torch.optim.AdamW(

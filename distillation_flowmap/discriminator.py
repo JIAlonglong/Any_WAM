@@ -247,6 +247,12 @@ class ActionDiscriminator(nn.Module):
         """
         B = actions.shape[0]
 
+        # 将输入转换为 float32 以匹配判别器参数
+        # （判别器参数可能是 float32，而输入是 bfloat16）
+        actions = actions.float()
+        video_latent = video_latent.float()
+        text_emb = text_emb.float()
+
         # === 步骤 1: 编码动作 ===
         # [B, C, F, N, 1] → [B, F*N, C] → [B, F*N, hidden_dim]
         action_tokens = actions.squeeze(-1)           # [B, C, F, N]

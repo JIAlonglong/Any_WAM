@@ -1,20 +1,14 @@
 """
-Flash-WAM Flow Map 蒸馏配置文件 —— LIBERO 环境（Stage 1 优化版）
+Flash-WAM Flow Map 蒸馏配置文件 —— LIBERO 环境（Stage 2 无 DMD 版本）
 
-基于 config_libero.py，优化单卡训练配置：
-  - 增大 gradient_accumulation_steps (2→16)，有效 batch = 16
-  - 添加 loss clipping 防止 outlier 梯度
-  - 调整学习率适配更大有效 batch
-  - 优化 GPU 利用率
-
-Stage 1: FlowMap 蒸馏（扩散 + 一致性 + 流映射目标）
+用于测试禁用 DMD 后的训练速度，对比 DMD 的开销。
 """
 
 import os
 import torch
 from easydict import EasyDict
 
-cfg = EasyDict(__name__="Config: Flash-WAM FlowMap Distillation (LIBERO Optimized)")
+cfg = EasyDict(__name__="Config: Flash-WAM FlowMap Distillation (LIBERO Stage 2 No DMD)")
 
 # ============================================================
 # 路径配置
@@ -27,7 +21,7 @@ cfg.teacher_model_path = os.environ.get(
     os.path.join(_project_root, "checkpoints", "libero"))
 
 cfg.output_dir = os.environ.get(
-    "OUTPUT_DIR", os.path.join(_this_dir, "output_libero_optimized"))
+    "OUTPUT_DIR", os.path.join(_this_dir, "output_libero_optimized_stage2_nodmd"))
 
 cfg.dataset_path = os.environ.get(
     "DATASET_PATH",
@@ -36,14 +30,14 @@ cfg.dataset_path = os.environ.get(
 cfg.empty_emb_path = os.path.join(cfg.dataset_path, "empty_emb.pt")
 
 # ============================================================
-# 模型架构配置
+# 模型架构配置（与 Stage 2 一致）
 # ============================================================
 cfg.patch_size = (1, 2, 2)
 cfg.param_dtype = torch.bfloat16
 cfg.env_type = "none"
 cfg.height = 128
 cfg.width = 128
-cfg.num_frames = 64                # 从 128 降到 64，减少约 2x 计算量
+cfg.num_frames = 64
 cfg.action_dim = 30
 cfg.action_per_frame = 4
 cfg.frame_chunk_size = 4
@@ -76,14 +70,14 @@ cfg.norm_stat = {
 }
 
 # ============================================================
-# FlowMatch 调度器配置
+# FlowMatch 调度器配置（与 Stage 2 一致）
 # ============================================================
 cfg.snr_shift = 5.0
 cfg.action_snr_shift = 0.05
 cfg.num_train_timesteps = 1000
 
 # ============================================================
-# LCM 蒸馏核心参数
+# LCM 蒸馏核心参数（与 Stage 2 一致）
 # ============================================================
 cfg.num_ddim_timesteps = 2
 
@@ -97,39 +91,39 @@ cfg.action_aware = _mode in ("video_action_aware", "flashwam")
 cfg.num_ddim_timesteps_action = 2
 cfg.action_loss_weight = 1.0
 cfg.action_distill_mode = "x0"
-cfg.action_aware_weight = 0.1       # 改进：从 0.01 增加到 0.1
+cfg.action_aware_weight = 0.1
 
 # ============================================================
-# Flow Map 蒸馏参数
+# Flow Map 蒸馏参数（与 Stage 2 一致）
 # ============================================================
 cfg.diffusion_ratio = 0.5
 cfg.consistency_ratio = 0.25
 cfg.flowmap_ratio = 0.25
 
 cfg.epsilon = 1.0
-cfg.gate_value = 0.1                # 改进：从 0.0 增加到 0.1
+cfg.gate_value = 0.1
 cfg.deltatime_type = 'r'
 cfg.weight_type = 'beta08'
-cfg.gt_regression_weight = 0.15     # 调低：从 0.5 降到 0.15，避免学生过拟合 GT 而忽略教师蒸馏信号
+cfg.gt_regression_weight = 0.5
 
 # ============================================================
-# 消融实验开关
+# 消融实验开关（与 Stage 2 一致）
 # ============================================================
 cfg.use_flowmap = True
 cfg.use_gt_regression = True
 cfg.use_central_diff = True
 cfg.selective_cdiff = True
 cfg.action_use_flowmap = False
-cfg.use_action_distill = True       # 新增：使用教师蒸馏（核心改进）
+cfg.use_action_distill = True
 
 # ============================================================
-# DMD 参数（Stage 1 默认关闭，Stage 2 启用）
+# DMD 参数（禁用 DMD 用于速度测试）
 # ============================================================
-cfg.use_dmd = False                 # Stage 1: 关闭 DMD
+cfg.use_dmd = False                 # 禁用 DMD
 cfg.dmd_weight = 0.1
 cfg.dmd_warmup_steps = 0
 cfg.dmd_rollout_steps_min = 2
-cfg.dmd_rollout_steps_max = 8
+cfg.dmd_rollout_steps_max = 4
 cfg.dmd_cfg_scale = 5.0
 cfg.dmd_discriminator_lr = 1e-5
 cfg.dmd_discriminator_steps = 1
@@ -140,7 +134,7 @@ cfg.dmd_num_heads = 8
 cfg.dmd_dropout = 0.1
 
 # ============================================================
-# LoRA 配置
+# LoRA 配置（与 Stage 2 一致）
 # ============================================================
 cfg.use_lora = True
 cfg.lora_rank = 128
@@ -157,7 +151,7 @@ cfg.lora_target_modules = [
 ]
 
 # ============================================================
-# LCM 超参数
+# LCM 超参数（与 Stage 2 一致）
 # ============================================================
 cfg.ema_decay = 0.995
 cfg.loss_type = "huber"
@@ -167,32 +161,31 @@ cfg.cfg_min = 2.0
 cfg.cfg_max = 10.0
 
 # ============================================================
-# 训练超参数（Stage 1 优化版）
+# 训练超参数（与 Stage 2 一致）
 # ============================================================
-cfg.learning_rate = 2e-5            # 从 5e-6 增大到 2e-5（有效 batch 4x，LR 4x）
+cfg.learning_rate = 5e-6
 cfg.beta1 = 0.9
 cfg.beta2 = 0.999
 cfg.weight_decay = 0.0
-cfg.max_grad_norm = 1.0             # 从 2.0 减小到 1.0，更保守的梯度裁剪
-cfg.warmup_steps = 200              # 从 100 增加到 200
-cfg.max_train_steps = 10000         # Stage 1: 训练 10000 步
-cfg.batch_size = 1                  # 模型架构限制：forward_train 假设 batch=1
-cfg.gradient_accumulation_steps = 16 # 从 32 降到 16，减少每步计算量
-cfg.load_worker = 8                 # 从 2 增大到 8，加速数据加载
-cfg.pin_memory = True               # 启用 pin_memory 加速 GPU 传输
-cfg.prefetch_factor = 4             # 预取 4 个 batch
-cfg.cache_dataset_in_memory = True  # 缓存数据集到内存（仅 4.4GB）
-cfg.use_torch_compile = False       # 禁用：PEFT (LoRA) 不兼容 torch.compile
+cfg.max_grad_norm = 1.0
+cfg.warmup_steps = 100
+cfg.max_train_steps = 20  # 速度测试：只运行 20 步
+cfg.batch_size = 1
+cfg.gradient_accumulation_steps = 16
+cfg.load_worker = 8
+cfg.pin_memory = True
+cfg.prefetch_factor = 4
+cfg.cache_dataset_in_memory = True
+cfg.use_torch_compile = False
 
-# Loss clipping（新增）
-cfg.loss_clip_value = 10.0          # clip video loss 到 [-10, 10]，防止 outlier
+# Loss clipping
+cfg.loss_clip_value = 10.0
 cfg.loss_clip_enabled = True
 
 cfg.noisy_cond_prob = 0.0
 cfg.cfg_prob = 0.0
 
-# Action 时间下采样：学生只处理每 N 帧的 action（256 → 64 tokens）
-# 教师保持全分辨率（256 tokens），学生用低分辨率减少计算量
+# Action 时间下采样
 cfg.action_downsample_factor = 4
 
 # ============================================================

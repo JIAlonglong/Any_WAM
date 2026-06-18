@@ -959,7 +959,7 @@ class FlowMapStepMixin:
             actions_gt_ds = batch['actions'][:, :, ::_ad]
 
             # 学生的 x0 预测（只计算一次，后续复用）
-            action_sigma_s = action_t_sigma[:, None, ::_ad, None, None].to(student_action_v)
+            action_sigma_s = action_r_sigma[:, None, ::_ad, None, None].to(student_action_v)
             student_action_pred = action_noisy_ds - action_sigma_s * student_action_v
             # mask 也只转换一次
             mask = actions_mask_ds.float()
@@ -972,7 +972,18 @@ class FlowMapStepMixin:
             )
 
             if has_flowmap:
-                action_target_pred = actions_gt_ds
+                # Flow Map 目标：与视频流映射目标策略一致
+                # 视频: video_target = video_v_cfg_5d - (t_5d - r_5d) * dF_dt
+                # 动作（x0 空间）: 优先使用 EMA 目标学生的预测（已包含教师 Euler 步 + EMA 在 r 处的 v-prediction）
+                # 回退: 使用教师的 v-prediction 转换到 x0 空间
+                if target_action_pred is not None:
+                    # EMA 目标学生已计算: target = x_prev_action - sigma_r * v_ema_at_r
+                    action_target_pred = target_action_pred
+                else:
+                    # 教师的 x0 预测: x0 = x_t - sigma_t * v_teacher
+                    sigma_t_a_5d = action_t_sigma[:, None, ::_ad, None, None].to(action_v_5d)
+                    action_v_5d_ds = action_v_5d[:, :, ::_ad]
+                    action_target_pred = action_noisy_ds - sigma_t_a_5d * action_v_5d_ds
             elif use_action_distill and target_action_pred is not None:
                 action_target_pred = target_action_pred
             elif self.action_distill_mode == "x0":
@@ -1012,11 +1023,23 @@ class FlowMapStepMixin:
 
         # 对视频 loss 按样本加权
         if self.distill_video:
-            # 逐样本 MSE
-            per_sample_video_loss = F.mse_loss(
-                student_video_v.float(), video_target.detach().float(),
-                reduction='none'
-            ).mean(dim=[1, 2, 3, 4])  # [B]
+            # 逐样本 loss（支持 huber 和 mse）
+            loss_type = getattr(self.config, 'loss_type', 'l2')
+            huber_c = getattr(self.config, 'huber_c', 0.001)
+            video_diff = (student_video_v.float() - video_target.detach().float())
+            if loss_type == "huber":
+                # Huber loss: 对 outlier 更鲁棒
+                # |x| < c: 0.5 * x^2 / c
+                # |x| >= c: |x| - 0.5 * c
+                abs_diff = video_diff.abs()
+                per_sample_video_loss = torch.where(
+                    abs_diff < huber_c,
+                    0.5 * video_diff ** 2 / huber_c,
+                    abs_diff - 0.5 * huber_c
+                ).mean(dim=[1, 2, 3, 4])  # [B]
+            else:
+                # MSE loss（原始行为）
+                per_sample_video_loss = (video_diff ** 2).mean(dim=[1, 2, 3, 4])  # [B]
 
             # AnyFlow 技巧：用扩散样本的 loss 均值缩放非扩散样本
             # 这有助于平衡不同模式的梯度贡献
@@ -1038,7 +1061,8 @@ class FlowMapStepMixin:
         # ==============================================================
         # 步骤 11: 总损失
         # ==============================================================
-        loss = video_loss \
+        video_loss_weight = getattr(self.config, 'video_loss_weight', 1.0)
+        loss = video_loss_weight * video_loss \
                + self.config.action_loss_weight * action_loss \
                + self.gt_regression_weight * gt_regression_loss \
                + getattr(self.config, 'action_aware_weight', 0.0) * action_aware_loss
@@ -1100,7 +1124,10 @@ class FlowMapStepMixin:
             cfg_scale = getattr(self.config, 'dmd_cfg_scale', 5.0)
 
         # 从纯噪声出发
+        # 当 retain_grad=True 时，需要从一开始就保留梯度
         current_action = torch.randn_like(batch['actions'])
+        if retain_grad:
+            current_action.requires_grad_(True)
 
         # 生成时间步序列
         sigmas = torch.linspace(1.0, 0.0, num_steps + 1, device=self.device)
@@ -1109,16 +1136,45 @@ class FlowMapStepMixin:
         # 准备空文本嵌入（用于 CFG 无条件推理）
         empty_emb = self.empty_emb.expand(B, -1, -1)
 
+        # 获取动作帧数
+        action_num_frames = batch['actions'].shape[2]
+
+        # 生成位置编码网格（grid_id）
+        # 需要为视频和动作分别生成 grid_id
+        from wan_va.utils.utils import get_mesh_id
+        patch_f, patch_h, patch_w = self.patch_size
+
+        # 视频 grid_id
+        latent_grid_id = get_mesh_id(
+            batch['latents'].shape[-3] // patch_f,
+            batch['latents'].shape[-2] // patch_h,
+            batch['latents'].shape[-1] // patch_w,
+            t=0, f_w=1, f_shift=0, action=False,
+        ).to(self.device)
+        latent_grid_id = latent_grid_id[None].repeat(B, 1, 1)
+
+        # 动作 grid_id
+        action_grid_id = get_mesh_id(
+            batch['actions'].shape[-3],  # 动作帧数
+            batch['actions'].shape[-2],  # 动作高度
+            batch['actions'].shape[-1],  # 动作宽度
+            t=1, f_w=1, f_shift=0, action=True,
+        ).to(self.device)
+        action_grid_id = action_grid_id[None].repeat(B, 1, 1)
+
         # 使用 torch.no_grad() 包裹学生前向（不计算学生梯度）
-        with torch.no_grad():
+        # 当 retain_grad=True 时，不用 no_grad() 以保留计算图
+        grad_context = torch.enable_grad() if retain_grad else torch.no_grad()
+        with grad_context:
             for i in range(num_steps):
                 t_action = action_sigmas[i]
                 r_action = action_sigmas[i + 1]
 
                 # 构建 input_dict（视频用 GT latent 作为条件，不参与去噪）
                 # 动作用当前去噪状态
-                action_t_expanded = t_action.expand(B, -1)  # [B, T]
-                action_r_expanded = r_action.expand(B, -1)  # [B, T]
+                # t_action/r_action 是标量张量，需要先 unsqueeze 再 expand 到 [B, T]
+                action_t_expanded = t_action.unsqueeze(0).expand(B, action_num_frames)  # [B, T]
+                action_r_expanded = r_action.unsqueeze(0).expand(B, action_num_frames)  # [B, T]
 
                 rollout_input = {
                     'latent_dict': {
@@ -1127,7 +1183,7 @@ class FlowMapStepMixin:
                         'timesteps': torch.zeros_like(action_t_expanded),  # 视频时间步为 0（GT 条件）
                         'cond_timesteps': torch.zeros_like(action_t_expanded),
                         'text_emb': batch['text_emb'],
-                        'grid_id': batch.get('grid_id', torch.zeros(B, 1, 3, device=self.device)),
+                        'grid_id': latent_grid_id,
                     },
                     'action_dict': {
                         'noisy_latents': current_action,
@@ -1135,10 +1191,10 @@ class FlowMapStepMixin:
                         'timesteps': action_t_expanded,
                         'cond_timesteps': torch.zeros_like(action_t_expanded),
                         'text_emb': batch['text_emb'],
-                        'grid_id': batch.get('action_grid_id', torch.zeros(B, 1, 3, device=self.device)),
+                        'grid_id': action_grid_id,
                     },
-                    'chunk_size': batch.get('chunk_size', 1),
-                    'window_size': batch.get('window_size', 72),
+                    'chunk_size': self.config.frame_chunk_size,  # 从 config 获取
+                    'window_size': self.config.attn_window,       # 从 config 获取
                 }
 
                 # 学生有条件前向
@@ -1180,10 +1236,13 @@ class FlowMapStepMixin:
         """
         DMD 训练步：更新判别器 + 计算 DMD 梯度。
 
+        优化版本：只做一次 rollout，同时用于判别器训练和 DMD 梯度计算。
+        原版本需要两次 rollout（一次无梯度、一次有梯度），开销翻倍。
+
         流程：
-          1. On-policy rollout：用学生生成假动作
-          2. 判别器更新：真假样本二分类
-          3. DMD 梯度计算：normalize(D(fake) - teacher_score)
+          1. On-policy rollout（保留计算图）：用学生生成假动作
+          2. 判别器更新：真假样本二分类（使用 detach 后的假动作）
+          3. DMD 梯度计算：normalize(D(fake) - teacher_score)（复用同一次 rollout）
 
         参数:
             batch: 数据批次
@@ -1194,15 +1253,14 @@ class FlowMapStepMixin:
         """
         from discriminator import train_discriminator_step, compute_dmd_gradient
 
-        # 1. On-policy rollout（生成假动作，不需要梯度）
-        with torch.no_grad():
-            fake_action = self._on_policy_rollout(batch)
+        # 1. On-policy rollout（保留计算图，用于后续 DMD 梯度计算）
+        fake_action = self._on_policy_rollout(batch, retain_grad=True)
 
-        # 2. 判别器更新
+        # 2. 判别器更新（使用 detach 后的假动作，不回传梯度到学生）
         d_loss = train_discriminator_step(
             self.discriminator,
             real_actions=batch['actions'],
-            fake_actions=fake_action.detach(),
+            fake_actions=fake_action.detach(),  # detach 切断到学生模型的梯度
             video_latent=batch['latents'],
             text_emb=batch['text_emb'],
         )
@@ -1210,12 +1268,10 @@ class FlowMapStepMixin:
         self.discriminator_optimizer.step()
         self.discriminator_optimizer.zero_grad()
 
-        # 3. DMD 梯度计算（需要重新 rollout 以保留计算图）
-        fake_action_g = self._on_policy_rollout(batch, retain_grad=True)
-
+        # 3. DMD 梯度计算（复用同一次 rollout，无需重新 rollout）
         dmd_grad = compute_dmd_gradient(
             self.discriminator,
-            fake_actions=fake_action_g,
+            fake_actions=fake_action,  # 使用保留计算图的 fake_action
             video_latent=batch['latents'],
             text_emb=batch['text_emb'],
             teacher_score=0.0,

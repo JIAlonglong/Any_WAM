@@ -76,11 +76,9 @@ class WanTwoTimeTextImageEmbedding(nn.Module):
             else None
         )
 
-        # 门控参数（不可训练，由 buffer 注册）
-        self.register_buffer(
-            "delta_emb_gate",
-            torch.tensor([gate_value], dtype=torch.float32),
-            persistent=False,
+        # 门控参数（可训练，由 nn.Parameter 注册）
+        self.delta_emb_gate = nn.Parameter(
+            torch.tensor([gate_value], dtype=torch.float32)
         )
         # delta 时间步类型：'r' 表示直接使用 r_timestep，'t-r' 表示使用 timestep - r_timestep
         self.deltatime_type = deltatime_type
@@ -159,6 +157,58 @@ class WanTwoTimeTextImageEmbedding(nn.Module):
         return temb.reshape(B, L, -1), timestep_proj.reshape(B, L, -1)
 
 
+def _replace_condition_embedder(old_embedder, inner_dim, gate_value, deltatime_type,
+                                 freq_dim, text_embed_dim):
+    """将原始 condition_embedder 替换为支持 Flow Map 的双时间步版本。
+
+    创建 WanTwoTimeTextImageEmbedding 实例，并从原 embedder 深拷贝所有权重。
+
+    Args:
+        old_embedder: 原始的 condition_embedder（WanTimeTextImageEmbedding 实例）
+        inner_dim: transformer 的 inner_dim
+        gate_value: 门控初始值
+        deltatime_type: delta 时间步类型，支持 'r' 和 't-r'
+        freq_dim: 时间步频率编码维度
+        text_embed_dim: 文本嵌入维度
+
+    Returns:
+        WanTwoTimeTextImageEmbedding 实例，权重已从 old_embedder 深拷贝
+    """
+    # 获取图像嵌入维度（如果原模型有 image_embedder）
+    image_embed_dim = None
+    if (
+        hasattr(old_embedder, "image_embedder")
+        and old_embedder.image_embedder is not None
+    ):
+        image_embed_dim = old_embedder.image_embedder.linear_1.in_features
+
+    # 创建新的双时间步嵌入模块
+    new_embedder = WanTwoTimeTextImageEmbedding(
+        dim=inner_dim,
+        gate_value=gate_value,
+        deltatime_type=deltatime_type,
+        time_freq_dim=freq_dim,
+        time_proj_dim=inner_dim * 6,
+        text_embed_dim=text_embed_dim,
+        image_embed_dim=image_embed_dim,
+    )
+
+    # 从原 embedder 深拷贝权重
+    new_embedder.time_embedder = copy.deepcopy(old_embedder.time_embedder)
+    # delta_embedder 从 time_embedder 深拷贝初始化（共享初始权重）
+    new_embedder.delta_embedder = copy.deepcopy(old_embedder.time_embedder)
+    new_embedder.time_proj = copy.deepcopy(old_embedder.time_proj)
+    new_embedder.text_embedder = copy.deepcopy(old_embedder.text_embedder)
+    # 深拷贝 image_embedder（如果原模型存在）
+    if (
+        hasattr(old_embedder, "image_embedder")
+        and old_embedder.image_embedder is not None
+    ):
+        new_embedder.image_embedder = copy.deepcopy(old_embedder.image_embedder)
+
+    return new_embedder
+
+
 def setup_flowmap_model(model, gate_value=0.0, deltatime_type="r"):
     """将模型的 condition_embedder 替换为支持 Flow Map 的双时间步版本。
 
@@ -179,93 +229,18 @@ def setup_flowmap_model(model, gate_value=0.0, deltatime_type="r"):
     # PixArtAlphaTextProjection 的第一个 Linear 层的 in_features 即为文本嵌入维度
     text_embed_dim = model.condition_embedder.text_embedder.linear_1.in_features
 
-    # 获取图像嵌入维度（如果原模型有 image_embedder）
-    image_embed_dim = None
-    if (
-        hasattr(model.condition_embedder, "image_embedder")
-        and model.condition_embedder.image_embedder is not None
-    ):
-        image_embed_dim = model.condition_embedder.image_embedder.linear_1.in_features
-
-    # 创建新的双时间步嵌入模块
-    new_condition_embedder = WanTwoTimeTextImageEmbedding(
-        dim=inner_dim,
-        gate_value=gate_value,
-        deltatime_type=deltatime_type,
-        time_freq_dim=freq_dim,
-        time_proj_dim=inner_dim * 6,
-        text_embed_dim=text_embed_dim,
-        image_embed_dim=image_embed_dim,
+    # 替换 condition_embedder
+    model.condition_embedder = _replace_condition_embedder(
+        model.condition_embedder, inner_dim, gate_value, deltatime_type,
+        freq_dim, text_embed_dim,
     )
-
-    # 从原模型的 condition_embedder 深拷贝权重
-    new_condition_embedder.time_embedder = copy.deepcopy(
-        model.condition_embedder.time_embedder
-    )
-    # delta_embedder 从 time_embedder 深拷贝初始化（共享初始权重）
-    new_condition_embedder.delta_embedder = copy.deepcopy(
-        model.condition_embedder.time_embedder
-    )
-    new_condition_embedder.time_proj = copy.deepcopy(
-        model.condition_embedder.time_proj
-    )
-    new_condition_embedder.text_embedder = copy.deepcopy(
-        model.condition_embedder.text_embedder
-    )
-    # 深拷贝 image_embedder（如果原模型存在）
-    if (
-        hasattr(model.condition_embedder, "image_embedder")
-        and model.condition_embedder.image_embedder is not None
-    ):
-        new_condition_embedder.image_embedder = copy.deepcopy(
-            model.condition_embedder.image_embedder
-        )
-
-    # 替换原模型的 condition_embedder
-    del model.condition_embedder
-    model.condition_embedder = new_condition_embedder
 
     # 同样替换 condition_embedder_action（如果存在）
     if hasattr(model, "condition_embedder_action"):
-        # 获取 action 侧的图像嵌入维度
-        action_image_embed_dim = None
-        if (
-            hasattr(model.condition_embedder_action, "image_embedder")
-            and model.condition_embedder_action.image_embedder is not None
-        ):
-            action_image_embed_dim = model.condition_embedder_action.image_embedder.linear_1.in_features
-
-        new_condition_embedder_action = WanTwoTimeTextImageEmbedding(
-            dim=inner_dim,
-            gate_value=gate_value,
-            deltatime_type=deltatime_type,
-            time_freq_dim=freq_dim,
-            time_proj_dim=inner_dim * 6,
-            text_embed_dim=text_embed_dim,
-            image_embed_dim=action_image_embed_dim,
+        model.condition_embedder_action = _replace_condition_embedder(
+            model.condition_embedder_action, inner_dim, gate_value, deltatime_type,
+            freq_dim, text_embed_dim,
         )
-        new_condition_embedder_action.time_embedder = copy.deepcopy(
-            model.condition_embedder_action.time_embedder
-        )
-        new_condition_embedder_action.delta_embedder = copy.deepcopy(
-            model.condition_embedder_action.time_embedder
-        )
-        new_condition_embedder_action.time_proj = copy.deepcopy(
-            model.condition_embedder_action.time_proj
-        )
-        new_condition_embedder_action.text_embedder = copy.deepcopy(
-            model.condition_embedder_action.text_embedder
-        )
-        # 深拷贝 action 侧的 image_embedder（如果原模型存在）
-        if (
-            hasattr(model.condition_embedder_action, "image_embedder")
-            and model.condition_embedder_action.image_embedder is not None
-        ):
-            new_condition_embedder_action.image_embedder = copy.deepcopy(
-                model.condition_embedder_action.image_embedder
-            )
-        del model.condition_embedder_action
-        model.condition_embedder_action = new_condition_embedder_action
 
     return model
 
@@ -286,6 +261,9 @@ def patch_model_forward(model):
         该函数修改 _time_embed 和 forward_train 方法，使其接受可选的 r_timestep 参数，
         并将其传递给 condition_embedder 的 forward 方法。
     """
+    # 在函数顶部导入 FlexAttnFunc，闭包捕获引用，避免每次 forward 调用时重复导入
+    from modules.model import FlexAttnFunc
+
     # 保存原始方法，便于 unpatch_model_forward 恢复
     original_time_embed = model._time_embed
     original_forward_train = model.forward_train
@@ -453,9 +431,6 @@ def patch_model_forward(model):
             condition_action_hidden_states.shape[1],
             padded_length,
         ]
-
-        # 延迟导入 FlexAttnFunc 以避免循环依赖
-        from modules.model import FlexAttnFunc  # noqa: E402
 
         FlexAttnFunc.init_mask(
             latent_dict["noisy_latents"].shape,

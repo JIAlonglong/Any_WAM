@@ -167,6 +167,10 @@ class LatentLeRobotDataset(LeRobotDataset):
         self._hf_torch_view = None  # 不再使用 HuggingFace datasets
         self.parse_meta()
 
+        # 预加载数据集到内存（如果启用缓存）
+        if self.cache_in_memory:
+            self._preload_dataset()
+
     def parse_meta(self):
         out = []
         for key, value in self.meta.episodes.items():
@@ -211,6 +215,28 @@ class LatentLeRobotDataset(LeRobotDataset):
                 if len(sample_frame_ids) > 1:
                     sample_stride = int(sample_frame_ids[1] - sample_frame_ids[0])
                     self._target_action_N = sample_stride * 4
+
+    def _preload_dataset(self):
+        """
+        预加载数据集到内存。
+
+        在训练开始前将所有样本加载到内存中，避免训练时的磁盘 I/O 瓶颈。
+        """
+        import time
+        from tqdm import tqdm
+
+        total_samples = len(self.new_metas)
+        print(f"Preloading {total_samples} samples to memory...")
+        start_time = time.time()
+
+        for idx in tqdm(range(total_samples), desc="Preloading"):
+            if idx not in self._memory_cache:
+                # 调用 __getitem__ 加载并缓存样本
+                _ = self[idx]
+
+        elapsed = time.time() - start_time
+        print(f"Preloaded {total_samples} samples in {elapsed:.1f}s "
+              f"({total_samples / elapsed:.1f} samples/s)")
 
     def _check_meta(self, start_frame, end_frame, episode_index):
         episode_chunk = self.meta.get_episode_chunk(episode_index)

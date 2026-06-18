@@ -27,6 +27,7 @@ Flow Map 蒸馏的训练步实现（FlowMapStepMixin）。
 """
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import contextlib
 from einops import rearrange

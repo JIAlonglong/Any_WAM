@@ -1115,18 +1115,27 @@ class FlowMapStepMixin:
         """
         B = batch['latents'].shape[0]
 
-        # 随机采样推理步数
+        # 随机采样推理步数（所有 rank 必须使用相同步数，否则 FSDP allgather 会死锁）
         if num_steps is None:
             step_min = getattr(self.config, 'dmd_rollout_steps_min', 2)
             step_max = getattr(self.config, 'dmd_rollout_steps_max', 8)
-            num_steps = torch.randint(step_min, step_max + 1, (1,)).item()
+            if dist.is_initialized():
+                # rank 0 采样，broadcast 到所有 rank
+                num_steps_tensor = torch.randint(step_min, step_max + 1, (1,), device=self.device)
+                dist.broadcast(num_steps_tensor, src=0)
+                num_steps = num_steps_tensor.item()
+            else:
+                num_steps = torch.randint(step_min, step_max + 1, (1,)).item()
 
         if cfg_scale is None:
             cfg_scale = getattr(self.config, 'dmd_cfg_scale', 5.0)
 
-        # 从纯噪声出发
+        # 从纯噪声出发（所有 rank 使用相同噪声，保证一致性）
         # 当 retain_grad=True 时，需要从一开始就保留梯度
         current_action = torch.randn_like(batch['actions'])
+        if dist.is_initialized():
+            # rank 0 生成噪声，broadcast 到所有 rank
+            dist.broadcast(current_action, src=0)
         if retain_grad:
             current_action.requires_grad_(True)
 

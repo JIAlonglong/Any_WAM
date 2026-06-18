@@ -1241,8 +1241,8 @@ class FlowMapStepMixin:
 
         流程：
           1. On-policy rollout（保留计算图）：用学生生成假动作
-          2. 判别器更新：真假样本二分类（使用 detach 后的假动作）
-          3. DMD 梯度计算：normalize(D(fake) - teacher_score)（复用同一次 rollout）
+          2. DMD 梯度计算：normalize(D(fake) - teacher_score)（先计算，保留计算图）
+          3. 判别器更新：真假样本二分类（使用 detach 后的假动作）
 
         参数:
             batch: 数据批次
@@ -1256,7 +1256,16 @@ class FlowMapStepMixin:
         # 1. On-policy rollout（保留计算图，用于后续 DMD 梯度计算）
         fake_action = self._on_policy_rollout(batch, retain_grad=True)
 
-        # 2. 判别器更新（使用 detach 后的假动作，不回传梯度到学生）
+        # 2. DMD 梯度计算（先计算，保留计算图）
+        dmd_grad = compute_dmd_gradient(
+            self.discriminator,
+            fake_actions=fake_action,  # 使用保留计算图的 fake_action
+            video_latent=batch['latents'],
+            text_emb=batch['text_emb'],
+            teacher_score=0.0,
+        )
+
+        # 3. 判别器更新（使用 detach 后的假动作，不回传梯度到学生）
         d_loss = train_discriminator_step(
             self.discriminator,
             real_actions=batch['actions'],
@@ -1267,14 +1276,5 @@ class FlowMapStepMixin:
         d_loss.backward()
         self.discriminator_optimizer.step()
         self.discriminator_optimizer.zero_grad()
-
-        # 3. DMD 梯度计算（复用同一次 rollout，无需重新 rollout）
-        dmd_grad = compute_dmd_gradient(
-            self.discriminator,
-            fake_actions=fake_action,  # 使用保留计算图的 fake_action
-            video_latent=batch['latents'],
-            text_emb=batch['text_emb'],
-            teacher_score=0.0,
-        )
 
         return dmd_grad, d_loss.detach()

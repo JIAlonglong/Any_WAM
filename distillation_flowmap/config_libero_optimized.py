@@ -125,7 +125,7 @@ cfg.use_action_distill = True       # 新增：使用教师蒸馏（核心改进
 # ============================================================
 # DMD 参数（Stage 1 默认关闭，Stage 2 启用）
 # ============================================================
-cfg.use_dmd = False                 # Stage 1: 关闭 DMD
+cfg.use_dmd = True                  # Stage 2: 启用 DMD
 cfg.dmd_weight = 0.1
 cfg.dmd_warmup_steps = 0
 cfg.dmd_rollout_steps_min = 2
@@ -133,7 +133,7 @@ cfg.dmd_rollout_steps_max = 8
 cfg.dmd_cfg_scale = 5.0
 cfg.dmd_discriminator_lr = 1e-5
 cfg.dmd_discriminator_steps = 1
-cfg.dmd_discriminator_warmup = 200
+cfg.dmd_discriminator_warmup = 2  # 快速测试 DMD
 cfg.dmd_hidden_dim = 256
 cfg.dmd_num_layers = 4
 cfg.dmd_num_heads = 8

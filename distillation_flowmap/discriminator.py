@@ -394,12 +394,14 @@ def compute_dmd_gradient(
 
     # 将 DMD 信号反向传播到 fake_actions，得到梯度
     # torch.autograd.grad 计算 fake_actions 相对于 dmd_signal 的梯度
+    # create_graph=True 使得 dmd_grad 保持计算图连接，
+    # 这样后续 dmd_loss.backward() 才能将梯度传回学生模型
     grad = torch.autograd.grad(
         outputs=dmd_signal,
         inputs=fake_actions,
         grad_outputs=torch.ones_like(dmd_signal),
-        create_graph=False,  # 不需要二阶导数
-        retain_graph=False,
+        create_graph=True,   # 保持计算图，允许梯度回传到学生
+        retain_graph=True,   # 保留计算图，dmd_loss.backward() 还需要用到
     )[0]  # [B, C, F, N, 1]
 
     # L2 归一化：防止梯度爆炸，稳定训练

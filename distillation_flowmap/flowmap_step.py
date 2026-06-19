@@ -1283,21 +1283,22 @@ class FlowMapStepMixin:
         # 1. On-policy rollout（保留计算图）
         fake_action = self._on_policy_rollout(batch, retain_grad=True)
 
-        # 2. 计算判别器对假动作的打分（非 detach，保留到学生的梯度路径）
-        # 将 DTensor 转换为普通 Tensor（FSDP 包装的 student 输出是 DTensor）
+        # 2. 计算判别器对假动作的打分
+        # 关键：禁用判别器梯度，避免 backward 时触发 FSDP reshard 导致 DTensor/Tensor 混用
+        # 参考 DMD2: https://github.com/tianweiy/DMD2/blob/main/main/sd_unified_model.py
+        self.discriminator.requires_grad_(False)
         fake_action_for_disc = _to_regular_tensor(fake_action)
-
         fake_logits = self.discriminator(
-            fake_action_for_disc,  # 不 detach！梯度要流回学生
+            fake_action_for_disc,
             _to_regular_tensor(batch['latents']),
             _to_regular_tensor(batch['text_emb']),
         )
         # DMD loss = weight * D(fake)^2
-        # 最大化 D(fake) → 学生生成更"真"的动作
         dmd_loss = getattr(self.config, 'dmd_weight', 0.1) * (fake_logits ** 2).mean()
 
-        # 3. 先 backward 到学生！此时判别器参数还未被修改
+        # 3. backward 到学生（判别器梯度已禁用，不会触发 reshard）
         dmd_loss.backward()
+        self.discriminator.requires_grad_(True)
 
         # 4. 再更新判别器（detach 假动作，不回传梯度到学生）
         d_loss = train_discriminator_step(

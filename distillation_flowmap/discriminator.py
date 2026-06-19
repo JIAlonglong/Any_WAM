@@ -245,30 +245,13 @@ class ActionDiscriminator(nn.Module):
             logits       : [B, 1]  — 判别器打分（未经过 sigmoid）
                            > 0 倾向"真"，< 0 倾向"假"
         """
-        # DTensor→Tensor 转换（FSDP 包装的 student 输出是 DTensor）
-        # 必须在 .float() 之前转换，否则 .float() 可能返回 DTensor
-        if hasattr(actions, '_local_tensor'):
-            actions = actions._local_tensor.float()
-        elif hasattr(actions, 'to_local'):
-            actions = actions.to_local().float()
-        else:
-            actions = actions.float()
-
-        if hasattr(video_latent, '_local_tensor'):
-            video_latent = video_latent._local_tensor.float()
-        elif hasattr(video_latent, 'to_local'):
-            video_latent = video_latent.to_local().float()
-        else:
-            video_latent = video_latent.float()
-
-        if hasattr(text_emb, '_local_tensor'):
-            text_emb = text_emb._local_tensor.float()
-        elif hasattr(text_emb, 'to_local'):
-            text_emb = text_emb.to_local().float()
-        else:
-            text_emb = text_emb.float()
-
         B = actions.shape[0]
+
+        # 将输入转换为 float32 以匹配判别器参数
+        # （判别器和学生模型都用 FSDP 包装，输入都是 DTensor）
+        actions = actions.float()
+        video_latent = video_latent.float()
+        text_emb = text_emb.float()
 
         # === 步骤 1: 编码动作 ===
         # [B, C, F, N, 1] → [B, F*N, C] → [B, F*N, hidden_dim]

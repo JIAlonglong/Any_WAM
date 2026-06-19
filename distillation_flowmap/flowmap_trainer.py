@@ -480,8 +480,17 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             ).to(self.device)  # 保持 float32，不转换 dtype
             self.discriminator.train()
 
-            # 判别器不使用 FSDP（参数量小，6.79M，不值得 FSDP 开销）
-            # DTensor→Tensor 转换在 _to_regular_tensor() 中处理
+            # 用 FSDP2 fully_shard 包装判别器（避免 DTensor/Tensor 混用）
+            # 判别器参数量小（6.79M），FSDP 开销可忽略
+            if config.world_size > 1:
+                from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+                mp_policy = MixedPrecisionPolicy(
+                    param_dtype=torch.float32,
+                    reduce_dtype=torch.float32,
+                )
+                fully_shard(self.discriminator, mp_policy=mp_policy)
+                if config.rank == 0:
+                    logger.info("  Discriminator wrapped with FSDP2 fully_shard")
 
             self.discriminator_optimizer = torch.optim.AdamW(
                 self.discriminator.parameters(),

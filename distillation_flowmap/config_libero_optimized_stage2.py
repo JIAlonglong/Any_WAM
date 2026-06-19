@@ -137,7 +137,7 @@ cfg.dmd_rollout_steps_max = 8
 cfg.dmd_cfg_scale = 5.0
 cfg.dmd_discriminator_lr = 1e-5
 cfg.dmd_discriminator_steps = 1
-cfg.dmd_discriminator_warmup = 200  # 判别器预热 200 步
+cfg.dmd_discriminator_warmup = 1  # 判别器预热 200 步
 cfg.dmd_hidden_dim = 256
 cfg.dmd_num_layers = 4
 cfg.dmd_num_heads = 8
@@ -201,7 +201,7 @@ cfg.action_downsample_factor = 4
 # ============================================================
 # 检查点与日志
 # ============================================================
-cfg.save_interval = 100      # 每 100 步保存一次 checkpoint
+cfg.save_interval = 2      # 每 100 步保存一次 checkpoint
 cfg.gc_interval = 50
 cfg.enable_wandb = True
 cfg.wandb_entity = None

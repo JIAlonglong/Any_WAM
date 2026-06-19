@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+from datetime import timedelta
+
 import torch
 import torch.distributed as dist
 
@@ -27,7 +29,8 @@ def init_distributed(world_size, local_rank, rank):
     dist.init_process_group(backend="nccl",
                             init_method="env://",
                             rank=rank,
-                            world_size=world_size)
+                            world_size=world_size,
+                            timeout=timedelta(minutes=30))
 
 def dist_mean(local_tensor):
     if dist.is_initialized():

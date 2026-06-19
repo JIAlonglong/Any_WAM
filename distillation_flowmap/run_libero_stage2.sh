@@ -36,6 +36,7 @@ export OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/output_libero_optimized_stage2}"
 export CONFIG_FILE="${CONFIG_FILE:-distillation_flowmap.config_libero_optimized_stage2}"
 export DISTILL_MODE="${DISTILL_MODE:-flashwam}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export NCCL_TIMEOUT=1800000  # 30 分钟，避免多卡 rollout 超时
 
 # 离线模式：禁止联网下载数据集
 export HF_DATASETS_OFFLINE=1

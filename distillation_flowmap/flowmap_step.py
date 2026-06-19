@@ -30,6 +30,16 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import contextlib
+
+
+def _to_regular_tensor(t):
+    """Convert DTensor to regular Tensor, preserving gradient flow."""
+    if hasattr(t, '_local_tensor'):
+        # DTensor: return the local tensor (preserves grad)
+        return t._local_tensor
+    elif hasattr(t, 'to_local'):
+        return t.to_local()
+    return t
 from einops import rearrange
 
 from utils import data_seq_to_patch, logger
@@ -1274,16 +1284,12 @@ class FlowMapStepMixin:
 
         # 2. 计算判别器对假动作的打分（非 detach，保留到学生的梯度路径）
         # 将 DTensor 转换为普通 Tensor（FSDP 包装的 student 输出是 DTensor）
-        fake_action_for_disc = fake_action
-        if hasattr(fake_action, 'to_local'):
-            fake_action_for_disc = fake_action.to_local()
-        elif hasattr(fake_action, 'full_tensor'):
-            fake_action_for_disc = fake_action.full_tensor()
+        fake_action_for_disc = _to_regular_tensor(fake_action)
 
         fake_logits = self.discriminator(
             fake_action_for_disc,  # 不 detach！梯度要流回学生
-            batch['latents'],
-            batch['text_emb'],
+            _to_regular_tensor(batch['latents']),
+            _to_regular_tensor(batch['text_emb']),
         )
         # DMD loss = weight * D(fake)^2
         # 最大化 D(fake) → 学生生成更"真"的动作
@@ -1293,19 +1299,12 @@ class FlowMapStepMixin:
         dmd_loss.backward()
 
         # 4. 再更新判别器（detach 假动作，不回传梯度到学生）
-        # 将 DTensor 转换为普通 Tensor
-        fake_action_detached = fake_action.detach()
-        if hasattr(fake_action_detached, 'to_local'):
-            fake_action_detached = fake_action_detached.to_local()
-        elif hasattr(fake_action_detached, 'full_tensor'):
-            fake_action_detached = fake_action_detached.full_tensor()
-
         d_loss = train_discriminator_step(
             self.discriminator,
-            real_actions=batch['actions'],
-            fake_actions=fake_action_detached,
-            video_latent=batch['latents'],
-            text_emb=batch['text_emb'],
+            real_actions=_to_regular_tensor(batch['actions']),
+            fake_actions=_to_regular_tensor(fake_action.detach()),
+            video_latent=_to_regular_tensor(batch['latents']),
+            text_emb=_to_regular_tensor(batch['text_emb']),
         )
         d_loss.backward()
         self.discriminator_optimizer.step()

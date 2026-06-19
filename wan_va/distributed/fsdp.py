@@ -11,7 +11,11 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 def apply_ac(model):
     """Apply activation checkpointing to the model."""
     for layer_id, transformer_block in enumerate(model.blocks):
-        transformer_block = ptd_checkpoint_wrapper(transformer_block, preserve_rng_state=False)
+        transformer_block = ptd_checkpoint_wrapper(
+            transformer_block,
+            preserve_rng_state=False,
+            use_reentrant=False,  # FSDP2 兼容：避免 DTensor/Tensor 混用
+        )
         model.blocks[layer_id] = transformer_block
 
 

@@ -1273,8 +1273,15 @@ class FlowMapStepMixin:
         fake_action = self._on_policy_rollout(batch, retain_grad=True)
 
         # 2. 计算判别器对假动作的打分（非 detach，保留到学生的梯度路径）
+        # 将 DTensor 转换为普通 Tensor（FSDP 包装的 student 输出是 DTensor）
+        fake_action_for_disc = fake_action
+        if hasattr(fake_action, 'to_local'):
+            fake_action_for_disc = fake_action.to_local()
+        elif hasattr(fake_action, 'full_tensor'):
+            fake_action_for_disc = fake_action.full_tensor()
+
         fake_logits = self.discriminator(
-            fake_action,          # 不 detach！梯度要流回学生
+            fake_action_for_disc,  # 不 detach！梯度要流回学生
             batch['latents'],
             batch['text_emb'],
         )
@@ -1286,10 +1293,17 @@ class FlowMapStepMixin:
         dmd_loss.backward()
 
         # 4. 再更新判别器（detach 假动作，不回传梯度到学生）
+        # 将 DTensor 转换为普通 Tensor
+        fake_action_detached = fake_action.detach()
+        if hasattr(fake_action_detached, 'to_local'):
+            fake_action_detached = fake_action_detached.to_local()
+        elif hasattr(fake_action_detached, 'full_tensor'):
+            fake_action_detached = fake_action_detached.full_tensor()
+
         d_loss = train_discriminator_step(
             self.discriminator,
             real_actions=batch['actions'],
-            fake_actions=fake_action.detach(),
+            fake_actions=fake_action_detached,
             video_latent=batch['latents'],
             text_emb=batch['text_emb'],
         )

@@ -742,11 +742,17 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     # 判别器预热期间：只训判别器，不注入 DMD 梯度
                     with torch.no_grad():
                         fake_action = self._on_policy_rollout(batch)
+                    # 将 DTensor 转换为普通 Tensor（FSDP 包装的 student 输出是 DTensor）
+                    fake_action_detached = fake_action.detach()
+                    if hasattr(fake_action_detached, 'to_local'):
+                        fake_action_detached = fake_action_detached.to_local()
+                    elif hasattr(fake_action_detached, 'full_tensor'):
+                        fake_action_detached = fake_action_detached.full_tensor()
                     from discriminator import train_discriminator_step
                     d_loss_val = train_discriminator_step(
                         self.discriminator,
                         real_actions=batch['actions'],
-                        fake_actions=fake_action.detach(),
+                        fake_actions=fake_action_detached,
                         video_latent=batch['latents'],
                         text_emb=batch['text_emb'],
                     )

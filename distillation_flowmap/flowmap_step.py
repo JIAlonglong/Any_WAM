@@ -33,12 +33,9 @@ import contextlib
 
 
 def _to_regular_tensor(t):
-    """Convert DTensor to regular Tensor, preserving gradient flow."""
-    if hasattr(t, '_local_tensor'):
-        # DTensor: return the local tensor (preserves grad)
-        return t._local_tensor
-    elif hasattr(t, 'to_local'):
-        return t.to_local()
+    """Convert DTensor to regular Tensor, preserving gradient flow via autograd."""
+    if hasattr(t, 'to_local'):
+        return t.to_local()  # autograd-aware conversion
     return t
 from einops import rearrange
 
@@ -1249,6 +1246,10 @@ class FlowMapStepMixin:
                 # v_action 形状: [B, F*N, C]，需要 reshape 为 [B, C, F, N, 1]
                 v_action_5d = self._extract_action_v(v_action, batch['actions'].shape[2])
                 current_action = current_action - (t_action - r_action) * v_action_5d
+
+        # 将 DTensor 转为普通 Tensor（FSDP 包装的 student 输出是 DTensor）
+        if hasattr(current_action, 'to_local'):
+            current_action = current_action.to_local()
 
         # 如果需要保留梯度图（用于 DMD 梯度计算）
         if retain_grad:

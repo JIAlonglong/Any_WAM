@@ -89,9 +89,9 @@ cfg.num_ddim_timesteps = 2
 cfg.distill_mode = os.environ.get("DISTILL_MODE", "flashwam")
 
 _mode = cfg.distill_mode
-cfg.distill_video = _mode in ("video", "joint", "video_action_aware", "flashwam")
-cfg.distill_action = _mode in ("action", "joint", "flashwam")
-cfg.action_aware = _mode in ("video_action_aware", "flashwam")
+cfg.distill_video = _mode in ("video", "joint", "video_action_aware", "flashwam", "onpolicy_transition")
+cfg.distill_action = _mode in ("action", "joint", "flashwam", "onpolicy_transition")
+cfg.action_aware = _mode in ("video_action_aware", "flashwam", "onpolicy_transition")
 
 cfg.num_ddim_timesteps_action = 2
 cfg.action_loss_weight = 1.0
@@ -127,9 +127,30 @@ cfg.action_use_flowmap = False
 cfg.use_action_distill = True       # DMD 需要动作蒸馏
 
 # ============================================================
-# DMD 参数（Stage 2 启用）
+# On-Policy Transition Matching 参数
 # ============================================================
-cfg.use_dmd = True                  # Stage 2: 启用 DMD
+cfg.use_onpolicy_transition = (_mode == "onpolicy_transition")
+cfg.rollout_step_pairs = [
+    [1, 1],
+    [1, 2],
+    [2, 2],
+    [4, 4],
+]
+cfg.teacher_micro_steps = 2
+cfg.teacher_solver = "euler"
+cfg.transition_loss_type = "huber"
+cfg.transition_huber_c = 1e-3
+cfg.video_transition_weight = 1.0
+cfg.local_fm_weight = 0.05
+cfg.action_state_mode = "data"
+cfg.action_onpolicy_prob = 0.0
+cfg.composition_weight = 0.0
+cfg.onpolicy_warmup_steps = 0
+
+# ============================================================
+# DMD 参数（Stage 2 启用，仅 flashwam 模式使用）
+# ============================================================
+cfg.use_dmd = (_mode == "flashwam")   # 仅 flashwam 模式启用 DMD
 cfg.dmd_weight = 0.1
 cfg.dmd_warmup_steps = 0            # DMD 从第一步开始
 cfg.dmd_rollout_steps_min = 2
@@ -201,7 +222,7 @@ cfg.action_downsample_factor = 4
 # ============================================================
 # 检查点与日志
 # ============================================================
-cfg.save_interval = 2      # 每 100 步保存一次 checkpoint
+cfg.save_interval = 100      # 每 100 步保存一次 checkpoint
 cfg.gc_interval = 50
 cfg.enable_wandb = True
 cfg.wandb_entity = None

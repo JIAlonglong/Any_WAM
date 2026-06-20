@@ -14,7 +14,6 @@ def apply_ac(model):
         transformer_block = ptd_checkpoint_wrapper(
             transformer_block,
             preserve_rng_state=False,
-            use_reentrant=False,  # FSDP2 兼容：避免 DTensor/Tensor 混用
         )
         model.blocks[layer_id] = transformer_block
 

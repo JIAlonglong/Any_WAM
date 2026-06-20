@@ -140,6 +140,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # DMD（On-Policy Distribution Matching Distillation）参数
         # ==============================================================
         self.use_dmd = getattr(config, 'use_dmd', False)
+        self.use_onpolicy_transition = getattr(config, 'use_onpolicy_transition', False)
         self.discriminator = None
         self.discriminator_optimizer = None
 
@@ -350,10 +351,45 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # conflicts with the bfloat16 base model.
         self.student = self.student.to(self.dtype)
 
-        self.student = _configure_model(
-            model=self.student, shard_fn=shard_model,
-            param_dtype=self.dtype, device=self.device, eval_mode=False,
-        )
+        # 创建非 FSDP 学生副本（用于 DMD rollout 和 on-policy transition rollout）
+        if self.use_dmd or self.use_onpolicy_transition:
+            import copy
+            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+            logger.info("Creating non-FSDP student copy for DMD rollout ...")
+            self._student_nofsdp = copy.deepcopy(self.student)
+            # 解包 CheckpointWrapper（避免分布式环境中触发 DTensor dispatch）
+            _unwrapped = 0
+            for i, block in enumerate(self._student_nofsdp.blocks):
+                if isinstance(block, CheckpointWrapper):
+                    self._student_nofsdp.blocks[i] = block._checkpoint_wrapped_module
+                    _unwrapped += 1
+            logger.info(f"Unwrapped {_unwrapped} CheckpointWrapper blocks in non-FSDP copy.")
+            self._student_nofsdp.eval()
+            for p in self._student_nofsdp.parameters():
+                p.requires_grad_(False)
+            # 对 nofsdp 副本也应用 patch_model_forward，否则闭包引用原始 FSDP 模型
+            self._student_nofsdp = patch_model_forward(self._student_nofsdp)
+            # 移动到正确的 CUDA 设备（deepcopy 时模型在 CPU 上）
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self._student_nofsdp = self._student_nofsdp.to(f"cuda:{local_rank}")
+            logger.info(f"Non-FSDP student copy created (patched, on cuda:{local_rank}).")
+        else:
+            self._student_nofsdp = None
+
+        if self.use_onpolicy_transition:
+            # On-policy mode: use DDP instead of FSDP to avoid DTensor mixing
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            # Apply activation checkpointing before DDP wrapping (same as FSDP path)
+            apply_ac(self.student)
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self.student = self.student.to(f"cuda:{local_rank}")
+            self.student = DDP(self.student, device_ids=[local_rank], find_unused_parameters=True)
+            logger.info(f"Student wrapped with DDP on cuda:{local_rank} (on-policy mode, with AC)")
+        else:
+            self.student = _configure_model(
+                model=self.student, shard_fn=shard_model,
+                param_dtype=self.dtype, device=self.device, eval_mode=False,
+            )
         self.student.train()                # 训练模式
         self.student.requires_grad_(True)   # 启用梯度计算
 
@@ -417,10 +453,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # before FSDP wrapping (same reason as online student above).
         self.target_student = self.target_student.to(self.dtype)
 
-        self.target_student = _configure_model(
-            model=self.target_student, shard_fn=shard_model,
-            param_dtype=self.dtype, device=self.device, eval_mode=False,
-        )
+        if self.use_onpolicy_transition:
+            # On-policy mode: use DDP for target student too (EMA needs matching param sizes)
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self.target_student = self.target_student.to(f"cuda:{local_rank}")
+            self.target_student = DDP(self.target_student, device_ids=[local_rank], find_unused_parameters=True)
+            logger.info(f"Target student wrapped with DDP on cuda:{local_rank} (on-policy mode)")
+        else:
+            self.target_student = _configure_model(
+                model=self.target_student, shard_fn=shard_model,
+                param_dtype=self.dtype, device=self.device, eval_mode=False,
+            )
         self.target_student.requires_grad_(False)  # 冻结，仅用于推理
         self.target_student.eval()
 
@@ -715,12 +759,24 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             # 获取下一个数据批次
             batch = self._get_next_batch()
 
-            # ---- 第一阶段：Flow Map 蒸馏（始终执行）----
-            result = self._train_step(batch, step_in_acc)
+            # ---- 训练步：Flow Map 或 On-Policy Transition Matching ----
+            use_onpolicy = self.use_onpolicy_transition
+            onpolicy_warmup = getattr(self.config, 'onpolicy_warmup_steps', 0)
+            use_onpolicy_now = (use_onpolicy and self.step >= onpolicy_warmup)
+
+            if use_onpolicy_now:
+                # On-policy transition matching 替代 _train_step
+                result = self._onpolicy_transition_step(batch, step_in_acc)
+            else:
+                # 标准 Flow Map 蒸馏
+                result = self._train_step(batch, step_in_acc)
 
             # 累积损失值
             acc_losses.append(result["loss"])
-            acc_video_losses.append(result["video_loss"])
+            if use_onpolicy_now:
+                acc_video_losses.append(result.get("video_transition_loss", torch.tensor(0.0, device=self.device)))
+            else:
+                acc_video_losses.append(result["video_loss"])
             acc_action_losses.append(result["action_loss"])
             acc_action_aware_losses.append(result["action_aware_loss"])
             acc_gt_regression_losses.append(result.get(
@@ -733,7 +789,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             use_dmd_now = (self.use_dmd
                            and self.distill_action
                            and self.step >= dmd_warmup_steps
-                           and result["should_sync"])
+                           and result["should_sync"]
+                           and not use_onpolicy_now)
 
             if use_dmd_now:
                 if self.step >= dmd_warmup_steps + dmd_discriminator_warmup:
@@ -780,9 +837,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
                     # EMA 更新只在正常参数更新后执行（跳过 NaN/Inf 梯度时不更新 EMA，
                     # 避免将异常梯度产生的错误权重传播到目标学生）
+                    # For DDP, access underlying module parameters
+                    student_params = self.student.module.parameters() if hasattr(self.student, 'module') else self.student.parameters()
+                    target_params = self.target_student.module.parameters() if hasattr(self.target_student, 'module') else self.target_student.parameters()
                     update_ema(
-                        self.target_student.parameters(),
-                        self.student.parameters(),
+                        target_params,
+                        student_params,
                         rate=config.ema_decay,
                     )
 
@@ -826,8 +886,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         "train/lr": lr,
                     }
                     if self.distill_video:
-                        postfix["v"] = f"{avg_video_loss:.4f}"
-                        log_dict["loss/video_consistency"] = avg_video_loss
+                        if use_onpolicy_now:
+                            postfix["vt"] = f"{avg_video_loss:.4f}"
+                            log_dict["loss/video_transition"] = avg_video_loss
+                        else:
+                            postfix["v"] = f"{avg_video_loss:.4f}"
+                            log_dict["loss/video_consistency"] = avg_video_loss
                     if self.distill_action:
                         postfix["a"] = f"{avg_action_loss:.4f}"
                         log_dict["loss/action_consistency"] = avg_action_loss
@@ -837,7 +901,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     postfix["gt"] = f"{avg_gt_regression_loss:.4f}"
                     log_dict["loss/gt_regression"] = avg_gt_regression_loss
                     # DMD 日志
-                    if self.use_dmd and self.step >= dmd_warmup_steps:
+                    if self.use_dmd and not use_onpolicy and self.step >= dmd_warmup_steps:
                         postfix["d"] = f"{avg_d_loss:.4f}"
                         log_dict["loss/discriminator"] = avg_d_loss
                         if avg_dmd_grad_norm > 0:

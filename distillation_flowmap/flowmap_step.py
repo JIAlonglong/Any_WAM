@@ -1085,6 +1085,7 @@ class FlowMapStepMixin:
             loss = torch.clamp(loss, max=loss_clip_value)
 
         # 检查损失是否为 NaN/Inf，如果是则跳过这一步
+
         if not torch.isfinite(loss):
             if self.config.rank == 0:
                 logger.warning(f"[step {self.step}] NaN/Inf loss, skipping")
@@ -1105,6 +1106,642 @@ class FlowMapStepMixin:
     # On-Policy Rollout + DMD 训练步（Phase 5: On-Policy DMD）
     # ==================================================================
 
+    def _sync_student_nofsdp(self):
+        """Sync weights from FSDP student to non-FSDP copy."""
+        if not hasattr(self, '_student_nofsdp'):
+            return
+        import torch.distributed.tensor as _dt
+        with torch.no_grad():
+            nofsdp_dict = dict(self._student_nofsdp.named_parameters())
+            synced = 0
+            for name, fsdp_p in self.student.named_parameters():
+                if name in nofsdp_dict:
+                    nofsdp_p = nofsdp_dict[name]
+                    if isinstance(fsdp_p, _dt.DTensor):
+                        full = fsdp_p.full_tensor()
+                    else:
+                        full = fsdp_p
+                    nofsdp_p.copy_(full.to(nofsdp_p.dtype))
+                    synced += 1
+            # Debug: check first param type
+            first_name, first_p = next(self._student_nofsdp.named_parameters())
+            print(f"[DEBUG] synced={synced}, first param={first_name}, type={type(first_p).__name__}, is_dt={isinstance(first_p, _dt.DTensor)}")
+
+    # ==================================================================
+    def _student_euler_integrate(self, noisy_latents, timesteps, target_r, base_input_dict,
+                                   empty_emb, cfg_scale, ref_shape, B, num_frames,
+                                   K_steps=1, micro_steps=1):
+        """
+        Student multi-step Euler integration from t to target_r.
+
+        Strategy: use non-FSDP student copy for K-step rollout (no gradient, avoids FSDP+checkpoint issues),
+        then do a single FSDP student forward at x_r for gradient flow.
+
+        Returns:
+            x_final: final latent at target_r (detached, from rollout)
+            v_final: student v-prediction at (x_final, target_r) with gradient
+        """
+        from modules.model import FlexAttnFunc
+        _ACTION_DS = getattr(self.config, 'action_downsample_factor', 4)
+
+        # ===== Phase 1: K-step Euler rollout (no gradient) =====
+        # Use self.student directly (DDP mode has no DTensor issues)
+        _rollout_model = self.student
+
+        with torch.no_grad():
+            # Compute timestep sequence
+            t_sigma = timesteps.float().mean() / self.config.num_train_timesteps
+            r_sigma = target_r.float().mean() / self.config.num_train_timesteps
+            sigmas = torch.linspace(t_sigma, r_sigma, K_steps + 1, device=self.device)
+            step_ts = sigmas * self.config.num_train_timesteps
+
+            current_x = noisy_latents
+
+            # Convert inputs to regular tensors for rollout model
+            _rt_latent = {k: _to_regular_tensor(v) if isinstance(v, torch.Tensor) else v
+                          for k, v in base_input_dict['latent_dict'].items()}
+            _rt_action = {k: _to_regular_tensor(v) if isinstance(v, torch.Tensor) else v
+                          for k, v in base_input_dict['action_dict'].items()}
+            _rt_empty = _to_regular_tensor(empty_emb)
+
+            for i in range(K_steps):
+                t_i = step_ts[i]
+                r_next = step_ts[min(i + 1, K_steps)]
+
+                step_input = {
+                    'latent_dict': {
+                        **_rt_latent,
+                        'noisy_latents': _to_regular_tensor(current_x),
+                        'timesteps': t_i.expand_as(timesteps),
+                    },
+                    'action_dict': _rt_action,
+                    'chunk_size': base_input_dict['chunk_size'],
+                    'window_size': base_input_dict['window_size'],
+                }
+
+                _ld = step_input['latent_dict']
+                _ad = step_input['action_dict']
+                _total_length = (
+                    _ld['noisy_latents'].flatten(0, 1).shape[0] * 2 +
+                    _ad['noisy_latents'].flatten(0, 1).shape[0] * 2
+                )
+                _padded_length = (128 - _total_length % 128) % 128
+                FlexAttnFunc.init_mask(
+                    _ld['noisy_latents'].shape,
+                    _ad['noisy_latents'].shape,
+                    _padded_length,
+                    step_input['chunk_size'],
+                    window_size=step_input['window_size'],
+                    patch_size=self.patch_size,
+                    device=self.device,
+                )
+
+                r_timestep_i = r_next.expand_as(timesteps)
+
+                # Rollout model forward (CFG)
+                v_video_cond, _ = _rollout_model(
+                    step_input, train_mode=True,  # use forward_train (nested dict format); no FSDP checkpoint issue with nofsdp copy
+                    r_timestep=r_timestep_i,
+                    action_r_timestep=r_timestep_i[:, ::_ACTION_DS] if self.distill_action else r_timestep_i,
+                )
+                v_video_cond_5d = self._extract_video_v(v_video_cond, ref_shape, B)
+
+                if cfg_scale > 1.0:
+                    step_input_uncond = {
+                        'latent_dict': {**step_input['latent_dict'],
+                                        'text_emb': _rt_empty.expand(B, -1, -1)},
+                        'action_dict': {**step_input['action_dict'],
+                                        'text_emb': _rt_empty.expand(B, -1, -1)},
+                        'chunk_size': step_input['chunk_size'],
+                        'window_size': step_input['window_size'],
+                    }
+                    v_video_uncond, _ = _rollout_model(
+                        step_input_uncond, train_mode=True,  # use forward_train (nested dict format); no FSDP checkpoint issue with nofsdp copy
+                        r_timestep=r_timestep_i,
+                        action_r_timestep=r_timestep_i[:, ::_ACTION_DS] if self.distill_action else r_timestep_i,
+                    )
+                    v_video_uncond_5d = self._extract_video_v(v_video_uncond, ref_shape, B)
+                    v_cfg = v_video_uncond_5d + cfg_scale * (v_video_cond_5d - v_video_uncond_5d)
+                else:
+                    v_cfg = v_video_cond_5d
+
+                v_cfg = _to_regular_tensor(v_cfg)
+
+                sigma_i = self.train_scheduler_latent.sigmas[
+                    torch.argmin((self.train_scheduler_latent.timesteps - t_i.cpu()).abs())]
+                sigma_next = self.train_scheduler_latent.sigmas[
+                    torch.argmin((self.train_scheduler_latent.timesteps - r_next.cpu()).abs())]
+                current_x = current_x + v_cfg * (sigma_next - sigma_i)
+
+        # ===== Phase 2: Use self.student directly (DDP mode) =====
+        _rollout_model = self.student
+
+        current_x_detached = current_x.detach().requires_grad_(True)
+
+        final_input = {
+            'latent_dict': {
+                **{k: _to_regular_tensor(v) if isinstance(v, torch.Tensor) else v
+                   for k, v in base_input_dict['latent_dict'].items()},
+                'noisy_latents': _to_regular_tensor(current_x_detached),
+                'timesteps': target_r,
+            },
+            'action_dict': {k: _to_regular_tensor(v) if isinstance(v, torch.Tensor) else v
+                            for k, v in base_input_dict['action_dict'].items()},
+            'chunk_size': base_input_dict['chunk_size'],
+            'window_size': base_input_dict['window_size'],
+        }
+        _ld = final_input['latent_dict']
+        _ad = final_input['action_dict']
+        _total_length = (
+            _ld['noisy_latents'].flatten(0, 1).shape[0] * 2 +
+            _ad['noisy_latents'].flatten(0, 1).shape[0] * 2
+        )
+        _padded_length = (128 - _total_length % 128) % 128
+        FlexAttnFunc.init_mask(
+            _ld['noisy_latents'].shape,
+            _ad['noisy_latents'].shape,
+            _padded_length,
+            final_input['chunk_size'],
+            window_size=final_input['window_size'],
+            patch_size=self.patch_size,
+            device=self.device,
+        )
+
+        v_final_cond, _ = _rollout_model(
+            final_input, train_mode=True,
+            r_timestep=target_r,
+            action_r_timestep=target_r[:, ::_ACTION_DS] if self.distill_action else target_r,
+        )
+        v_final_cond_5d = self._extract_video_v(v_final_cond, ref_shape, B)
+
+        if cfg_scale > 1.0:
+            final_uncond = {
+                'latent_dict': {**final_input['latent_dict'],
+                                'text_emb': _rt_empty.expand(B, -1, -1)},
+                'action_dict': {**final_input['action_dict'],
+                                'text_emb': _rt_empty.expand(B, -1, -1)},
+                'chunk_size': final_input['chunk_size'],
+                'window_size': final_input['window_size'],
+            }
+            v_final_uncond, _ = _rollout_model(
+                final_uncond, train_mode=True,
+                r_timestep=target_r,
+                action_r_timestep=target_r[:, ::_ACTION_DS] if self.distill_action else target_r,
+            )
+            v_final_uncond_5d = self._extract_video_v(v_final_uncond, ref_shape, B)
+            v_final_cfg = v_final_uncond_5d + cfg_scale * (v_final_cond_5d - v_final_uncond_5d)
+        else:
+            v_final_cfg = v_final_cond_5d
+
+        v_final_cfg = _to_regular_tensor(v_final_cfg)
+
+        return current_x_detached, v_final_cfg
+
+
+    def _teacher_integrate_to_r(self, noisy_latents, timesteps, target_r, input_dict, empty_emb,
+                                 cfg_scale, ref_shape, B, num_frames, num_steps=2):
+        """
+        Teacher multi-step Euler integration from t to target_r (no_grad).
+
+        使用 teacher 模型做 num_steps 步 Euler 积分，
+        从 t 的噪声样本出发，到达 target_r 处的"teacher 认为的"状态。
+
+        参数:
+            noisy_latents: 起始噪声 latent [B, C, F, H, W]
+            timesteps: 起始时间步 [B, T]
+            target_r: 目标时间步 [B, T]
+            input_dict: 基础 input_dict
+            empty_emb: 空文本嵌入
+            cfg_scale: CFG 引导强度
+            ref_shape: 参考形状
+            B: batch size
+            num_frames: 帧数
+            num_steps: 积分步数
+
+        返回:
+            v_teacher: teacher 在 target_r 处的 v-prediction [B, C, F, H, W]
+        """
+        _ACTION_DS = getattr(self.config, 'action_downsample_factor', 4)
+
+        # 计算时间步序列
+        t_sigma = timesteps.float().mean() / self.config.num_train_timesteps
+        r_sigma = target_r.float().mean() / self.config.num_train_timesteps
+        sigmas = torch.linspace(t_sigma, r_sigma, num_steps + 1, device=self.device)
+        step_ts = sigmas * self.config.num_train_timesteps
+
+        current_x = noisy_latents
+
+        with torch.no_grad():
+            for i in range(num_steps):
+                t_i = step_ts[i]
+                r_i = step_ts[i + 1]
+
+                # 构建 teacher input
+                teacher_input = {
+                    'latent_dict': {
+                        **input_dict['latent_dict'],
+                        'noisy_latents': current_x,
+                        'timesteps': t_i.expand_as(timesteps),
+                    },
+                    'action_dict': input_dict['action_dict'],
+                    'chunk_size': input_dict['chunk_size'],
+                    'window_size': input_dict['window_size'],
+                }
+
+                # Teacher CFG forward
+                v_cond, v_uncond, _ = self._batched_cfg_forward(teacher_input, empty_emb)
+                v_cfg = v_uncond + cfg_scale * (v_cond - v_uncond)
+                v_cfg_5d = self._extract_video_v(v_cfg, ref_shape, B)
+                v_cfg_5d = _to_regular_tensor(v_cfg_5d)
+
+                # Euler step
+                sigma_i = self.train_scheduler_latent.sigmas[
+                    torch.argmin((self.train_scheduler_latent.timesteps - t_i.cpu()).abs())]
+                sigma_next = self.train_scheduler_latent.sigmas[
+                    torch.argmin((self.train_scheduler_latent.timesteps - r_i.cpu()).abs())]
+                current_x = current_x + v_cfg_5d * (sigma_next - sigma_i)
+
+            # 最终 teacher v-prediction at target_r
+            final_teacher_input = {
+                'latent_dict': {
+                    **input_dict['latent_dict'],
+                    'noisy_latents': current_x,
+                    'timesteps': target_r,
+                },
+                'action_dict': input_dict['action_dict'],
+                'chunk_size': input_dict['chunk_size'],
+                'window_size': input_dict['window_size'],
+            }
+            v_cond_final, v_uncond_final, _ = self._batched_cfg_forward(final_teacher_input, empty_emb)
+            v_cfg_final = v_uncond_final + cfg_scale * (v_cond_final - v_uncond_final)
+            v_teacher = self._extract_video_v(v_cfg_final, ref_shape, B)
+            v_teacher = _to_regular_tensor(v_teacher)
+
+        return v_teacher
+
+    def _onpolicy_transition_step(self, batch, batch_idx):
+        """
+        On-Policy Transition Matching 训练步（替代 DMD）。
+
+        核心思路：
+          1. 采样 (t, r) 对，加噪得到 x_t
+          2. Student 多步 Euler rollout：x_t → x_r（保留梯度图）
+          3. Teacher 多步 Euler 积分：x_t → x_r_teacher（no_grad，提供 target）
+          4. Loss = MSE(v_student(x_r, r), v_teacher(x_r, r))
+                 + local_fm_loss(v_student(x_r, r), v_gt(x_r, r))
+
+        与 _train_step 的核心区别：
+          - _train_step: teacher 单步 CFG forward + 中心差分，student 单步预测
+          - _onpolicy_transition: student 多步 rollout（on-policy），teacher 多步积分（target）
+
+        返回:
+            loss_dict: 包含各项损失的字典
+        """
+        batch = self.convert_input_format(batch)
+
+        B = batch['latents'].shape[0]
+        ref_shape = batch['latents'].shape
+        num_frames = ref_shape[2]
+        actions_mask = batch.get('actions_mask')
+        _ACTION_DS = getattr(self.config, 'action_downsample_factor', 4)
+
+        # ==============================================================
+        # 步骤 1: 准备基础 input_dict
+        # ==============================================================
+        input_dict = self._prepare_base_dict(batch)
+
+        # ==============================================================
+        # 步骤 2: 混合时间步采样（复用 FlowMap 的采样逻辑）
+        # ==============================================================
+        video_t, video_r, video_is_diffusion = self.sample_timestep_mixed(
+            B, num_frames, dtype=torch.float32, device=self.device
+        )
+        video_t_sigma = video_t / self.config.num_train_timesteps
+
+        if self.distill_action:
+            action_t, action_r, action_is_diffusion = self.sample_timestep_mixed(
+                B, num_frames, dtype=torch.float32, device=self.device
+            )
+            action_t_sigma = action_t / self.config.num_train_timesteps
+            action_r_sigma = action_r / self.config.num_train_timesteps
+
+        # ==============================================================
+        # 步骤 3: 加噪
+        # ==============================================================
+        video_noise = torch.randn_like(batch['latents'])
+        video_noisy_latents = self.train_scheduler_latent.add_noise(
+            batch['latents'], video_noise, video_t, t_dim=2
+        )
+        video_v_target = self.train_scheduler_latent.training_target(
+            batch['latents'], video_noise, video_t
+        )
+
+        if self.distill_action:
+            action_noise = torch.randn_like(batch['actions'])
+            action_noisy_latents = self.train_scheduler_action.add_noise(
+                batch['actions'], action_noise, action_t, t_dim=2
+            )
+
+        # 填充 input_dict（为 student/teacher Euler 积分准备）
+        input_dict['latent_dict']['noisy_latents'] = video_noisy_latents
+        input_dict['latent_dict']['timesteps'] = video_t
+        input_dict['latent_dict']['targets'] = video_v_target
+        if self.distill_action:
+            input_dict['action_dict']['noisy_latents'] = action_noisy_latents
+            input_dict['action_dict']['timesteps'] = action_t
+            input_dict['action_dict']['targets'] = self.train_scheduler_action.training_target(batch['actions'], action_noise, action_t)
+
+        # ==============================================================
+        # 步骤 4: 采样 (N, K) 步数对（分布式一致）
+        # ==============================================================
+        # Action time downsampling: consistent with _train_step (every _ACTION_DS frames)
+        _ACTION_DS = getattr(self.config, 'action_downsample_factor', 4)
+        # Create student input_dict with downsampled action (to match _train_step)
+        _ACTION_DS = getattr(self.config, 'action_downsample_factor', 4)
+        if self.distill_action:
+            _ad = input_dict['action_dict']
+            student_input_dict = {
+                'latent_dict': input_dict['latent_dict'],
+                'action_dict': {
+                    'noisy_latents': _ad['noisy_latents'][:, :, ::_ACTION_DS],
+                    'latent':        _ad['latent'][:, :, ::_ACTION_DS],
+                    'timesteps':     _ad['timesteps'][:, ::_ACTION_DS],
+                    'cond_timesteps':_ad['cond_timesteps'][:, ::_ACTION_DS],
+                    'text_emb':      _ad['text_emb'],
+                    'grid_id':       _ad['grid_id'][:, :, ::_ACTION_DS] if _ad.get('grid_id') is not None else None,
+                    'actions_mask':  _ad['actions_mask'][:, :, ::_ACTION_DS] if _ad.get('actions_mask') is not None else None,
+                },
+                'chunk_size': input_dict['chunk_size'],
+                'window_size': input_dict['window_size'],
+            }
+        else:
+            student_input_dict = input_dict
+
+        rollout_step_pairs = getattr(self.config, 'rollout_step_pairs', [[1, 1]])
+        if dist.is_initialized():
+            idx = torch.randint(0, len(rollout_step_pairs), (1,), device=self.device)
+            dist.broadcast(idx, src=0)
+            N_steps, K_steps = rollout_step_pairs[idx.item()]
+        else:
+            import random
+            N_steps, K_steps = random.choice(rollout_step_pairs)
+
+        # ==============================================================
+        # 步骤 5: CFG scale
+        # ==============================================================
+        cfg_scale = self.config.cfg_min + torch.rand(1).item() * (
+            self.config.cfg_max - self.config.cfg_min)
+
+        # 准备空文本嵌入
+        B_emb = input_dict['latent_dict']['text_emb'].shape[0]
+        empty_emb = self.empty_emb.expand(B_emb, -1, -1)
+
+        # ==============================================================
+        # 步骤 6: 梯度累积控制
+        # ==============================================================
+        should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
+        if not should_sync:
+            if hasattr(self.student, 'set_requires_gradient_sync'):
+                self.student.set_requires_gradient_sync(False)
+        else:
+            if hasattr(self.student, 'set_requires_gradient_sync'):
+                self.student.set_requires_gradient_sync(True)
+
+        # 步骤 7: Student 多步 Euler rollout（保留梯度图）
+        # ==============================================================
+        if self.distill_video:
+            student_x_r, student_v_at_r = self._student_euler_integrate(
+                noisy_latents=video_noisy_latents,
+                timesteps=video_t,
+                target_r=video_r,
+                base_input_dict=student_input_dict,
+                empty_emb=empty_emb,
+                cfg_scale=cfg_scale,
+                ref_shape=ref_shape,
+                B=B,
+                num_frames=num_frames,
+                K_steps=K_steps,
+            )
+
+        # ==============================================================
+        # 步骤 8: Teacher 多步 Euler 积分（no_grad，提供 target）
+        # ==============================================================
+        if self.distill_video:
+            teacher_micro_steps = getattr(self.config, 'teacher_micro_steps', 2)
+            total_teacher_steps = N_steps * teacher_micro_steps
+            teacher_v_at_r = self._teacher_integrate_to_r(
+                noisy_latents=video_noisy_latents,
+                timesteps=video_t,
+                target_r=video_r,
+                input_dict=input_dict,
+                empty_emb=empty_emb,
+                cfg_scale=cfg_scale,
+                ref_shape=ref_shape,
+                B=B,
+                num_frames=num_frames,
+                num_steps=total_teacher_steps,
+            )
+
+        # ==============================================================
+        # 步骤 9: 计算 transition loss
+        # ==============================================================
+        video_transition_loss = torch.tensor(0.0, device=self.device)
+        local_fm_loss = torch.tensor(0.0, device=self.device)
+        action_loss = torch.tensor(0.0, device=self.device)
+        action_aware_loss = torch.tensor(0.0, device=self.device)
+        gt_regression_loss = torch.tensor(0.0, device=self.device)
+
+        if self.distill_video:
+            # 9a. Transition loss: student v vs teacher v at (x_r, r)
+            transition_loss_type = getattr(self.config, 'transition_loss_type', 'huber')
+            transition_huber_c = getattr(self.config, 'transition_huber_c', 1e-3)
+            video_diff = (student_v_at_r.float() - teacher_v_at_r.detach().float())
+
+            if transition_loss_type == "huber":
+                abs_diff = video_diff.abs()
+                per_sample_loss = torch.where(
+                    abs_diff < transition_huber_c,
+                    0.5 * video_diff ** 2 / transition_huber_c,
+                    abs_diff - 0.5 * transition_huber_c
+                ).mean(dim=[1, 2, 3, 4])
+            else:
+                per_sample_loss = (video_diff ** 2).mean(dim=[1, 2, 3, 4])
+
+            # 时间步加权
+            weight_type = getattr(self.config, 'weight_type', 'uniform')
+            weight = self._get_timestep_weight(video_t.mean(dim=-1), weight_type).to(self.device)
+            video_transition_loss = (per_sample_loss * weight).mean()
+
+            # 9b. Local FM loss: student v vs GT v at (x_r, r)
+            local_fm_weight = getattr(self.config, 'local_fm_weight', 0.05)
+            if local_fm_weight > 0:
+                video_v_target_at_r = self.train_scheduler_latent.training_target(
+                    batch['latents'], video_noise, video_r
+                )
+                # 用 student rollout 后的 x_r 做 student 预测
+                # student_v_at_r 已经是 student 在 x_r_student 处的预测
+                # GT target 是 noise - x0（与 x 无关）
+                local_diff = (student_v_at_r.float() - video_v_target_at_r.detach().float())
+                local_fm_loss = (local_diff ** 2).mean()
+
+        # ==============================================================
+        # 步骤 10: 动作损失（如果有）
+        # ==============================================================
+        if self.distill_action:
+            # 动作使用标准 FlowMap 逻辑（不做 rollout）
+            action_noisy_ds = action_noisy_latents[:, :, ::_ACTION_DS]
+            action_input = {
+                'latent_dict': {
+                    **input_dict['latent_dict'],
+                    'noisy_latents': video_noisy_latents,
+                    'timesteps': action_t,
+                    'targets': self.train_scheduler_latent.training_target(
+                        batch['latents'], video_noise, action_t),
+                },
+                'action_dict': {
+                    'noisy_latents': action_noisy_latents,
+                    'timesteps': action_t,
+                    'targets': self.train_scheduler_action.training_target(
+                        batch['actions'], action_noise, action_t),
+                },
+            }
+
+            with torch.no_grad():
+                _, _, action_v_cond = self._batched_cfg_forward(input_dict, empty_emb)
+                action_v_5d = self._extract_action_v(action_v_cond, num_frames)
+                sigma_s_a = action_t_sigma[:, None, :, None, None].to(action_v_5d)
+                sigma_r_a = action_r_sigma[:, None, :, None, None].to(action_v_5d)
+                x_prev_action = action_noisy_latents + action_v_5d * (sigma_r_a - sigma_s_a)
+
+            # Student action prediction at r
+            student_action_input = {
+                'latent_dict': {
+                    **input_dict['latent_dict'],
+                    'timesteps': video_r,
+                },
+                'action_dict': {
+                    'noisy_latents': action_noisy_latents[:, :, ::_ACTION_DS],
+                    'latent': batch['actions'][:, :, ::_ACTION_DS],
+                    'timesteps': action_r[:, ::_ACTION_DS],
+                    'cond_timesteps': input_dict['action_dict']['cond_timesteps'][:, ::_ACTION_DS],
+                    'text_emb': input_dict['action_dict']['text_emb'],
+                },
+                'chunk_size': input_dict['chunk_size'],
+                'window_size': input_dict['window_size'],
+            }
+            if 'grid_id' in input_dict['action_dict'] and input_dict['action_dict']['grid_id'] is not None:
+                student_action_input['action_dict']['grid_id'] = input_dict['action_dict']['grid_id'][:, :, ::_ACTION_DS]
+
+            from modules.model import FlexAttnFunc
+            _ld = student_action_input['latent_dict']
+            _ad = student_action_input['action_dict']
+            _total_length = (
+                _ld['noisy_latents'].flatten(0, 1).shape[0] * 2 +
+                _ad['noisy_latents'].flatten(0, 1).shape[0] * 2
+            )
+            _padded_length = (128 - _total_length % 128) % 128
+            FlexAttnFunc.init_mask(
+                _ld['noisy_latents'].shape,
+                _ad['noisy_latents'].shape,
+                _padded_length,
+                student_action_input['chunk_size'],
+                window_size=student_action_input['window_size'],
+                patch_size=self.patch_size,
+                device=self.device,
+            )
+
+            action_r_ds = action_r[:, ::_ACTION_DS]
+            _, student_action_v_seq = self.student(
+                student_action_input, train_mode=True,
+                r_timestep=video_r,
+                action_r_timestep=action_r_ds,
+            )
+            student_action_v = self._extract_action_v(student_action_v_seq, batch['actions'].shape[2] // _ACTION_DS)
+
+            # Action loss (x0 prediction vs EMA target)
+            actions_mask_ds = actions_mask[:, :, ::_ACTION_DS]
+            actions_gt_ds = batch['actions'][:, :, ::_ACTION_DS]
+            action_sigma_s = action_r_sigma[:, None, ::_ACTION_DS, None, None].to(student_action_v)
+            student_action_pred = action_noisy_ds - action_sigma_s * student_action_v
+            mask = actions_mask_ds.float()
+
+            with torch.no_grad():
+                target_input = {
+                    'latent_dict': {**input_dict['latent_dict'], 'timesteps': video_r},
+                    'action_dict': {
+                        'noisy_latents': x_prev_action.detach()[:, :, ::_ACTION_DS],
+                        'latent': batch['actions'][:, :, ::_ACTION_DS],
+                        'timesteps': action_r[:, ::_ACTION_DS],
+                        'cond_timesteps': input_dict['action_dict']['cond_timesteps'][:, ::_ACTION_DS],
+                        'text_emb': input_dict['action_dict']['text_emb'],
+                    },
+                    'chunk_size': input_dict['chunk_size'],
+                    'window_size': input_dict['window_size'],
+                }
+                if 'grid_id' in input_dict['action_dict'] and input_dict['action_dict']['grid_id'] is not None:
+                    target_input['action_dict']['grid_id'] = input_dict['action_dict']['grid_id'][:, :, ::_ACTION_DS]
+
+                _, target_action_v_seq = self.target_student(
+                    target_input, train_mode=True,
+                    r_timestep=video_r,
+                    action_r_timestep=action_r_ds,
+                )
+                target_action_v = self._extract_action_v(target_action_v_seq, batch['actions'].shape[2] // _ACTION_DS)
+                sigma_r_a_5d = action_r_sigma[:, None, ::_ACTION_DS, None, None].to(target_action_v)
+                x_prev_action_ds = x_prev_action[:, :, ::_ACTION_DS]
+                target_action_pred = x_prev_action_ds - sigma_r_a_5d * target_action_v
+
+            action_diff = (student_action_pred.float() * mask) - (target_action_pred.detach().float() * mask)
+            action_loss = (action_diff ** 2).sum() / mask.sum().clamp(min=1)
+
+            # GT regression
+            if getattr(self.config, 'use_gt_regression', True) and self.gt_regression_weight > 0:
+                gt_diff = (student_action_pred.float() * mask) - (actions_gt_ds.float() * mask)
+                gt_regression_loss = (gt_diff ** 2).sum() / mask.sum().clamp(min=1)
+
+            # Action-aware regularization
+            if self.action_aware:
+                action_targets = input_dict['action_dict']['targets'][:, :, ::_ACTION_DS]
+                aa_diff = (student_action_v.float() - action_targets.float().detach()) * mask
+                action_aware_loss = (aa_diff ** 2).sum() / mask.sum().clamp(min=1)
+
+        # ==============================================================
+        # 步骤 11: 总损失
+        # ==============================================================
+        video_transition_weight = getattr(self.config, 'video_transition_weight', 1.0)
+        local_fm_w = getattr(self.config, 'local_fm_weight', 0.05)
+
+        loss = video_transition_weight * video_transition_loss                + local_fm_w * local_fm_loss                + self.config.action_loss_weight * action_loss                + self.gt_regression_weight * gt_regression_loss                + getattr(self.config, 'action_aware_weight', 0.0) * action_aware_loss
+
+        loss = loss / self.gradient_accumulation_steps
+
+        # Loss clipping
+        loss_clip_value = getattr(self.config, 'loss_clip_value', None)
+        if loss_clip_value is not None and getattr(self.config, 'loss_clip_enabled', True):
+            loss = torch.clamp(loss, max=loss_clip_value)
+        if not torch.isfinite(loss):
+            if self.config.rank == 0:
+                logger.warning(f"[step {self.step}] NaN/Inf loss, skipping")
+            loss = torch.zeros(1, device=self.device, requires_grad=True)
+
+        loss.backward()
+
+
+
+        return {
+            'loss': loss.detach(),
+            'video_transition_loss': video_transition_loss.detach(),
+            'local_fm_loss': local_fm_loss.detach(),
+            'action_loss': action_loss.detach() if self.distill_action else action_loss,
+            'action_aware_loss': action_aware_loss.detach() if self.action_aware else action_aware_loss,
+            'gt_regression_loss': gt_regression_loss.detach() if self.distill_action else gt_regression_loss,
+            'rollout_steps': K_steps,
+            'micro_steps': N_steps * getattr(self.config, 'teacher_micro_steps', 2),
+            'video_t_mean': video_t.mean().item(),
+            'video_r_mean': video_r.mean().item(),
+            'should_sync': should_sync,
+        }
+
     def _on_policy_rollout(self, batch, num_steps=None, cfg_scale=None, retain_grad=False):
         """
         用当前学生模型做 on-policy 推理，生成假动作。
@@ -1123,6 +1760,16 @@ class FlowMapStepMixin:
             fake_action: 学生生成的动作 latent [B, C, F, N, 1]
         """
         B = batch['latents'].shape[0]
+        # 使用非 FSDP 副本进行 DMD rollout（避免 FSDP + CheckpointWrapper 的 DTensor 问题）
+        _rollout_model = getattr(self, '_student_nofsdp', self.student)
+        if _rollout_model is not self.student:
+            self._sync_student_nofsdp()
+            _rollout_model.train()
+            # 将所有输入转为纯 Tensor（避免 DTensor + Tensor 混合报错）
+            batch = {k: _to_regular_tensor(v) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            _empty_emb = _to_regular_tensor(self.empty_emb)
+        else:
+            _empty_emb = self.empty_emb
 
         # 随机采样推理步数（所有 rank 必须使用相同步数，否则 FSDP allgather 会死锁）
         if num_steps is None:
@@ -1153,7 +1800,7 @@ class FlowMapStepMixin:
         action_sigmas = self.train_scheduler_action.apply_shift(sigmas) * self.config.num_train_timesteps
 
         # 准备空文本嵌入（用于 CFG 无条件推理）
-        empty_emb = self.empty_emb.expand(B, -1, -1)
+        empty_emb = _empty_emb.expand(B, -1, -1)
 
         # 获取动作帧数
         action_num_frames = batch['actions'].shape[2]
@@ -1186,7 +1833,8 @@ class FlowMapStepMixin:
         grad_context = torch.enable_grad() if retain_grad else torch.no_grad()
         # 使用 FSDP no_sync() 禁用梯度同步，避免多卡 NCCL 超时
         # 在 rollout 阶段，多次前向传播不需要同步梯度
-        fsdp_context = self.student.no_sync() if hasattr(self.student, "no_sync") else contextlib.nullcontext()
+        # rollout model 不需要 FSDP no_sync，直接用 nullcontext
+        fsdp_context = contextlib.nullcontext()
         with grad_context, fsdp_context:
             for i in range(num_steps):
                 t_action = action_sigmas[i]
@@ -1219,8 +1867,31 @@ class FlowMapStepMixin:
                     'window_size': self.config.attn_window,       # 从 config 获取
                 }
 
+                # DEBUG: check all input types
+                if i == 0:
+                    import torch.distributed.tensor as _dt
+                    def _dt_check(name, obj):
+                        if isinstance(obj, _dt.DTensor):
+                            print(f"[DT-DEBUG] {name}: DTensor")
+                        elif isinstance(obj, torch.Tensor):
+                            print(f"[DT-DEBUG] {name}: Tensor {obj.shape} {obj.dtype}")
+                        elif isinstance(obj, dict):
+                            for k, v in obj.items():
+                                _dt_check(f'{name}.{k}', v)
+                    _dt_check('batch_latents', batch['latents'])
+                    _dt_check('batch_text_emb', batch['text_emb'])
+                    _dt_check('batch_actions', batch['actions'])
+                    _dt_check('empty_emb', empty_emb)
+                    _dt_check('current_action', current_action)
+                    _dt_check('rollout_input', rollout_input)
+                    _dt_check('action_r_expanded', action_r_expanded)
+                    # Check model buffers
+                    for bn, buf in _rollout_model.named_buffers():
+                        if isinstance(buf, _dt.DTensor):
+                            print(f"[DT-DEBUG] BUFFER {bn}: DTensor")
+
                 # 学生有条件前向
-                _, v_action_cond = self.student(
+                _, v_action_cond = _rollout_model(
                     rollout_input, train_mode=True,
                     r_timestep=action_r_expanded,
                     action_r_timestep=action_r_expanded,
@@ -1234,7 +1905,7 @@ class FlowMapStepMixin:
                         'chunk_size': rollout_input['chunk_size'],
                         'window_size': rollout_input['window_size'],
                     }
-                    _, v_action_uncond = self.student(
+                    _, v_action_uncond = _rollout_model(
                         rollout_input_uncond, train_mode=True,
                         r_timestep=action_r_expanded,
                         action_r_timestep=action_r_expanded,

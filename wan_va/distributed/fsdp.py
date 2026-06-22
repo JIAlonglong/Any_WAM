@@ -46,6 +46,36 @@ def shard_model(model,
     return model
 
 
+def shard_model_fsdp1(model,
+                      param_dtype=torch.bfloat16,
+                      reduce_dtype=torch.float32):
+    """Shard model using PyTorch FSDP1 with auto_wrap_policy."""
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+    from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+
+    mp_policy = MixedPrecision(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+    )
+
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    model = model.to(device)
+
+    auto_wrap_policy = ModuleWrapPolicy({type(model.blocks[0])})
+
+    model = FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        mixed_precision=mp_policy,
+        use_orig_params=True,
+        device_id=torch.cuda.current_device(),
+    )
+
+    return model
+
+
 def free_model(model):
     del model
     gc.collect()

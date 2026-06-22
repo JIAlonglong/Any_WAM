@@ -74,6 +74,9 @@ def flowmap_inference(
     snr_shift=5.0,
     action_snr_shift=1.0,
     patch_size=(1, 2, 2),
+    init_latent=None,
+    update_cache=0,
+    cache_name="pos",
 ):
     """Flow Map 推理：支持任意步数的去噪生成。
 
@@ -96,6 +99,11 @@ def flowmap_inference(
         snr_shift:          视频的 SNR 偏移系数（默认 5.0，与训练配置一致）
         action_snr_shift:   动作的 SNR 偏移系数（默认 1.0，与训练配置一致）
         patch_size:         视频 patch 大小 (p_t, p_h, p_w)，默认 (1, 2, 2)
+        init_latent:        首帧条件 latent [B, C, 1, H, W]，为 None 时不注入首帧条件。
+                            注入首帧条件后，第 0 帧始终保持在干净的 GT 状态，
+                            作为其他帧去噪的空间-时间锚点。
+        update_cache:       KV cache 模式 (0=只读, 1=追加, 2=覆盖)，仅在最后一步生效。
+        cache_name:         KV cache 名称，用于跨 chunk 缓存注意力状态。
 
     返回:
         denoised_latent:    去噪后的视频 latent [B, C, F, H, W]
@@ -157,6 +165,12 @@ def flowmap_inference(
             continue
 
         # ------------------------------------------------------------
+        # 注入首帧条件：将第 0 帧替换为 GT 干净 latent，保持锚点
+        # ------------------------------------------------------------
+        if init_latent is not None:
+            current_latent[:, :, 0:1] = init_latent[:, :, 0:1].to(current_latent.dtype)
+
+        # ------------------------------------------------------------
         # 步骤 5a: 条件预测（使用真实文本嵌入）
         # ------------------------------------------------------------
         # 构建 input_dict，与 forward_train 的接口对齐
@@ -166,8 +180,8 @@ def flowmap_inference(
                 'noisy_latents': current_latent.to(dtype),
                 'latent': current_latent.to(dtype),  # 条件 latent（推理时不使用条件分支）
                 'text_emb': text_emb,
-                'timesteps': torch.full((B, num_frames), t_video, device=device, dtype=dtype),
-                'cond_timesteps': torch.full((B, num_frames), r_video, device=device, dtype=dtype),
+                'timesteps': _make_timesteps(B, num_frames, t_video, init_latent, device, dtype),
+                'cond_timesteps': _make_cond_timesteps(B, num_frames, r_video, init_latent, device, dtype),
                 'grid_id': _make_grid_id(current_latent, model, device),
             },
             'action_dict': {
@@ -190,6 +204,8 @@ def flowmap_inference(
             train_mode=True,
             r_timestep=torch.full((B, num_frames), r_video, device=device, dtype=dtype),
             action_r_timestep=torch.full((B, num_frames), r_action, device=device, dtype=dtype),
+            update_cache=update_cache if (i == max_steps - 1) else 0,
+            cache_name=cache_name,
         )
 
         # 将扁平输出转换为 5D 张量
@@ -218,6 +234,8 @@ def flowmap_inference(
             train_mode=True,
             r_timestep=torch.full((B, num_frames), r_video, device=device, dtype=dtype),
             action_r_timestep=torch.full((B, num_frames), r_action, device=device, dtype=dtype),
+            update_cache=update_cache if (i == max_steps - 1) else 0,
+            cache_name=cache_name,
         )
         video_v_uncond_5d = _extract_video_v(video_v_uncond, current_latent.shape, B, patch_size)
 
@@ -252,6 +270,22 @@ def flowmap_inference(
     # 步骤 6: 返回去噪结果
     # ================================================================
     return current_latent, current_action
+
+
+def _make_timesteps(B, num_frames, t_val, init_latent, device, dtype):
+    """Create timestep tensor, zeroing frame 0 if init_latent is provided."""
+    ts = torch.full((B, num_frames), t_val, device=device, dtype=dtype)
+    if init_latent is not None:
+        ts[:, 0:1] = 0.0  # Frame 0 is clean (no noise)
+    return ts
+
+
+def _make_cond_timesteps(B, num_frames, r_val, init_latent, device, dtype):
+    """Create cond_timestep tensor, zeroing frame 0 if init_latent is provided."""
+    ts = torch.full((B, num_frames), r_val, device=device, dtype=dtype)
+    if init_latent is not None:
+        ts[:, 0:1] = 0.0  # Frame 0 stays clean (no movement)
+    return ts
 
 
 def _extract_video_v(video_pred, ref_shape, batch_size, patch_size=(1, 2, 2)):

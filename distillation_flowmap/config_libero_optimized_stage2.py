@@ -26,7 +26,12 @@ cfg.teacher_model_path = os.environ.get(
     os.path.join(_project_root, "checkpoints", "libero"))
 
 cfg.output_dir = os.environ.get(
+
     "OUTPUT_DIR", os.path.join(_this_dir, "output_libero_optimized_stage2"))
+
+# Stage 1 checkpoint resume (LoRA adapter weights)
+cfg.resume_from_path = os.path.join(_project_root, "checkpoints", "lingbot_va_flowmap_distill", "flowmap_distill_stage1")
+cfg.resume_from_step = 700
 
 cfg.dataset_path = os.environ.get(
     "DATASET_PATH",
@@ -42,7 +47,7 @@ cfg.param_dtype = torch.bfloat16
 cfg.env_type = "none"
 cfg.height = 128
 cfg.width = 128
-cfg.num_frames = 64                # 与 Stage 1 一致
+cfg.num_frames = 32                # 與 Stage 1 一致
 cfg.action_dim = 30
 cfg.action_per_frame = 4
 cfg.frame_chunk_size = 4
@@ -94,9 +99,9 @@ cfg.distill_action = _mode in ("action", "joint", "flashwam", "onpolicy_transiti
 cfg.action_aware = _mode in ("video_action_aware", "flashwam", "onpolicy_transition")
 
 cfg.num_ddim_timesteps_action = 2
-cfg.action_loss_weight = 1.0
+cfg.action_loss_weight = 5.0      # 适度提高 action 重要性
 cfg.action_distill_mode = "x0"
-cfg.action_aware_weight = 0.1       # 与 Stage 1 一致
+cfg.action_aware_weight = 0.5     # 同步提高到 5x
 
 # ============================================================
 # Flow Map 蒸馏参数（与 Stage 1 一致）
@@ -105,11 +110,11 @@ cfg.diffusion_ratio = 0.5
 cfg.consistency_ratio = 0.25
 cfg.flowmap_ratio = 0.25
 
-cfg.epsilon = 1.0
-cfg.gate_value = 0.1                # 与 Stage 1 一致
+cfg.epsilon = 5.0
+cfg.gate_value = 0.25                # 提升 delta_embedder 贡献 (原 0.1)
 cfg.deltatime_type = 'r'
 cfg.weight_type = 'beta08'
-cfg.gt_regression_weight = 0.5      # 与 Stage 1 一致
+cfg.gt_regression_weight = 1.0    # 同步提高到 2x
 
 # Video loss 权重（Stage 2 新增）
 # video loss 在潜空间计算，值域（100-1600）比其他 loss（0.1-5）大 100 倍
@@ -132,14 +137,13 @@ cfg.use_action_distill = True       # DMD 需要动作蒸馏
 cfg.use_onpolicy_transition = (_mode == "onpolicy_transition")
 cfg.rollout_step_pairs = [
     [1, 1],
-    [1, 2],
-    [2, 2],
-    [4, 4],
-]
-cfg.teacher_micro_steps = 2
+    [1, 1],
+    [1, 2],  # Change 3: 偏向 [1,1] 减少 teacher 前向次数
+    ]
+cfg.teacher_micro_steps = 1
 cfg.teacher_solver = "euler"
 cfg.transition_loss_type = "huber"
-cfg.transition_huber_c = 1e-3
+cfg.transition_huber_c = 5e-4  # 缩小平坦区，恢复梯度
 cfg.video_transition_weight = 1.0
 cfg.local_fm_weight = 0.05
 cfg.action_state_mode = "data"
@@ -153,6 +157,16 @@ cfg.onpolicy_warmup_steps = 0
 cfg.use_dmd = (_mode == "flashwam")   # 仅 flashwam 模式启用 DMD
 cfg.dmd_weight = 0.1
 cfg.dmd_warmup_steps = 0            # DMD 从第一步开始
+
+# ============================================================
+# Stage 2 继训注意事项
+# ============================================================
+# 若从旧 checkpoint (gate=0.1) resume，需手动覆盖 gate 参数：
+#   model.condition_embedder.delta_emb_gate.data.fill_(0.3)
+#   model.condition_embedder_action.delta_emb_gate.data.fill_(0.3)
+# 或在 flowmap_trainer.py 的 load_checkpoint 后添加上述逻辑。
+# 注意: gate 已改为 register_buffer(persistent=False)，checkpoint 不保存 gate，
+#        resume 时自动使用 config 中的 gate_value，无需手动覆盖。
 cfg.dmd_rollout_steps_min = 2
 cfg.dmd_rollout_steps_max = 8
 cfg.dmd_cfg_scale = 5.0
@@ -168,8 +182,8 @@ cfg.dmd_dropout = 0.1
 # LoRA 配置（与 Stage 1 一致）
 # ============================================================
 cfg.use_lora = True
-cfg.lora_rank = 128
-cfg.lora_alpha = 64
+cfg.lora_rank = 512
+cfg.lora_alpha = 256
 cfg.lora_dropout = 0.0
 cfg.lora_target_modules = [
     "to_q", "to_k", "to_v",
@@ -179,6 +193,8 @@ cfg.lora_target_modules = [
     "time_proj",
     "delta_embedder.linear_1",
     "delta_embedder.linear_2",
+    "time_embedder.linear_1",
+    "time_embedder.linear_2",
 ]
 
 # ============================================================
@@ -186,7 +202,7 @@ cfg.lora_target_modules = [
 # ============================================================
 cfg.ema_decay = 0.995
 cfg.loss_type = "huber"
-cfg.huber_c = 0.001
+cfg.huber_c = 0.0005  # 缩小平坦区
 cfg.sigma_data = 0.5
 cfg.cfg_min = 2.0
 cfg.cfg_max = 10.0
@@ -194,20 +210,20 @@ cfg.cfg_max = 10.0
 # ============================================================
 # 训练超参数（Stage 2 优化版）
 # ============================================================
-cfg.learning_rate = 5e-6            # Stage 2: 降低学习率（微调需要更精细）
+cfg.learning_rate = 5e-6            # Stage 2: scaled by sqrt(2) for batch_size=2
 cfg.beta1 = 0.9
 cfg.beta2 = 0.999
 cfg.weight_decay = 0.0
 cfg.max_grad_norm = 1.0             # 与 Stage 1 一致
 cfg.warmup_steps = 100              # Stage 2: 减少 warmup（已有良好初始化）
-cfg.max_train_steps = 15000         # Stage 2: 从 Stage 1 恢复后继续训练
-cfg.batch_size = 1                  # 模型架构限制：forward_train 假设 batch=1
-cfg.gradient_accumulation_steps = 16 # 与 Stage 1 一致
+cfg.max_train_steps = 20000         # Stage 2: 更多 steps 让 delta_embedder 收敛
+cfg.batch_size = 1  # bs=2 + checkpointing: mask bug unresolvable
+cfg.gradient_accumulation_steps = 2                 # Change 1: 减半以配合 batch_size=2
 cfg.load_worker = 8                 # 与 Stage 1 一致
 cfg.pin_memory = True
 cfg.prefetch_factor = 4
 cfg.cache_dataset_in_memory = True
-cfg.use_torch_compile = False       # 禁用：PEFT (LoRA) 不兼容 torch.compile
+cfg.use_torch_compile = False  # compile CUDA graphs + kernel cache OOM even with bs=1       # Change 2: 重新启用 torch.compile（无 checkpointing 时安全）
 
 # Loss clipping（与 Stage 1 一致）
 cfg.loss_clip_value = 10.0

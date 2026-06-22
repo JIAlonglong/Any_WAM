@@ -106,8 +106,8 @@ cfg.diffusion_ratio = 0.5
 cfg.consistency_ratio = 0.25
 cfg.flowmap_ratio = 0.25
 
-cfg.epsilon = 1.0
-cfg.gate_value = 0.1                # 改进：从 0.0 增加到 0.1
+cfg.epsilon = 5.0
+cfg.gate_value = 0.25                # 改进：从 0.0 增加到 0.1
 cfg.deltatime_type = 'r'
 cfg.weight_type = 'beta08'
 cfg.gt_regression_weight = 0.15     # 调低：从 0.5 降到 0.15，避免学生过拟合 GT 而忽略教师蒸馏信号
@@ -143,8 +143,8 @@ cfg.dmd_dropout = 0.1
 # LoRA 配置
 # ============================================================
 cfg.use_lora = True
-cfg.lora_rank = 128
-cfg.lora_alpha = 64
+cfg.lora_rank = 512
+cfg.lora_alpha = 256
 cfg.lora_dropout = 0.0
 cfg.lora_target_modules = [
     "to_q", "to_k", "to_v",
@@ -154,6 +154,8 @@ cfg.lora_target_modules = [
     "time_proj",
     "delta_embedder.linear_1",
     "delta_embedder.linear_2",
+    "time_embedder.linear_1",
+    "time_embedder.linear_2",
 ]
 
 # ============================================================

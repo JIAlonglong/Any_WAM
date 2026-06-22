@@ -50,6 +50,8 @@ from wan_va.modules.utils import (
     load_vae,
 )
 from wan_va.utils import (
+    FlowMatchScheduler,
+    data_seq_to_patch,
     get_mesh_id,
     init_logger,
     logger,
@@ -59,6 +61,8 @@ from wan_va.utils import (
 
 from model_flowmap import patch_model_forward, setup_flowmap_model
 from inference import create_inference_kwargs, flowmap_inference
+from einops import rearrange
+from tqdm import tqdm
 
 
 class VA_Server:
@@ -254,6 +258,22 @@ class VA_Server:
                 "action_snr_shift": job_config.action_snr_shift,
             })
         self.flowmap_kwargs = create_inference_kwargs(_inf_cfg)
+
+        # ------------------------------------------------------------------
+        # 6b. Initialize FlowMatchSchedulers for standard denoising
+        # ------------------------------------------------------------------
+        self.scheduler = FlowMatchScheduler(
+            shift=job_config.snr_shift,
+            sigma_min=0.0,
+            extra_one_step=True,
+        )
+        self.action_scheduler = FlowMatchScheduler(
+            shift=job_config.action_snr_shift,
+            sigma_min=0.0,
+            extra_one_step=True,
+        )
+        self.scheduler.set_timesteps(1000, training=True)
+        self.action_scheduler.set_timesteps(1000, training=True)
 
         # ------------------------------------------------------------------
         # 7. Environment-specific setup (robotwin_tshape needs dual VAE)
@@ -494,7 +514,7 @@ class VA_Server:
 
     def _reset(self, prompt=None):
         logger.info("Reset.")
-        self.use_cfg = self.job_config.guidance_scale > 1
+        self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         self.frame_st_id = 0
         self.init_latent = None
 
@@ -716,79 +736,121 @@ class VA_Server:
     # ==================================================================
 
     def _infer(self, obs, frame_st_id=0):
+        """
+        Standard denoising-based inference with streaming KV cache.
+        Follows the original LingBot-VA server pattern: video denoising loop
+        followed by action denoising loop, using update_cache to maintain
+        temporal context across chunks.
+        """
         frame_chunk_size = self.job_config.frame_chunk_size
         action_dim = self.job_config.action_dim
-
-        # Clear KV cache before flowmap inference (it does cond/uncond separately
-        # with batch=1, but the cache was initialized with batch=2 for CFG)
-        self.transformer.clear_cache(self.cache_name)
 
         if frame_st_id == 0:
             init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
 
-        # Sample initial noise for video and action
         latents = torch.randn(
-            1,
-            48,
-            frame_chunk_size,
-            self.latent_height,
-            self.latent_width,
-            device=self.device,
-            dtype=self.dtype,
+            1, 48, frame_chunk_size, self.latent_height, self.latent_width,
+            device=self.device, dtype=self.dtype,
         )
         actions = torch.randn(
-            1,
-            action_dim,
-            frame_chunk_size,
-            self.action_per_frame,
-            1,
-            device=self.device,
-            dtype=self.dtype,
+            1, action_dim, frame_chunk_size, self.action_per_frame, 1,
+            device=self.device, dtype=self.dtype,
         )
 
-        # Encode text for CFG
-        text_emb = self.prompt_embeds.to(self.dtype)
-        if self.use_cfg and self.negative_prompt_embeds is not None:
-            empty_emb = self.negative_prompt_embeds.to(self.dtype)
-        else:
-            empty_emb = text_emb
+        video_inference_step = self.job_config.num_inference_steps
+        action_inference_step = self.job_config.action_num_inference_steps
+        video_step = self.job_config.video_exec_step
+
+        self.scheduler.set_timesteps(video_inference_step)
+        self.action_scheduler.set_timesteps(action_inference_step)
+        timesteps = self.scheduler.timesteps
+        action_timesteps = self.action_scheduler.timesteps
+
+        timesteps = F.pad(timesteps, (0, 1), mode='constant', value=0)
+        if video_step != -1:
+            timesteps = timesteps[:video_step]
+
+        action_timesteps = F.pad(action_timesteps, (0, 1), mode='constant', value=0)
+
+        patch_size = self.job_config.patch_size
 
         with torch.no_grad():
-            # Run FlowMap inference (handles denoising loop internally)
-            denoised_latent, denoised_action = flowmap_inference(
-                model=self.transformer,
-                noisy_latent=latents,
-                noisy_action=actions,
-                text_emb=text_emb,
-                empty_emb=empty_emb,
-                num_steps=self.num_steps,
-                action_num_steps=self.action_num_steps,
-                cfg_scale=self.job_config.guidance_scale,
-                **self.flowmap_kwargs,
-            )
-
-            # Restore condition frames (first frame = initial observation)
-            if frame_st_id == 0:
-                denoised_latent[:, :, 0:1] = self.init_latent[:, :, 0:1].to(
-                    self.dtype
+            # --- Video Generation Loop ---
+            for i, t in enumerate(tqdm(timesteps)):
+                last_step = i == len(timesteps) - 1
+                latent_cond = self.init_latent[:, :, 0:1].to(self.dtype) if frame_st_id == 0 else None
+                input_dict = self._prepare_input(
+                    latents, None, t, t, latent_cond, None, frame_st_id=frame_st_id,
                 )
-                denoised_action[:, :, 0:1] = 0.0
 
-        denoised_action[:, ~self.action_mask] *= 0
+                video_noise_pred = self.transformer(
+                    self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                    update_cache=1 if last_step else 0,
+                    cache_name=self.cache_name,
+                    action_mode=False,
+                )
 
-        save_async(
-            denoised_latent,
-            os.path.join(self.exp_save_root, f"latents_{frame_st_id}.pt"),
-        )
-        save_async(
-            denoised_action,
-            os.path.join(self.exp_save_root, f"actions_{frame_st_id}.pt"),
-        )
+                if not last_step or video_step != -1:
+                    video_noise_pred = data_seq_to_patch(
+                        patch_size, video_noise_pred, frame_chunk_size,
+                        self.latent_height, self.latent_width,
+                        batch_size=2 if self.use_cfg else 1,
+                    )
+                    if self.job_config.guidance_scale > 1:
+                        video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (
+                            video_noise_pred[:1] - video_noise_pred[1:]
+                        )
+                    else:
+                        video_noise_pred = video_noise_pred[:1]
+                    latents = self.scheduler.step(
+                        video_noise_pred, t, latents, return_dict=False,
+                    )
 
-        actions_np = self.postprocess_action(denoised_action)
+                latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
+
+            # --- Action Generation Loop ---
+            for i, t in enumerate(tqdm(action_timesteps)):
+                last_step = i == len(action_timesteps) - 1
+                action_cond = torch.zeros(
+                    [1, action_dim, 1, self.action_per_frame, 1],
+                    device=self.device, dtype=self.dtype,
+                ) if frame_st_id == 0 else None
+
+                input_dict = self._prepare_input(
+                    None, actions, t, t, None, action_cond, frame_st_id=frame_st_id,
+                )
+                action_noise_pred = self.transformer(
+                    self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                    update_cache=1 if last_step else 0,
+                    cache_name=self.cache_name,
+                    action_mode=True,
+                )
+
+                if not last_step:
+                    action_noise_pred = rearrange(
+                        action_noise_pred, 'b (f n) c -> b c f n 1', f=frame_chunk_size,
+                    )
+                    if self.job_config.action_guidance_scale > 1:
+                        action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (
+                            action_noise_pred[:1] - action_noise_pred[1:]
+                        )
+                    else:
+                        action_noise_pred = action_noise_pred[:1]
+                    actions = self.action_scheduler.step(
+                        action_noise_pred, t, actions, return_dict=False,
+                    )
+
+                actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+
+        actions[:, ~self.action_mask] *= 0
+
+        save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
+        save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
+
+        actions_np = self.postprocess_action(actions)
         torch.cuda.empty_cache()
-        return actions_np, denoised_latent
+        return actions_np, latents
 
     # ==================================================================
     # Public inference interface

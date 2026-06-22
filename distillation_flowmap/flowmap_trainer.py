@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 
 import torch
+import math
 import torch.distributed as dist
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -34,6 +35,7 @@ from tqdm import tqdm
 from safetensors.torch import save_file
 
 from distributed.fsdp import shard_model, apply_ac
+from wan_va.distributed.fsdp import shard_model_fsdp1
 from distributed.util import _configure_model, dist_mean
 from modules.utils import load_transformer
 from utils import logger, warmup_constant_lambda, FlowMatchScheduler
@@ -222,24 +224,42 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.teacher.requires_grad_(False)  # 冻结所有参数
         self.teacher.eval()                 # 评估模式
         self.teacher = self.teacher.to(self.dtype)
-        # 使用 FSDP 分片和配置化
-        self.teacher = _configure_model(
-            model=self.teacher, shard_fn=shard_model,
-            param_dtype=self.dtype, device=self.device, eval_mode=True,
-        )
 
-        # torch.compile 加速教师模型（冻结模型，无 LoRA，可以安全编译）
-        # 注意：教师始终 compile，与 use_torch_compile（控制学生）无关
-        # 使用 mode="default" 而非 "reduce-overhead"，避免 CUDA graphs 与多次 teacher 前向冲突
-        if not getattr(config, 'skip_teacher_compile', False):
-            logger.info("Compiling teacher model with torch.compile ...")
-            self.teacher = torch.compile(self.teacher, mode="default")
-            logger.info("Teacher model compiled.")
+        # 创建非 FSDP 教师副本（用于纯推理 forward，避免 FSDP all-gather 通信开销）
+        # 教师 frozen + eval，不需要梯度同步，非 FSDP forward 结果完全一致
+        import copy
+        logger.info("Creating non-FSDP teacher copy for inference ...")
+        self._teacher_nofsdp = copy.deepcopy(self.teacher)
+        self._teacher_nofsdp = self._teacher_nofsdp.to(self.dtype)
+        self._teacher_nofsdp.eval()
+        for p in self._teacher_nofsdp.parameters():
+            p.requires_grad_(False)
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self._teacher_nofsdp = self._teacher_nofsdp.to(f"cuda:{local_rank}")
+        logger.info(f"Non-FSDP teacher copy created (on cuda:{local_rank}).")
+        if self.use_onpolicy_transition:
+            # On-policy mode: use FSDP1 (no DTensor issues)
+            self.teacher = shard_model_fsdp1(self.teacher, param_dtype=self.dtype)
+            logger.info("Teacher wrapped with FSDP1 (on-policy mode)")
+        else:
+            # FSDP2 mode
+            self.teacher = _configure_model(
+                model=self.teacher, shard_fn=shard_model,
+                param_dtype=self.dtype, device=self.device, eval_mode=True,
+            )
+            if not getattr(config, 'skip_teacher_compile', False):
+                logger.info("Compiling teacher model with torch.compile ...")
+                self.teacher = torch.compile(self.teacher, mode="default")
+                logger.info("Teacher model compiled.")
 
         # 确定学生模型的初始化路径（从检查点恢复或从教师初始化）
         resume_path = getattr(config, "resume_from_path", None)
         resume_step = getattr(config, "resume_from_step", None)
         self._is_lora_resume = False  # 标记是否从 LoRA checkpoint 恢复
+        self._nofsdp_synced = False  # dirty flag for _sync_student_nofsdp optimization
+        self._recent_ckpts = []     # track last 3 checkpoint steps for cleanup
+        self._best_loss = float('inf')
+        self._best_step = 0
 
         if resume_path is not None:
             # 从指定路径恢复
@@ -298,7 +318,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         else:
             logger.info("Loading online student (trainable) ...")
             self.student = load_transformer(student_path, torch_dtype=torch.float32, torch_device="cpu")
-        apply_ac(self.student)  # 应用激活检查点（节省显存）
+        # apply_ac disabled - checkpointing + batched CFG = mask mismatch during backward
+        # apply_ac(self.student)
         self.student = self.student.to(self.dtype)
 
         # 为学生模型添加 Flow Map 能力
@@ -377,14 +398,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             self._student_nofsdp = None
 
         if self.use_onpolicy_transition:
-            # On-policy mode: use DDP instead of FSDP to avoid DTensor mixing
-            from torch.nn.parallel import DistributedDataParallel as DDP
-            # Apply activation checkpointing before DDP wrapping (same as FSDP path)
-            apply_ac(self.student)
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            self.student = self.student.to(f"cuda:{local_rank}")
-            self.student = DDP(self.student, device_ids=[local_rank], find_unused_parameters=True)
-            logger.info(f"Student wrapped with DDP on cuda:{local_rank} (on-policy mode, with AC)")
+            # On-policy mode: use FSDP1 (shards parameters across GPUs)
+            # apply_ac disabled - checkpointing + batched CFG = mask mismatch during backward
+            # apply_ac(self.student)
+            self.student = shard_model_fsdp1(self.student, param_dtype=self.dtype)
+            logger.info("Student wrapped with FSDP1 (on-policy mode)")
         else:
             self.student = _configure_model(
                 model=self.student, shard_fn=shard_model,
@@ -394,11 +412,13 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.student.requires_grad_(True)   # 启用梯度计算
 
         # torch.compile 加速（可选）
+        self._student_blocks_compiled = False
         if getattr(config, 'use_torch_compile', False):
-            logger.info("Compiling student model with torch.compile ...")
-            self.student = torch.compile(self.student, mode="reduce-overhead")
-            logger.info("Student model compiled.")
-
+            logger.info("Compiling student transformer blocks with torch.compile ...")
+            for i, block in enumerate(self.student.blocks):
+                self.student.blocks[i] = torch.compile(block, mode="reduce-overhead")
+            logger.info(f"Compiled {len(self.student.blocks)} blocks.")
+            self._student_blocks_compiled = True
         # 3. 目标学生（EMA, frozen）：在线学生的指数移动平均副本
         # 如果从 LoRA checkpoint 恢复，需要先加载基座模型，再加载 LoRA adapter
         if self._is_lora_resume:
@@ -454,12 +474,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.target_student = self.target_student.to(self.dtype)
 
         if self.use_onpolicy_transition:
-            # On-policy mode: use DDP for target student too (EMA needs matching param sizes)
-            from torch.nn.parallel import DistributedDataParallel as DDP
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            self.target_student = self.target_student.to(f"cuda:{local_rank}")
-            self.target_student = DDP(self.target_student, device_ids=[local_rank], find_unused_parameters=True)
-            logger.info(f"Target student wrapped with DDP on cuda:{local_rank} (on-policy mode)")
+            # On-policy mode: use FSDP1 (shards parameters across GPUs)
+            self.target_student = shard_model_fsdp1(self.target_student, param_dtype=self.dtype)
+            logger.info("Target student wrapped with FSDP1 (on-policy mode)")
         else:
             self.target_student = _configure_model(
                 model=self.target_student, shard_fn=shard_model,
@@ -482,9 +499,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             foreach=False,
         )
         # 学习率调度器：warmup + 常数学习率
+        # Cosine decay: warmup then decay to 10% of peak
+        def cosine_decay_lambda(step):
+            warmup = config.warmup_steps
+            total = config.max_train_steps
+            if step < warmup:
+                return step / max(1, warmup)
+            progress = (step - warmup) / max(1, total - warmup)
+            return 0.1 + 0.9 * (1 + math.cos(math.pi * progress)) / 2
+
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps),
+            lr_lambda=cosine_decay_lambda,
         )
         # 如果从检查点恢复，快速推进学习率调度器到正确位置
         if self.step > 0:
@@ -834,15 +860,15 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
+                    self._nofsdp_synced = False  # invalidate dirty flag after weight update
 
                     # EMA 更新只在正常参数更新后执行（跳过 NaN/Inf 梯度时不更新 EMA，
                     # 避免将异常梯度产生的错误权重传播到目标学生）
-                    # For DDP, access underlying module parameters
-                    student_params = self.student.module.parameters() if hasattr(self.student, 'module') else self.student.parameters()
-                    target_params = self.target_student.module.parameters() if hasattr(self.target_student, 'module') else self.target_student.parameters()
+                    # FSDP1 with use_orig_params=True preserves original parameter names,
+                    # so model.parameters() works directly (no .module needed)
                     update_ema(
-                        target_params,
-                        student_params,
+                        self.target_student.parameters(),
+                        self.student.parameters(),
                         rate=config.ema_decay,
                     )
 
@@ -916,10 +942,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
                 self.step += 1
 
-                # 定期保存检查点
+                # 定期保存检查点（保留最近 3 个 + 最佳 loss 的）
                 if self.step % config.save_interval == 0:
                     self._save_checkpoint("online_student")
                     self._save_checkpoint("target_student")
+
 
             # 分布式同步屏障
             if dist.is_initialized():

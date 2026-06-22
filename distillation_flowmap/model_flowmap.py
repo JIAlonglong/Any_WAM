@@ -76,9 +76,12 @@ class WanTwoTimeTextImageEmbedding(nn.Module):
             else None
         )
 
-        # 门控参数（可训练，由 nn.Parameter 注册）
-        self.delta_emb_gate = nn.Parameter(
-            torch.tensor([gate_value], dtype=torch.float32)
+        # Gate as non-persistent buffer (like AnyFlow).
+        # Not saved in state_dict → config controls the value on resume.
+        self.register_buffer(
+            'delta_emb_gate',
+            torch.tensor([gate_value], dtype=torch.float32),
+            persistent=False,
         )
         # delta 时间步类型：'r' 表示直接使用 r_timestep，'t-r' 表示使用 timestep - r_timestep
         self.deltatime_type = deltatime_type
@@ -295,6 +298,13 @@ def patch_model_forward(model):
                 dim=1,
             )
 
+        # If r_timestep not explicitly passed, check for injected override
+        # (set by patched_forward when train_mode=False but r_timestep is provided)
+        if r_latent_time_steps is None:
+            r_latent_time_steps = getattr(model, '_r_override', None)
+            if r_latent_time_steps is None and action_mode:
+                r_latent_time_steps = getattr(model, '_action_r_override', None)
+
         temb, timestep_proj = current_condition_embedder(
             latent_time_steps, dtype=dtype, r_timestep=r_latent_time_steps
         )
@@ -305,7 +315,7 @@ def patch_model_forward(model):
     model._time_embed = patched_time_embed
 
     @wraps(original_forward_train)
-    def patched_forward_train(input_dict, fdm=False, r_timestep=None, action_r_timestep=None):
+    def patched_forward_train(input_dict, fdm=False, r_timestep=None, action_r_timestep=None, update_cache=0):
         """为 forward_train 添加 r_timestep 和 action_r_timestep 支持。
 
         当 r_timestep 不为 None 时，将其传递给 latent 的 _time_embed 以启用 Flow Map 蒸馏。
@@ -318,6 +328,7 @@ def patch_model_forward(model):
             r_timestep: latent 的参考时间步，形状 [B, T]
             action_r_timestep: action 的独立参考时间步，形状 [B, T]，
                 为 None 时退化为使用 r_timestep
+            update_cache: KV cache 模式 (0=只读, 1=追加, 2=覆盖)
         """
         # 转换 dtype 到局部变量，避免原地修改调用者的 input_dict
         latent_dict = {
@@ -449,7 +460,7 @@ def patch_model_forward(model):
                 text_hidden_states,
                 timestep_proj,
                 rotary_emb,
-                update_cache=False,
+                update_cache=update_cache,
             )
             if i == 0:
                 pass  # Removed debug print
@@ -467,17 +478,16 @@ def patch_model_forward(model):
         latent_hidden_states, _, action_hidden_states, _, _ = torch.split(
             hidden_states, split_list, dim=1
         )
-        B_actual = latent_hidden_states.shape[0]
         latent_hidden_states = model.proj_out(latent_hidden_states)
         latent_hidden_states = einops.rearrange(
             latent_hidden_states,
-            "b (b1 l) (n c) -> (b b1) l (n c)",
+            "1 (b l) (n c) -> b (l n) c",
             n=math.prod(model.patch_size),
-            b1=B_actual,
+            b=batch_size,
         )
         action_hidden_states = model.action_proj_out(action_hidden_states)
         action_hidden_states = einops.rearrange(
-            action_hidden_states, "b (b1 l) c -> (b b1) l c", b1=B_actual
+            action_hidden_states, "1 (b l) c -> b l c", b=batch_size
         )
 
         return latent_hidden_states, action_hidden_states
@@ -511,16 +521,27 @@ def patch_model_forward(model):
             return model.forward_train(
                 input_dict, fdm=fdm, r_timestep=r_timestep,
                 action_r_timestep=action_r_timestep,
+                update_cache=update_cache,
             )
-        # 非训练模式调用原始 forward 逻辑（不需要 r_timestep）
-        return original_forward(
-            input_dict,
-            update_cache=update_cache,
-            cache_name=cache_name,
-            action_mode=action_mode,
-            train_mode=train_mode,
-            fdm=fdm,
-        )
+        # Non-train mode: inject r_timestep via model attributes so
+        # patched_time_embed can pick them up inside original_forward.
+        # This enables delta_embedder in standard denoising + KV cache path.
+        if r_timestep is not None:
+            model._r_override = r_timestep
+        if action_r_timestep is not None:
+            model._action_r_override = action_r_timestep
+        try:
+            return original_forward(
+                input_dict,
+                update_cache=update_cache,
+                cache_name=cache_name,
+                action_mode=action_mode,
+                train_mode=train_mode,
+                fdm=fdm,
+            )
+        finally:
+            model._r_override = None
+            model._action_r_override = None
 
     # 替换 forward 方法
     model.forward = patched_forward

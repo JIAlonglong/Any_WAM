@@ -5,9 +5,18 @@ import torch
 import torch.distributed as dist
 
 
-def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
+def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True, fsdp1=False):
     """
-    TODO
+    Configure and shard a model for distributed inference/training.
+
+    Args:
+        model: The model to configure.
+        shard_fn: Sharding function (e.g. shard_model or shard_model_fsdp1).
+        param_dtype: Parameter dtype for mixed precision.
+        device: Target device.
+        eval_mode: If True, set model to eval mode with no gradients.
+        fsdp1: If True, use FSDP1-based sharding via shard_model_fsdp1.
+               When True, shard_fn is ignored and shard_model_fsdp1 is used directly.
     """
     if eval_mode:
         model.eval().requires_grad_(False)
@@ -15,7 +24,11 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
         dist.barrier(device_ids=[torch.cuda.current_device()])
 
     if dist.is_initialized() and dist.get_world_size() > 1:
-        model = shard_fn(model)
+        if fsdp1:
+            from wan_va.distributed.fsdp import shard_model_fsdp1
+            model = shard_model_fsdp1(model, param_dtype=param_dtype, reduce_dtype=torch.float32)
+        else:
+            model = shard_fn(model)
     else:
         model.to(param_dtype)
         model.to(device)

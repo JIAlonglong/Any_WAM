@@ -1,5 +1,5 @@
 #!/bin/bash
-# LIBERO FlowMap 蒸馏启动脚本 —— Stage 1（默认 4 卡）
+# LIBERO FlowMap 蒸馏启动脚本 —— Stage 1
 #
 # Stage 1: FlowMap 蒸馏（扩散 + 一致性 + 流映射目标）
 # Stage 2: 请使用 run_libero_stage2.sh
@@ -21,9 +21,15 @@
 #   OUTPUT_DIR=/path/to/output bash distillation_flowmap/run_libero.sh
 set -euo pipefail
 
-# 激活 flashwam conda 环境
-eval "$(conda shell.bash hook)"
-conda activate flashwam
+if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+elif [ -f /root/nas/junjie/miniconda3/etc/profile.d/conda.sh ]; then
+    source /root/nas/junjie/miniconda3/etc/profile.d/conda.sh
+else
+    echo "conda not found; set PATH or install conda before running this script" >&2
+    exit 1
+fi
+conda activate "${CONDA_ENV:-/root/nas/junjie/conda_envs/any_wam}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -31,10 +37,10 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # ============================================================
 # 路径配置
 # ============================================================
-export TEACHER_PATH="${TEACHER_PATH:-${PROJECT_ROOT}/checkpoints/libero}"
+export TEACHER_PATH="${TEACHER_PATH:-${PROJECT_ROOT}/checkpoints/lingbot-va-posttrain-libero}"
 export DATASET_PATH="${DATASET_PATH:-${PROJECT_ROOT}/training_data/libero-long-lerobot}"
-export OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/output_libero_new}"
-export CONFIG_FILE="${CONFIG_FILE:-distillation_flowmap.config_libero}"
+export OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/output_libero_stage1_retrain_20260623}"
+export CONFIG_FILE="${CONFIG_FILE:-distillation_flowmap.config_libero_optimized}"
 export DISTILL_MODE="${DISTILL_MODE:-flashwam}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -43,26 +49,19 @@ export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 
-# 如果指定了优化配置，使用优化版（单卡训练优化）
-if [ "${OPTIMIZED:-0}" = "1" ]; then
-    export CONFIG_FILE="distillation_flowmap.config_libero_optimized"
-    echo "Using optimized config for single-GPU training"
-fi
-
 # ============================================================
 # 训练参数
 # ============================================================
-NGPU="${NGPU:-4}"
+NGPU="${NGPU:-8}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 RESUME_FROM_STEP="${RESUME_FROM_STEP:-}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-}"
 
 # 多卡时自动换算 gradient_accumulation_steps，保持等效 batch size 不变
-# 原始配置：batch_size=1, gradient_accumulation_steps=4, 等效 batch=16
-# num_frames=64, lora_rank=128, lora_alpha=64
+# 原始配置：batch_size=1, gradient_accumulation_steps=16, 等效 batch=16
 # 多卡等效 batch = batch_size × ACCUM × NGPU
-# NGPU=4 时: 1 × 4 × 4 = 16
-ORIG_ACCUM=${ORIG_ACCUM:-4}
+# NGPU=8 时: 1 × 2 × 8 = 16
+ORIG_ACCUM=${ORIG_ACCUM:-16}
 ACCUM=$((ORIG_ACCUM / NGPU))
 [ "$ACCUM" -lt 1 ] && ACCUM=1
 
@@ -85,7 +84,7 @@ echo "Output:      ${OUTPUT_DIR}"
 echo "Config:      ${CONFIG_FILE}"
 echo "Distill mode: ${DISTILL_MODE}"
 echo "GPUs:        ${NGPU}"
-echo "Grad accum:  ${ACCUM} (effective batch: $((4 * ACCUM * NGPU)))"
+echo "Grad accum:  ${ACCUM} (effective batch: $((ACCUM * NGPU)))"
 echo "Master port: ${MASTER_PORT}"
 if [ -n "$RESUME_FROM_STEP" ]; then
     echo "Resume step: ${RESUME_FROM_STEP}"

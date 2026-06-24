@@ -922,6 +922,10 @@ def main():
         help="Teacher: 20-step original denoising | Student: 8-step FlowMap+LoRA",
     )
     parser.add_argument(
+        "--prompt", type=str, default=None,
+        help="Override the prompt for video generation",
+    )
+    parser.add_argument(
         "--base-model-path", type=str,
         default=None,
         help="Path to base model (auto-selected by --env if not set).",
@@ -983,6 +987,8 @@ def main():
 
     # Build config
     env_type = getattr(args, 'env', 'libero')
+    if args.base_model_path is None:
+        args.base_model_path = "/root/nas/junjie/jj/Any_WAM/checkpoints/lingbot-va-posttrain-robotwin" if env_type == "robotwin" else "/root/nas/junjie/jj/Any_WAM/checkpoints/lingbot-va-posttrain-libero"
     build_fn = build_robotwin_config if env_type == 'robotwin' else build_libero_config
     if args.example_dir is None:
         args.example_dir = "/root/nas/junjie/jj/Any_WAM/lingbot-va/example/robotwin" if env_type == "robotwin" else "/root/nas/junjie/jj/Any_WAM/lingbot-va/example/libero"
@@ -992,9 +998,9 @@ def main():
         num_chunks=args.num_chunks,
         cfg_scale=args.cfg_scale,
     )
-    if args.base_model_path is None:
-        args.base_model_path = "/root/nas/junjie/jj/Any_WAM/checkpoints/lingbot-va-posttrain-robotwin" if env_type == "robotwin" else "/root/nas/junjie/jj/Any_WAM/checkpoints/lingbot-va-posttrain-libero"
     config.save_root = os.path.dirname(args.output) or "."
+    if args.prompt is not None:
+        config.prompt = args.prompt
 
     # Set num steps
     if args.mode == "teacher":

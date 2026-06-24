@@ -129,6 +129,8 @@ cfg.use_gt_regression = True
 cfg.use_central_diff = True
 cfg.selective_cdiff = True
 cfg.action_use_flowmap = False
+cfg.action_epsilon = getattr(cfg, "epsilon", 1.0)  # action-side central-difference radius
+
 
 # ============================================================
 # DMD（On-Policy Distribution Matching Distillation）参数

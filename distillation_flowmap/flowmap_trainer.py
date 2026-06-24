@@ -135,6 +135,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.epsilon = getattr(config, 'epsilon', 1.0)
         # GT 回归 loss 权重（辅助损失，帮助稳定训练）
         self.gt_regression_weight = getattr(config, 'gt_regression_weight', 0.1)
+        # Action block 总权重：显式控制动作分支整体梯度强度
+        self.action_block_weight = getattr(config, 'action_block_weight', 1.0)
         # LoRA 微调开关
         self.use_lora = getattr(config, 'use_lora', False)
 
@@ -148,9 +150,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
         # WandB 日志初始化（仅主进程）
         if config.enable_wandb and HAS_WANDB and config.rank == 0:
+            from datetime import datetime
+            _wandb_name = getattr(config, "wandb_run_name", None) or getattr(config, "wandb_name_prefix", "stage1") + "_rank%d_%s" % (config.lora_rank, datetime.now().strftime("%Y%m%d_%H%M"))
             wandb.init(
                 project="flowmap_distill_lingbot_va",
                 entity=getattr(config, "wandb_entity", None),
+                name=_wandb_name,
                 config=dict(config),
             )
 
@@ -193,6 +198,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 logger.info(f"  k_action = {self.k_action}, "
                             f"action_loss_weight = {config.action_loss_weight}, "
                             f"mode = {self.action_distill_mode}")
+                logger.info(f"  action_block_weight = {self.action_block_weight}")
             if self.action_aware:
                 logger.info(f"  action_aware_weight = {config.action_aware_weight}")
             logger.info(f"Empty embedding shape: {self.empty_emb.shape}")
@@ -251,10 +257,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 logger.info("Compiling teacher model with torch.compile ...")
                 self.teacher = torch.compile(self.teacher, mode="default")
                 logger.info("Teacher model compiled.")
+            # 释放 FSDP teacher（推理用 _teacher_nofsdp），省 ~10GB/卡
+            if self._teacher_nofsdp is not None:
+                del self.teacher
+                self.teacher = None
+                logger.info("FSDP teacher released (inference uses non-FSDP copy).")
 
         # 确定学生模型的初始化路径（从检查点恢复或从教师初始化）
         resume_path = getattr(config, "resume_from_path", None)
         resume_step = getattr(config, "resume_from_step", None)
+        self._resume_ckpt_dir = None
         self._is_lora_resume = False  # 标记是否从 LoRA checkpoint 恢复
         self._nofsdp_synced = False  # dirty flag for _sync_student_nofsdp optimization
         self._recent_ckpts = []     # track last 3 checkpoint steps for cleanup
@@ -263,19 +275,34 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
         if resume_path is not None:
             # 从指定路径恢复
+            self._resume_ckpt_dir = resume_path
             student_path = os.path.join(resume_path, "online_student", "transformer")
             target_path = os.path.join(resume_path, "target_student", "transformer")
             self.step = resume_step if resume_step is not None else 0
             # 检查是否是 LoRA checkpoint
             student_config_path = os.path.join(student_path, "config.json")
             if os.path.exists(student_config_path):
-                import json
                 with open(student_config_path) as f:
                     ckpt_config = json.load(f)
+                ckpt_step = int(ckpt_config.get("checkpoint_step", 0))
+                if resume_step is not None and resume_step != ckpt_step:
+                    raise ValueError(
+                        f"resume_from_step={resume_step} does not match "
+                        f"checkpoint_step={ckpt_step} in {student_config_path}"
+                    )
+                if resume_step is None:
+                    self.step = ckpt_step
                 if ckpt_config.get('use_lora', False):
                     self._is_lora_resume = True
                     if config.rank == 0:
                         logger.info(f"Detected LoRA checkpoint, will load base model from teacher and apply LoRA adapters")
+                if self._is_lora_resume and not self.use_lora:
+                    raise ValueError(
+                        "Checkpoint was saved with use_lora=True, but current config.use_lora=False. "
+                        "Set use_lora=True to resume this checkpoint."
+                    )
+            else:
+                raise FileNotFoundError(f"Missing checkpoint config: {student_config_path}")
             if config.rank == 0:
                 logger.info(f"Resuming from path: {resume_path}")
                 logger.info(f"  Online student: {student_path}")
@@ -283,6 +310,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 logger.info(f"  Starting step: {self.step}")
         elif resume_step is not None:
             # 从输出目录的指定步数恢复
+            self._resume_ckpt_dir = os.path.join(config.output_dir, "checkpoints", f"step_{resume_step}")
             student_path = os.path.join(
                 config.output_dir, "checkpoints", f"step_{resume_step}",
                 "online_student", "transformer")
@@ -296,10 +324,23 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 import json
                 with open(student_config_path) as f:
                     ckpt_config = json.load(f)
+                ckpt_step = int(ckpt_config.get("checkpoint_step", resume_step))
+                if ckpt_step != resume_step:
+                    raise ValueError(
+                        f"resume_from_step={resume_step} does not match "
+                        f"checkpoint_step={ckpt_step} in {student_config_path}"
+                    )
                 if ckpt_config.get('use_lora', False):
                     self._is_lora_resume = True
                     if config.rank == 0:
                         logger.info(f"Detected LoRA checkpoint, will load base model from teacher and apply LoRA adapters")
+                if self._is_lora_resume and not self.use_lora:
+                    raise ValueError(
+                        "Checkpoint was saved with use_lora=True, but current config.use_lora=False. "
+                        "Set use_lora=True to resume this checkpoint."
+                    )
+            else:
+                raise FileNotFoundError(f"Missing checkpoint config: {student_config_path}")
             if config.rank == 0:
                 logger.info(f"Resuming from step {resume_step}")
                 logger.info(f"  Online student: {student_path}")
@@ -489,15 +530,29 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # 优化器和学习率调度器
         # ==============================================================
         # AdamW 优化器：只优化在线学生的可训练参数
-        self.optimizer = torch.optim.AdamW(
-            [p for p in self.student.parameters() if p.requires_grad],
-            lr=config.learning_rate,
-            betas=(config.beta1, config.beta2),
-            eps=1e-8,
-            weight_decay=config.weight_decay,
-            fused=True,      # 使用融合实现（更快）
-            foreach=False,
-        )
+        # 8-bit Adam (省 ~50% optimizer 显存)
+        use_8bit_optimizer = getattr(config, 'use_8bit_optimizer', False)
+        if use_8bit_optimizer:
+            import bitsandbytes as bnb
+            self.optimizer = bnb.optim.AdamW8bit(
+                [p for p in self.student.parameters() if p.requires_grad],
+                lr=config.learning_rate,
+                betas=(config.beta1, config.beta2),
+                eps=1e-8,
+                weight_decay=config.weight_decay,
+            )
+            if config.rank == 0:
+                logger.info("Using 8-bit AdamW optimizer (bitsandbytes)")
+        else:
+            self.optimizer = torch.optim.AdamW(
+                [p for p in self.student.parameters() if p.requires_grad],
+                lr=config.learning_rate,
+                betas=(config.beta1, config.beta2),
+                eps=1e-8,
+                weight_decay=config.weight_decay,
+                fused=True,      # 使用融合实现（更快）
+                foreach=False,
+            )
         # 学习率调度器：warmup + 常数学习率
         # Cosine decay: warmup then decay to 10% of peak
         def cosine_decay_lambda(step):
@@ -512,8 +567,26 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             self.optimizer,
             lr_lambda=cosine_decay_lambda,
         )
-        # 如果从检查点恢复，快速推进学习率调度器到正确位置
-        if self.step > 0:
+        optimizer_state_path = None
+        scheduler_state_path = None
+        if self._resume_ckpt_dir is not None:
+            optimizer_state_path = os.path.join(self._resume_ckpt_dir, "optimizer.pt")
+            scheduler_state_path = os.path.join(self._resume_ckpt_dir, "lr_scheduler.pt")
+
+        if optimizer_state_path is not None and os.path.exists(optimizer_state_path):
+            opt_state = torch.load(optimizer_state_path, map_location="cpu")
+            self.optimizer.load_state_dict(opt_state)
+            if config.rank == 0:
+                logger.info(f"Loaded optimizer state from {optimizer_state_path}")
+
+        if scheduler_state_path is not None and os.path.exists(scheduler_state_path):
+            sched_state = torch.load(scheduler_state_path, map_location="cpu")
+            self.lr_scheduler.load_state_dict(sched_state)
+            if config.rank == 0:
+                logger.info(f"Loaded LR scheduler state from {scheduler_state_path}, "
+                            f"lr={self.lr_scheduler.get_last_lr()[0]:.2e}")
+        # 如果从旧检查点恢复且没有单独的 scheduler 状态，则快速推进学习率调度器
+        elif self.step > 0:
             for _ in range(self.step):
                 self.lr_scheduler.step()
             if config.rank == 0:
@@ -661,11 +734,21 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
 
             if self.config.rank == 0:
-                ckpt_dir = self.save_dir / f"step_{self.step}" / which / "transformer"
+                step_dir = self.save_dir / f"step_{self.step}"
+                ckpt_dir = step_dir / which / "transformer"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 save_file(state_dict_bf16, ckpt_dir / "diffusion_pytorch_model.safetensors")
                 config_dict = dict(model.config)
                 config_dict.pop("_name_or_path", None)
+                # Persist FlowMap/runtime metadata needed by inference and resume scripts.
+                config_dict['gate_value'] = getattr(self.config, 'gate_value', 0.0)
+                config_dict['deltatime_type'] = getattr(self.config, 'deltatime_type', 'r')
+                config_dict['num_train_timesteps'] = getattr(self.config, 'num_train_timesteps', 1000)
+                config_dict['snr_shift'] = getattr(self.config, 'snr_shift', 1.0)
+                config_dict['action_snr_shift'] = getattr(self.config, 'action_snr_shift', 1.0)
+                config_dict['patch_size'] = list(getattr(self.config, 'patch_size', (1, 2, 2)))
+                config_dict['distill_mode'] = getattr(self.config, 'distill_mode', 'flashwam')
+                config_dict['checkpoint_step'] = self.step
                 # 保存 LoRA 元信息，方便恢复时重建 LoRA 结构
                 if self.use_lora:
                     config_dict['use_lora'] = True
@@ -675,6 +758,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 with open(ckpt_dir / "config.json", "w") as f:
                     json.dump(config_dict, f, indent=2)
                 logger.info(f"  Saved {which} -> {ckpt_dir} ({'LoRA adapter' if self.use_lora else 'full model'})")
+
+                if which == "online_student":
+                    torch.save(self.optimizer.state_dict(), step_dir / "optimizer.pt")
+                    torch.save(self.lr_scheduler.state_dict(), step_dir / "lr_scheduler.pt")
+                    logger.info(f"  Saved optimizer/scheduler -> {step_dir}")
 
             # 保存判别器权重（仅在 use_dmd=True 且保存 online_student 时）
             if self.use_dmd and which == "online_student" and self.discriminator is not None:
@@ -704,6 +792,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 logger.error(traceback.format_exc())
             if dist.is_initialized():
                 dist.barrier(device_ids=[torch.cuda.current_device()])
+            raise
 
     # ==================================================================
     # 主训练循环
@@ -747,6 +836,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         f"({config.num_train_timesteps} / {config.num_ddim_timesteps_action})")
             logger.info(f"  action_loss_weight = {config.action_loss_weight}")
             logger.info(f"  action_distill_mode = {self.action_distill_mode}")
+            logger.info(f"  action_block_weight = {self.action_block_weight}")
         logger.info(f"  Teacher CFG: [{config.cfg_min}, {config.cfg_max}]")
         logger.info(f"  EMA decay: {config.ema_decay}")
         logger.info(f"  Loss: {config.loss_type}")
@@ -812,10 +902,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             # ---- 第二阶段：DMD（条件满足时执行）----
             d_loss_val = torch.tensor(0.0, device=self.device)
             dmd_grad_norm = 0.0
+            skip_step = result.get("skip_step", False)
             use_dmd_now = (self.use_dmd
                            and self.distill_action
                            and self.step >= dmd_warmup_steps
                            and result["should_sync"]
+                           and not skip_step
                            and not use_onpolicy_now)
 
             if use_dmd_now:
@@ -846,31 +938,35 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
             # 检查是否需要梯度同步（达到累积步数）
             if result["should_sync"]:
-                # 梯度裁剪
-                total_norm = torch.nn.utils.clip_grad_norm_(
-                    self.student.parameters(), config.max_grad_norm)
-
-                if not torch.isfinite(total_norm):
-                    # 梯度范数为 NaN/Inf，跳过这一步
-                    if config.rank == 0:
-                        logger.warning(f"[step {self.step}] NaN grad norm, skipping")
+                if skip_step:
+                    total_norm = torch.tensor(float("nan"), device=self.device)
                     self.optimizer.zero_grad()
                 else:
-                    # 正常更新参数
-                    self.optimizer.step()
-                    self.lr_scheduler.step()
-                    self.optimizer.zero_grad()
-                    self._nofsdp_synced = False  # invalidate dirty flag after weight update
+                    # 梯度裁剪
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        self.student.parameters(), config.max_grad_norm)
 
-                    # EMA 更新只在正常参数更新后执行（跳过 NaN/Inf 梯度时不更新 EMA，
-                    # 避免将异常梯度产生的错误权重传播到目标学生）
-                    # FSDP1 with use_orig_params=True preserves original parameter names,
-                    # so model.parameters() works directly (no .module needed)
-                    update_ema(
-                        self.target_student.parameters(),
-                        self.student.parameters(),
-                        rate=config.ema_decay,
-                    )
+                    if not torch.isfinite(total_norm):
+                        # 梯度范数为 NaN/Inf，跳过这一步
+                        if config.rank == 0:
+                            logger.warning(f"[step {self.step}] NaN grad norm, skipping")
+                        self.optimizer.zero_grad()
+                    else:
+                        # 正常更新参数
+                        self.optimizer.step()
+                        self.lr_scheduler.step()
+                        self.optimizer.zero_grad()
+                        self._nofsdp_synced = False  # invalidate dirty flag after weight update
+
+                        # EMA 更新只在正常参数更新后执行（跳过 NaN/Inf 梯度时不更新 EMA，
+                        # 避免将异常梯度产生的错误权重传播到目标学生）
+                        # FSDP1 with use_orig_params=True preserves original parameter names,
+                        # so model.parameters() works directly (no .module needed)
+                        update_ema(
+                            self.target_student.parameters(),
+                            self.student.parameters(),
+                            rate=config.ema_decay,
+                        )
 
                 # 计算平均损失（跨所有进程）
                 lr = self.lr_scheduler.get_last_lr()[0]
@@ -882,6 +978,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     torch.stack(acc_gt_regression_losses).sum()).item()
                 avg_d_loss = dist_mean(torch.stack(acc_d_losses).sum()).item()
                 avg_dmd_grad_norm = dist_mean(torch.stack(acc_dmd_grad_norms).sum()).item()
+                action_total_raw = (
+                    avg_action_loss
+                    + self.gt_regression_weight * avg_gt_regression_loss
+                    + getattr(self.config, "action_aware_weight", 0.0) * avg_action_aware_loss
+                )
+                action_total = self.action_block_weight * action_total_raw
                 # 重置累积器
                 acc_losses = []
                 acc_video_losses = []
@@ -920,7 +1022,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                             log_dict["loss/video_consistency"] = avg_video_loss
                     if self.distill_action:
                         postfix["a"] = f"{avg_action_loss:.4f}"
+                        postfix["at"] = f"{action_total:.4f}"
                         log_dict["loss/action_consistency"] = avg_action_loss
+                        log_dict["loss/action_total_raw"] = action_total_raw
+                        log_dict["loss/action_total"] = action_total
                     if self.action_aware:
                         postfix["aa"] = f"{avg_action_aware_loss:.4f}"
                         log_dict["loss/action_aware"] = avg_action_aware_loss

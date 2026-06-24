@@ -21,7 +21,6 @@ import torch
 import torch.distributed as dist
 
 
-_ema_first_call = True  # 标记是否是第一次调用（用于调试打印）
 _is_distributed = None  # 缓存分布式状态
 
 
@@ -40,7 +39,7 @@ def update_ema(target_params, source_params, rate=0.95):
       - 自动处理 DTensor（FSDP 分布式训练中的分片张量）
       - 使用 torch._foreach_lerp_ 融合多个参数的更新操作
     """
-    global _ema_first_call, _is_distributed
+    global _is_distributed
 
     # 缓存分布式状态
     if _is_distributed is None:
@@ -56,9 +55,6 @@ def update_ema(target_params, source_params, rate=0.95):
     else:
         # 非分布式训练：使用 fused kernel
         _update_ema_fused(target_params, source_params, rate)
-
-    _ema_first_call = False
-
 
 def _update_ema_fused(target_params, source_params, rate):
     """
@@ -90,12 +86,6 @@ def _update_ema_distributed(target_params, source_params, rate):
         td, sd = targ.data, src.data
         t_dt = type(td).__name__ == "DTensor"
         s_dt = type(sd).__name__ == "DTensor"
-
-        # 第一次调用时打印形状信息（用于调试）
-        if _ema_first_call and len(dt_target_dtensor) + len(dt_target_plain) < 3:
-            t_shape = td._local_tensor.shape if t_dt else td.shape
-            s_shape = sd._local_tensor.shape if s_dt else sd.shape
-            print(f"[EMA] t_dt={t_dt} t={t_shape}  s_dt={s_dt} s={s_shape}", flush=True)
 
         if t_dt and s_dt:
             dt_target_dtensor.append((td._local_tensor, sd._local_tensor))

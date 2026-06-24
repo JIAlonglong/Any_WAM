@@ -111,8 +111,10 @@ def flowmap_inference(
     """
     device = noisy_latent.device
     dtype = noisy_latent.dtype
+    timestep_dtype = torch.float32
     B = noisy_latent.shape[0]
     num_frames = noisy_latent.shape[2]
+    action_num_frames = noisy_action.shape[2]
 
     # 如果 action_num_steps 未指定，使用与 num_steps 相同的值
     if action_num_steps is None:
@@ -149,95 +151,110 @@ def flowmap_inference(
     current_latent = noisy_latent.clone()
     current_action = noisy_action.clone()
 
-    # ================================================================
-    # 步骤 5: 逐步去噪推理
-    # ================================================================
-    # 使用统一的步数循环，video 和 action 使用相同的步数但不同的时间步
-    for i in range(max_steps):
-        # 当前时间步 t 和目标时间步 r
-        t_video = video_timesteps[i]
-        r_video = video_timesteps[i + 1]
-        t_action = action_timesteps[i]
-        r_action = action_timesteps[i + 1]
+    was_training = model.training
+    model.eval()
 
-        # 如果 t == r，跳过（不会发生，但作为安全检查）
-        if t_video == r_video and t_action == r_action:
-            continue
+    try:
+        # ================================================================
+        # 步骤 5: 逐步去噪推理
+        # ================================================================
+        # 使用统一的步数循环，video 和 action 使用相同的步数但不同的时间步
+        with torch.no_grad():
+            for i in range(max_steps):
+                # 当前时间步 t 和目标时间步 r
+                t_video = video_timesteps[i]
+                r_video = video_timesteps[i + 1]
+                t_action = action_timesteps[i]
+                r_action = action_timesteps[i + 1]
+
+                # 如果 t == r，跳过（不会发生，但作为安全检查）
+                if t_video == r_video and t_action == r_action:
+                    continue
 
         # ------------------------------------------------------------
         # 注入首帧条件：将第 0 帧替换为 GT 干净 latent，保持锚点
         # ------------------------------------------------------------
-        if init_latent is not None:
-            current_latent[:, :, 0:1] = init_latent[:, :, 0:1].to(current_latent.dtype)
+                if init_latent is not None:
+                    current_latent[:, :, 0:1] = init_latent[:, :, 0:1].to(current_latent.dtype)
 
         # ------------------------------------------------------------
         # 步骤 5a: 条件预测（使用真实文本嵌入）
         # ------------------------------------------------------------
         # 构建 input_dict，与 forward_train 的接口对齐
         # 时间步需要扩展为 [B, T] 形状，T 为帧数
-        input_dict_cond = {
-            'latent_dict': {
-                'noisy_latents': current_latent.to(dtype),
-                'latent': current_latent.to(dtype),  # 条件 latent（推理时不使用条件分支）
-                'text_emb': text_emb,
-                'timesteps': _make_timesteps(B, num_frames, t_video, init_latent, device, dtype),
-                'cond_timesteps': _make_cond_timesteps(B, num_frames, r_video, init_latent, device, dtype),
-                'grid_id': _make_grid_id(current_latent, model, device),
-            },
-            'action_dict': {
-                'noisy_latents': current_action.to(dtype),
-                'latent': current_action.to(dtype),
-                'text_emb': text_emb,
-                'timesteps': torch.full((B, num_frames), t_action, device=device, dtype=dtype),
-                'cond_timesteps': torch.full((B, num_frames), r_action, device=device, dtype=dtype),
-                'grid_id': _make_action_grid_id(current_action, device),
-            },
-            'chunk_size': getattr(model, '_chunk_size', 2),
-            'window_size': getattr(model, '_window_size', 72),
-        }
+                video_r_timestep = _make_cond_timesteps(
+                    B, num_frames, r_video, init_latent, device, timestep_dtype
+                )
+                action_r_timestep = _expand_timestep(
+                    B, action_num_frames, r_action, device, timestep_dtype
+                )
+                input_dict_cond = {
+                    'latent_dict': {
+                        'noisy_latents': current_latent.to(dtype),
+                        'latent': current_latent.to(dtype),  # 条件 latent（推理时不使用条件分支）
+                        'text_emb': text_emb,
+                        'timesteps': _make_timesteps(
+                            B, num_frames, t_video, init_latent, device, timestep_dtype
+                        ),
+                        'cond_timesteps': video_r_timestep,
+                        'grid_id': _make_grid_id(current_latent, model, device),
+                    },
+                    'action_dict': {
+                        'noisy_latents': current_action.to(dtype),
+                        'latent': current_action.to(dtype),
+                        'text_emb': text_emb,
+                        'timesteps': _expand_timestep(
+                            B, action_num_frames, t_action, device, timestep_dtype
+                        ),
+                        'cond_timesteps': action_r_timestep,
+                        'grid_id': _make_action_grid_id(current_action, device),
+                    },
+                    'chunk_size': getattr(model, '_chunk_size', 2),
+                    'window_size': getattr(model, '_window_size', 72),
+                }
 
         # 条件前向推理（不使用 CFG）
         # r_timestep 和 action_r_timestep 分别传递视频和动作的目标时间步
         # 因为视频和动作使用不同的 SNR shift，所以 r 值不同
-        video_v_cond, action_v_cond = model(
-            input_dict_cond,
-            train_mode=True,
-            r_timestep=torch.full((B, num_frames), r_video, device=device, dtype=dtype),
-            action_r_timestep=torch.full((B, num_frames), r_action, device=device, dtype=dtype),
-            update_cache=update_cache if (i == max_steps - 1) else 0,
-            cache_name=cache_name,
-        )
+                video_v_cond, action_v_cond = model(
+                    input_dict_cond,
+                    train_mode=True,
+                    r_timestep=video_r_timestep,
+                    action_r_timestep=action_r_timestep,
+                    update_cache=update_cache if (i == max_steps - 1) else 0,
+                    cache_name=cache_name,
+                )
 
         # 将扁平输出转换为 5D 张量
-        video_v_cond_5d = _extract_video_v(video_v_cond, current_latent.shape, B, patch_size)
-        action_v_cond_5d = _extract_action_v(action_v_cond, num_frames)
+                video_v_cond_5d = _extract_video_v(video_v_cond, current_latent.shape, B, patch_size)
+                action_v_cond_5d = _extract_action_v(action_v_cond, action_num_frames)
 
         # ------------------------------------------------------------
         # 步骤 5b: 无条件预测（使用空文本嵌入）
         # ------------------------------------------------------------
-        input_dict_uncond = {
-            'latent_dict': {
-                **input_dict_cond['latent_dict'],
-                'text_emb': empty_emb,  # 替换为空文本嵌入
-            },
-            'action_dict': {
-                **input_dict_cond['action_dict'],
-                'text_emb': empty_emb,  # 替换为空文本嵌入
-            },
-            'chunk_size': input_dict_cond['chunk_size'],
-            'window_size': input_dict_cond['window_size'],
-        }
+                input_dict_uncond = {
+                    'latent_dict': {
+                        **input_dict_cond['latent_dict'],
+                        'text_emb': empty_emb,  # 替换为空文本嵌入
+                    },
+                    'action_dict': {
+                        **input_dict_cond['action_dict'],
+                        'text_emb': empty_emb,  # 替换为空文本嵌入
+                    },
+                    'chunk_size': input_dict_cond['chunk_size'],
+                    'window_size': input_dict_cond['window_size'],
+                }
 
         # 无条件推理同样需要传递 action_r_timestep
-        video_v_uncond, _ = model(
-            input_dict_uncond,
-            train_mode=True,
-            r_timestep=torch.full((B, num_frames), r_video, device=device, dtype=dtype),
-            action_r_timestep=torch.full((B, num_frames), r_action, device=device, dtype=dtype),
-            update_cache=update_cache if (i == max_steps - 1) else 0,
-            cache_name=cache_name,
-        )
-        video_v_uncond_5d = _extract_video_v(video_v_uncond, current_latent.shape, B, patch_size)
+                video_v_uncond, _ = model(
+                    input_dict_uncond,
+                    train_mode=True,
+                    r_timestep=video_r_timestep,
+                    action_r_timestep=action_r_timestep,
+                    update_cache=0,
+                    cache_name=cache_name,
+                )
+                video_v_uncond_5d = _extract_video_v(video_v_uncond, current_latent.shape, B, patch_size)
 
         # ------------------------------------------------------------
         # 步骤 5c: CFG 组合
@@ -245,9 +262,9 @@ def flowmap_inference(
         # 标准 CFG 公式：v = v_uncond + cfg_scale * (v_cond - v_uncond)
         # cfg_scale=1 时退化为纯条件预测
         # cfg_scale 越大，条件引导越强，但可能引入伪影
-        video_v_cfg = video_v_uncond_5d + cfg_scale * (video_v_cond_5d - video_v_uncond_5d)
-        # 动作不使用 CFG（action_guidance_scale=1），直接使用条件预测
-        action_v_cfg = action_v_cond_5d
+                video_v_cfg = video_v_uncond_5d + cfg_scale * (video_v_cond_5d - video_v_uncond_5d)
+                # 动作不使用 CFG（action_guidance_scale=1），直接使用条件预测
+                action_v_cfg = action_v_cond_5d
 
         # ------------------------------------------------------------
         # 步骤 5d: Flow Map Euler 更新
@@ -256,15 +273,21 @@ def flowmap_inference(
         # 其中 t 和 r 是归一化后的 sigma 值（0~1 范围）
         # 注意：这里使用 sigma 而非训练时间步，因为 FlowMatch 的更新公式
         #       基于归一化的 sigma 空间
-        sigma_t_video = video_sigmas[i]
-        sigma_r_video = video_sigmas[i + 1]
-        sigma_t_action = action_sigmas[i]
-        sigma_r_action = action_sigmas[i + 1]
+                sigma_t_video = video_sigmas[i]
+                sigma_r_video = video_sigmas[i + 1]
+                sigma_t_action = action_sigmas[i]
+                sigma_r_action = action_sigmas[i + 1]
 
         # 视频 Euler 步
-        current_latent = current_latent - (sigma_t_video - sigma_r_video) * video_v_cfg
-        # 动作 Euler 步
-        current_action = current_action - (sigma_t_action - sigma_r_action) * action_v_cfg
+                current_latent = current_latent - (sigma_t_video - sigma_r_video) * video_v_cfg
+                # 动作 Euler 步
+                current_action = current_action - (sigma_t_action - sigma_r_action) * action_v_cfg
+
+            if init_latent is not None:
+                current_latent[:, :, 0:1] = init_latent[:, :, 0:1].to(current_latent.dtype)
+    finally:
+        if was_training:
+            model.train()
 
     # ================================================================
     # 步骤 6: 返回去噪结果
@@ -274,7 +297,7 @@ def flowmap_inference(
 
 def _make_timesteps(B, num_frames, t_val, init_latent, device, dtype):
     """Create timestep tensor, zeroing frame 0 if init_latent is provided."""
-    ts = torch.full((B, num_frames), t_val, device=device, dtype=dtype)
+    ts = _expand_timestep(B, num_frames, t_val, device, dtype)
     if init_latent is not None:
         ts[:, 0:1] = 0.0  # Frame 0 is clean (no noise)
     return ts
@@ -282,10 +305,17 @@ def _make_timesteps(B, num_frames, t_val, init_latent, device, dtype):
 
 def _make_cond_timesteps(B, num_frames, r_val, init_latent, device, dtype):
     """Create cond_timestep tensor, zeroing frame 0 if init_latent is provided."""
-    ts = torch.full((B, num_frames), r_val, device=device, dtype=dtype)
+    ts = _expand_timestep(B, num_frames, r_val, device, dtype)
     if init_latent is not None:
         ts[:, 0:1] = 0.0  # Frame 0 stays clean (no movement)
     return ts
+
+
+def _expand_timestep(B, num_frames, value, device, dtype):
+    """Expand a scalar tensor timestep without casting it to the latent dtype."""
+    if not torch.is_tensor(value):
+        value = torch.as_tensor(value, device=device)
+    return torch.ones((B, num_frames), device=device, dtype=dtype) * value.to(device=device, dtype=dtype)
 
 
 def _extract_video_v(video_pred, ref_shape, batch_size, patch_size=(1, 2, 2)):

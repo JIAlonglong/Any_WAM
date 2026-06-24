@@ -95,17 +95,29 @@ class SafeMultiLatentLeRobotDataset:
         repo_list = [v.split("/meta/info.json")[0] for v in repo_list]
 
         self._datasets = []
+        skipped = []
         for repo_id in repo_list:
             try:
                 ds = LatentLeRobotDataset(repo_id=repo_id, config=config)
                 self._datasets.append(ds)
             except Exception as e:
-                # 加载失败，打印警告并跳过
-                print(f"WARNING: Skipping incomplete dataset {os.path.basename(repo_id)}: {e}")
+                skipped.append((repo_id, e))
 
         total = len(repo_list)
         loaded = len(self._datasets)
         print(f"Loaded {loaded}/{total} sub-datasets successfully")
+        if skipped:
+            allow_partial = bool(getattr(config, "allow_partial_datasets", False))
+            details = "\n".join(
+                f"  - {os.path.basename(repo_id)}: {err}" for repo_id, err in skipped
+            )
+            if not allow_partial:
+                raise RuntimeError(
+                    "Incomplete sub-datasets detected.\n"
+                    "Set config.allow_partial_datasets=True to ignore them.\n"
+                    f"{details}"
+                )
+            print("WARNING: allow_partial_datasets=True, skipping incomplete datasets:\n" + details)
         if loaded == 0:
             raise RuntimeError(
                 "No valid sub-datasets found. Dataset download may be incomplete."

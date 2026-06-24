@@ -96,6 +96,7 @@ cfg.action_aware = _mode in ("video_action_aware", "flashwam")
 
 cfg.num_ddim_timesteps_action = 2
 cfg.action_loss_weight = 1.0
+cfg.action_block_weight = float(os.environ.get("ACTION_BLOCK_WEIGHT", 4.0))
 cfg.action_distill_mode = "x0"
 cfg.action_aware_weight = 0.1       # 改进：从 0.01 增加到 0.1
 
@@ -119,19 +120,21 @@ cfg.use_flowmap = True
 cfg.use_gt_regression = True
 cfg.use_central_diff = True
 cfg.selective_cdiff = True
-cfg.action_use_flowmap = False
+cfg.action_use_flowmap = True
+cfg.action_epsilon = getattr(cfg, "epsilon", 1.0)  # action-side central-difference radius
+
 cfg.use_action_distill = True       # 新增：使用教师蒸馏（核心改进）
 
 # ============================================================
 # DMD 参数（Stage 1 默认关闭，Stage 2 启用）
 # ============================================================
-cfg.use_dmd = True                  # Stage 2: 启用 DMD
+cfg.use_dmd = False                  # Stage 2: 启用 DMD
 cfg.dmd_weight = 0.1
 cfg.dmd_warmup_steps = 0
 cfg.dmd_rollout_steps_min = 2
 cfg.dmd_rollout_steps_max = 8
 cfg.dmd_cfg_scale = 5.0
-cfg.dmd_discriminator_lr = 1e-5
+cfg.dmd_discriminator_lr = 5e-4
 cfg.dmd_discriminator_steps = 1
 cfg.dmd_discriminator_warmup = 2  # 快速测试 DMD
 cfg.dmd_hidden_dim = 256
@@ -143,7 +146,7 @@ cfg.dmd_dropout = 0.1
 # LoRA 配置
 # ============================================================
 cfg.use_lora = True
-cfg.lora_rank = 512
+cfg.lora_rank = 256
 cfg.lora_alpha = 256
 cfg.lora_dropout = 0.0
 cfg.lora_target_modules = [

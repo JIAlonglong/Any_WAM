@@ -124,6 +124,7 @@ cfg.action_aware = _mode in ("video_action_aware", "flashwam")                  
 
 cfg.num_ddim_timesteps_action = 2   # 动作的锚点数（k_action = 1000/2 = 500）
 cfg.action_loss_weight = 1.0        # 动作一致性损失的权重
+cfg.action_block_weight = 1.0       # 动作分支总权重；用于显式控制 action 整体梯度强度
 cfg.action_distill_mode = "x0"      # 动作一致性函数的参数化方式（"x0" 直接预测干净样本）
 cfg.action_aware_weight = 0.1       # 动作感知正则化损失的权重（较小，仅起辅助作用）
                                     # 改进：从 0.01 增加到 0.1，加强动作正则化
@@ -197,6 +198,8 @@ cfg.selective_cdiff = True          # 是否使用选择性中心差分（True =
                                     # False — 对所有 batch 都计算中心差分（消融用，验证是否需要全量计算）
 
 cfg.action_use_flowmap = False      # 动作是否使用流映射目标（False = 动作用 GT 回归 + x0）
+cfg.action_epsilon = getattr(cfg, "epsilon", 1.0)  # action-side central-difference radius
+
                                     # 动作维度低（30 维），中心差分信号可能不稳定，默认关闭
                                     # True  — 动作也使用流映射中间目标（与视频对称）
                                     # False — 动作仅使用 GT 回归 + x0 一致性目标

@@ -10,6 +10,7 @@
 #   TEST_NUM=3 bash evaluation/libero/run_eval_flowmap.sh         # 每任务测试 3 个 episode
 #
 # 环境变量：
+#   OUTPUT_ROOT: checkpoint 输出目录
 #   NUM_STEPS:   推理步数 (默认 2)
 #   TEST_NUM:    每任务测试 episode 数 (默认 5)
 #   PORT:        WebSocket 端口 (默认 29056)
@@ -17,9 +18,12 @@
 
 set -e
 
-# 使用 flashwam conda 环境
-CONDA_ENV="flashwam"
-PYTHON_CMD="conda run -n $CONDA_ENV python"
+CONDA_ENV="${CONDA_ENV:-/root/nas/junjie/conda_envs/any_wam}"
+if [ -d "$CONDA_ENV" ]; then
+    PYTHON_CMD="conda run -p $CONDA_ENV python"
+else
+    PYTHON_CMD="conda run -n $CONDA_ENV python"
+fi
 
 STEP="${1:-step_8500}"
 VARIANT="${2:-online_student}"
@@ -28,8 +32,9 @@ TEST_NUM="${TEST_NUM:-5}"
 PORT="${PORT:-29056}"
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-STUDENT_CKPT="${PROJECT_ROOT}/distillation_flowmap/output_libero_new/checkpoints/${STEP}/${VARIANT}/transformer"
-TEACHER_CKPT="${PROJECT_ROOT}/checkpoints/libero/transformer"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/distillation_flowmap/output_libero_stage1_retrain_20260623}"
+STUDENT_CKPT="${OUTPUT_ROOT}/checkpoints/${STEP}/${VARIANT}/transformer"
+TEACHER_CKPT="${TEACHER_CKPT:-${PROJECT_ROOT}/checkpoints/lingbot-va-posttrain-libero/transformer}"
 SAVE_ROOT="${PROJECT_ROOT}/evaluation/outputs/flowmap_${STEP}_${VARIANT}"
 VIDEO_DIR="${SAVE_ROOT}/videos"
 
@@ -49,7 +54,7 @@ echo "============================================"
 if [ ! -d "$STUDENT_CKPT" ]; then
     echo "ERROR: Student checkpoint not found: $STUDENT_CKPT"
     echo "Available checkpoints:"
-    ls "${PROJECT_ROOT}/distillation_flowmap/output_libero_new/checkpoints/"
+    ls "${OUTPUT_ROOT}/checkpoints/"
     exit 1
 fi
 

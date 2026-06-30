@@ -145,6 +145,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # ==============================================================
         self.use_dmd = getattr(config, 'use_dmd', False)
         self.use_onpolicy_transition = getattr(config, 'use_onpolicy_transition', False)
+        self.use_opd_aux = getattr(config, 'use_opd_aux', False)
         self.discriminator = None
         self.discriminator_optimizer = None
 
@@ -213,6 +214,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info(f"  weight_type        = {getattr(config, 'weight_type', 'uniform')} (时间步采样权重)")
             logger.info(f"  gt_regression_weight = {self.gt_regression_weight} (GT 回归 loss 权重)")
             logger.info(f"  use_lora           = {self.use_lora} (LoRA 微调)")
+            logger.info(f"  use_opd_aux        = {self.use_opd_aux} (teacher-transition auxiliary)")
+            if self.use_opd_aux:
+                logger.info(f"  opd_aux_weight     = {getattr(config, 'opd_aux_weight', 0.1)}")
+                logger.info(f"  opd_aux_interval   = {getattr(config, 'opd_aux_interval', 1)}")
+                logger.info(f"  one_step_focus     = {getattr(config, 'one_step_focus_ratio', 0.0)}")
             if self.use_lora:
                 logger.info(f"  lora_rank          = {config.lora_rank}")
                 logger.info(f"  lora_alpha         = {config.lora_alpha}")
@@ -279,18 +285,21 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             student_path = os.path.join(resume_path, "online_student", "transformer")
             target_path = os.path.join(resume_path, "target_student", "transformer")
             self.step = resume_step if resume_step is not None else 0
+            reset_resume_step = getattr(config, "reset_resume_step", False)
             # 检查是否是 LoRA checkpoint
             student_config_path = os.path.join(student_path, "config.json")
             if os.path.exists(student_config_path):
                 with open(student_config_path) as f:
                     ckpt_config = json.load(f)
                 ckpt_step = int(ckpt_config.get("checkpoint_step", 0))
-                if resume_step is not None and resume_step != ckpt_step:
+                if (not reset_resume_step) and resume_step is not None and resume_step != ckpt_step:
                     raise ValueError(
                         f"resume_from_step={resume_step} does not match "
                         f"checkpoint_step={ckpt_step} in {student_config_path}"
                     )
-                if resume_step is None:
+                if reset_resume_step:
+                    self.step = 0
+                elif resume_step is None:
                     self.step = ckpt_step
                 if ckpt_config.get('use_lora', False):
                     self._is_lora_resume = True
@@ -307,6 +316,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 logger.info(f"Resuming from path: {resume_path}")
                 logger.info(f"  Online student: {student_path}")
                 logger.info(f"  Target student: {target_path}")
+                if reset_resume_step:
+                    logger.info(f"  Resetting resumed checkpoint step to 0 for a new training stage")
                 logger.info(f"  Starting step: {self.step}")
         elif resume_step is not None:
             # 从输出目录的指定步数恢复
@@ -321,7 +332,6 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             # 检查是否是 LoRA checkpoint
             student_config_path = os.path.join(student_path, "config.json")
             if os.path.exists(student_config_path):
-                import json
                 with open(student_config_path) as f:
                     ckpt_config = json.load(f)
                 ckpt_step = int(ckpt_config.get("checkpoint_step", resume_step))
@@ -371,6 +381,33 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             self.student, gate_value=config.gate_value, deltatime_type=config.deltatime_type)
         self.student = patch_model_forward(self.student)
 
+        def load_flowmap_delta_weights(model, transformer_dir, label):
+            """Restore FlowMap-only weights dropped by the base Wan loader."""
+            if transformer_dir == teacher_path:
+                return
+            weights_path = os.path.join(transformer_dir, "diffusion_pytorch_model.safetensors")
+            if not os.path.exists(weights_path):
+                return
+            from safetensors import safe_open
+
+            delta_state = {}
+            with safe_open(weights_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if ".delta_embedder." in key:
+                        delta_state[key] = f.get_tensor(key)
+            if not delta_state:
+                if config.rank == 0:
+                    logger.warning("No FlowMap delta weights found for %s at %s", label, weights_path)
+                return
+            _, unexpected = model.load_state_dict(delta_state, strict=False)
+            if config.rank == 0:
+                logger.info("Loaded %d FlowMap delta weights for %s", len(delta_state), label)
+                if unexpected:
+                    logger.warning("Unexpected FlowMap delta keys for %s: %s", label, unexpected)
+
+        if not self._is_lora_resume:
+            load_flowmap_delta_weights(self.student, student_path, "online student")
+
         # ==============================================================
         # LoRA 可选：为学生模型添加 LoRA adapter（降低显存开销）
         # ==============================================================
@@ -414,7 +451,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.student = self.student.to(self.dtype)
 
         # 创建非 FSDP 学生副本（用于 DMD rollout 和 on-policy transition rollout）
-        if self.use_dmd or self.use_onpolicy_transition:
+        if (self.use_dmd or self.use_onpolicy_transition or
+                getattr(config, 'opd_aux_use_nofsdp_rollout', False)):
             import copy
             from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
             logger.info("Creating non-FSDP student copy for DMD rollout ...")
@@ -476,6 +514,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.target_student = setup_flowmap_model(
             self.target_student, gate_value=config.gate_value, deltatime_type=config.deltatime_type)
         self.target_student = patch_model_forward(self.target_student)
+        if not self._is_lora_resume:
+            load_flowmap_delta_weights(self.target_student, target_path, "target student")
 
         # 如果从 LoRA checkpoint 恢复，为目标学生也添加 LoRA 并加载权重
         if self._is_lora_resume and self.use_lora:
@@ -569,9 +609,15 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         )
         optimizer_state_path = None
         scheduler_state_path = None
-        if self._resume_ckpt_dir is not None:
+        resume_optimizer_state = getattr(config, "resume_optimizer_state", True)
+        if self._resume_ckpt_dir is not None and resume_optimizer_state:
             optimizer_state_path = os.path.join(self._resume_ckpt_dir, "optimizer.pt")
             scheduler_state_path = os.path.join(self._resume_ckpt_dir, "lr_scheduler.pt")
+        elif self._resume_ckpt_dir is not None and config.rank == 0:
+            logger.info(
+                "Skipping optimizer/LR scheduler state restore; "
+                "model weights and checkpoint step are still restored."
+            )
 
         if optimizer_state_path is not None and os.path.exists(optimizer_state_path):
             opt_state = torch.load(optimizer_state_path, map_location="cpu")
@@ -670,6 +716,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.save_dir = Path(config.output_dir) / "checkpoints"
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.train_loader_iter = None  # 数据迭代器（懒加载）
+        self._light_eval_batches = None
+        self._stage1_start_eval_batches = None
 
         # ==============================================================
         # DMD 判别器 checkpoint 恢复（如果从 checkpoint 恢复）
@@ -795,6 +843,993 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             raise
 
     # ==================================================================
+    # 轻量级固定样本 eval：不跑环境、不跑 teacher，只评估学生重建能力
+    # ==================================================================
+    def _light_eval_is_enabled(self):
+        return bool(getattr(self.config, "enable_light_eval", False))
+
+    def _get_light_eval_batches(self):
+        if self._light_eval_batches is not None:
+            return self._light_eval_batches
+
+        from torch.utils.data._utils.collate import default_collate
+
+        dataset = self.train_loader.dataset
+        num_batches = max(1, int(getattr(self.config, "light_eval_num_batches", 1)))
+        start_index = int(getattr(self.config, "light_eval_start_index", 0))
+        batches = []
+        for i in range(num_batches):
+            idx = (start_index + i) % len(dataset)
+            # batch_size is intentionally fixed to 1: the model/FlexAttention
+            # path has several batch=1 assumptions elsewhere in training.
+            batches.append(default_collate([dataset[idx]]))
+        self._light_eval_batches = batches
+        return batches
+
+    def _get_stage1_start_eval_batches(self):
+        if self._stage1_start_eval_batches is not None:
+            return self._stage1_start_eval_batches
+
+        from torch.utils.data._utils.collate import default_collate
+
+        dataset = self.train_loader.dataset
+        num_batches = max(1, int(getattr(self.config, "stage1_start_eval_num_batches", 1)))
+        start_index = int(getattr(self.config, "stage1_start_eval_start_index", 0))
+        batches = []
+        for i in range(num_batches):
+            idx = (start_index + i) % len(dataset)
+            batches.append(default_collate([dataset[idx]]))
+        self._stage1_start_eval_batches = batches
+        return batches
+
+    def _light_eval_pairs(self):
+        pairs = getattr(self.config, "light_eval_pairs", None)
+        if not pairs:
+            pairs = [(1000, 1000), (1000, 0), (750, 250)]
+        return [(float(t), float(r)) for t, r in pairs]
+
+    def _rollout_eval_is_enabled(self):
+        return bool(getattr(self.config, "enable_rollout_eval", False))
+
+    def _rollout_eval_pairs(self):
+        pairs = getattr(self.config, "rollout_eval_pairs", None)
+        if not pairs:
+            pairs = [(1000, 0), (1000, 500), (750, 250)]
+        return [(float(t), float(r)) for t, r in pairs]
+
+    def _rollout_eval_student_steps(self):
+        steps = getattr(self.config, "rollout_eval_student_steps", None)
+        if not steps:
+            steps = [1, 2, 4]
+        return [max(1, int(s)) for s in steps]
+
+    @torch.no_grad()
+    def _run_light_eval(self):
+        """
+        Deterministic validation on fixed train/val samples.
+
+        Metrics:
+          - *_v_mse: predicted FlowMatch velocity vs fixed-noise target.
+          - *_xr_mse/l1: one Euler jump from x_t to x_r vs true x_r built
+            from the same clean sample and fixed noise.
+
+        This intentionally avoids teacher forward and environment rollout so it
+        can run inside training without changing optimizer/EMA state.
+        """
+        if not self._light_eval_is_enabled():
+            return {}
+
+        was_training = self.student.training
+        self.student.eval()
+
+        metric_sums = {}
+        metric_counts = {}
+        seed_base = int(getattr(self.config, "light_eval_seed", 42))
+        action_ds = getattr(self.config, "action_downsample_factor", 4)
+
+        def add_metric(name, value):
+            value = value.detach().float()
+            metric_sums[name] = metric_sums.get(name, torch.zeros((), device=self.device)) + value
+            metric_counts[name] = metric_counts.get(name, 0) + 1
+
+        try:
+            for batch_idx, batch in enumerate(self._get_light_eval_batches()):
+                batch = self._move_eval_batch_to_device(batch)
+                base_input = self._prepare_base_dict(batch)
+                B = batch["latents"].shape[0]
+                ref_shape = batch["latents"].shape
+                num_frames = ref_shape[2]
+
+                for pair_idx, (t_value, r_value) in enumerate(self._light_eval_pairs()):
+                    gen = torch.Generator(device=self.device)
+                    gen.manual_seed(seed_base + batch_idx * 1009 + pair_idx)
+
+                    video_t = torch.full(
+                        (B, num_frames), t_value, device=self.device, dtype=torch.float32)
+                    video_r = torch.full(
+                        (B, num_frames), r_value, device=self.device, dtype=torch.float32)
+                    action_t = video_t
+                    action_r = video_r
+
+                    video_noise = torch.randn(
+                        batch["latents"].shape, device=self.device,
+                        dtype=batch["latents"].dtype, generator=gen)
+                    action_noise = torch.randn(
+                        batch["actions"].shape, device=self.device,
+                        dtype=batch["actions"].dtype, generator=gen)
+
+                    video_noisy_t = self.train_scheduler_latent.add_noise(
+                        batch["latents"], video_noise, video_t, t_dim=2)
+                    video_noisy_r = self.train_scheduler_latent.add_noise(
+                        batch["latents"], video_noise, video_r, t_dim=2)
+                    video_v_target = self.train_scheduler_latent.training_target(
+                        batch["latents"], video_noise, video_t)
+
+                    action_noisy_t = self.train_scheduler_action.add_noise(
+                        batch["actions"], action_noise, action_t, t_dim=2)
+                    action_noisy_r = self.train_scheduler_action.add_noise(
+                        batch["actions"], action_noise, action_r, t_dim=2)
+                    action_v_target = self.train_scheduler_action.training_target(
+                        batch["actions"], action_noise, action_t)
+
+                    eval_input = {
+                        "latent_dict": {
+                            **base_input["latent_dict"],
+                            "noisy_latents": video_noisy_t,
+                            "timesteps": video_t,
+                            "targets": video_v_target,
+                        },
+                        "action_dict": {
+                            "noisy_latents": action_noisy_t[:, :, ::action_ds],
+                            "latent": batch["actions"][:, :, ::action_ds],
+                            "timesteps": action_t[:, ::action_ds],
+                            "cond_timesteps": base_input["action_dict"]["cond_timesteps"][:, ::action_ds],
+                            "text_emb": base_input["action_dict"]["text_emb"],
+                            "targets": action_v_target[:, :, ::action_ds],
+                        },
+                        "chunk_size": base_input["chunk_size"],
+                        "window_size": base_input["window_size"],
+                    }
+                    if base_input["action_dict"].get("grid_id") is not None:
+                        from flowmap_step import _downsample_action_grid_id
+                        eval_input["action_dict"]["grid_id"] = _downsample_action_grid_id(
+                            base_input["action_dict"]["grid_id"], batch["actions"], action_ds)
+                    if base_input["action_dict"].get("actions_mask") is not None:
+                        eval_input["action_dict"]["actions_mask"] = (
+                            base_input["action_dict"]["actions_mask"][:, :, ::action_ds])
+
+                    from modules.model import FlexAttnFunc
+                    _ld = eval_input["latent_dict"]
+                    _ad = eval_input["action_dict"]
+                    _total_length = (
+                        _ld["noisy_latents"].flatten(0, 1).shape[0] * 2 +
+                        _ad["noisy_latents"].flatten(0, 1).shape[0] * 2
+                    )
+                    _padded_length = (128 - _total_length % 128) % 128
+                    FlexAttnFunc.init_mask(
+                        _ld["noisy_latents"].shape,
+                        _ad["noisy_latents"].shape,
+                        _padded_length,
+                        eval_input["chunk_size"],
+                        window_size=eval_input["window_size"],
+                        patch_size=self.patch_size,
+                        device=self.device,
+                    )
+
+                    student_video_seq, student_action_seq = self.student(
+                        eval_input, train_mode=True,
+                        r_timestep=video_r,
+                        action_r_timestep=action_r[:, ::action_ds],
+                    )
+
+                    pair_name = f"t{int(t_value)}_r{int(r_value)}"
+                    sigma_t = video_t[:, None, :, None, None] / self.config.num_train_timesteps
+                    sigma_r = video_r[:, None, :, None, None] / self.config.num_train_timesteps
+
+                    if self.distill_video:
+                        student_video_v = self._extract_video_v(student_video_seq, ref_shape, B)
+                        video_pred_xr = video_noisy_t + student_video_v * (sigma_r - sigma_t)
+                        add_metric(f"light_eval/{pair_name}/video_v_mse",
+                                   (student_video_v.float() - video_v_target.float()).pow(2).mean())
+                        add_metric(f"light_eval/{pair_name}/video_xr_mse",
+                                   (video_pred_xr.float() - video_noisy_r.float()).pow(2).mean())
+                        add_metric(f"light_eval/{pair_name}/video_xr_l1",
+                                   (video_pred_xr.float() - video_noisy_r.float()).abs().mean())
+
+                    if self.distill_action or self.action_aware:
+                        action_frames = batch["actions"].shape[2] // action_ds
+                        student_action_v = self._extract_action_v(student_action_seq, action_frames)
+                        action_v_target_ds = action_v_target[:, :, ::action_ds]
+                        action_noisy_t_ds = action_noisy_t[:, :, ::action_ds]
+                        action_noisy_r_ds = action_noisy_r[:, :, ::action_ds]
+                        action_sigma_t = action_t[:, None, ::action_ds, None, None] / self.config.num_train_timesteps
+                        action_sigma_r = action_r[:, None, ::action_ds, None, None] / self.config.num_train_timesteps
+                        action_pred_xr = action_noisy_t_ds + student_action_v * (
+                            action_sigma_r - action_sigma_t)
+
+                        mask = batch.get("actions_mask")
+                        if mask is not None:
+                            mask = mask[:, :, ::action_ds].float()
+                            denom = (mask.sum() * student_action_v.shape[1]).clamp(min=1)
+                            action_v_mse = (
+                                ((student_action_v.float() - action_v_target_ds.float()) * mask).pow(2).sum()
+                                / denom
+                            )
+                            action_xr_mse = (
+                                ((action_pred_xr.float() - action_noisy_r_ds.float()) * mask).pow(2).sum()
+                                / denom
+                            )
+                            action_xr_l1 = (
+                                ((action_pred_xr.float() - action_noisy_r_ds.float()).abs() * mask).sum()
+                                / denom
+                            )
+                        else:
+                            action_v_mse = (student_action_v.float() - action_v_target_ds.float()).pow(2).mean()
+                            action_xr_mse = (action_pred_xr.float() - action_noisy_r_ds.float()).pow(2).mean()
+                            action_xr_l1 = (action_pred_xr.float() - action_noisy_r_ds.float()).abs().mean()
+
+                        add_metric(f"light_eval/{pair_name}/action_v_mse", action_v_mse)
+                        add_metric(f"light_eval/{pair_name}/action_xr_mse", action_xr_mse)
+                        add_metric(f"light_eval/{pair_name}/action_xr_l1", action_xr_l1)
+
+        finally:
+            if was_training:
+                self.student.train()
+
+        out = {}
+        for name, total in metric_sums.items():
+            avg = total / max(1, metric_counts[name])
+            if dist.is_initialized():
+                avg = dist_mean(avg)
+            out[name] = avg.item()
+        return out
+
+    @torch.no_grad()
+    def _run_rollout_eval(self):
+        """
+        Fixed-sample rollout eval for Stage 2.
+
+        This is heavier than _run_light_eval because it queries teacher rollout.
+        It measures whether a small number of student Euler steps lands near the
+        teacher/reference trajectory. Use a coarse interval such as 250 or 500.
+        """
+        if not self._rollout_eval_is_enabled():
+            return {}
+
+        from modules.model import FlexAttnFunc
+        from flowmap_step import _downsample_action_grid_id
+
+        was_training = self.student.training
+        self.student.eval()
+        self.target_student.eval()
+        if getattr(self, "_student_nofsdp", None) is not None:
+            self._student_nofsdp.eval()
+
+        metric_sums = {}
+        metric_counts = {}
+        summary_sums = {}
+        summary_counts = {}
+        seed_base = int(getattr(self.config, "rollout_eval_seed", 42))
+        action_ds = getattr(self.config, "action_downsample_factor", 4)
+        teacher_steps = max(1, int(getattr(self.config, "rollout_eval_teacher_steps", 4)))
+        cfg_scale = float(getattr(self.config, "rollout_eval_cfg_scale", 5.0))
+        pairs = self._rollout_eval_pairs()
+        student_steps = self._rollout_eval_student_steps()
+        max_batches = max(1, int(getattr(self.config, "rollout_eval_num_batches", 1)))
+        save_videos = (
+            self.config.rank == 0 and
+            bool(getattr(self.config, "rollout_eval_save_videos", False))
+        )
+        video_dir = None
+        video_vae = None
+        video_processor = None
+        video_pairs_saved = 0
+        video_max_pairs = max(1, int(getattr(self.config, "rollout_eval_video_max_pairs", 1)))
+        video_sample_index = max(0, int(getattr(self.config, "rollout_eval_video_sample_index", 0)))
+        video_fps = max(1, int(getattr(self.config, "rollout_eval_video_fps", 10)))
+        if save_videos:
+            from diffusers.video_processor import VideoProcessor
+            from modules.utils import load_vae
+
+            video_dir = getattr(self.config, "rollout_eval_video_dir", None)
+            if video_dir is None:
+                video_dir = os.path.join(
+                    self.config.output_dir,
+                    "rollout_eval_videos",
+                    f"step_{int(getattr(self, 'step', 0)):06d}",
+                )
+            os.makedirs(video_dir, exist_ok=True)
+            video_vae = load_vae(
+                os.path.join(self.config.teacher_model_path, "vae"),
+                torch_dtype=torch.float16,
+                torch_device=self.device,
+            )
+            video_vae.eval()
+            video_processor = VideoProcessor(vae_scale_factor=1)
+
+        def add_metric(name, value):
+            value = value.detach().float()
+            metric_sums[name] = metric_sums.get(name, torch.zeros((), device=self.device)) + value
+            metric_counts[name] = metric_counts.get(name, 0) + 1
+
+        def add_summary(k_steps, name, value):
+            key = f"rollout_eval_summary/s{k_steps}/{name}"
+            value = value.detach().float()
+            summary_sums[key] = summary_sums.get(key, torch.zeros((), device=self.device)) + value
+            summary_counts[key] = summary_counts.get(key, 0) + 1
+
+        def init_eval_mask(input_dict):
+            ld = input_dict["latent_dict"]
+            ad = input_dict["action_dict"]
+            total_length = (
+                ld["noisy_latents"].flatten(0, 1).shape[0] * 2 +
+                ad["noisy_latents"].flatten(0, 1).shape[0] * 2
+            )
+            padded_length = (128 - total_length % 128) % 128
+            FlexAttnFunc.init_mask(
+                ld["noisy_latents"].shape,
+                ad["noisy_latents"].shape,
+                padded_length,
+                input_dict["chunk_size"],
+                window_size=input_dict["window_size"],
+                patch_size=self.patch_size,
+                device=self.device,
+            )
+
+        def masked_mse_l1(diff, mask):
+            if mask is None:
+                return diff.float().pow(2).mean(), diff.float().abs().mean()
+            mask = mask.float()
+            denom = (mask.sum() * diff.shape[1]).clamp(min=1)
+            return (
+                (diff.float() * mask).pow(2).sum() / denom,
+                (diff.float().abs() * mask).sum() / denom,
+            )
+
+        def decode_eval_latents(latents):
+            latents = latents.detach().to(next(video_vae.parameters()).device, dtype=video_vae.dtype)
+            latents_mean = (
+                torch.tensor(video_vae.config.latents_mean)
+                .view(1, video_vae.config.z_dim, 1, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents_std_inv = (
+                1.0
+                / torch.tensor(video_vae.config.latents_std)
+                .view(1, video_vae.config.z_dim, 1, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents = latents / latents_std_inv + latents_mean
+            video = video_vae.decode(latents, return_dict=False)[0]
+            return video_processor.postprocess_video(video, output_type="np")[0]
+
+        def save_eval_contact_sheet(named_videos, path):
+            if not named_videos:
+                return
+            import numpy as np
+            from PIL import Image, ImageDraw
+
+            def to_uint8(frame):
+                arr = np.asarray(frame)
+                if arr.dtype != np.uint8:
+                    arr = np.clip(arr * 255.0 if arr.max() <= 1.5 else arr, 0, 255).astype(np.uint8)
+                return arr
+
+            first_video = next(iter(named_videos.values()))
+            frame_count = len(first_video)
+            frame_ids = sorted(set([0, frame_count // 2, frame_count - 1]))
+            thumb_w = 192
+            rows = []
+            for name, video in named_videos.items():
+                thumbs = []
+                for frame_id in frame_ids:
+                    img = Image.fromarray(to_uint8(video[frame_id])).convert("RGB")
+                    scale = thumb_w / img.width
+                    img = img.resize((thumb_w, max(1, int(img.height * scale))))
+                    thumbs.append(img)
+                rows.append((name, thumbs))
+
+            label_h = 24
+            gap = 6
+            row_h = label_h + max(img.height for _, row in rows for img in row)
+            sheet_w = len(frame_ids) * thumb_w + (len(frame_ids) - 1) * gap
+            sheet_h = len(rows) * row_h + (len(rows) - 1) * gap
+            sheet = Image.new("RGB", (sheet_w, sheet_h), "white")
+            draw = ImageDraw.Draw(sheet)
+            y = 0
+            for name, row in rows:
+                draw.text((0, y + 4), name, fill=(0, 0, 0))
+                x = 0
+                for img in row:
+                    sheet.paste(img, (x, y + label_h))
+                    x += thumb_w + gap
+                y += row_h + gap
+            sheet.save(path)
+
+        try:
+            for batch_idx, batch in enumerate(self._get_light_eval_batches()[:max_batches]):
+                batch = self._move_eval_batch_to_device(batch)
+                base_input = self._prepare_base_dict(batch)
+                B = batch["latents"].shape[0]
+                ref_shape = batch["latents"].shape
+                num_frames = ref_shape[2]
+                empty_emb = self.empty_emb.expand(
+                    base_input["latent_dict"]["text_emb"].shape[0], -1, -1)
+
+                for pair_idx, (t_value, r_value) in enumerate(pairs):
+                    gen = torch.Generator(device=self.device)
+                    gen.manual_seed(seed_base + batch_idx * 1009 + pair_idx)
+
+                    video_t = torch.full(
+                        (B, num_frames), t_value, device=self.device, dtype=torch.float32)
+                    video_r = torch.full(
+                        (B, num_frames), r_value, device=self.device, dtype=torch.float32)
+                    action_t = video_t
+                    action_r = video_r
+
+                    video_noise = torch.randn(
+                        batch["latents"].shape, device=self.device,
+                        dtype=batch["latents"].dtype, generator=gen)
+                    action_noise = torch.randn(
+                        batch["actions"].shape, device=self.device,
+                        dtype=batch["actions"].dtype, generator=gen)
+
+                    video_noisy_t = self.train_scheduler_latent.add_noise(
+                        batch["latents"], video_noise, video_t, t_dim=2)
+                    video_noisy_r = self.train_scheduler_latent.add_noise(
+                        batch["latents"], video_noise, video_r, t_dim=2)
+                    video_v_target_r = self.train_scheduler_latent.training_target(
+                        batch["latents"], video_noise, video_r)
+
+                    action_noisy_t = self.train_scheduler_action.add_noise(
+                        batch["actions"], action_noise, action_t, t_dim=2)
+                    action_noisy_r = self.train_scheduler_action.add_noise(
+                        batch["actions"], action_noise, action_r, t_dim=2)
+                    action_v_target_t = self.train_scheduler_action.training_target(
+                        batch["actions"], action_noise, action_t)
+
+                    input_dict = {
+                        "latent_dict": {
+                            **base_input["latent_dict"],
+                            "noisy_latents": video_noisy_t,
+                            "timesteps": video_t,
+                            "targets": self.train_scheduler_latent.training_target(
+                                batch["latents"], video_noise, video_t),
+                        },
+                        "action_dict": {
+                            **base_input["action_dict"],
+                            "noisy_latents": action_noisy_t,
+                            "timesteps": action_t,
+                            "targets": action_v_target_t,
+                        },
+                        "chunk_size": base_input["chunk_size"],
+                        "window_size": base_input["window_size"],
+                    }
+                    student_input = {
+                        "latent_dict": input_dict["latent_dict"],
+                        "action_dict": {
+                            "noisy_latents": action_noisy_t[:, :, ::action_ds],
+                            "latent": batch["actions"][:, :, ::action_ds],
+                            "timesteps": action_t[:, ::action_ds],
+                            "cond_timesteps": input_dict["action_dict"]["cond_timesteps"][:, ::action_ds],
+                            "text_emb": input_dict["action_dict"]["text_emb"],
+                            "grid_id": _downsample_action_grid_id(
+                                input_dict["action_dict"].get("grid_id"), batch["actions"], action_ds),
+                            "actions_mask": (
+                                input_dict["action_dict"]["actions_mask"][:, :, ::action_ds]
+                                if input_dict["action_dict"].get("actions_mask") is not None else None
+                            ),
+                        },
+                        "chunk_size": input_dict["chunk_size"],
+                        "window_size": input_dict["window_size"],
+                    }
+
+                    pair_name = f"t{int(t_value)}_r{int(r_value)}"
+                    teacher_x_r, teacher_v_r = self._teacher_integrate_to_r(
+                        noisy_latents=video_noisy_t,
+                        timesteps=video_t,
+                        target_r=video_r,
+                        input_dict=input_dict,
+                        empty_emb=empty_emb,
+                        cfg_scale=cfg_scale,
+                        ref_shape=ref_shape,
+                        B=B,
+                        num_frames=num_frames,
+                        num_steps=teacher_steps,
+                    )
+                    videos_to_save = {}
+                    should_save_pair_video = (
+                        save_videos and batch_idx == 0 and video_pairs_saved < video_max_pairs
+                    )
+                    if should_save_pair_video:
+                        sample_idx = min(video_sample_index, B - 1)
+                        videos_to_save["gt_r"] = video_noisy_r[sample_idx:sample_idx + 1].detach().cpu()
+                        videos_to_save[f"teacher_t{teacher_steps}"] = (
+                            teacher_x_r[sample_idx:sample_idx + 1].detach().cpu()
+                        )
+
+                    for k_steps in student_steps:
+                        student_x_r, student_v_r = self._student_euler_integrate(
+                            noisy_latents=video_noisy_t,
+                            timesteps=video_t,
+                            target_r=video_r,
+                            base_input_dict=student_input,
+                            empty_emb=empty_emb,
+                            cfg_scale=cfg_scale,
+                            ref_shape=ref_shape,
+                            B=B,
+                            num_frames=num_frames,
+                            K_steps=k_steps,
+                            action_target_r=action_r,
+                        )
+                        if should_save_pair_video:
+                            sample_idx = min(video_sample_index, B - 1)
+                            videos_to_save[f"student_s{k_steps}"] = (
+                                student_x_r[sample_idx:sample_idx + 1].detach().cpu()
+                            )
+                        prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{teacher_steps}"
+
+                        video_teacher_x_mse = (
+                            student_x_r.float() - teacher_x_r.float()).pow(2).mean()
+                        video_teacher_x_l1 = (
+                            student_x_r.float() - teacher_x_r.float()).abs().mean()
+                        video_teacher_v_mse = (
+                            student_v_r.float() - teacher_v_r.float()).pow(2).mean()
+                        video_teacher_v_l1 = (
+                            student_v_r.float() - teacher_v_r.float()).abs().mean()
+                        video_gt_x_mse = (
+                            student_x_r.float() - video_noisy_r.float()).pow(2).mean()
+                        video_gt_x_l1 = (
+                            student_x_r.float() - video_noisy_r.float()).abs().mean()
+                        video_gt_v_mse = (
+                            student_v_r.float() - video_v_target_r.float()).pow(2).mean()
+
+                        add_metric(prefix + "/video_teacher_x_mse", video_teacher_x_mse)
+                        add_metric(prefix + "/video_teacher_x_l1", video_teacher_x_l1)
+                        add_metric(prefix + "/video_teacher_v_mse", video_teacher_v_mse)
+                        add_metric(prefix + "/video_teacher_v_l1", video_teacher_v_l1)
+                        add_metric(prefix + "/video_gt_x_mse", video_gt_x_mse)
+                        add_metric(prefix + "/video_gt_x_l1", video_gt_x_l1)
+                        add_metric(prefix + "/video_gt_v_mse", video_gt_v_mse)
+                        add_metric(prefix + "/video_latent_norm", student_x_r.float().pow(2).mean().sqrt())
+                        add_summary(k_steps, "video_teacher_x_l1_mean", video_teacher_x_l1)
+                        add_summary(k_steps, "video_gt_x_l1_mean", video_gt_x_l1)
+
+                        action_input = {
+                            "latent_dict": {
+                                **input_dict["latent_dict"],
+                                "noisy_latents": student_x_r.detach(),
+                                "timesteps": video_r,
+                            },
+                            "action_dict": student_input["action_dict"],
+                            "chunk_size": input_dict["chunk_size"],
+                            "window_size": input_dict["window_size"],
+                        }
+                        init_eval_mask(action_input)
+                        _, student_action_seq = self.student(
+                            action_input, train_mode=True,
+                            r_timestep=video_r,
+                            action_r_timestep=action_r[:, ::action_ds],
+                        )
+                        action_frames = batch["actions"].shape[2] // action_ds
+                        student_action_v = self._extract_action_v(student_action_seq, action_frames)
+                        action_noisy_t_ds = action_noisy_t[:, :, ::action_ds]
+                        action_noisy_r_ds = action_noisy_r[:, :, ::action_ds]
+                        action_v_target_ds = action_v_target_t[:, :, ::action_ds]
+                        action_sigma_t = (
+                            action_t[:, None, ::action_ds, None, None] /
+                            self.config.num_train_timesteps)
+                        action_sigma_r = (
+                            action_r[:, None, ::action_ds, None, None] /
+                            self.config.num_train_timesteps)
+                        action_pred_xr = action_noisy_t_ds + student_action_v * (
+                            action_sigma_r.to(student_action_v) -
+                            action_sigma_t.to(student_action_v))
+                        mask = batch.get("actions_mask")
+                        mask_ds = mask[:, :, ::action_ds] if mask is not None else None
+
+                        action_gt_xr_mse, action_gt_xr_l1 = masked_mse_l1(
+                            action_pred_xr - action_noisy_r_ds, mask_ds)
+                        action_gt_v_mse, action_gt_v_l1 = masked_mse_l1(
+                            student_action_v - action_v_target_ds, mask_ds)
+                        add_metric(prefix + "/action_gt_xr_mse", action_gt_xr_mse)
+                        add_metric(prefix + "/action_gt_xr_l1", action_gt_xr_l1)
+                        add_metric(prefix + "/action_gt_v_mse", action_gt_v_mse)
+                        add_metric(prefix + "/action_gt_v_l1", action_gt_v_l1)
+                        add_metric(prefix + "/action_v_norm", student_action_v.float().pow(2).mean().sqrt())
+                        if student_action_v.shape[2] > 1:
+                            add_metric(
+                                prefix + "/action_v_smoothness_l1",
+                                (student_action_v[:, :, 1:] - student_action_v[:, :, :-1])
+                                .float().abs().mean())
+                        add_summary(k_steps, "action_gt_xr_l1_mean", action_gt_xr_l1)
+                        add_summary(k_steps, "action_gt_v_l1_mean", action_gt_v_l1)
+
+                    if should_save_pair_video:
+                        from diffusers.utils import export_to_video
+
+                        decoded = {}
+                        for video_name, latent_cpu in videos_to_save.items():
+                            video_np = decode_eval_latents(latent_cpu.to(self.device))
+                            decoded[video_name] = video_np
+                            path = os.path.join(video_dir, f"{pair_name}_{video_name}.mp4")
+                            export_to_video(video_np, path, fps=video_fps)
+                            logger.info("Saved rollout eval video: %s", path)
+                        sheet_path = os.path.join(video_dir, f"{pair_name}_contact_sheet.png")
+                        save_eval_contact_sheet(decoded, sheet_path)
+                        logger.info("Saved rollout eval contact sheet: %s", sheet_path)
+                        video_pairs_saved += 1
+        finally:
+            if video_vae is not None:
+                del video_vae
+                torch.cuda.empty_cache()
+            if was_training:
+                self.student.train()
+
+        out = {}
+        all_sums = {**metric_sums, **summary_sums}
+        all_counts = {**metric_counts, **summary_counts}
+        for name, total in all_sums.items():
+            avg = total / max(1, all_counts[name])
+            if dist.is_initialized():
+                avg = dist_mean(avg)
+            out[name] = avg.item()
+        return out
+
+    @torch.no_grad()
+    def _run_stage1_start_eval(self, model=None, metric_prefix="stage1_start_eval",
+                               supports_r_timestep=True, transition_prefix=None):
+        """
+        One-shot Stage-1 quality snapshot before Stage-2 training.
+
+        This checks local Flow Matching and one-step x0 reconstruction on fixed
+        samples. It is intentionally diagnostic only: callers should log the
+        result and continue training regardless of metric values or eval errors.
+        """
+        if not bool(getattr(self.config, "enable_stage1_start_eval", False)):
+            return {}
+
+        model = model if model is not None else self.student
+        was_training = model.training
+        model.eval()
+
+        metric_sums = {}
+        metric_counts = {}
+        seed_base = int(getattr(self.config, "stage1_start_eval_seed", 42))
+        timesteps = getattr(self.config, "stage1_start_eval_timesteps",
+                            [1000, 750, 500, 250])
+        timesteps = [float(t) for t in timesteps]
+        transition_pairs = getattr(
+            self.config, "stage1_start_eval_transition_pairs",
+            [(1000, 750), (1000, 500), (750, 250), (500, 0)]
+        )
+        transition_pairs = [(float(t), float(r)) for t, r in transition_pairs]
+        action_ds = getattr(self.config, "action_downsample_factor", 4)
+
+        def add_metric(name, value):
+            value = value.detach().float()
+            metric_sums[name] = metric_sums.get(name, torch.zeros((), device=self.device)) + value
+            metric_counts[name] = metric_counts.get(name, 0) + 1
+
+        try:
+            for batch_idx, batch in enumerate(self._get_stage1_start_eval_batches()):
+                batch = self._move_eval_batch_to_device(batch)
+                base_input = self._prepare_base_dict(batch)
+                B = batch["latents"].shape[0]
+                ref_shape = batch["latents"].shape
+                num_frames = ref_shape[2]
+
+                for t_idx, t_value in enumerate(timesteps):
+                    gen = torch.Generator(device=self.device)
+                    gen.manual_seed(seed_base + batch_idx * 1009 + t_idx)
+
+                    video_t = torch.full(
+                        (B, num_frames), t_value, device=self.device, dtype=torch.float32)
+                    video_r0 = torch.zeros_like(video_t)
+                    action_t = video_t
+                    action_r0 = video_r0
+
+                    video_noise = torch.randn(
+                        batch["latents"].shape, device=self.device,
+                        dtype=batch["latents"].dtype, generator=gen)
+                    action_noise = torch.randn(
+                        batch["actions"].shape, device=self.device,
+                        dtype=batch["actions"].dtype, generator=gen)
+
+                    video_noisy_t = self.train_scheduler_latent.add_noise(
+                        batch["latents"], video_noise, video_t, t_dim=2)
+                    video_v_target = self.train_scheduler_latent.training_target(
+                        batch["latents"], video_noise, video_t)
+
+                    action_noisy_t = self.train_scheduler_action.add_noise(
+                        batch["actions"], action_noise, action_t, t_dim=2)
+                    action_v_target = self.train_scheduler_action.training_target(
+                        batch["actions"], action_noise, action_t)
+
+                    eval_input = {
+                        "latent_dict": {
+                            **base_input["latent_dict"],
+                            "noisy_latents": video_noisy_t,
+                            "timesteps": video_t,
+                            "targets": video_v_target,
+                        },
+                        "action_dict": {
+                            "noisy_latents": action_noisy_t[:, :, ::action_ds],
+                            "latent": batch["actions"][:, :, ::action_ds],
+                            "timesteps": action_t[:, ::action_ds],
+                            "cond_timesteps": base_input["action_dict"]["cond_timesteps"][:, ::action_ds],
+                            "text_emb": base_input["action_dict"]["text_emb"],
+                            "targets": action_v_target[:, :, ::action_ds],
+                        },
+                        "chunk_size": base_input["chunk_size"],
+                        "window_size": base_input["window_size"],
+                    }
+                    if base_input["action_dict"].get("grid_id") is not None:
+                        from flowmap_step import _downsample_action_grid_id
+                        eval_input["action_dict"]["grid_id"] = _downsample_action_grid_id(
+                            base_input["action_dict"]["grid_id"], batch["actions"], action_ds)
+                    if base_input["action_dict"].get("actions_mask") is not None:
+                        eval_input["action_dict"]["actions_mask"] = (
+                            base_input["action_dict"]["actions_mask"][:, :, ::action_ds])
+
+                    from modules.model import FlexAttnFunc
+                    _ld = eval_input["latent_dict"]
+                    _ad = eval_input["action_dict"]
+                    _total_length = (
+                        _ld["noisy_latents"].flatten(0, 1).shape[0] * 2 +
+                        _ad["noisy_latents"].flatten(0, 1).shape[0] * 2
+                    )
+                    _padded_length = (128 - _total_length % 128) % 128
+                    FlexAttnFunc.init_mask(
+                        _ld["noisy_latents"].shape,
+                        _ad["noisy_latents"].shape,
+                        _padded_length,
+                        eval_input["chunk_size"],
+                        window_size=eval_input["window_size"],
+                        patch_size=self.patch_size,
+                        device=self.device,
+                    )
+
+                    if supports_r_timestep:
+                        student_video_seq, student_action_seq = model(
+                            eval_input, train_mode=True,
+                            r_timestep=video_r0,
+                            action_r_timestep=action_r0[:, ::action_ds],
+                        )
+                    else:
+                        student_video_seq, student_action_seq = model(
+                            eval_input, train_mode=True,
+                        )
+
+                    t_name = f"t{int(t_value)}"
+                    sigma_t = video_t[:, None, :, None, None] / self.config.num_train_timesteps
+                    sigma_0 = torch.zeros_like(sigma_t)
+
+                    if self.distill_video:
+                        student_video_v = self._extract_video_v(student_video_seq, ref_shape, B)
+                        video_pred_x0 = video_noisy_t + student_video_v * (sigma_0 - sigma_t)
+                        add_metric(f"{metric_prefix}/{t_name}/video_v_mse",
+                                   (student_video_v.float() - video_v_target.float()).pow(2).mean())
+                        add_metric(f"{metric_prefix}/{t_name}/video_v_l1",
+                                   (student_video_v.float() - video_v_target.float()).abs().mean())
+                        add_metric(f"{metric_prefix}/{t_name}/video_x0_mse",
+                                   (video_pred_x0.float() - batch["latents"].float()).pow(2).mean())
+                        add_metric(f"{metric_prefix}/{t_name}/video_x0_l1",
+                                   (video_pred_x0.float() - batch["latents"].float()).abs().mean())
+
+                    if self.distill_action or self.action_aware:
+                        action_frames = batch["actions"].shape[2] // action_ds
+                        student_action_v = self._extract_action_v(student_action_seq, action_frames)
+                        action_v_target_ds = action_v_target[:, :, ::action_ds]
+                        action_noisy_t_ds = action_noisy_t[:, :, ::action_ds]
+                        action_latent_ds = batch["actions"][:, :, ::action_ds]
+                        action_sigma_t = action_t[:, None, ::action_ds, None, None] / self.config.num_train_timesteps
+                        action_sigma_0 = torch.zeros_like(action_sigma_t)
+                        action_pred_x0 = action_noisy_t_ds + student_action_v * (
+                            action_sigma_0 - action_sigma_t)
+
+                        mask = batch.get("actions_mask")
+                        if mask is not None:
+                            mask = mask[:, :, ::action_ds].float()
+                            denom = (mask.sum() * student_action_v.shape[1]).clamp(min=1)
+                            action_v_mse = (
+                                ((student_action_v.float() - action_v_target_ds.float()) * mask).pow(2).sum()
+                                / denom
+                            )
+                            action_v_l1 = (
+                                ((student_action_v.float() - action_v_target_ds.float()).abs() * mask).sum()
+                                / denom
+                            )
+                            action_x0_mse = (
+                                ((action_pred_x0.float() - action_latent_ds.float()) * mask).pow(2).sum()
+                                / denom
+                            )
+                            action_x0_l1 = (
+                                ((action_pred_x0.float() - action_latent_ds.float()).abs() * mask).sum()
+                                / denom
+                            )
+                        else:
+                            action_v_mse = (student_action_v.float() - action_v_target_ds.float()).pow(2).mean()
+                            action_v_l1 = (student_action_v.float() - action_v_target_ds.float()).abs().mean()
+                            action_x0_mse = (action_pred_x0.float() - action_latent_ds.float()).pow(2).mean()
+                            action_x0_l1 = (action_pred_x0.float() - action_latent_ds.float()).abs().mean()
+
+                        add_metric(f"{metric_prefix}/{t_name}/action_v_mse", action_v_mse)
+                        add_metric(f"{metric_prefix}/{t_name}/action_v_l1", action_v_l1)
+                        add_metric(f"{metric_prefix}/{t_name}/action_x0_mse", action_x0_mse)
+                        add_metric(f"{metric_prefix}/{t_name}/action_x0_l1", action_x0_l1)
+
+                if transition_prefix is None:
+                    continue
+
+                for pair_idx, (t_value, r_value) in enumerate(transition_pairs):
+                    gen = torch.Generator(device=self.device)
+                    gen.manual_seed(seed_base + batch_idx * 1009 + 10000 + pair_idx)
+
+                    video_t = torch.full(
+                        (B, num_frames), t_value, device=self.device, dtype=torch.float32)
+                    video_r = torch.full(
+                        (B, num_frames), r_value, device=self.device, dtype=torch.float32)
+                    action_t = video_t
+                    action_r = video_r
+
+                    video_noise = torch.randn(
+                        batch["latents"].shape, device=self.device,
+                        dtype=batch["latents"].dtype, generator=gen)
+                    action_noise = torch.randn(
+                        batch["actions"].shape, device=self.device,
+                        dtype=batch["actions"].dtype, generator=gen)
+
+                    video_noisy_t = self.train_scheduler_latent.add_noise(
+                        batch["latents"], video_noise, video_t, t_dim=2)
+                    video_noisy_r = self.train_scheduler_latent.add_noise(
+                        batch["latents"], video_noise, video_r, t_dim=2)
+                    video_v_target_t = self.train_scheduler_latent.training_target(
+                        batch["latents"], video_noise, video_t)
+                    video_v_target_eff = (
+                        (video_noisy_r - video_noisy_t)
+                        / ((video_r[:, None, :, None, None] - video_t[:, None, :, None, None])
+                           / self.config.num_train_timesteps).clamp(min=-1.0, max=-1e-6)
+                    )
+
+                    action_noisy_t = self.train_scheduler_action.add_noise(
+                        batch["actions"], action_noise, action_t, t_dim=2)
+                    action_noisy_r = self.train_scheduler_action.add_noise(
+                        batch["actions"], action_noise, action_r, t_dim=2)
+                    action_v_target_t = self.train_scheduler_action.training_target(
+                        batch["actions"], action_noise, action_t)
+                    action_v_target_eff = (
+                        (action_noisy_r - action_noisy_t)
+                        / ((action_r[:, None, :, None, None] - action_t[:, None, :, None, None])
+                           / self.config.num_train_timesteps).clamp(min=-1.0, max=-1e-6)
+                    )
+
+                    eval_input = {
+                        "latent_dict": {
+                            **base_input["latent_dict"],
+                            "noisy_latents": video_noisy_t,
+                            "timesteps": video_t,
+                            "targets": video_v_target_t,
+                        },
+                        "action_dict": {
+                            "noisy_latents": action_noisy_t[:, :, ::action_ds],
+                            "latent": batch["actions"][:, :, ::action_ds],
+                            "timesteps": action_t[:, ::action_ds],
+                            "cond_timesteps": base_input["action_dict"]["cond_timesteps"][:, ::action_ds],
+                            "text_emb": base_input["action_dict"]["text_emb"],
+                            "targets": action_v_target_t[:, :, ::action_ds],
+                        },
+                        "chunk_size": base_input["chunk_size"],
+                        "window_size": base_input["window_size"],
+                    }
+                    if base_input["action_dict"].get("grid_id") is not None:
+                        from flowmap_step import _downsample_action_grid_id
+                        eval_input["action_dict"]["grid_id"] = _downsample_action_grid_id(
+                            base_input["action_dict"]["grid_id"], batch["actions"], action_ds)
+                    if base_input["action_dict"].get("actions_mask") is not None:
+                        eval_input["action_dict"]["actions_mask"] = (
+                            base_input["action_dict"]["actions_mask"][:, :, ::action_ds])
+
+                    from modules.model import FlexAttnFunc
+                    _ld = eval_input["latent_dict"]
+                    _ad = eval_input["action_dict"]
+                    _total_length = (
+                        _ld["noisy_latents"].flatten(0, 1).shape[0] * 2 +
+                        _ad["noisy_latents"].flatten(0, 1).shape[0] * 2
+                    )
+                    _padded_length = (128 - _total_length % 128) % 128
+                    FlexAttnFunc.init_mask(
+                        _ld["noisy_latents"].shape,
+                        _ad["noisy_latents"].shape,
+                        _padded_length,
+                        eval_input["chunk_size"],
+                        window_size=eval_input["window_size"],
+                        patch_size=self.patch_size,
+                        device=self.device,
+                    )
+
+                    if supports_r_timestep:
+                        student_video_seq, student_action_seq = model(
+                            eval_input, train_mode=True,
+                            r_timestep=video_r,
+                            action_r_timestep=action_r[:, ::action_ds],
+                        )
+                    else:
+                        student_video_seq, student_action_seq = model(
+                            eval_input, train_mode=True,
+                        )
+
+                    pair_name = f"t{int(t_value)}_r{int(r_value)}"
+                    sigma_t = video_t[:, None, :, None, None] / self.config.num_train_timesteps
+                    sigma_r = video_r[:, None, :, None, None] / self.config.num_train_timesteps
+
+                    if self.distill_video:
+                        student_video_v = self._extract_video_v(student_video_seq, ref_shape, B)
+                        video_pred_xr = video_noisy_t + student_video_v * (sigma_r - sigma_t)
+                        add_metric(f"{transition_prefix}/{pair_name}/video_xr_mse",
+                                   (video_pred_xr.float() - video_noisy_r.float()).pow(2).mean())
+                        add_metric(f"{transition_prefix}/{pair_name}/video_xr_l1",
+                                   (video_pred_xr.float() - video_noisy_r.float()).abs().mean())
+                        add_metric(f"{transition_prefix}/{pair_name}/video_v_eff_mse",
+                                   (student_video_v.float() - video_v_target_eff.float()).pow(2).mean())
+
+                    if self.distill_action or self.action_aware:
+                        action_frames = batch["actions"].shape[2] // action_ds
+                        student_action_v = self._extract_action_v(student_action_seq, action_frames)
+                        action_noisy_t_ds = action_noisy_t[:, :, ::action_ds]
+                        action_noisy_r_ds = action_noisy_r[:, :, ::action_ds]
+                        action_v_target_eff_ds = action_v_target_eff[:, :, ::action_ds]
+                        action_sigma_t = action_t[:, None, ::action_ds, None, None] / self.config.num_train_timesteps
+                        action_sigma_r = action_r[:, None, ::action_ds, None, None] / self.config.num_train_timesteps
+                        action_pred_xr = action_noisy_t_ds + student_action_v * (
+                            action_sigma_r - action_sigma_t)
+
+                        mask = batch.get("actions_mask")
+                        if mask is not None:
+                            mask = mask[:, :, ::action_ds].float()
+                            denom = (mask.sum() * student_action_v.shape[1]).clamp(min=1)
+                            action_xr_mse = (
+                                ((action_pred_xr.float() - action_noisy_r_ds.float()) * mask).pow(2).sum()
+                                / denom
+                            )
+                            action_xr_l1 = (
+                                ((action_pred_xr.float() - action_noisy_r_ds.float()).abs() * mask).sum()
+                                / denom
+                            )
+                            action_v_eff_mse = (
+                                ((student_action_v.float() - action_v_target_eff_ds.float()) * mask).pow(2).sum()
+                                / denom
+                            )
+                        else:
+                            action_xr_mse = (action_pred_xr.float() - action_noisy_r_ds.float()).pow(2).mean()
+                            action_xr_l1 = (action_pred_xr.float() - action_noisy_r_ds.float()).abs().mean()
+                            action_v_eff_mse = (
+                                student_action_v.float() - action_v_target_eff_ds.float()).pow(2).mean()
+
+                        add_metric(f"{transition_prefix}/{pair_name}/action_xr_mse", action_xr_mse)
+                        add_metric(f"{transition_prefix}/{pair_name}/action_xr_l1", action_xr_l1)
+                        add_metric(f"{transition_prefix}/{pair_name}/action_v_eff_mse", action_v_eff_mse)
+
+        finally:
+            if was_training:
+                model.train()
+
+        out = {}
+        for name, total in metric_sums.items():
+            avg = total / max(1, metric_counts[name])
+            if dist.is_initialized():
+                avg = dist_mean(avg)
+            out[name] = avg.item()
+        return out
+
+    def _move_eval_batch_to_device(self, batch):
+        # Keep cached eval batches on CPU; convert a shallow copy each eval run.
+        return {
+            key: value.to(self.device) if isinstance(value, torch.Tensor) else value
+            for key, value in batch.items()
+        }
+
+    # ==================================================================
     # 主训练循环
     # ==================================================================
     def train(self):
@@ -850,15 +1885,87 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info(f"  DMD enabled: weight={getattr(config, 'dmd_weight', 0.1)}, "
                         f"rollout=[{getattr(config, 'dmd_rollout_steps_min', 2)}, "
                         f"{getattr(config, 'dmd_rollout_steps_max', 8)}]")
+        if self.use_opd_aux:
+            logger.info(f"  OPD aux enabled: weight={getattr(config, 'opd_aux_weight', 0.1)}, "
+                        f"warmup={getattr(config, 'opd_aux_warmup_steps', 0)}, "
+                        f"interval={getattr(config, 'opd_aux_interval', 1)}, "
+                        f"prob={getattr(config, 'opd_aux_prob', 1.0)}")
+            logger.info(f"  one_step_focus: video={getattr(config, 'video_one_step_focus_ratio', getattr(config, 'one_step_focus_ratio', 0.0))}, "
+                        f"action={getattr(config, 'action_one_step_focus_ratio', getattr(config, 'one_step_focus_ratio', 0.0))}, "
+                        f"opd_aux={getattr(config, 'opd_aux_one_step_focus_ratio', getattr(config, 'one_step_focus_ratio', 0.0))}")
+
+        if bool(getattr(config, "enable_stage1_start_eval", False)):
+            try:
+                if config.rank == 0:
+                    logger.info("Running Stage-1 start eval before Stage-2 training ...")
+                stage1_eval_log_dict = self._run_stage1_start_eval(
+                    model=self.student,
+                    metric_prefix="stage1_start_eval/current",
+                    transition_prefix="stage1_flowmap_eval/current",
+                    supports_r_timestep=True,
+                )
+                if bool(getattr(config, "enable_stage1_start_eval_baseline", True)):
+                    baseline_model = getattr(self, "_teacher_nofsdp", None)
+                    if baseline_model is not None:
+                        baseline_log_dict = self._run_stage1_start_eval(
+                            model=baseline_model,
+                            metric_prefix="stage1_start_eval/baseline",
+                            transition_prefix="stage1_flowmap_eval/baseline",
+                            supports_r_timestep=False,
+                        )
+                        stage1_eval_log_dict.update(baseline_log_dict)
+                        eps = 1e-12
+                        for b_key, b_val in baseline_log_dict.items():
+                            if b_key.startswith("stage1_start_eval/baseline/"):
+                                base_prefix = "stage1_start_eval"
+                            elif b_key.startswith("stage1_flowmap_eval/baseline/"):
+                                base_prefix = "stage1_flowmap_eval"
+                            else:
+                                continue
+                            suffix = b_key.replace(f"{base_prefix}/baseline/", "", 1)
+                            c_key = f"{base_prefix}/current/{suffix}"
+                            if c_key in stage1_eval_log_dict:
+                                rel = (b_val - stage1_eval_log_dict[c_key]) / max(abs(b_val), eps)
+                                stage1_eval_log_dict[f"{base_prefix}/improve/{suffix}"] = rel
+                    elif config.rank == 0:
+                        logger.warning("Stage-1 baseline eval requested, but _teacher_nofsdp is unavailable.")
+                if config.rank == 0 and stage1_eval_log_dict:
+                    logger.info(
+                        "Stage-1 start eval: " +
+                        ", ".join(
+                            f"{k}={v:.6f}" for k, v in sorted(stage1_eval_log_dict.items())
+                        )
+                    )
+                    if config.enable_wandb and HAS_WANDB:
+                        wandb.log(stage1_eval_log_dict, step=self.step)
+                    if self.tb_writer is not None:
+                        for key, value in stage1_eval_log_dict.items():
+                            self.tb_writer.add_scalar(key, value, self.step)
+                if dist.is_initialized():
+                    dist.barrier(device_ids=[torch.cuda.current_device()])
+            except Exception as e:
+                if config.rank == 0:
+                    logger.warning(f"Stage-1 start eval failed; continuing Stage-2 training: {e}")
+                    import traceback
+                    logger.warning(traceback.format_exc())
+                if dist.is_initialized():
+                    dist.barrier(device_ids=[torch.cuda.current_device()])
 
         self.optimizer.zero_grad()
         acc_losses = []              # 累积的总损失
         acc_video_losses = []        # 累积的视频损失
+        acc_video_local_fm_losses = []  # 累积的视频 local FM 损失
         acc_action_losses = []       # 累积的动作损失
+        acc_action_local_fm_losses = []  # 累积的动作 local FM 损失
         acc_action_aware_losses = [] # 累积的动作感知损失
         acc_gt_regression_losses = []  # 累积的 GT 回归损失（Flow Map 特有）
         acc_d_losses = []            # 累积的判别器损失（DMD 特有）
         acc_dmd_grad_norms = []      # 累积的 DMD 梯度范数（DMD 特有）
+        acc_opd_aux_losses = []
+        acc_opd_video_transition_losses = []
+        acc_opd_local_fm_losses = []
+        acc_opd_action_transition_losses = []
+        acc_opd_action_local_fm_losses = []
         step_in_acc = 0              # 当前累积步数
         # DMD 参数
         dmd_weight = getattr(config, 'dmd_weight', 0.1)
@@ -875,17 +1982,41 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             # 获取下一个数据批次
             batch = self._get_next_batch()
 
-            # ---- 训练步：Flow Map 或 On-Policy Transition Matching ----
+            # ---- 训练步：FlowMap 主目标始终优先；旧 on-policy replacement 仅作 legacy ablation ----
             use_onpolicy = self.use_onpolicy_transition
             onpolicy_warmup = getattr(self.config, 'onpolicy_warmup_steps', 0)
             use_onpolicy_now = (use_onpolicy and self.step >= onpolicy_warmup)
 
             if use_onpolicy_now:
-                # On-policy transition matching 替代 _train_step
+                # Legacy ablation: replacement-style transition matching.
                 result = self._onpolicy_transition_step(batch, step_in_acc)
             else:
-                # 标准 Flow Map 蒸馏
                 result = self._train_step(batch, step_in_acc)
+
+            zero_tensor = torch.tensor(0.0, device=self.device)
+            opd_aux_result = None
+            use_opd_aux_now = False
+            if (self.use_opd_aux and not use_onpolicy_now and
+                    self.step >= getattr(self.config, 'opd_aux_warmup_steps', 0) and
+                    not result.get("skip_step", False)):
+                opd_aux_interval = max(1, int(getattr(self.config, 'opd_aux_interval', 1)))
+                use_opd_aux_now = (self.step % opd_aux_interval == 0)
+                opd_aux_prob = float(getattr(self.config, 'opd_aux_prob', 1.0))
+                if use_opd_aux_now and opd_aux_prob < 1.0:
+                    if dist.is_initialized():
+                        aux_draw = torch.rand(1, device=self.device)
+                        dist.broadcast(aux_draw, src=0)
+                        use_opd_aux_now = aux_draw.item() < opd_aux_prob
+                    else:
+                        use_opd_aux_now = torch.rand(1).item() < opd_aux_prob
+
+            if use_opd_aux_now:
+                opd_aux_result = self._opd_aux_transition_step(batch, step_in_acc)
+                result["loss"] = result["loss"] + opd_aux_result.get("loss", zero_tensor)
+                result["skip_step"] = (
+                    result.get("skip_step", False) or
+                    opd_aux_result.get("skip_step", False)
+                )
 
             # 累积损失值
             acc_losses.append(result["loss"])
@@ -893,10 +2024,29 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_video_losses.append(result.get("video_transition_loss", torch.tensor(0.0, device=self.device)))
             else:
                 acc_video_losses.append(result["video_loss"])
+            acc_video_local_fm_losses.append(result.get(
+                "local_fm_loss", zero_tensor))
             acc_action_losses.append(result["action_loss"])
+            acc_action_local_fm_losses.append(result.get(
+                "action_local_fm_loss", result["action_aware_loss"]))
             acc_action_aware_losses.append(result["action_aware_loss"])
             acc_gt_regression_losses.append(result.get(
-                "gt_regression_loss", torch.tensor(0.0, device=self.device)))
+                "gt_regression_loss", zero_tensor))
+            acc_opd_aux_losses.append(
+                opd_aux_result.get("opd_aux_loss", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_video_transition_losses.append(
+                opd_aux_result.get("opd_video_transition_loss", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_local_fm_losses.append(
+                opd_aux_result.get("opd_local_fm_loss", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_action_transition_losses.append(
+                opd_aux_result.get("opd_action_transition_loss", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_action_local_fm_losses.append(
+                opd_aux_result.get("opd_action_local_fm_loss", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
             step_in_acc += 1
 
             # ---- 第二阶段：DMD（条件满足时执行）----
@@ -908,7 +2058,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                            and self.step >= dmd_warmup_steps
                            and result["should_sync"]
                            and not skip_step
-                           and not use_onpolicy_now)
+                           and not use_onpolicy_now
+                           and not use_opd_aux_now)
 
             if use_dmd_now:
                 if self.step >= dmd_warmup_steps + dmd_discriminator_warmup:
@@ -972,12 +2123,23 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 lr = self.lr_scheduler.get_last_lr()[0]
                 avg_loss = dist_mean(torch.stack(acc_losses).sum()).item()
                 avg_video_loss = dist_mean(torch.stack(acc_video_losses).sum()).item()
+                avg_video_local_fm_loss = dist_mean(torch.stack(acc_video_local_fm_losses).sum()).item()
                 avg_action_loss = dist_mean(torch.stack(acc_action_losses).sum()).item()
+                avg_action_local_fm_loss = dist_mean(torch.stack(acc_action_local_fm_losses).sum()).item()
                 avg_action_aware_loss = dist_mean(torch.stack(acc_action_aware_losses).sum()).item()
                 avg_gt_regression_loss = dist_mean(
                     torch.stack(acc_gt_regression_losses).sum()).item()
                 avg_d_loss = dist_mean(torch.stack(acc_d_losses).sum()).item()
                 avg_dmd_grad_norm = dist_mean(torch.stack(acc_dmd_grad_norms).sum()).item()
+                avg_opd_aux_loss = dist_mean(torch.stack(acc_opd_aux_losses).sum()).item()
+                avg_opd_video_transition_loss = dist_mean(
+                    torch.stack(acc_opd_video_transition_losses).sum()).item()
+                avg_opd_local_fm_loss = dist_mean(
+                    torch.stack(acc_opd_local_fm_losses).sum()).item()
+                avg_opd_action_transition_loss = dist_mean(
+                    torch.stack(acc_opd_action_transition_losses).sum()).item()
+                avg_opd_action_local_fm_loss = dist_mean(
+                    torch.stack(acc_opd_action_local_fm_losses).sum()).item()
                 action_total_raw = (
                     avg_action_loss
                     + self.gt_regression_weight * avg_gt_regression_loss
@@ -987,11 +2149,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 # 重置累积器
                 acc_losses = []
                 acc_video_losses = []
+                acc_video_local_fm_losses = []
                 acc_action_losses = []
+                acc_action_local_fm_losses = []
                 acc_action_aware_losses = []
                 acc_gt_regression_losses = []
                 acc_d_losses = []
                 acc_dmd_grad_norms = []
+                acc_opd_aux_losses = []
+                acc_opd_video_transition_losses = []
+                acc_opd_local_fm_losses = []
+                acc_opd_action_transition_losses = []
+                acc_opd_action_local_fm_losses = []
                 step_in_acc = 0
 
                 # 定期清理显存
@@ -1016,7 +2185,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     if self.distill_video:
                         if use_onpolicy_now:
                             postfix["vt"] = f"{avg_video_loss:.4f}"
+                            postfix["vlfm"] = f"{avg_video_local_fm_loss:.4f}"
                             log_dict["loss/video_transition"] = avg_video_loss
+                            log_dict["loss/video_local_fm"] = avg_video_local_fm_loss
                         else:
                             postfix["v"] = f"{avg_video_loss:.4f}"
                             log_dict["loss/video_consistency"] = avg_video_loss
@@ -1027,8 +2198,23 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         log_dict["loss/action_total_raw"] = action_total_raw
                         log_dict["loss/action_total"] = action_total
                     if self.action_aware:
+                        postfix["alfm"] = f"{avg_action_local_fm_loss:.4f}"
                         postfix["aa"] = f"{avg_action_aware_loss:.4f}"
+                        log_dict["loss/action_local_fm"] = avg_action_local_fm_loss
                         log_dict["loss/action_aware"] = avg_action_aware_loss
+                    if avg_opd_aux_loss > 0:
+                        postfix["opd"] = f"{avg_opd_aux_loss:.4f}"
+                        postfix["ovt"] = f"{avg_opd_video_transition_loss:.4f}"
+                        postfix["ovlfm"] = f"{avg_opd_local_fm_loss:.4f}"
+                        log_dict["loss/opd_aux"] = avg_opd_aux_loss
+                        log_dict["loss/opd_video_transition"] = avg_opd_video_transition_loss
+                        log_dict["loss/opd_local_fm"] = avg_opd_local_fm_loss
+                        if self.distill_action:
+                            postfix["oat"] = f"{avg_opd_action_transition_loss:.4f}"
+                            log_dict["loss/opd_action_transition"] = avg_opd_action_transition_loss
+                        if self.action_aware:
+                            postfix["oalfm"] = f"{avg_opd_action_local_fm_loss:.4f}"
+                            log_dict["loss/opd_action_local_fm"] = avg_opd_action_local_fm_loss
                     postfix["gt"] = f"{avg_gt_regression_loss:.4f}"
                     log_dict["loss/gt_regression"] = avg_gt_regression_loss
                     # DMD 日志
@@ -1046,6 +2232,48 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                             self.tb_writer.add_scalar(key, value, self.step)
 
                 self.step += 1
+
+                # Lightweight deterministic eval. All ranks run this because
+                # the student may be FSDP-wrapped; only rank 0 logs results.
+                light_eval_interval = int(getattr(config, "light_eval_interval", 0))
+                if (self._light_eval_is_enabled() and light_eval_interval > 0 and
+                        self.step % light_eval_interval == 0):
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    eval_log_dict = self._run_light_eval()
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    if config.rank == 0 and eval_log_dict:
+                        logger.info(
+                            "Light eval: " + ", ".join(
+                                f"{k}={v:.6f}" for k, v in sorted(eval_log_dict.items())
+                            )
+                        )
+                        if config.enable_wandb and HAS_WANDB:
+                            wandb.log(eval_log_dict, step=self.step)
+                        if self.tb_writer is not None:
+                            for key, value in eval_log_dict.items():
+                                self.tb_writer.add_scalar(key, value, self.step)
+
+                rollout_eval_interval = int(getattr(config, "rollout_eval_interval", 0))
+                if (self._rollout_eval_is_enabled() and rollout_eval_interval > 0 and
+                        self.step % rollout_eval_interval == 0):
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    rollout_eval_log_dict = self._run_rollout_eval()
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    if config.rank == 0 and rollout_eval_log_dict:
+                        logger.info(
+                            "Rollout eval: " + ", ".join(
+                                f"{k}={v:.6f}" for k, v in sorted(rollout_eval_log_dict.items())
+                            )
+                        )
+                        if config.enable_wandb and HAS_WANDB:
+                            wandb.log(rollout_eval_log_dict, step=self.step)
+                        if self.tb_writer is not None:
+                            for key, value in rollout_eval_log_dict.items():
+                                self.tb_writer.add_scalar(key, value, self.step)
 
                 # 定期保存检查点（保留最近 3 个 + 最佳 loss 的）
                 if self.step % config.save_interval == 0:

@@ -1,1377 +1,412 @@
-# Flash-WAM × AnyFlow 结合方案：Flow Map 蒸馏
+# Any_WAM FlowMap Distillation Current Plan
 
-## 1. 背景与动机
+## 1. 目标
 
-### 1.1 现状：Flash-WAM 的 LCM 蒸馏
+当前 `distillation_flowmap` 的目标不是再做一个“待实现方案”，而是把已经落地的 FlowMap / on-policy 蒸馏实现、关键设计取舍、已修问题、以及后续建议整理清楚，方便继续训练、复现和团队协作。
 
-Flash-WAM 当前使用 LCM (Latent Consistency Model) 蒸馏，将 LingBot-VA 的 1000 步 FlowMatch 推理压缩为 **2 步**。核心机制：
+目前系统的核心目标是：
 
-- **一致性函数**：`f(x_t, σ) = c_skip·x_t + c_out·(x_t - σ·v)`，学习从任意噪声水平到干净样本的端点映射
-- **教师 CFG Euler 步**：教师模型做有条件+无条件推理，CFG 组合后推进一步作为"伪 GT"
-- **双模态**：同时蒸馏视频和动作，动作使用 x0 参数化
-
-**局限**：只能做 2 步推理，无法灵活调整推理步数。
-
-### 1.2 AnyFlow 的 Flow Map 蒸馏
-
-AnyFlow 学习**任意两个时间点之间的流映射** `Φ(x_t, t, r) → x_r`，而非仅端点映射。核心创新：
-
-- **双时间步嵌入**：模型同时接收 `t`（当前噪声水平）和 `r`（目标时间步），通过门控融合 `rt_emb = (1-gate)·temb + gate·delta_emb`
-- **中心差分法**：
-- **混合训练**：50% 扩散（r=t）+ 25% 一致性（r=0）+ 25% 流映射（r<t）
-- **On-Policy DMD**：第二阶段用判别器 + 教师分数进行分布匹配蒸馏
-
-**优势**：单一模型适配 2/4/8/16/50 步推理，质量随步数增加而提升。
-
-**局限**：AnyFlow 仅处理单一模态（图像/视频），**不支持动作等额外模态的联合蒸馏**。
-
-### 1.3 Flash-WAM 的独特优势：双模态蒸馏
-
-Flash-WAM 与 AnyFlow 的**根本区别**在于：
-
-| 特性 | AnyFlow | Flash-WAM |
-|---|---|---|
-| 模态支持 | 单一模态（视频） | **双模态（视频+动作）** |
-| 动作生成 | 无 | **直接输出机器人动作** |
-| 应用场景 | 通用视频生成 | **机器人操控** |
-| 训练信号 | 纯视频 loss | **视频 loss + 动作回归 loss** |
-
-**关键洞察**：Flash-WAM 的双模态结构是一个**独特的技术贡献**，而非简单的工程实现。将 Flow Map 蒸馏引入双模态场景，需要解决：
-1. **跨模态一致性**：视频和动作的流映射需要保持同步
-2. **动作空间的特殊性**：动作是低维（30 维）连续空间，流映射的有效性需要验证
-3. **GT 动作监督**：数据集中的 GT 动作提供了额外的监督信号，这是 AnyFlow 不具备的
-
-### 1.4 结合目标与创新点
-
-将 AnyFlow 的流映射能力引入 Flash-WAM，实现以下目标：
-
-**技术目标**：
-1. 模型支持**灵活推理步数**（2~50 步），而非固定 2 步
-2. 保留 Flash-WAM 的**视频+动作双模态**结构
-3. 保留 Flash-WAM 的**教师 CFG**引导机制
-4. 利用 RobotWin/Libero 数据集中的**GT 动作**作为判别信号
-
-**创新贡献**（区别于 AnyFlow）：
-1. **双模态流映射**：首次将 Flow Map 蒸馏扩展到视频+动作联合生成场景
-2. **动作空间流映射验证**：探索流映射在低维连续动作空间（30 维）的有效性
-3. **GT 动作监督**：利用数据集中的 GT 动作作为额外监督信号，提升动作生成质量
-4. **选择性中心差分**：优化中心差分计算，只在流映射 batch 使用，减少计算开销
+1. 在 Flash-WAM / Any_WAM 的视频+动作联合建模框架上引入 FlowMap 蒸馏。
+2. 支持视频蒸馏、动作蒸馏、以及 `video_action_aware` 辅助正则三种模式组合。
+3. 在 Stage 1 中学习混合目标（diffusion / consistency / flowmap）。
+4. 在 Stage 2 中切换到 on-policy transition matching，减少学生 rollout 时的分布偏移。
+5. 在 Stage 3 中从同一个 Stage 1 checkpoint 再分叉出独立优化分支，用于你额外新增的训练目标，而不是强依赖 Stage 2。
 
 ---
 
-## 2. 整体架构
+## 2. 当前代码结构
 
-### 2.1 目录结构
+当前相关实现主要在：
 
-**核心原则**：原有 `distillation/` 完全不动，新代码放在独立的 `distillation_flowmap/` 文件夹中。
+- `distillation_flowmap/flowmap_step.py`
+- `distillation_flowmap/flowmap_trainer.py`
+- `distillation_flowmap/model_flowmap.py`
+- `distillation/patches.py`
 
-```
-Flash-WAM/
-├── distillation/                    # 原始 LCM 蒸馏（完全不动）
-│   ├── __init__.py
-│   ├── config.py                    # 原始 LCM 配置
-│   ├── consistency.py               # 边界条件缩放
-│   ├── data.py                      # DataMixin（噪声添加、input_dict 构建）
-│   ├── ema.py                       # EMA 更新
-│   ├── patches.py                   # flash_attn 存根、安全数据集
-│   ├── step.py                      # LCM 训练步（StepMixin）
-│   ├── trainer.py                   # LCM 蒸馏主类（FlashWAMDistiller）
-│   ├── train.py                     # LCM 入口
-│   └── run.sh                       # LCM 启动脚本
-│
-├── distillation_flowmap/            # 新增：Flow Map 蒸馏
-│   ├── __init__.py
-│   ├── config.py                    # Flow Map 配置（新增流映射参数）
-│   ├── flowmap_step.py              # Flow Map 训练步（新的 StepMixin）
-│   ├── flowmap_trainer.py           # Flow Map 蒸馏主类
-│   ├── model_flowmap.py             # 双时间步嵌入 + setup_flowmap_model
-│   ├── train.py                     # Flow Map 入口
-│   └── run.sh                       # Flow Map 启动脚本
-│
-├── wan_va/                          # 原始模型代码（完全不动）
-│   └── modules/
-│       └── model.py                 # WanTransformer3DModel（不修改）
-│
-└── plan.md                          # 本文件
-```
+职责划分如下：
 
-### 2.2 代码复用关系
+- `flowmap_step.py`
+  - 实现 Stage 1 的 `_train_step()`
+  - 实现 Stage 2 的 `_onpolicy_transition_step()`
+  - 实现混合时间步采样、teacher/student forward、中心差分、Euler rollout、action-aware loss
+- `flowmap_trainer.py`
+  - 初始化 teacher / student / target_student
+  - 配置 LoRA、FSDP/FSDP1、optimizer、scheduler、dataset
+  - 调度 Stage 1 / Stage 2 / Stage 3 训练
+  - 执行 checkpoint 保存和 resume
+- `model_flowmap.py`
+  - 给 student / target_student 注入双时间步嵌入能力
+  - patch forward，使模型支持 `r_timestep` / `action_r_timestep`
+- `distillation/patches.py`
+  - 安装 `flash_attn` stub
+  - 提供 fail-fast 的 `SafeMultiLatentLeRobotDataset`
 
-```
-distillation_flowmap/
-│
-├── 复用（直接 import）：
-│   ├── distillation/data.py         → DataMixin（噪声添加逻辑不变）
-│   ├── distillation/ema.py          → update_ema（EMA 逻辑不变）
-│   ├── distillation/patches.py      → SafeMultiLatentLeRobotDataset、install_flash_attn_stub
-│   └── wan_va/modules/model.py      → WanTransformer3DModel（基类，不修改）
-│
-├── 替换（新实现）：
-│   ├── distillation/step.py         → flowmap_step.py（流映射训练步）
-│   ├── distillation/trainer.py      → flowmap_trainer.py（扩展训练循环）
-│   ├── distillation/config.py       → config.py（新增流映射参数）
-│   └── distillation/consistency.py  → 融入 flowmap_step.py（边界条件仍使用）
-│
-└── 新增：
-    ├── model_flowmap.py             → 双时间步嵌入模块（WanTwoTimeTextImageEmbedding）
-    └── train.py / run.sh            → 新入口
-```
+当前保留的配置文件：
 
-### 2.3 模型改造策略
+- `distillation_flowmap/config.py`
+  - RobotWin / 通用基础配置
+- `distillation_flowmap/config_libero.py`
+  - 原始 LIBERO 基础配置
+- `distillation_flowmap/config_libero_optimized.py`
+  - LIBERO FlowMap 共享基础配置
+- `distillation_flowmap/config_libero_fullfinetune_stage1_warmup.py`
+  - Stage 1 全量微调 warmup
+- `distillation_flowmap/config_libero_fullfinetune_stage2_anyflow.py`
+  - Stage 2 全量微调 continuation；集中包含 OPD aux、rollout eval 和 full-ft 参数
 
-**关键决策**：不修改 `wan_va/modules/model.py`，而是在 `distillation_flowmap/model_flowmap.py` 中实现模型改造逻辑。
-
-```python
-# distillation_flowmap/model_flowmap.py
-
-def setup_flowmap_model(model, gate_value=0.0, deltatime_type='r'):
-    """
-    在已加载的 WanTransformer3DModel 上添加流映射能力。
-
-    做法：
-      1. 创建 WanTwoTimeTextImageEmbedding（双时间步嵌入）
-      2. 从原模型的 condition_embedder 深拷贝权重
-      3. 替换原模型的 condition_embedder
-
-    这样原模型代码完全不需要修改。
-    """
-    inner_dim = model.config.num_attention_heads * model.config.attention_head_dim
-
-    condition_embedder = WanTwoTimeTextImageEmbedding(
-        dim=inner_dim,
-        gate_value=gate_value,
-        deltatime_type=deltatime_type,
-        time_freq_dim=model.config.freq_dim,
-        time_proj_dim=inner_dim * 6,
-        text_embed_dim=model.config.text_dim,
-        image_embed_dim=model.config.image_dim,
-    )
-
-    # 从原模型深拷贝权重
-    condition_embedder.time_embedder = copy.deepcopy(model.condition_embedder.time_embedder)
-    condition_embedder.delta_embedder = copy.deepcopy(model.condition_embedder.time_embedder)
-    condition_embedder.time_proj = copy.deepcopy(model.condition_embedder.time_proj)
-    condition_embedder.text_embedder = copy.deepcopy(model.condition_embedder.text_embedder)
-    if hasattr(model.condition_embedder, 'image_embedder') and model.condition_embedder.image_embedder is not None:
-        condition_embedder.image_embedder = copy.deepcopy(model.condition_embedder.image_embedder)
-
-    # 替换
-    del model.condition_embedder
-    model.condition_embedder = condition_embedder
-
-    return model
-```
-
-### 2.4 系统组件图
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│              distillation_flowmap/ (新代码)                   │
-│                                                             │
-│  ┌──────────┐    ┌──────────────┐    ┌──────────────────┐   │
-│  │ Teacher   │    │ Online       │    │ Target Student   │   │
-│  │ (frozen)  │───▶│ Student      │───▶│ (EMA, frozen)    │   │
-│  │ LingBotVA │    │ + delta_emb  │    │ + delta_emb      │   │
-│  │           │    │ (from model_ │    │                  │   │
-│  │           │    │  flowmap.py) │    │                  │   │
-│  └──────────┘    └──────────────┘    └──────────────────┘   │
-│       │                │                       │            │
-│       │ CFG Euler      │ Flow Map              │ EMA        │
-│       │ + 中心差分      │ 预测                   │ (from      │
-│       │                │                       │  ema.py)   │
-│       ▼                ▼                       ▼            │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │              flowmap_step.py                          │   │
-│  │  video: 流映射 loss (中心差分) + 一致性 loss (r=0)     │   │
-│  │  action: 流映射 loss + GT MSE 回归                    │   │
-│  └──────────────────────────────────────────────────────┘   │
-│                                                             │
-│  复用自 distillation/：                                      │
-│    data.py (DataMixin)  ema.py (update_ema)  patches.py    │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 2.5 与原始 Flash-WAM 的差异
-
-| 组件 | 原始 distillation/ | 新 distillation_flowmap/ |
-|---|---|---|
-| 模型输入 | 单时间步 `t` | 双时间步 `t` + `r` |
-| 时间步嵌入 | `time_embedder` | `time_embedder` + `delta_embedder` + gate |
-| 训练目标 | LCM 一致性 loss | 混合 loss（扩散 + 一致性 + 流映射） |
-| 推理步数 | 固定 2 步 | 灵活 2~50 步 |
-| 教师使用 | CFG Euler 步（2 次前向） | CFG Euler 步 + 中心差分（4 次前向） |
-| 动作判别 | 无 | GT MSE + (可选) DMD 判别器 |
-| 启动方式 | `DISTILL_MODE=flashwam bash distillation/run.sh` | `bash distillation_flowmap/run.sh` |
+旧的 `config_libero_optimized_stage2.py`、`config_libero_optimized_stage2_distillstyle.py` 和
+`config_libero_optimized_stage3.py` 已经合并/移除，避免 Stage2 配置链过长。
 
 ---
 
-## 3. 分阶段实施计划
+## 3. 当前训练设计
 
-### Phase 1：模型改造 — 添加双时间步嵌入
+### 3.1 Stage 1: FlowMap Distillation
 
-**目标**：在 `distillation_flowmap/model_flowmap.py` 中实现双时间步嵌入模块和模型改造函数。
+Stage 1 仍然是主基础训练阶段，当前设计是：
 
-**新增文件**：`distillation_flowmap/model_flowmap.py`
+1. 对视频采样混合 `(t, r)`：
+   - diffusion: `r = t`
+   - consistency: `r = 0`
+   - flowmap: `0 < r < t`
+2. 对动作分支单独采样自己的 `(action_t, action_r)`。
+3. teacher 在 `t` 处给出目标速度场，并通过中心差分近似 `dF/dt`。
+4. student 在 `r` 处预测，与目标计算 loss。
 
-**内容**：
+当前混合采样逻辑已经改成真正的 per-sample 随机模式采样，不再依赖 `round(ratio * batch_size)` 之类的固定切块方式。
 
-1. **`WanTwoTimeTextImageEmbedding`** 类（参照 AnyFlow）：
-   - 在现有 `WanTimeTextImageEmbedding` 基础上添加 `delta_embedder`
-   - 门控融合：`rt_emb = (1-gate)·temb + gate·delta_emb`
-   - `gate` 初始值 0.0（蒸馏初期 delta 通路不参与，逐步学习）
-   - 支持 `deltatime_type='r'`（直接用 r）或 `'t-r'`（用时间差）
+### 3.2 Stage 1 的监督项
 
-2. **`setup_flowmap_model(model, gate_value, deltatime_type)`** 函数：
-   - 用 `WanTwoTimeTextImageEmbedding` 替换原模型的 `condition_embedder`
-   - `delta_embedder` 从 `time_embedder` 深拷贝初始化
-   - 保留原始 `time_embedder`、`time_proj`、`text_embedder` 权重
-   - 不修改 `wan_va/modules/model.py`，通过 monkey-patch 替换
+当前实现支持以下损失项：
 
-3. **`patch_model_forward(model)`** 函数：
-   - 给模型的 forward 方法添加 `r_timestep` 参数支持
-   - 原始 forward 签名：`forward(hidden_states, timestep, ...)`
-   - 改造后：`forward(hidden_states, timestep, r_timestep=None, ...)`
-   - 当 `r_timestep=None` 时退化为原始行为（完全兼容）
+- 视频主损失
+  - `video_loss` 或 `video_transition_loss`
+- 动作蒸馏损失
+  - `action_loss`
+- 动作 GT 回归
+  - `gt_regression_loss`
+- 动作感知辅助正则
+  - `action_aware_loss`
+- 视频局部 FM 正则
+  - `local_fm_loss`
 
-**初始化策略**：
-```python
-# distillation_flowmap/flowmap_trainer.py 中
-from model_flowmap import setup_flowmap_model, patch_model_forward
+动作分支当前设计不是简单绑定视频时间步，而是：
 
-# 加载教师权重后，为学生模型添加 flowmap 能力
-self.student = load_transformer(student_path, ...)
-self.student = setup_flowmap_model(self.student, gate_value=0.0)
-self.student = patch_model_forward(self.student)
+- `distill_action=True` 时，动作拥有独立的 `action_t/action_r`
+- `action_aware=True` 但 `distill_action=False` 时，也会构建完整动作输入，只是不计算动作蒸馏主损失
 
-# 教师模型保持原始结构（不添加 delta_embedder）
-self.teacher = load_transformer(teacher_path, ...)
+这点现在已经在 `_train_step()` 和 `_onpolicy_transition_step()` 里统一。
+
+### 3.3 Stage 2: AnyFlow + Student-State OPD Aux
+
+Stage 2 当前不是旧的 replacement-style OPD，也不是单独的 Stage3/KTO 分支。
+当前设计是：
+
+1. 保留 AnyFlow / FlowMap 主目标。
+2. 低频加入 OPD aux，默认 `OPD_AUX_INTERVAL=8`。
+3. student 从 `x_t` 做 K 步 Euler rollout 到自己的 `student_x_r`。
+4. teacher 直接在同一个 `student_x_r` 上 forward，提供 transition target。
+5. velocity transition loss 只比较同一个 latent state 上的 teacher/student velocity。
+
+当前入口是：
+
+- `config_libero_fullfinetune_stage2_anyflow.py`
+- `flowmap_trainer.py` 中的 OPD aux 调度
+- `flowmap_step.py` 中的 `_opd_aux_transition_step()`
+
+默认 rollout pair 收窄为 `[[1, 1], [2, 1]]`，action OPD 默认关闭，先验证 video
+侧少步 rollout 是否改善。
+
+### 3.4 已移除的历史分支
+
+Stage3/KTO 配置和旧 stage2 run 脚本已经移除。后续如果要做 KTO/PCGrad/其它
+多目标优化，建议在当前干净的 Stage2 配置稳定后单独新建实验配置。
+3. `cfg.rollout_step_pairs = [[1, 1]]`
+4. `cfg.teacher_micro_steps = 2`
+5. `cfg.video_transition_weight = 0.2`
+6. `cfg.local_fm_weight = 0.05`
+7. `cfg.transition_loss_type = 'huber'`
+8. `cfg.kto_adaptive = True`
+9. `cfg.kto_good_weight = 0.3`
+10. `cfg.kto_bad_weight = 1.0`
+11. `cfg.max_train_steps = 5000`
+12. `cfg.learning_rate = 5e-6`
+13. 默认 `resume_from_path` 指向 Stage 1 checkpoint
+14. 默认 `output_dir` 为 `output_libero_stage3_kto`
+
+这说明 Stage 3 当前不是新的基础训练阶段，而是：
+
+1. 同样从 Stage 1 checkpoint 热启动
+2. 复用 Stage 2 的 on-policy transition matching 主体
+3. 只是在视频 transition loss 上打开了 KTO-style pointwise adaptive weighting
+4. 因此它更准确地说是 “Stage 2 on-policy 的 KTO 变体”
+
+可以把当前阶段关系理解为：
+
+```text
+Stage 1 (FlowMap base)
+├── Stage 2: on-policy transition matching
+└── Stage 3: KTO-PAOPD (same on-policy path, different weighting config)
 ```
 
-**验证方法**：
-- 设置 `gate=0.0` 时，模型输出应与原始模型完全一致（r_timestep 被忽略）
-- 逐步增大学习 gate，观察模型是否开始利用 r_timestep 信息
+因此，当前最关键的不是“先 Stage 2 再 Stage 3”，而是：
 
-**预计工作量**：~250 行代码，1~2 天
+- 先确保 Stage 1 checkpoint 可信
+- 再从这个可信 Stage 1 checkpoint 分别拉出 Stage 2 / Stage 3
+
+如果 Stage 1 本身带着旧 bug 训练出来，那么 Stage 2 和 Stage 3 都会一起继承这个问题。
+
+### 3.5 Stage 2 和 Stage 3 的真实区别
+
+从当前代码看，Stage 2 和 Stage 3 的区别主要不在训练框架，而在配置：
+
+- Stage 2
+  - 目标：标准 on-policy transition matching
+  - 重点：减少学生 rollout 的 exposure bias
+- Stage 3
+  - 目标：在 on-policy transition matching 上再加入 KTO-style 自适应 token weighting
+  - 重点：把更多梯度预算分给“学生还没学好”的 token
+
+因此 Stage 3 的定位不是“另一个完全独立算法”，而是：
+
+- 基于 Stage 2 框架
+- 但从 Stage 1 checkpoint 直接启动
+- 用不同的 loss weighting 做并行实验
 
 ---
 
-### Phase 2：训练策略改造 — 混合训练目标
+## 4. 当前实现里的关键设计
 
-**目标**：实现 AnyFlow 的混合采样和中心差分训练目标，替代纯 LCM 一致性 loss。
+### 4.1 双时间步条件
 
-**新增文件**：`distillation_flowmap/flowmap_step.py`、`distillation_flowmap/config.py`
+student / target_student 通过 `delta_embedder` 接收参考时间步：
 
-#### 2.1 FlowMapStepMixin（flowmap_step.py）
+- 视频：`r_timestep`
+- 动作：`action_r_timestep`
 
-继承或参考 `distillation/step.py` 的 `StepMixin`，核心改动：
+teacher 保持原始结构，不做 FlowMap 改造。
 
-```python
-# distillation_flowmap/flowmap_step.py
+### 4.2 视频和动作时间步解耦
 
-from distillation.consistency import scalings_for_boundary_conditions
-from distillation.step import StepMixin  # 参考，不直接继承
+当前实现明确支持：
 
-class FlowMapStepMixin:
-    """
-    Flow Map 蒸馏的训练步。
+- 视频独立的 `video_t/video_r`
+- 动作独立的 `action_t/action_r`
 
-    与原始 StepMixin 的区别：
-      1. 使用混合时间步采样（扩散 + 一致性 + 流映射）
-      2. 使用中心差分法估计训练目标
-      3. 模型接收 r_timestep 参数
-      4. 支持 GT 动作回归 loss
-    """
+动作分支不再被动复用视频时间步。这对于：
 
-    def sample_timestep_mixed(self, batch_size, dtype, device):
-        """
-        混合时间步采样：50% 扩散 + 25% 一致性 + 25% 流映射。
+- `joint`
+- `video_action_aware`
+- on-policy 动作正则
 
-        返回:
-            t: 当前时间步 [B]
-            r: 目标时间步 [B]（r <= t）
-            is_diffusion: 是否是扩散模式 [B]（用于 loss 缩放）
-        """
-        t_1 = torch.rand(batch_size, dtype=dtype, device=device)
-        t_2 = torch.rand(batch_size, dtype=dtype, device=device)
-        t = torch.maximum(t_1, t_2)
-        r = torch.minimum(t_1, t_2)
-        is_diffusion = torch.zeros(batch_size, dtype=torch.bool, device=device)
+都很关键。
 
-        for i in range(batch_size):
-            rand_val = torch.rand(1).item()
-            if rand_val < self.config.diffusion_ratio:
-                r[i] = t[i]
-                is_diffusion[i] = True
-            elif rand_val < self.config.diffusion_ratio + self.config.consistency_ratio:
-                r[i] = 0
+### 4.3 On-policy student 语义统一
 
-        # 应用 SNR shift
-        t = self.train_scheduler_latent.apply_shift(t) * self.config.num_train_timesteps
-        r = self.train_scheduler_latent.apply_shift(r) * self.config.num_train_timesteps
-        return t, r, is_diffusion
+当前 on-policy 实现里，student rollout Phase 1 和 terminal loss Phase 2 现在都走同一套 student field 语义，不再出现：
 
-    @torch.no_grad()
-    def compute_central_difference(self, input_dict, t, r, cfg_scale, eps=1.0, mask=None):
-        """
-        中心差分法估计流映射的时间导数 dF/dt。
+- rollout 用 conditional-only
+- final loss 用 CFG-combined
 
-        原理：在 t+ε 和 t-ε 处分别做教师 CFG 前向，数值估计导数。
-        dF/dt ≈ (v_{t+ε} - v_{t-ε}) / (2ε)
+这种不一致。
 
-        注意：需要 4 次教师前向（t±ε 各有条件+无条件）。
-              使用选择性计算，只对流映射 batch（mask=True）做中心差分。
+这次修复后：
 
-        优化策略：
-          - 扩散 batch（r=t）和一致性 batch（r=0）不需要中心差分
-          - 只有流映射 batch（r<t）需要计算 dF/dt
-          - 通过 mask 参数选择性计算，减少教师前向次数
-        """
-        if mask is None or not mask.any():
-            # 没有需要计算中心差分的 batch，返回零
-            return torch.zeros_like(t)
+- `_student_euler_integrate()` 的 rollout 和 final prediction 都统一经过 `_student_cfg_forward()`
+- `force_cfg=True` 用于 rollout 保持与 terminal loss 一致的向量场语义
 
-        # 只对需要的 batch 计算中心差分
-        # 简化实现：对所有 batch 计算（后续可优化为只计算 mask=True 的 batch）
-        # t + ε 处的教师 CFG 预测
-        input_plus = self._shift_input_timesteps(input_dict, +eps)
-        v_plus_cond, _ = self.teacher(input_plus, train_mode=True)
-        v_plus_uncond, _ = self.teacher(self._make_uncond(input_plus), train_mode=True)
-        v_plus_cfg = v_plus_uncond + cfg_scale * (v_plus_cond - v_plus_uncond)
+### 4.4 Stage 3 的 KTO 自适应加权
 
-        # t - ε 处的教师 CFG 预测
-        input_minus = self._shift_input_timesteps(input_dict, -eps)
-        v_minus_cond, _ = self.teacher(input_minus, train_mode=True)
-        v_minus_uncond, _ = self.teacher(self._make_uncond(input_minus), train_mode=True)
-        v_minus_cfg = v_minus_uncond + cfg_scale * (v_minus_cond - v_minus_uncond)
+当前 KTO 逻辑已经在 `flowmap_step.py` 的 on-policy 视频 loss 中接入，核心思想是：
 
-        dF_dt = (v_plus_cfg - v_minus_cfg) / (2 * eps)
+1. 先计算 student 和 teacher 的 token 级误差
+2. 估计 token similarity
+3. 用当前 batch 的中位数作为动态阈值
+4. 已学好的 token 用较小权重
+5. 未学好的 token 用较大权重
 
-        # 将不需要中心差分的 batch 置零
-        if mask is not None:
-            dF_dt = dF_dt * mask.float().view(-1, 1, 1, 1, 1)
+这意味着 Stage 3 不是改 student / teacher rollout，本质上改的是 on-policy transition loss 的样本内重加权策略。
 
-        return dF_dt
+### 4.5 Resume 和 Checkpoint 设计
 
-    def _train_step(self, batch, batch_idx):
-        """
-        Flow Map 蒸馏训练步。
+当前 checkpoint 设计已经更新为：
 
-        与原始 _train_step 的区别：
-          1. 使用 sample_timestep_mixed() 采样 (t, r)
-          2. 用中心差分法计算 dF/dt
-          3. 训练目标 = v_pred - (t-r) * dF/dt
-          4. 模型接收 r_timestep
-          5. 支持 GT 动作回归 loss
-        """
-        batch = self.convert_input_format(batch)
-        B = batch['latents'].shape[0]
-        ref_shape = batch['latents'].shape
-        num_frames = ref_shape[2]
-        actions_mask = batch.get('actions_mask')
-        gt_actions = batch['actions']  # GT 动作（未加噪）
+- 保存：
+  - `online_student`
+  - `target_student`
+  - `optimizer.pt`
+  - `lr_scheduler.pt`
+  - `config.json`
+  - `discriminator` 相关状态（如果启用 DMD）
+- 恢复：
+  - 强校验 `resume_from_step` 与 checkpoint 中的 `checkpoint_step`
+  - LoRA checkpoint 必须配 `use_lora=True`
+  - 如果有 `optimizer.pt` / `lr_scheduler.pt`，优先恢复完整状态
+  - 如果是老 checkpoint 没有 scheduler 状态，则退回原来的 scheduler fast-forward
 
-        # ---- 1. 准备 input_dict ----
-        input_dict = self._prepare_input_dict(batch)
+这比旧版本更安全，避免了 silent mismatch。
 
-        # ---- 2. 混合时间步采样 ----
-        t_video, r_video, is_diffusion = self.sample_timestep_mixed(
-            num_frames, dtype=self.dtype, device=self.device)
-        # 动作也使用相同策略
-        t_action, r_action, _ = self.sample_timestep_mixed(
-            num_frames, dtype=self.dtype, device=self.device)
+### 4.6 数据集加载策略
 
-        # ---- 3. 教师 CFG + 中心差分 ----
-        cfg_scale = self.config.cfg_min + torch.rand(1).item() * (
-            self.config.cfg_max - self.config.cfg_min)
+数据集加载当前默认是 fail-fast：
 
-        with torch.no_grad():
-            # 标准教师 CFG 前向
-            video_v_cond, action_v_cond = self.teacher(input_dict, train_mode=True)
-            video_v_uncond, _ = self.teacher(self._make_uncond(input_dict), train_mode=True)
-            video_v_cfg = video_v_uncond + cfg_scale * (video_v_cond - video_v_uncond)
+- 如果某些子数据集损坏或缺失，默认直接报错
+- 只有显式设置 `allow_partial_datasets=True` 才允许跳过
 
-            # 中心差分（仅流映射模式需要，扩散和一致性模式不需要）
-            need_cdiff = ~is_diffusion
-            if need_cdiff.any():
-                dF_dt = self.compute_central_difference(
-                    input_dict, t_video, r_video, cfg_scale, eps=self.config.epsilon)
-
-            # 计算训练目标
-            v_pred = noise - latents  # FlowMatch v-target
-            # target = v_pred - (t-r) * dF/dt
-            # 当 r=t（扩散）：target = v_pred（标准 FlowMatch）
-            # 当 r=0（一致性）：target = v_pred - t * dF/dt
-            # 当 r<t（流映射）：target = v_pred - (t-r) * dF/dt
-            video_target = v_pred - (t_video - r_video) * dF_dt
-
-        # ---- 4. 学生预测（带 r_timestep）----
-        student_video_v, student_action_v = self.student(
-            input_dict, r_timestep_video=r_video, r_timestep_action=r_action,
-            train_mode=True)
-
-        # ---- 5. 视频流映射 loss ----
-        video_flowmap_loss = F.mse_loss(student_video_v.float(), video_target.detach().float())
-        # 时间步加权
-        weight = self.scheduler.get_train_weight(t_video)
-        video_flowmap_loss = (video_flowmap_loss * weight).mean()
-
-        # 扩散样本的 loss 均值用于缩放非扩散样本（AnyFlow 技巧）
-        with torch.no_grad():
-            diffusion_mean = video_flowmap_loss[is_diffusion].mean()
-            scale = diffusion_mean / (video_flowmap_loss[~is_diffusion].detach().mean() + 1e-5)
-        video_flowmap_loss[~is_diffusion] = video_flowmap_loss[~is_diffusion] * scale
-
-        # ---- 6. 动作 loss（流映射 + GT 回归）----
-        action_flowmap_loss = torch.tensor(0.0, device=self.device)
-        gt_regression_loss = torch.tensor(0.0, device=self.device)
-
-        if self.distill_action:
-            # 动作流映射 loss
-            action_target = gt_actions - (t_action - r_action) * dF_dt_action
-            action_flowmap_loss = F.mse_loss(
-                student_action_v.float() * mask, action_target.float() * mask)
-
-            # GT 动作回归 loss（直接监督）
-            student_action_x0 = noisy_action - t_action * student_action_v
-            gt_regression_loss = F.mse_loss(
-                student_action_x0.float() * mask, gt_actions.float() * mask)
-
-        # ---- 7. 总 loss ----
-        loss = video_flowmap_loss \
-             + self.config.action_loss_weight * action_flowmap_loss \
-             + self.config.gt_regression_weight * gt_regression_loss
-
-        loss = loss / self.gradient_accumulation_steps
-        loss.backward()
-
-        return {
-            "loss": loss.detach(),
-            "video_loss": video_flowmap_loss.detach(),
-            "action_loss": action_flowmap_loss.detach(),
-            "gt_regression_loss": gt_regression_loss.detach(),
-            "should_sync": ...,
-        }
-```
-
-#### 2.2 配置文件（config.py）
-
-```python
-# distillation_flowmap/config.py
-
-import os
-import torch
-from easydict import EasyDict
-
-cfg = EasyDict(__name__="Config: Flash-WAM FlowMap Distillation")
-
-# ---- 路径（与原 distillation/config.py 相同）----
-_this_dir = os.path.dirname(os.path.abspath(__file__))
-_project_root = os.path.dirname(_this_dir)
-cfg.teacher_model_path = os.environ.get("TEACHER_PATH", ...)
-cfg.output_dir = os.environ.get("OUTPUT_DIR", ...)
-cfg.dataset_path = os.environ.get("DATASET_PATH", ...)
-cfg.empty_emb_path = ...
-
-# ---- 模型架构（与原 distillation/config.py 相同）----
-cfg.patch_size = (1, 2, 2)
-cfg.param_dtype = torch.bfloat16
-cfg.height = 256
-cfg.width = 320
-cfg.action_dim = 30
-# ... 其余与原配置一致 ...
-
-# ---- FlowMatch 调度器（与原配置一致）----
-cfg.snr_shift = 5.0
-cfg.action_snr_shift = 1.0
-cfg.num_train_timesteps = 1000
-
-# ---- Flow Map 蒸馏（新增）----
-cfg.diffusion_ratio = 0.5        # 扩散目标占比（r=t）
-cfg.consistency_ratio = 0.25     # 一致性目标占比（r=0）
-cfg.flowmap_ratio = 0.25         # 流映射目标占比（r<t，剩余部分）
-cfg.epsilon = 1.0                # 中心差分的扰动步长
-cfg.gate_value = 0.0             # delta_emb_gate 初始值（0 = 初期不使用 r 信息）
-cfg.deltatime_type = 'r'         # delta 时间步类型：'r' 或 't-r'
-cfg.weight_type = 'beta08'       # 时间步权重：'gaussian' / 'beta08' / 'uniform'
-
-# ---- 动作蒸馏（与原配置一致 + 新增）----
-cfg.distill_video = True
-cfg.distill_action = True
-cfg.action_aware = True
-cfg.action_loss_weight = 1.0
-cfg.action_aware_weight = 0.01
-cfg.gt_regression_weight = 0.1   # 新增：GT 回归 loss 权重
-
-# ---- LCM 超参数（与原配置一致）----
-cfg.ema_decay = 0.995
-cfg.loss_type = "l2"             # FlowMap 用 L2（不用 Huber）
-cfg.sigma_data = 0.5
-cfg.cfg_min = 2.0
-cfg.cfg_max = 10.0
-
-# ---- 训练超参数（与原配置一致）----
-cfg.learning_rate = 5e-6
-cfg.max_train_steps = 10000
-cfg.batch_size = 1
-cfg.gradient_accumulation_steps = 8
-# ...
-```
-
-#### 2.3 训练入口（train.py）
-
-```python
-# distillation_flowmap/train.py
-
-"""
-Flash-WAM Flow Map 蒸馏入口。
-
-与原始 distillation/train.py 的区别：
-  - 使用 FlowMapTrainer 替代 FlashWAMDistiller
-  - 使用 FlowMapStepMixin 替代 StepMixin
-  - 模型添加了双时间步嵌入
-
-启动方式：
-  bash distillation_flowmap/run.sh
-"""
-
-import argparse
-import os
-import sys
-
-# 复用 wan_va 的 Python 路径
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "wan_va"))
-# 复用 distillation 的 patches
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-
-from distillation.patches import install_flash_attn_stub
-install_flash_attn_stub()
-
-from distributed.util import init_distributed
-from utils import init_logger, logger
-from flowmap_trainer import FlowMapDistiller  # 新的主类
-
-def run(args):
-    from config import cfg
-    # ... 分布式初始化、参数覆盖（与原 train.py 相同）...
-    trainer = FlowMapDistiller(cfg)
-    trainer.train()
-
-# ...
-```
-
-**预计工作量**：~400 行代码（step 300 + config 80 + train 50），3~4 天
+这样做是为了避免训练无意中在“半截数据集”上继续跑，导致数据分布 silently 变掉。
 
 ---
 
-### Phase 3：动作模态适配 — GT 动作回归 + 流映射
+## 5. 这轮已经完成的关键修复
 
-**目标**：将流映射扩展到动作模态，利用数据集中的 GT 动作作为监督信号。
+下面这些问题已经修过，并且已经同步到远端代码。
 
-**改动文件**：`distillation_flowmap/flowmap_step.py`（在 Phase 2 基础上扩展）
+### 5.1 Stage 1 / 通用训练逻辑
 
-#### 3.1 动作流映射
+1. 混合时间步采样 bug
+   - 之前 `batch_size=1` 或小 batch 时模式采样会失真
+   - 现在已改成 per-sample 随机分配
 
-动作模态也使用流映射训练，与视频共享同一套 (t, r) 采样策略：
+2. `selective_cdiff` 子 batch 的 `empty_emb` 使用错误
+   - 会导致 central difference 子路径条件不一致
+   - 已修
 
-```python
-# 动作的流映射目标
-if self.distill_action:
-    # 动作使用 x0 参数化（与现有 Flash-WAM 一致）
-    action_target = gt_actions - (t_action - r_action) * dF_dt_action
+3. `distill_action=False` 时共享动作路径崩溃
+   - 已改成在 `action_aware` 场景下也准备完整动作输入
 
-    # 学生动作预测
-    student_action_v = self._extract_action_v(student_action_v_seq, num_frames)
-    student_action_pred = noisy_action - t_action * student_action_v  # x0 参数化
+4. EMA action target 条件不一致
+   - 之前 action target 计算时视频上下文和时间步不匹配
+   - 已修成使用 `video_context_r`
 
-    # 动作流映射 loss
-    action_flowmap_loss = F.mse_loss(student_action_pred * mask, action_target * mask)
-```
+5. 动作 consistency 分支时间步用错
+   - 非 `x0` 参数化时错误用了 `action_t_sigma`
+   - 现在已改为 `action_r_sigma`
 
-#### 3.2 GT 动作回归 loss
+6. per-sample timestep rollout 修复
+   - 之前 Euler 积分部分用过 batch mean 时间步
+   - 现在改为按样本插值路径
 
-利用数据集中的 GT 动作作为额外监督信号：
+### 5.2 On-policy 路径
 
-```python
-def action_gt_regression_loss(self, student_action_pred, gt_action, actions_mask):
-    """
-    GT 动作回归：学生预测 vs 真实动作的 MSE。
+1. `video_action_aware` 没有真正闭环
+   - `_onpolicy_transition_step()` 原来只在 `distill_action=True` 时构建动作路径
+   - 已改为 `distill_action or action_aware`
 
-    与 action_aware_loss 的区别：
-      - action_aware_loss：基于 flow matching target（noise - x0）
-      - gt_regression：直接基于归一化后的 GT 动作值
-    """
-    mask = actions_mask.float()
-    diff = (student_action_pred.float() - gt_action.float()) * mask
-    loss = (diff ** 2).sum() / mask.sum().clamp(min=1)
-    return loss
-```
+2. on-policy 的 `action_r` 没有传进 video rollout
+   - 之前 video rollout 用的是视频 `r`
+   - 现在显式支持 `action_target_r`
 
-#### 3.3 总 loss 组合
+3. rollout 和 final loss 语义不一致
+   - 之前 Phase 1 / Phase 2 student field 不一致
+   - 现在已统一
 
-```python
-loss = video_flowmap_loss \
-     + config.action_loss_weight * action_flowmap_loss \
-     + config.gt_regression_weight * gt_regression_loss \
-     + config.action_aware_weight * action_aware_loss
-```
+### 5.3 Resume / Checkpoint 路径
 
-**预计工作量**：~150 行代码，1~2 天（与 Phase 2 合并实施）
+1. `resume_from_path` 时 step 丢失
+   - 现在会从 checkpoint `config.json` 读取 `checkpoint_step`
 
----
+2. `resume_from_path` / `resume_from_step` 不一致不报错
+   - 现在会 fail fast
 
-### Phase 4：推理改造 — 灵活步数
+3. LoRA checkpoint 可以被错误地用非 LoRA 配置恢复
+   - 现在会 fail fast
 
-**目标**：修改推理 pipeline，支持 2~50 步的灵活推理。
+4. 主 optimizer / scheduler 状态没有保存恢复
+   - 现在已经补齐
 
-**新增文件**：`distillation_flowmap/inference.py`
-
-```python
-# distillation_flowmap/inference.py
-
-"""
-Flow Map 推理：支持 2~50 步的灵活推理。
-
-用法：
-  from inference import flowmap_inference
-  video, action = flowmap_inference(model, noisy_latent, noisy_action, text_emb, num_steps=4)
-"""
-
-def flowmap_inference(model, noisy_latent, noisy_action, text_emb,
-                      num_steps=2, cfg_scale=5.0, empty_emb=None,
-                      scheduler_latent=None, scheduler_action=None):
-    """
-    流映射推理：支持任意步数。
-
-    参数:
-        model:         带有 flowmap 能力的学生模型
-        noisy_latent:  初始噪声 latent [B, C, F, H, W]
-        noisy_action:  初始噪声 action [B, C, F, N, 1]
-        text_emb:      文本嵌入
-        num_steps:     推理步数（2/4/8/16/50）
-        cfg_scale:     CFG 引导强度
-
-    返回:
-        denoised_latent: 去噪后的视频 latent
-        denoised_action: 去噪后的动作
-
-    时间步序列：
-      num_steps=2:  [1.0, 0.5, 0.0]  → 2 步（等价于 LCM）
-      num_steps=4:  [1.0, 0.75, 0.5, 0.25, 0.0]
-      num_steps=8:  [1.0, 0.875, ..., 0.125, 0.0]
-      num_steps=50: [1.0, 0.98, ..., 0.02, 0.0]
-    """
-    timesteps = torch.linspace(1.0, 0.0, num_steps + 1)
-    timesteps = scheduler_latent.apply_shift(timesteps) * scheduler_latent.num_train_timesteps
-
-    latents = noisy_latent
-    actions = noisy_action
-
-    for i in range(num_steps):
-        t = timesteps[i]
-        r = timesteps[i + 1]
-
-        # 条件预测
-        v_video_cond, v_action_cond = model(
-            latents, actions, timestep=t, r_timestep=r, text_emb=text_emb)
-
-        # 无条件预测
-        if cfg_scale > 1.0 and empty_emb is not None:
-            v_video_uncond, _ = model(
-                latents, actions, timestep=t, r_timestep=r, text_emb=empty_emb)
-            v_video = v_video_uncond + cfg_scale * (v_video_cond - v_video_uncond)
-        else:
-            v_video = v_video_cond
-
-        # 流映射更新：x_r = x_t - (t-r) * v
-        latents = latents - (t - r) * v_video
-        actions = actions - (t - r) * v_action_cond
-
-    return latents, actions
-```
-
-**预计工作量**：~100 行代码，1 天
+5. checkpoint 保存失败只记日志不终止
+   - 现在会直接抛异常，防止后续基于坏 checkpoint 恢复
 
 ---
 
-### Phase 5（可选）：On-Policy DMD 蒸馏
+## 6. 当前训练建议
 
-**目标**：引入 AnyFlow 的 DMD 方法，通过 on-policy rollout 进一步提升生成质量。
+### 6.1 Stage 1
 
-**前提**：Phase 1-4 验证有效后再实施。
+Stage 1 应该基于修复后的代码重新训练。
 
-**新增文件**：`distillation_flowmap/discriminator.py`
+原因：
 
-#### 5.1 动作判别器
+- 旧 Stage 1 训练时混合采样逻辑有 bug
+- 旧代码下的 checkpoint 统计步数和真实状态可能不一致
+- 部分动作路径和 on-policy 相关逻辑之前没有闭环
 
-利用数据集中的 GT 动作，训练一个真/假动作判别器：
+如果目标是得到可信的 Stage 2 / Stage 3 起点，建议不要继续沿用修复前生成的 Stage 1 checkpoint。
 
-```python
-# distillation_flowmap/discriminator.py
+### 6.2 Stage 2
 
-class ActionDiscriminator(nn.Module):
-    """
-    条件动作判别器：给定视频 context，判断动作是真实的还是生成的。
+Stage 2 当前建议：
 
-    训练数据：
-      - 真样本：(video_latent, GT_action) → label = 1
-      - 假样本：(video_latent, student_generated_action) → label = 0
+1. 只在修复后的 Stage 1 checkpoint 上启动
+2. 先开较小的 `rollout_step_pairs` 做稳定性验证
+3. 先验证：
+   - loss 是否稳定
+   - `video_transition_loss` 是否正常下降
+   - `action_aware_loss` 是否量级合理
+4. 再扩大 rollout 步数范围
 
-    架构：
-      - 动作编码：Linear(action_dim → hidden)
-      - 视频条件：Conv3D + Pool → hidden
-      - 交叉注意力：动作 attend to 视频
-      - 分类头：hidden → 1
-    """
-    def __init__(self, action_dim=30, video_dim=16, hidden_dim=256,
-                 num_layers=4, num_heads=8, text_dim=4096):
-        super().__init__()
-        self.action_proj = nn.Linear(action_dim, hidden_dim)
-        self.video_encoder = nn.Sequential(
-            nn.Conv3d(video_dim, hidden_dim, 1),
-            nn.AdaptiveAvgPool3d((1, 1, 1)),
-            nn.Flatten(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.text_proj = nn.Linear(text_dim, hidden_dim)
-        self.pos_embed = nn.Parameter(torch.randn(1, 512, hidden_dim) * 0.02)
-        self.blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=hidden_dim, nhead=num_heads,
-                dim_feedforward=hidden_dim * 4, batch_first=True
-            )
-            for _ in range(num_layers)
-        ])
-        self.cls_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, 1),
-        )
+### 6.3 Stage 3
 
-    def forward(self, actions, video_latent, text_emb):
-        B = actions.shape[0]
-        a = self.action_proj(rearrange(actions, 'b c f n 1 -> b (f n) c'))
-        v = self.video_encoder(video_latent).unsqueeze(1)
-        t = self.text_proj(text_emb.mean(dim=1, keepdim=True))
-        x = torch.cat([v, t, a], dim=1)
-        x = x + self.pos_embed[:, :x.shape[1]]
-        for block in self.blocks:
-            x = block(x)
-        return self.cls_head(x[:, 0])
-```
+Stage 3 当前建议按“独立分支”来理解，而不是默认接在 Stage 2 后面：
 
-#### 5.2 DMD 训练循环
+1. 也只从修复后的 Stage 1 checkpoint 启动
+2. 不要把旧的、未修复 Stage 1 当作 Stage 3 的基座
+3. 当前代码里的 Stage 3 实际就是 KTO-PAOPD，建议单独比较：
+   - Stage 2 标准 on-policy
+   - Stage 3 KTO 自适应加权
+4. 重点观察：
+   - `video_transition_loss` 是否更稳定
+   - KTO weighting 是否导致过度关注少数 token
+   - 动作相关 loss 是否被视频加权策略间接压制
+5. 先确认 Stage 3 的新增加权不会掩盖 Stage 1 基础能力退化，再扩大训练
 
-在 `flowmap_trainer.py` 中扩展，交替训练 Generator 和 Discriminator：
+### 6.4 Resume 使用建议
 
-```python
-# flowmap_trainer.py 中新增
+恢复训练时建议遵守：
 
-def train_step_with_dmd(self, batch):
-    """
-    DMD 训练：交替更新 Generator 和 Discriminator。
-
-    Generator 训练：
-      1. 用当前学生做 on-policy rollout（2~50 步随机）
-      2. 计算 DMD 梯度：判别器分数 - 教师分数
-      3. Generator loss = MSE(pred, (pred - grad).detach())
-
-    Discriminator 训练：
-      1. 真样本：(video, GT_action)
-      2. 假样本：(video, student_generated_action)
-      3. 标准二分类 loss
-    """
-    # ---- 判别器更新 ----
-    with torch.no_grad():
-        fake_actions = self.on_policy_rollout(batch, num_steps=random.choice([2,4,8,16,50]))
-
-    real_logits = self.discriminator(gt_actions, video_latent, text_emb)
-    fake_logits = self.discriminator(fake_actions.detach(), video_latent, text_emb)
-    d_loss = (F.binary_cross_entropy_with_logits(real_logits, 1) +
-              F.binary_cross_entropy_with_logits(fake_logits, 0)) / 2
-    d_loss.backward()
-
-    # ---- Generator 更新 ----
-    fake_actions_g = self.on_policy_rollout(batch, num_steps=...)
-    fake_score = self.discriminator(fake_actions_g, video_latent, text_emb)
-
-    with torch.no_grad():
-        real_score = self.teacher_action_score(video_latent, gt_actions, sigma)
-
-    grad = (fake_score - real_score) / (fake_score - real_score).abs().mean()
-    g_loss = F.mse_loss(student_pred, (student_pred - grad).detach())
-    g_loss.backward()
-```
-
-**预计工作量**：~500 行代码，3~5 天
+1. `resume_from_path` 和 `resume_from_step` 不要随便同时写两个互相矛盾的值
+2. LoRA checkpoint 必须配套 `use_lora=True`
+3. 同阶段中断恢复时，优先用新 checkpoint（包含 optimizer/scheduler 状态）
 
 ---
 
-## 4. 关键风险与应对
+## 7. 当前已知限制
 
-### 4.1 技术风险
+虽然这轮高优先问题都已经修了，但还有一些不是 bug、只是当前实现边界：
 
-| 风险 | 影响 | 应对策略 |
-|---|---|---|
-| 中心差分增加教师前向次数（2→4 次） | 训练速度约降 2 倍 | **已实现选择性中心差分**：只在流映射 batch 计算，扩散/一致性 batch 不需要；减小 epsilon 从 1.0 到 0.5 |
-| 动作流映射在低维空间（30 维）效果未知 | 动作质量可能下降 | 保留 LCM 一致性作为 fallback，增大 consistency_ratio；通过 Ablation 1-3 验证 |
-| Gate 学习不稳定 | 模型无法有效利用 r_timestep | 初始 gate=0.0，逐步 warmup；监控 gate 值变化；通过 Ablation 4 验证不同初始值 |
-| DMD 判别器过拟合训练数据 | 生成动作多样性下降 | 使用 GT MSE 正则，限制判别器容量；Phase 5 视资源情况决定 |
-| 计算资源不足 | 无法跑完整实验 | Phase 1-3 先验证，Phase 5 视资源情况决定；优化中心差分计算减少开销 |
-| 模型 forward 签名改动影响其他代码 | 兼容性问题 | 使用 `r_timestep=None` 默认参数，None 时退化为原始行为 |
-
-### 4.2 创新性风险（针对审稿人可能提出的质疑）
-
-| 风险 | 影响 | 应对策略 |
-|---|---|---|
-| 被认为是 AnyFlow 的简单工程应用 | 审稿人可能质疑创新性 | **强调双模态结构的独特贡献**：Flash-WAM 的视频+动作联合蒸馏是 AnyFlow 不具备的；首次将 Flow Map 蒸馏扩展到机器人操控场景 |
-| 动作流映射的有效性存疑 | 审稿人可能质疑低维空间流映射的必要性 | **通过消融实验验证**：Ablation 1-3 对比纯 GT 回归 vs 流映射 + GT 回归；提供跨模态一致性分析 |
-| 与现有方法的区别不清晰 | 审稿人可能认为与 LCM 蒸馏差异不大 | **明确技术贡献**：双时间步嵌入、选择性中心差分、GT 动作监督；通过实验矩阵展示逐步改进 |
-
-### 4.3 风险缓解优先级
-
-**高优先级**（必须在实验中验证）：
-1. 动作流映射的有效性（Ablation 1-3）
-2. 选择性中心差分的计算优化（Ablation 6）
-3. 双模态 vs 单模态的对比（Cross-modal 1-2）
-
-**中优先级**（根据资源情况决定）：
-1. Gate 学习策略（Ablation 4）
-2. 中心差分参数敏感性（Ablation 5）
-3. DMD 判别器训练（Phase 5）
-
-**低优先级**（可选的扩展实验）：
-1. 更多推理步数的对比（16/50 步）
-2. 不同数据集的泛化性验证
+1. on-policy 训练当前仍然比 Stage 1 更复杂、更敏感
+2. 当前 `video_t.mean(dim=-1)` 的时间步加权方式默认帧内共享时间步，因此现在没问题；如果未来改成 frame-wise 不同时间步，需要重新审视
+3. `allow_partial_datasets=True` 是显式 opt-in；一旦开启，训练集分布可能被破坏，需要人工确认
+4. Stage 3 作为独立分支时，新增目标本身的稳定性和对 base 能力的保持，还需要单独验证，不能默认继承 Stage 2 的结论
 
 ---
 
-## 5. 实验计划
+## 8. 建议的后续工作
 
-### 5.1 实验矩阵
+建议按下面顺序继续：
 
-#### 核心实验（验证 Flow Map 蒸馏的有效性）
-
-| 实验 | 蒸馏模式 | 推理步数 | 目的 |
-|---|---|---|---|
-| Baseline | LCM (flashwam) | 2 步 | 当前 SOTA 基线 |
-| Exp1 | FlowMap (r=t/0/<t) | 2 步 | 验证流映射 ≥ LCM |
-| Exp2 | FlowMap | 4 步 | 验证步数增加带来提升 |
-| Exp3 | FlowMap | 8 步 | 质量 vs 速度权衡 |
-| Exp4 | FlowMap + GT MSE | 2/4/8 步 | 验证 GT 监督的增益 |
-| Exp5 | FlowMap + DMD | 2/4/8 步 | 完整方案 |
-
-#### 消融实验（验证关键设计选择）
-
-| 实验 | 蒸馏模式 | 推理步数 | 目的 |
-|---|---|---|---|
-| **Ablation 1** | 纯 GT 回归（无流映射） | 2 步 | 验证流映射对动作模态的必要性 |
-| **Ablation 2** | 流映射 + GT 回归 | 2 步 | 验证流映射 + GT 回归的协同效果 |
-| **Ablation 3** | 流映射（无 GT 回归） | 2 步 | 验证 GT 回归的独立贡献 |
-| **Ablation 4** | 不同 gate 初始值（0.0/0.1/0.5） | 2 步 | 验证 gate 学习策略 |
-| **Ablation 5** | 不同中心差分 epsilon（0.1/0.5/1.0） | 2 步 | 验证中心差分参数敏感性 |
-| **Ablation 6** | 选择性中心差分 vs 全量中心差分 | 2 步 | 验证计算优化的有效性 |
-
-#### 跨模态分析实验
-
-| 实验 | 蒸馏模式 | 推理步数 | 目的 |
-|---|---|---|---|
-| **Cross-modal 1** | 视频-only FlowMap | 2/4/8 步 | 验证双模态结构的必要性 |
-| **Cross-modal 2** | 动作-only FlowMap | 2/4/8 步 | 验证视频对动作生成的影响 |
-| **Cross-modal 3** | 跨模态同步性分析 | 4 步 | 验证视频-动作的时间一致性 |
-
-### 5.2 评估指标
-
-#### 视频质量
-- **FID**：与 GT 视频的分布距离
-- **FVD**：视频质量的时序一致性
-- **LPIPS**：感知相似度
-
-#### 动作质量
-- **MSE**：与 GT 动作的均方误差
-- **成功率**：在模拟器中执行的成功率（关键指标）
-- **动作平滑度**：动作序列的时序一致性
-- **跨模态一致性**：视频-动作的语义匹配度
-
-#### 效率指标
-- **推理速度**：不同步数下的延迟（ms/step）
-- **训练效率**：收敛速度（达到相同质量所需的训练步数）
-- **计算开销**：中心差分带来的额外教师前向次数
-- **GPU 小时数**：完成训练所需的总计算资源
-
-### 5.3 关键对比分析
-
-#### 核心对比（验证创新点）
-1. **FlowMap vs LCM**：相同步数（2 步）下的质量对比
-2. **FlowMap vs AnyFlow**：双模态 vs 单模态的效果对比（如有 AnyFlow 基线）
-3. **GT 回归 vs 流映射**：动作模态的两种监督方式对比
-
-#### 消融分析（验证设计选择）
-1. **流映射的必要性**：Ablation 1 vs Ablation 2
-2. **GT 回归的贡献**：Ablation 2 vs Ablation 3
-3. **Gate 学习策略**：Ablation 4 的不同初始值对比
-4. **中心差分参数**：Ablation 5 的不同 epsilon 对比
-5. **计算优化**：Ablation 6 的选择性 vs 全量中心差分
-
-#### 跨模态分析（验证双模态优势）
-1. **双模态 vs 单模态**：Cross-modal 1/2 vs Exp1-5
-2. **视频-动作一致性**：Cross-modal 3 的同步性分析
-
-### 5.3 数据集
-
-- **RobotWin**：已有 GT 动作，主要实验数据集
-- **Libero**：验证泛化性（如果有 latent 数据）
+1. 用当前修复后的代码重新跑 Stage 1
+2. 产出新的、可信的 Stage 1 checkpoint
+3. 基于新 Stage 1 checkpoint 启动 Stage 2 on-policy
+4. 基于同一个新 Stage 1 checkpoint 启动 Stage 3 独立分支
+5. 分别评估 Stage 2 和 Stage 3，再决定是否继续串联更高层训练
 
 ---
 
-## 6. 文件改动清单
-
-### 新增文件（distillation_flowmap/）
-
-| 文件 | 内容 | 行数估算 |
-|---|---|---|
-| `distillation_flowmap/__init__.py` | 模块说明 | ~5 |
-| `distillation_flowmap/config.py` | Flow Map 配置 | ~100 |
-| `distillation_flowmap/model_flowmap.py` | 双时间步嵌入 + setup_flowmap_model | ~250 |
-| `distillation_flowmap/flowmap_step.py` | Flow Map 训练步 | ~300 |
-| `distillation_flowmap/flowmap_trainer.py` | Flow Map 蒸馏主类 | ~250 |
-| `distillation_flowmap/train.py` | 入口 | ~60 |
-| `distillation_flowmap/run.sh` | 启动脚本 | ~30 |
-| `distillation_flowmap/inference.py` | 灵活步数推理 | ~100 |
-| `distillation_flowmap/discriminator.py` | (Phase 5) 动作判别器 | ~200 |
-| **总计** | | **~1300** |
-
-### 不修改的文件
-
-| 文件 | 原因 |
-|---|---|
-| `wan_va/modules/model.py` | 模型改造通过 monkey-patch 实现，不修改原文件 |
-| `distillation/*.py` | 原始 LCM 蒸馏代码完全不动 |
-| `distillation/run.sh` | 原始启动脚本不动 |
-
-### 复用的文件（import）
-
-| 文件 | 复用内容 |
-|---|---|
-| `distillation/data.py` | DataMixin（_add_noise、_prepare_input_dict） |
-| `distillation/ema.py` | update_ema |
-| `distillation/patches.py` | install_flash_attn_stub、SafeMultiLatentLeRobotDataset |
-| `distillation/consistency.py` | scalings_for_boundary_conditions |
-| `wan_va/utils/*` | FlowMatchScheduler、logger、sample_timestep_id 等 |
-| `wan_va/distributed/*` | FSDP、分布式工具 |
-
----
-
-## 7. 启动方式
-
-### 原始 LCM 蒸馏（不变）
-
-```bash
-DISTILL_MODE=flashwam \
-TEACHER_PATH=/path/to/teacher \
-DATASET_PATH=/path/to/dataset \
-NGPU=4 \
-bash distillation/run.sh
-```
-
-### 新的 Flow Map 蒸馏
-
-```bash
-TEACHER_PATH=/path/to/teacher \
-DATASET_PATH=/path/to/dataset \
-NGPU=4 \
-bash distillation_flowmap/run.sh
-```
-
-两者互不干扰，可以同时运行。
-
----
-
-## 8. 时间估算
-
-| Phase | 工作量 | 依赖 | 预计时间 |
-|---|---|---|---|
-| Phase 1 | ~250 行 | 无 | 1~2 天 |
-| Phase 2 | ~400 行 | Phase 1 | 3~4 天 |
-| Phase 3 | ~150 行 | Phase 2 | 1~2 天 |
-| Phase 4 | ~100 行 | Phase 1 | 1 天 |
-| Phase 5 | ~500 行 | Phase 1-3 | 3~5 天 |
-| **总计** | ~1400 行 | — | **9~14 天** |
-
-**建议**：Phase 1-3 为核心改动（~800 行，5~8 天），完成后即可开始实验。Phase 4 与 Phase 2-3 并行。Phase 5 视实验结果决定是否实施。
-
----
-
-## 9. 创新点总结与审稿人回应策略
-
-### 9.1 核心创新点
-
-**与 AnyFlow 的区别**（强调双模态结构的独特贡献）：
-
-| 维度 | AnyFlow | Flash-WAM FlowMap | 创新点 |
-|---|---|---|---|
-| 模态支持 | 单一模态（视频） | **双模态（视频+动作）** | 首次将 Flow Map 蒸馏扩展到多模态场景 |
-| 应用场景 | 通用视频生成 | **机器人操控** | 面向具身智能的实际应用 |
-| 训练信号 | 纯视频 loss | **视频 loss + 动作回归 loss** | 利用 GT 动作作为额外监督 |
-| 计算优化 | 全量中心差分 | **选择性中心差分** | 减少教师前向次数，提升训练效率 |
-| 动作生成 | 无 | **直接输出机器人动作** | 端到端的动作生成能力 |
-
-**技术贡献**：
-1. **双模态流映射**：首次将 Flow Map 蒸馏扩展到视频+动作联合生成场景
-2. **动作空间流映射验证**：探索流映射在低维连续动作空间（30 维）的有效性
-3. **GT 动作监督**：利用数据集中的 GT 动作作为额外监督信号，提升动作生成质量
-4. **选择性中心差分**：优化中心差分计算，只在流映射 batch 使用，减少计算开销
-
-### 9.2 审稿人可能质疑及回应策略
-
-#### 质疑 1：创新性不足，只是 AnyFlow 的工程应用
-
-**回应策略**：
-- **强调应用场景的独特性**：Flash-WAM 面向机器人操控，这是 AnyFlow 不涉及的领域
-- **强调双模态结构的技术挑战**：视频+动作的联合蒸馏需要解决跨模态一致性问题
-- **提供消融实验**：通过 Ablation 1-3 验证流映射对动作模态的必要性
-- **对比实验**：与纯 LCM 蒸馏对比，展示 Flow Map 的优势
-
-#### 质疑 2：动作流映射在低维空间的有效性
-
-**回应策略**：
-- **提供消融实验**：Ablation 1-3 对比纯 GT 回归 vs 流映射 + GT 回归
-- **分析动作空间特性**：30 维动作空间虽然是低维，但具有时序依赖性，流映射可以捕捉这种依赖
-- **展示跨模态一致性**：通过 Cross-modal 3 验证视频-动作的同步性
-
-#### 质疑 3：中心差分的计算开销
-
-**回应策略**：
-- **展示选择性中心差分的优化效果**：Ablation 6 对比选择性 vs 全量中心差分
-- **提供计算开销分析**：详细说明中心差分的额外教师前向次数
-- **讨论参数敏感性**：通过 Ablation 5 验证不同 epsilon 的影响
-
-#### 质疑 4：与现有方法的区别不清晰
-
-**回应策略**：
-- **明确技术贡献**：双时间步嵌入、选择性中心差分、GT 动作监督
-- **提供实验矩阵**：展示逐步改进的实验结果
-- **对比分析**：与 LCM 蒸馏、AnyFlow 等方法进行详细对比
-
-### 9.3 论文写作建议
-
-#### Title 建议
-- **强调双模态和机器人应用**：`Flash-WAM: Flow Map Distillation for Video-Action Joint Generation in Robot Manipulation`
-- **强调灵活推理**：`Flexible-Step Video-Action Generation via Flow Map Distillation`
-
-#### Abstract 结构
-1. **背景**：机器人操控需要高效的视频-动作生成模型
-2. **问题**：现有方法（LCM 蒸馏）只能做固定步数推理
-3. **方法**：引入 Flow Map 蒸馏，支持灵活推理步数
-4. **创新**：首次将 Flow Map 蒸馏扩展到双模态场景，利用 GT 动作监督
-5. **结果**：在 RobotWin/Libero 数据集上验证有效性
-
-#### Introduction 结构
-1. **背景**：机器人操控与视频生成
-2. **现有方法**：LCM 蒸馏的局限性
-3. **Flow Map 蒸馏**：AnyFlow 的方法
-4. **我们的方法**：Flash-WAM FlowMap 的创新点
-5. **贡献**：双模态流映射、动作空间验证、GT 监督、计算优化
-
-### 9.4 实验展示策略
-
-#### 核心实验（必须展示）
-1. **FlowMap vs LCM**：相同步数（2 步）下的质量对比
-2. **不同推理步数**：2/4/8 步的质量 vs 速度权衡
-3. **GT 回归的贡献**：Ablation 2 vs Ablation 3
-
-#### 消融实验（支撑创新点）
-1. **流映射的必要性**：Ablation 1 vs Ablation 2
-2. **选择性中心差分**：Ablation 6 的计算优化效果
-3. **Gate 学习策略**：Ablation 4 的不同初始值对比
-
-#### 可视化分析（增强说服力）
-1. **视频-动作一致性**：展示视频和动作的时序对应关系
-2. **不同推理步数的生成质量**：展示 2/4/8 步的视觉效果
-3. **Gate 值变化**：展示 gate 的学习过程
-
----
-
-## 10. 总结
-
-本方案通过将 AnyFlow 的 Flow Map 蒸馏引入 Flash-WAM，实现了以下目标：
-
-1. **灵活推理步数**：支持 2~50 步的灵活推理，而非固定 2 步
-2. **双模态流映射**：首次将 Flow Map 蒸馏扩展到视频+动作联合生成场景
-3. **动作质量提升**：利用 GT 动作监督，提升动作生成质量
-4. **计算效率优化**：通过选择性中心差分，减少教师前向次数
-
-**与 AnyFlow 的区别**：Flash-WAM 的双模态结构是独特的技术贡献，而非简单的工程应用。通过消融实验和跨模态分析，可以验证流映射对动作模态的有效性，以及双模态结构的优势。
-
-**审稿人回应策略**：通过详细的消融实验、跨模态分析、计算优化展示，以及清晰的创新点阐述，回应审稿人可能提出的质疑。
-
----
-
-## 11. Bug Fix 记录：FlexAttn block_mask 大小不匹配
-
-### 11.1 问题描述
-
-FlowMap 蒸馏训练在单卡测试时出现 `FlexAttnFunc` 的 `block_mask` 大小不匹配错误：
-
-```
-ValueError: block_mask was created for block_mask.shape=(1, 1, 9216, 9216)
-but got q_len=8448 and kv_len=8448.
-```
-
-### 11.2 根因分析
-
-**`compute_central_difference_merged`** 方法构建 4B batch 时，`latent_dict` 和 `action_dict` 的 batch 维不一致：
-
-- `latent_dict`：4B（t+ε 和 t-ε 的 cond + uncond）
-- `action_dict`：B=1（原始输入，未复制）
-
-`FlexAttnFunc.init_mask`（`wan_va/modules/model.py` 第 126 行）使用 `B = latent_shape[0]`（=4）**同时**构建 latent 和 action 的 `seq_id`：
-
-```python
-B = latent_shape[0]  # = 4
-latent_seq_id = torch.arange(B)[...].expand(-1, L_F//p, L_H//p, L_W//p).flatten()  # 4 组
-action_seq_id = torch.arange(B)[...].expand(-1, A_F, A_H, A_W).flatten()           # 也用 4！
-```
-
-但 `action_dict` 实际只有 B=1，导致：
-
-| 维度 | block_mask 预期 | hidden_states 实际 |
-|------|----------------|-------------------|
-| latent 部分 | 4 × 2 × L_lat | 4 × 2 × L_lat |
-| action 部分 | 4 × 2 × L_act | 1 × 2 × L_act |
-| **总计** | **4 × (2L_lat + 2L_act) + pad** | **4 × 2L_lat + 1 × 2L_act + pad** |
-
-block_mask 大于实际序列 → 报错。
-
-### 11.3 修复方案
-
-将 `compute_central_difference_merged` 从"单次 4B 前向"改为"两次 2B 前向"：
-
-- t+ε 时做一次 2B CFG forward（cond + uncond）
-- t-ε 时做一次 2B CFG forward（cond + uncond）
-- 每次 2B forward 中 latent_dict 和 action_dict 的 batch 维一致（都是 2B）
-
-**为什么不用 4B**：尝试过 4B（4 倍复制 action_dict），但 OOM。80G A800 装不下 4B 序列的 attention 计算（序列长度翻倍，attention 显存 ∝ seq_len²）。
-
-### 11.4 修改文件
-
-**`distillation_flowmap/flowmap_step.py`** — `compute_central_difference_merged` 方法：
-
-1. 删除 4B batch 拼接逻辑（`all_noisy_latents`, `all_latents`, `all_text_emb` 等中间变量）
-2. 新增 `_build_2b_input()` 辅助函数，构建 2B 的 input_dict（cond + uncond）
-3. 两次 2B teacher forward 替代一次 4B forward
-4. 两次 forward 间重置 `FlexAttnFunc.attention_mask = None`（让 `init_mask` 重新创建 mask）
-5. 两次 forward 使用相同 batch size（2B），可复用 mask cache
-
-**不修改 `wan_va/modules/model.py`**，不影响其他功能。
-
-### 11.5 验证结果
-
-- ✅ 训练正常运行 15+ 步，无 block_mask 错误、无 OOM
-- ✅ 每步约 43 秒（单卡 A800），在合理范围内
-- ✅ 未修改模型核心代码，未影响其他功能
-
-### 11.6 注意事项
-
-- `FlexAttnFunc` 使用类级别变量（`attention_mask`, `cross_attention_mask`）缓存 block_mask
-- 不同 batch size 的 forward 之间需要重置 mask，否则会使用错误大小的缓存
-- `_mask_cache` 的 key 是 `(B, padded_length, fdm)`，同 batch size 的 forward 可复用
-
----
-
-## 12. Phase 1 实施完成记录
-
-### 12.1 完成时间
-
-- 开始时间：2025-06-14
-- 完成时间：2025-06-16
-- 训练时长：~12 小时（单卡 A800）
-
-### 12.2 实施内容
-
-Phase 1-4 已全部完成，包括：
-
-1. **模型改造**（model_flowmap.py）：
-   - `WanTwoTimeTextImageEmbedding`：双时间步嵌入模块
-   - `setup_flowmap_model()`：添加 delta_embedder + gate 机制
-   - `patch_model_forward()`：支持 r_timestep 参数
-
-2. **训练策略**（flowmap_step.py, flowmap_trainer.py）：
-   - 混合时间步采样（50% 扩散 + 25% 一致性 + 25% 流映射）
-   - 中心差分法估计 dF/dt
-   - 混合 loss：video_consistency + action_consistency + gt_regression + action_aware
-
-3. **推理模块**（inference.py）：
-   - `flowmap_inference()`：支持 2~50 步灵活推理
-   - 支持 video 和 action 不同步数
-
-4. **评估模块**（evaluation/libero/）：
-   - `run_eval_new.sh`：LIBERO 评估脚本
-   - `compare_checkpoints.py`：checkpoint 质量对比脚本
-
-### 12.3 训练配置
-
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| 学习率 | 2e-5 | LoRA 微调 |
-| LoRA rank | 128 | 高秩保留更多信息 |
-| LoRA alpha | 64 | |
-| batch_size | 1 | 单样本 |
-| gradient_accumulation_steps | 16 | 等效 batch_size=16 |
-| max_train_steps | 8500 | |
-| ema_decay | 0.995 | EMA 目标学生 |
-| diffusion_ratio | 0.5 | |
-| consistency_ratio | 0.25 | |
-| flowmap_ratio | 0.25 | |
-| gt_regression_weight | 0.5 | GT 动作回归权重 |
-| action_aware_weight | 0.1 | |
-| action_loss_weight | 1.0 | |
-| loss_clip_value | 10.0 | 梯度裁剪 |
-
-### 12.4 训练损失收敛情况
-
-| 指标 | 初始值 | 最终值 | 状态 |
-|------|--------|--------|------|
-| loss/total | ~10 | 4-8 | ✓ 收敛 |
-| loss/video_consistency | ~50 | 8-116 | ✓ 收敛（有波动） |
-| loss/action_consistency | ~0.05 | 0.006-0.01 | ✓ 收敛（非常好） |
-| loss/action_aware | ~0.1 | 0.017-0.039 | ✓ 收敛 |
-| loss/gt_regression | ~0.1 | 0.016-0.031 | ✓ 收敛 |
-
-### 12.5 Checkpoint 质量对比
-
-```
-step_1000 vs step_8500:
-  Video MSE:     0.000000
-  Video Cosine:  1.000000
-  Action MSE:    0.000000
-  Action Cosine: 1.003906
-  Action L1:     0.000000
-```
-
-**结论**：模型在 step_1000 时已经收敛，后续训练没有显著变化。
-
-### 12.6 LIBERO 评估结果
-
-使用 20 步推理（video 20步, action 20步）：
-
-| 任务 | Episode 数 | 成功率 |
-|------|-----------|--------|
-| 0: alphabet soup + tomato sauce | 2 | 0% |
-| 1: cream cheese + butter | 2 | 0% |
-| 2: stove + moka pot | 2 | 0% |
-
-**说明**：成功率 0% 是阶段1的预期结果。阶段1的目标是学习 flow map，不是直接优化任务成功率。阶段2（DMD）会优化成功率。
-
-### 12.7 生成的视频
-
-视频位置：`evaluation/outputs/step_8500_online_student/videos/libero_10/`
-
-```
-├── 0_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket/
-│   ├── 0_False.mp4  (17:57, 196KB)
-│   └── 1_False.mp4  (18:03, 193KB)
-├── 1_put_both_the_cream_cheese_box_and_the_butter_in_the_basket/
-│   ├── 0_False.mp4  (16:14, 238KB)
-│   └── 1_False.mp4  (15:35, 226KB)
-└── 2_turn_on_the_stove_and_put_the_moka_pot_on_it/
-    ├── 0_False.mp4  (18:09, 250KB)
-    └── 1_False.mp4  (18:15, 229KB)
-```
-
----
-
-## 13. 阶段1质量评估方法
-
-### 13.1 评估维度
-
-阶段1（FlowMap distillation）的质量可以从以下几个维度评估：
-
-#### 1. 训练损失收敛
-
-- **action_consistency_loss**：最关键指标，表示学生和教师在动作预测上的一致性
-  - 优秀：< 0.01
-  - 良好：0.01-0.05
-  - 一般：> 0.05
-
-- **video_consistency_loss**：视频预测一致性
-  - 由于视频维度高（48 channels × 30 × 40），绝对值较大
-  - 关注趋势是否收敛
-
-- **gt_regression_loss**：GT 动作回归
-  - 表示学生预测的动作与真实动作的差距
-  - 越小越好
-
-#### 2. Checkpoint 一致性
-
-比较不同训练步骤的 checkpoint 在相同输入下的输出：
-
-- **Action Cosine Similarity**：> 0.95 表示收敛
-- **Video Latent Cosine**：> 0.95 表示收敛
-- **Action MSE**：< 0.01 表示收敛
-
-#### 3. 少步推理质量
-
-比较不同推理步数的质量：
-
-- **2 步**：FlowMap distillation 的核心优势，应接近教师 20 步的质量
-- **4 步**：质量应优于 2 步
-- **8 步**：质量应接近教师
-
-#### 4. LIBERO 任务成功率
-
-- 阶段1的成功率通常较低（0-20%）
-- 阶段2（DMD）会显著提升成功率
-- 阶段1的成功率不是主要评估指标
-
-### 13.2 评估工具
-
-#### 训练损失监控
-
-```bash
-# 启动 TensorBoard
-conda run -n flashwam tensorboard --logdir distillation_flowmap/output_libero_new/tensorboard --port 6006
-```
-
-#### Checkpoint 对比
-
-```bash
-# 对比不同 checkpoint
-PYTHONPATH=wan_va:distillation_flowmap:$PYTHONPATH conda run -n flashwam python evaluation/libero/compare_checkpoints.py \
-    --checkpoint-dir distillation_flowmap/output_libero_new/checkpoints \
-    --steps 1000 3000 5000 7000 8500 \
-    --num-samples 3 \
-    --num-steps 20 \
-    --output evaluation/outputs/checkpoint_comparison.json
-```
-
-#### LIBERO 评估
-
-```bash
-# 评估单个 checkpoint
-NUM_STEPS=20 TEST_NUM=2 bash evaluation/libero/run_eval_new.sh step_8500
-
-# 评估多个 checkpoint
-for step in 1000 3000 5000 7000 8500; do
-    NUM_STEPS=20 TEST_NUM=2 bash evaluation/libero/run_eval_new.sh step_$step
-done
-```
-
-### 13.3 阶段1成功标准
-
-| 指标 | 阈值 | 说明 |
-|------|------|------|
-| action_consistency_loss | < 0.01 | 动作一致性 |
-| checkpoint 一致性 | cosine > 0.95 | 模型收敛 |
-| 2步推理质量 | 接近教师20步 | FlowMap 核心优势 |
-| LIBERO 成功率 | > 0%（阶段1） | 不是主要指标 |
-
-### 13.4 从阶段1到阶段2
-
-阶段1完成后，可以进入阶段2（DMD on-policy distillation）：
-
-1. **启用 DMD**：在 `config_libero_optimized.py` 中设置 `use_dmd=True`
-2. **加载阶段1 EMA 权重**：使用 `target_student` checkpoint
-3. **降低学习率**：阶段2 使用更小的学习率（如 2e-6）
-4. **On-policy rollout**：用当前学生生成 fake actions
-5. **判别器训练**：区分真实动作和生成动作
-
-阶段2的目标是直接优化任务成功率，预期成功率会显著提升。
+## 9. 当前状态总结
+
+截至本次更新，`distillation_flowmap` 已经不是“概念验证代码”，而是一套已经补齐了以下关键能力的可训练实现：
+
+- FlowMap Stage 1 混合蒸馏
+- 双模态视频+动作路径
+- `video_action_aware` 独立闭环
+- on-policy transition matching
+- 更安全的 checkpoint / resume
+- fail-fast 的数据集加载策略
+
+当前最重要的结论是：
+
+- 老的 Stage 1 不建议继续信任
+- 修复后的代码可以作为新的正式训练基线
+- Stage 2 和 Stage 3 都应该从新的 Stage 1 checkpoint 分叉
+- 当前更合理的结构是“Stage 1 为基座，Stage 2 / Stage 3 并行实验”

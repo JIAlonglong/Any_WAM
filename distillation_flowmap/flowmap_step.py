@@ -38,6 +38,23 @@ def _to_regular_tensor(t):
     if hasattr(t, 'to_local'):
         return t.to_local()  # autograd-aware conversion
     return t
+
+
+def _downsample_action_grid_id(grid_id, action_latents, factor):
+    """Downsample action RoPE grid IDs along the action frame dimension.
+
+    action grid_id layout is [B, 4, F * N], matching actions [B, C, F, N, 1].
+    A plain grid_id[:, :, ::factor] samples one token per frame; this keeps all
+    N action tokens for every selected frame.
+    """
+    if grid_id is None:
+        return None
+    if factor == 1:
+        return grid_id
+    B, _, F_action, N_action, W_action = action_latents.shape
+    if W_action != 1:
+        raise ValueError(f"Expected action width 1, got {W_action}")
+    return grid_id.reshape(B, 4, F_action, N_action, W_action)[:, :, ::factor].reshape(B, 4, -1)
 from einops import rearrange
 
 from utils import data_seq_to_patch, logger
@@ -69,7 +86,10 @@ class FlowMapStepMixin:
     # ==================================================================
     # 混合时间步采样：扩散目标 + 一致性目标 + 流映射目标
     # ==================================================================
-    def sample_timestep_mixed(self, batch_size, num_frames, dtype, device):
+    def sample_timestep_mixed(
+        self, batch_size, num_frames, dtype, device, scheduler=None,
+        one_step_focus_ratio=None, one_step_t_min=None,
+    ):
         """
         混合时间步采样，实现三种目标的随机切换。
 
@@ -86,6 +106,13 @@ class FlowMapStepMixin:
             num_frames: 时间维度 T（帧数）
             dtype:      数据类型（通常为 torch.float32）
             device:     设备（GPU）
+            scheduler:  使用哪个 FlowMatchScheduler 应用 SNR shift；
+                        None 时使用视频 scheduler。
+            one_step_focus_ratio:
+                        额外强制采样 endpoint 一步目标的比例。被选中的样本
+                        使用 r=0 且 t 接近高噪声区，用来显式偏向 v1/a1。
+            one_step_t_min:
+                        endpoint 样本的最小归一化 t。
 
         返回:
             t:           主时间步 [batch_size, num_frames]，已应用 SNR shift 并缩放到原始时间步（0~num_train_timesteps）
@@ -124,14 +151,45 @@ class FlowMapStepMixin:
         r = torch.where(is_diffusion, t, r)
         r = torch.where(is_consistency, torch.zeros_like(r), r)
 
+        # v1/a1 focus: keep the AnyFlow mixed objective, but inject additional
+        # endpoint samples close to the actual one-step inference path.
+        if one_step_focus_ratio is not None and one_step_focus_ratio > 0:
+            focus_ratio = max(0.0, min(1.0, float(one_step_focus_ratio)))
+            focus_t_min = 0.0 if one_step_t_min is None else float(one_step_t_min)
+            focus_t_min = max(0.0, min(1.0, focus_t_min))
+            focus_mask = torch.rand(batch_size, dtype=dtype, device=device) < focus_ratio
+            if focus_mask.any():
+                focused_t = focus_t_min + (1.0 - focus_t_min) * torch.rand(
+                    batch_size, dtype=dtype, device=device)
+                t = torch.where(focus_mask, focused_t, t)
+                r = torch.where(focus_mask, torch.zeros_like(r), r)
+                is_diffusion = is_diffusion & (~focus_mask)
+
         # 步骤 4：扩展为 per-frame [B, T]（与 AnyFlow 参考实现一致）
         t = t.unsqueeze(1).expand(-1, num_frames)
         r = r.unsqueeze(1).expand(-1, num_frames)
 
-        # 应用 SNR shift（与 FlowMatchScheduler 一致）并转换为原始时间步
-        t = self.train_scheduler_latent.apply_shift(t) * self.config.num_train_timesteps
-        r = self.train_scheduler_latent.apply_shift(r) * self.config.num_train_timesteps
+        # 应用对应分支的 SNR shift 并转换为原始时间步。
+        # LIBERO action uses action_snr_shift=0.05, not the video shift=5.0.
+        scheduler = scheduler or self.train_scheduler_latent
+        t = scheduler.apply_shift(t) * self.config.num_train_timesteps
+        r = scheduler.apply_shift(r) * self.config.num_train_timesteps
         return t, r, is_diffusion
+
+    def _one_step_focus_kwargs(self, branch):
+        """Return branch-specific endpoint sampling knobs for v1/a1 training."""
+        ratio = getattr(
+            self.config, f"{branch}_one_step_focus_ratio",
+            getattr(self.config, "one_step_focus_ratio", 0.0),
+        )
+        t_min = getattr(
+            self.config, f"{branch}_one_step_t_min",
+            getattr(self.config, "one_step_t_min", 0.85),
+        )
+        return {
+            "one_step_focus_ratio": ratio,
+            "one_step_t_min": t_min,
+        }
 
     def _build_timestep_path(self, timesteps, target_r, num_steps):
         """Linearly interpolate per-sample timestep grids from t to r."""
@@ -853,7 +911,8 @@ class FlowMapStepMixin:
 
         # 视频时间步采样：sample_timestep_mixed 已应用 SNR shift 并转换为原始时间步
         video_t, video_r, video_is_diffusion = self.sample_timestep_mixed(
-            B, num_frames, dtype=torch.float32, device=self.device
+            B, num_frames, dtype=torch.float32, device=self.device,
+            **self._one_step_focus_kwargs("video"),
         )
 
         # 恢复原始比例
@@ -881,7 +940,9 @@ class FlowMapStepMixin:
                 self.flowmap_ratio = 0.0
 
             action_t, action_r, action_is_diffusion = self.sample_timestep_mixed(
-                B, num_frames, dtype=torch.float32, device=self.device
+                B, num_frames, dtype=torch.float32, device=self.device,
+                scheduler=self.train_scheduler_action,
+                **self._one_step_focus_kwargs("action"),
             )
 
             # 恢复原始比例
@@ -1132,7 +1193,8 @@ class FlowMapStepMixin:
             'window_size': input_dict['window_size'],
         }
         if 'grid_id' in input_dict['action_dict'] and input_dict['action_dict']['grid_id'] is not None:
-            student_input['action_dict']['grid_id'] = input_dict['action_dict']['grid_id'][:, :, ::_ACTION_DS]
+            student_input['action_dict']['grid_id'] = _downsample_action_grid_id(
+                input_dict['action_dict']['grid_id'], batch['actions'], _ACTION_DS)
         if 'actions_mask' in input_dict['action_dict'] and input_dict['action_dict']['actions_mask'] is not None:
             student_input['action_dict']['actions_mask'] = input_dict['action_dict']['actions_mask'][:, :, ::_ACTION_DS]
 
@@ -1210,7 +1272,8 @@ class FlowMapStepMixin:
                 'window_size': input_dict['window_size'],
             }
             if 'grid_id' in input_dict['action_dict'] and input_dict['action_dict']['grid_id'] is not None:
-                target_input['action_dict']['grid_id'] = input_dict['action_dict']['grid_id'][:, :, ::_ACTION_DS]
+                target_input['action_dict']['grid_id'] = _downsample_action_grid_id(
+                    input_dict['action_dict']['grid_id'], batch['actions'], _ACTION_DS)
             if 'actions_mask' in input_dict['action_dict'] and input_dict['action_dict']['actions_mask'] is not None:
                 target_input['action_dict']['actions_mask'] = input_dict['action_dict']['actions_mask'][:, :, ::_ACTION_DS]
 
@@ -1239,6 +1302,7 @@ class FlowMapStepMixin:
         action_loss = torch.tensor(0.0, device=self.device)
         gt_regression_loss = torch.tensor(0.0, device=self.device)
         action_aware_loss = torch.tensor(0.0, device=self.device)
+        action_local_fm_loss = torch.tensor(0.0, device=self.device)
 
         if self.distill_action or self.action_aware:
             # Action 时间下采样：与学生模型一致（每 _ACTION_DS 帧取 1 个）
@@ -1304,7 +1368,8 @@ class FlowMapStepMixin:
             if self.action_aware:
                 action_targets = input_dict['action_dict']['targets'][:, :, ::_ad]
                 aa_diff = (student_action_v.float() - action_targets.float().detach()) * mask
-                action_aware_loss = (aa_diff ** 2).sum() / action_denom
+                action_local_fm_loss = (aa_diff ** 2).sum() / action_denom
+                action_aware_loss = action_local_fm_loss
 
         # ==============================================================
         # 步骤 10: 时间步加权 + 扩散样本缩放
@@ -1377,6 +1442,7 @@ class FlowMapStepMixin:
                 "loss": zero_loss,
                 "video_loss": video_loss.detach(),
                 "action_loss": action_loss.detach() if self.distill_action else action_loss,
+                "action_local_fm_loss": action_local_fm_loss.detach() if self.action_aware else action_local_fm_loss,
                 "action_aware_loss": action_aware_loss.detach() if self.action_aware else action_aware_loss,
                 "gt_regression_loss": gt_regression_loss.detach() if self.distill_action else gt_regression_loss,
                 "should_sync": should_sync,
@@ -1390,6 +1456,7 @@ class FlowMapStepMixin:
             "loss": loss.detach(),
             "video_loss": video_loss.detach(),
             "action_loss": action_loss.detach() if self.distill_action else action_loss,
+            "action_local_fm_loss": action_local_fm_loss.detach() if self.action_aware else action_local_fm_loss,
             "action_aware_loss": action_aware_loss.detach() if self.action_aware else action_aware_loss,
             "gt_regression_loss": gt_regression_loss.detach() if self.distill_action else gt_regression_loss,
             "should_sync": should_sync,
@@ -1423,7 +1490,8 @@ class FlowMapStepMixin:
     # ==================================================================
     def _student_euler_integrate(self, noisy_latents, timesteps, target_r, base_input_dict,
                                    empty_emb, cfg_scale, ref_shape, B, num_frames,
-                                   K_steps=1, micro_steps=1, action_target_r=None):
+                                   K_steps=1, action_target_r=None,
+                                   return_last_step_start=False):
         """
         Student multi-step Euler integration from t to target_r.
 
@@ -1433,6 +1501,7 @@ class FlowMapStepMixin:
         Returns:
             x_final: final latent at target_r (detached, from rollout)
             v_final: student v-prediction at (x_final, target_r) with gradient
+            optional last_step_start: (x, t) at the start of the final student macro step
         """
         from modules.model import FlexAttnFunc
         _ACTION_DS = getattr(self.config, 'action_downsample_factor', 4)
@@ -1443,7 +1512,7 @@ class FlowMapStepMixin:
         # ===== Phase 1: K-step Euler rollout (no gradient) =====
         # Use self.student directly (FSDP handles dispatch)
         # Use nofsdp copy for rollout to avoid FSDP all-gather overhead
-        _rollout_model = getattr(self, '_student_nofsdp', self.student)
+        _rollout_model = getattr(self, '_student_nofsdp', None) or self.student
         if _rollout_model is not self.student:
             if not getattr(self, '_nofsdp_synced', False):
                 self._sync_student_nofsdp()
@@ -1464,10 +1533,15 @@ class FlowMapStepMixin:
         with torch.no_grad():
             step_ts = self._build_timestep_path(timesteps.float(), target_r.float(), K_steps)
             current_x = noisy_latents
+            last_step_start_x = current_x
+            last_step_start_t = step_ts[0]
 
             for i in range(K_steps):
                 t_i = step_ts[i]
                 r_next = step_ts[min(i + 1, K_steps)]
+                if i == K_steps - 1:
+                    last_step_start_x = current_x.detach()
+                    last_step_start_t = t_i.detach()
 
                 step_input = {
                     'latent_dict': {
@@ -1524,7 +1598,9 @@ class FlowMapStepMixin:
         # ===== Phase 2: Use FSDP student for gradient computation =====
         _rollout_model = self.student
 
-        current_x_detached = current_x.detach().requires_grad_(True)
+        # We only optimize model parameters here; asking autograd for gradients
+        # w.r.t. the latent input keeps extra buffers alive during Stage 2.
+        current_x_detached = current_x.detach()
 
         final_input = {
             'latent_dict': {
@@ -1577,6 +1653,8 @@ class FlowMapStepMixin:
                 for _bi, _block in enumerate(_saved_blocks):
                     self.student.blocks[_bi] = _block
 
+        if return_last_step_start:
+            return current_x_detached, v_final_cfg, last_step_start_x.detach(), last_step_start_t.detach()
 
         return current_x_detached, v_final_cfg
 
@@ -1602,6 +1680,7 @@ class FlowMapStepMixin:
             num_steps: 积分步数
 
         返回:
+            current_x: teacher rollout 到 target_r 后的 latent [B, C, F, H, W]
             v_teacher: teacher 在 target_r 处的 v-prediction [B, C, F, H, W]
         """
         _ACTION_DS = getattr(self.config, 'action_downsample_factor', 4)
@@ -1653,7 +1732,33 @@ class FlowMapStepMixin:
             v_cfg_final = v_uncond_final + cfg_scale * (v_cond_final - v_uncond_final)
             v_teacher = self._extract_video_v(v_cfg_final, ref_shape, B)
 
-        return v_teacher
+        return current_x, v_teacher
+
+    def _teacher_forward_at_student_state(self, student_x_r, target_r, input_dict, empty_emb,
+                                          cfg_scale, ref_shape, B):
+        """
+        Query the teacher at the state actually visited by the student rollout.
+
+        This keeps the transition target on the student's rollout distribution
+        instead of comparing student and teacher predictions at two different
+        terminal states.
+        """
+        with torch.no_grad():
+            teacher_input = {
+                'latent_dict': {
+                    **input_dict['latent_dict'],
+                    'noisy_latents': student_x_r.detach(),
+                    'timesteps': target_r,
+                },
+                'action_dict': input_dict['action_dict'],
+                'chunk_size': input_dict['chunk_size'],
+                'window_size': input_dict['window_size'],
+            }
+            v_cond, v_uncond, _ = self._batched_cfg_forward(teacher_input, empty_emb)
+            v_cfg = v_uncond + cfg_scale * (v_cond - v_uncond)
+            v_teacher = self._extract_video_v(v_cfg, ref_shape, B)
+
+        return student_x_r.detach(), v_teacher
 
     def _onpolicy_transition_step(self, batch, batch_idx):
         """
@@ -1691,13 +1796,17 @@ class FlowMapStepMixin:
         # 步骤 2: 混合时间步采样（复用 FlowMap 的采样逻辑）
         # ==============================================================
         video_t, video_r, video_is_diffusion = self.sample_timestep_mixed(
-            B, num_frames, dtype=torch.float32, device=self.device
+            B, num_frames, dtype=torch.float32, device=self.device,
+            **self._one_step_focus_kwargs("video"),
         )
         video_t_sigma = video_t / self.config.num_train_timesteps
+        video_r_sigma = video_r / self.config.num_train_timesteps
 
         if self.distill_action or self.action_aware:
             action_t, action_r, action_is_diffusion = self.sample_timestep_mixed(
-                B, num_frames, dtype=torch.float32, device=self.device
+                B, num_frames, dtype=torch.float32, device=self.device,
+                scheduler=self.train_scheduler_action,
+                **self._one_step_focus_kwargs("action"),
             )
             action_t_sigma = action_t / self.config.num_train_timesteps
             action_r_sigma = action_r / self.config.num_train_timesteps
@@ -1742,7 +1851,8 @@ class FlowMapStepMixin:
                     'timesteps':     _ad['timesteps'][:, ::_ACTION_DS],
                     'cond_timesteps':_ad['cond_timesteps'][:, ::_ACTION_DS],
                     'text_emb':      _ad['text_emb'],
-                    'grid_id':       _ad['grid_id'][:, :, ::_ACTION_DS] if _ad.get('grid_id') is not None else None,
+                    'grid_id':       _downsample_action_grid_id(
+                        _ad['grid_id'], _ad['latent'], _ACTION_DS) if _ad.get('grid_id') is not None else None,
                     'actions_mask':  _ad['actions_mask'][:, :, ::_ACTION_DS] if _ad.get('actions_mask') is not None else None,
                 },
                 'chunk_size': input_dict['chunk_size'],
@@ -1751,7 +1861,11 @@ class FlowMapStepMixin:
         else:
             student_input_dict = input_dict
 
-        rollout_step_pairs = getattr(self.config, 'rollout_step_pairs', [[1, 1]])
+        rollout_step_pairs = getattr(
+            self.config,
+            'opd_rollout_step_pairs',
+            getattr(self.config, 'rollout_step_pairs', [[1, 1]]),
+        )
         if dist.is_initialized():
             idx = torch.randint(0, len(rollout_step_pairs), (1,), device=self.device)
             dist.broadcast(idx, src=0)
@@ -1784,7 +1898,7 @@ class FlowMapStepMixin:
         # 步骤 7: Student 多步 Euler rollout（保留梯度图）
         # ==============================================================
         if self.distill_video:
-            student_x_r, student_v_at_r = self._student_euler_integrate(
+            student_x_r, student_v_at_r, student_last_x, student_last_t = self._student_euler_integrate(
                 noisy_latents=video_noisy_latents,
                 timesteps=video_t,
                 target_r=video_r,
@@ -1796,15 +1910,17 @@ class FlowMapStepMixin:
                 num_frames=num_frames,
                 K_steps=K_steps,
                 action_target_r=action_r if (self.distill_action or self.action_aware) else None,
+                return_last_step_start=True,
             )
 
         # ==============================================================
-        # 步骤 8: Teacher 多步 Euler 积分（no_grad，提供 target）
+        # 步骤 8: Teacher target（no_grad，提供 student-state target）
         # ==============================================================
+        effective_teacher_steps = 1
         if self.distill_video:
-            teacher_micro_steps = getattr(self.config, 'teacher_micro_steps', 2)
-            total_teacher_steps = N_steps * teacher_micro_steps
-            teacher_v_at_r = self._teacher_integrate_to_r(
+            video_transition_param = getattr(self.config, 'video_transition_param', 'x0')
+            effective_teacher_steps = max(1, N_steps)
+            teacher_x_r, teacher_v_at_r = self._teacher_integrate_to_r(
                 noisy_latents=video_noisy_latents,
                 timesteps=video_t,
                 target_r=video_r,
@@ -1814,8 +1930,19 @@ class FlowMapStepMixin:
                 ref_shape=ref_shape,
                 B=B,
                 num_frames=num_frames,
-                num_steps=total_teacher_steps,
+                num_steps=effective_teacher_steps,
             )
+            if video_transition_param == 'velocity':
+                video_transition_param = 'x0'
+                if self.config.rank == 0 and not getattr(
+                    self, '_warned_video_endpoint_uses_x0', False
+                ):
+                    logger.warning(
+                        "Using x0 video transition loss for K-step student vs "
+                        "N-step teacher endpoint distillation; velocity MSE is "
+                        "only valid for same-state teacher labels."
+                    )
+                    self._warned_video_endpoint_uses_x0 = True
 
         # ==============================================================
         # 步骤 9: 计算 transition loss
@@ -1824,14 +1951,32 @@ class FlowMapStepMixin:
         local_fm_loss = torch.tensor(0.0, device=self.device)
         action_loss = torch.tensor(0.0, device=self.device)
         action_aware_loss = torch.tensor(0.0, device=self.device)
+        action_local_fm_loss = torch.tensor(0.0, device=self.device)
         gt_regression_loss = torch.tensor(0.0, device=self.device)
 
         if self.distill_video:
-            # 9a. Transition loss: student v vs teacher v at (x_r, r)
+            # 9a. Transition loss.
+            # Default is the original OPD velocity objective; distill-style mode
+            # matches the validated consistency-distillation prediction target.
             # KTO-style pointwise adaptive weighting: bad tokens get higher weight
             transition_loss_type = getattr(self.config, 'transition_loss_type', 'huber')
             transition_huber_c = getattr(self.config, 'transition_huber_c', 1e-3)
-            video_diff = (student_v_at_r.float() - teacher_v_at_r.detach().float())
+            if video_transition_param == 'consistency':
+                student_video_pred = self._consistency_function(
+                    student_v_at_r, student_x_r, video_r_sigma
+                )
+                with torch.no_grad():
+                    teacher_video_pred = self._consistency_function(
+                        teacher_v_at_r, teacher_x_r, video_r_sigma
+                    )
+                video_diff = (student_video_pred.float() - teacher_video_pred.detach().float())
+            elif video_transition_param == 'x0':
+                sigma_r = video_r_sigma[:, None, :, None, None].to(student_v_at_r)
+                student_video_pred = student_x_r - sigma_r * student_v_at_r
+                teacher_video_pred = teacher_x_r - sigma_r * teacher_v_at_r
+                video_diff = (student_video_pred.float() - teacher_video_pred.detach().float())
+            else:
+                video_diff = (student_v_at_r.float() - teacher_v_at_r.detach().float())
 
             if transition_loss_type == "huber":
                 abs_diff = video_diff.abs()
@@ -1922,7 +2067,8 @@ class FlowMapStepMixin:
                 'window_size': input_dict['window_size'],
             }
             if 'grid_id' in input_dict['action_dict'] and input_dict['action_dict']['grid_id'] is not None:
-                student_action_input['action_dict']['grid_id'] = input_dict['action_dict']['grid_id'][:, :, ::_ACTION_DS]
+                student_action_input['action_dict']['grid_id'] = _downsample_action_grid_id(
+                    input_dict['action_dict']['grid_id'], batch['actions'], _ACTION_DS)
             if 'actions_mask' in input_dict['action_dict'] and input_dict['action_dict']['actions_mask'] is not None:
                 student_action_input['action_dict']['actions_mask'] = input_dict['action_dict']['actions_mask'][:, :, ::_ACTION_DS]
 
@@ -1979,7 +2125,8 @@ class FlowMapStepMixin:
                         'window_size': input_dict['window_size'],
                     }
                     if 'grid_id' in input_dict['action_dict'] and input_dict['action_dict']['grid_id'] is not None:
-                        target_input['action_dict']['grid_id'] = input_dict['action_dict']['grid_id'][:, :, ::_ACTION_DS]
+                        target_input['action_dict']['grid_id'] = _downsample_action_grid_id(
+                            input_dict['action_dict']['grid_id'], batch['actions'], _ACTION_DS)
                     if 'actions_mask' in input_dict['action_dict'] and input_dict['action_dict']['actions_mask'] is not None:
                         target_input['action_dict']['actions_mask'] = input_dict['action_dict']['actions_mask'][:, :, ::_ACTION_DS]
 
@@ -2001,11 +2148,13 @@ class FlowMapStepMixin:
                     gt_diff = (student_action_pred.float() * mask) - (actions_gt_ds.float() * mask)
                     gt_regression_loss = (gt_diff ** 2).sum() / action_denom
 
-            # Action-aware regularization
+            # Action local FM regularization: student action velocity vs GT FM target.
+            # action_aware_loss is kept as a backward-compatible alias.
             if self.action_aware:
                 action_targets = input_dict['action_dict']['targets'][:, :, ::_ACTION_DS]
                 aa_diff = (student_action_v.float() - action_targets.float().detach()) * mask
-                action_aware_loss = (aa_diff ** 2).sum() / action_denom
+                action_local_fm_loss = (aa_diff ** 2).sum() / action_denom
+                action_aware_loss = action_local_fm_loss
 
         # ==============================================================
         # 步骤 11: 总损失
@@ -2039,6 +2188,7 @@ class FlowMapStepMixin:
                 'video_transition_loss': video_transition_loss.detach(),
                 'local_fm_loss': local_fm_loss.detach(),
                 'action_loss': action_loss.detach() if self.distill_action else action_loss,
+                'action_local_fm_loss': action_local_fm_loss.detach() if self.action_aware else action_local_fm_loss,
                 'action_aware_loss': action_aware_loss.detach() if self.action_aware else action_aware_loss,
                 'gt_regression_loss': gt_regression_loss.detach() if self.distill_action else gt_regression_loss,
                 'should_sync': should_sync,
@@ -2047,18 +2197,395 @@ class FlowMapStepMixin:
 
         loss.backward()
 
+        empty_cache_interval = getattr(self.config, 'onpolicy_empty_cache_interval', 0)
+        if empty_cache_interval and (self.step % empty_cache_interval == 0):
+            torch.cuda.empty_cache()
 
         return {
             'loss': loss.detach(),
             'video_transition_loss': video_transition_loss.detach(),
             'local_fm_loss': local_fm_loss.detach(),
             'action_loss': action_loss.detach() if self.distill_action else action_loss,
+            'action_local_fm_loss': action_local_fm_loss.detach() if self.action_aware else action_local_fm_loss,
             'action_aware_loss': action_aware_loss.detach() if self.action_aware else action_aware_loss,
             'gt_regression_loss': gt_regression_loss.detach() if self.distill_action else gt_regression_loss,
             'rollout_steps': K_steps,
-            'micro_steps': N_steps * getattr(self.config, 'teacher_micro_steps', 2),
+            'teacher_steps': effective_teacher_steps,
             'video_t_mean': video_t.mean().item(),
             'video_r_mean': video_r.mean().item(),
+            'should_sync': should_sync,
+            'skip_step': False,
+        }
+
+    def _opd_aux_transition_step(self, batch, batch_idx):
+        """
+        Auxiliary teacher-transition loss on top of the regular FlowMap step.
+
+        This keeps the regular AnyFlow step as the main objective and adds a
+        teacher-transition auxiliary for both video and action.
+        """
+        batch = self.convert_input_format(batch)
+
+        B = batch['latents'].shape[0]
+        ref_shape = batch['latents'].shape
+        num_frames = ref_shape[2]
+        actions_mask = batch.get('actions_mask')
+        _ACTION_DS = getattr(self.config, 'action_downsample_factor', 4)
+
+        input_dict = self._prepare_base_dict(batch)
+
+        video_t, video_r, _ = self.sample_timestep_mixed(
+            B, num_frames, dtype=torch.float32, device=self.device,
+            **self._one_step_focus_kwargs("opd_aux"),
+        )
+        video_r_sigma = video_r / self.config.num_train_timesteps
+
+        action_t = action_r = None
+        action_t_sigma = action_r_sigma = None
+        if self.distill_action or self.action_aware:
+            action_t, action_r, _ = self.sample_timestep_mixed(
+                B, num_frames, dtype=torch.float32, device=self.device,
+                scheduler=self.train_scheduler_action,
+                **self._one_step_focus_kwargs("action"),
+            )
+            action_t_sigma = action_t / self.config.num_train_timesteps
+            action_r_sigma = action_r / self.config.num_train_timesteps
+
+        video_noise = torch.randn_like(batch['latents'])
+        video_noisy_latents = self.train_scheduler_latent.add_noise(
+            batch['latents'], video_noise, video_t, t_dim=2
+        )
+        video_v_target = self.train_scheduler_latent.training_target(
+            batch['latents'], video_noise, video_t
+        )
+        input_dict['latent_dict']['noisy_latents'] = video_noisy_latents
+        input_dict['latent_dict']['timesteps'] = video_t
+        input_dict['latent_dict']['targets'] = video_v_target
+
+        if self.distill_action or self.action_aware:
+            action_noise = torch.randn_like(batch['actions'])
+            action_noisy_latents = self.train_scheduler_action.add_noise(
+                batch['actions'], action_noise, action_t, t_dim=2
+            )
+            input_dict['action_dict']['noisy_latents'] = action_noisy_latents
+            input_dict['action_dict']['timesteps'] = action_t
+            input_dict['action_dict']['targets'] = self.train_scheduler_action.training_target(
+                batch['actions'], action_noise, action_t
+            )
+            _ad = input_dict['action_dict']
+            student_input_dict = {
+                'latent_dict': input_dict['latent_dict'],
+                'action_dict': {
+                    'noisy_latents': _ad['noisy_latents'][:, :, ::_ACTION_DS],
+                    'latent':        _ad['latent'][:, :, ::_ACTION_DS],
+                    'timesteps':     _ad['timesteps'][:, ::_ACTION_DS],
+                    'cond_timesteps':_ad['cond_timesteps'][:, ::_ACTION_DS],
+                    'text_emb':      _ad['text_emb'],
+                    'grid_id':       _downsample_action_grid_id(
+                        _ad['grid_id'], _ad['latent'], _ACTION_DS) if _ad.get('grid_id') is not None else None,
+                    'actions_mask':  _ad['actions_mask'][:, :, ::_ACTION_DS] if _ad.get('actions_mask') is not None else None,
+                },
+                'chunk_size': input_dict['chunk_size'],
+                'window_size': input_dict['window_size'],
+            }
+        else:
+            student_input_dict = input_dict
+
+        rollout_step_pairs = getattr(
+            self.config,
+            'opd_rollout_step_pairs',
+            getattr(self.config, 'rollout_step_pairs', [[1, 1]]),
+        )
+        if dist.is_initialized():
+            idx = torch.randint(0, len(rollout_step_pairs), (1,), device=self.device)
+            dist.broadcast(idx, src=0)
+            N_steps, K_steps = rollout_step_pairs[idx.item()]
+        else:
+            import random
+            N_steps, K_steps = random.choice(rollout_step_pairs)
+
+        cfg_scale = self.config.cfg_min + torch.rand(1).item() * (
+            self.config.cfg_max - self.config.cfg_min)
+        empty_emb = self.empty_emb.expand(
+            input_dict['latent_dict']['text_emb'].shape[0], -1, -1)
+
+        should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
+        if hasattr(self.student, 'set_requires_gradient_sync'):
+            self.student.set_requires_gradient_sync(should_sync)
+
+        student_x_r, student_v_at_r, student_last_x, student_last_t = self._student_euler_integrate(
+            noisy_latents=video_noisy_latents,
+            timesteps=video_t,
+            target_r=video_r,
+            base_input_dict=student_input_dict,
+            empty_emb=empty_emb,
+            cfg_scale=cfg_scale,
+            ref_shape=ref_shape,
+            B=B,
+            num_frames=num_frames,
+            K_steps=K_steps,
+            action_target_r=action_r if (self.distill_action or self.action_aware) else None,
+            return_last_step_start=True,
+        )
+
+        video_transition_param = getattr(self.config, 'video_transition_param', 'x0')
+        effective_teacher_steps = 1
+        effective_teacher_steps = max(1, N_steps)
+        teacher_x_r, teacher_v_at_r = self._teacher_integrate_to_r(
+            noisy_latents=video_noisy_latents,
+            timesteps=video_t,
+            target_r=video_r,
+            input_dict=input_dict,
+            empty_emb=empty_emb,
+            cfg_scale=cfg_scale,
+            ref_shape=ref_shape,
+            B=B,
+            num_frames=num_frames,
+            num_steps=effective_teacher_steps,
+        )
+        if video_transition_param == 'velocity':
+            video_transition_param = 'x0'
+            if self.config.rank == 0 and not getattr(
+                self, '_warned_opd_video_endpoint_uses_x0', False
+            ):
+                logger.warning(
+                    "Using x0 OPD video transition loss for K-step student vs "
+                    "N-step teacher endpoint distillation; velocity MSE is only "
+                    "valid for same-state teacher labels."
+                )
+                self._warned_opd_video_endpoint_uses_x0 = True
+
+        transition_loss_type = getattr(self.config, 'transition_loss_type', 'huber')
+        transition_huber_c = getattr(self.config, 'transition_huber_c', 1e-3)
+        if video_transition_param == 'consistency':
+            student_video_pred = self._consistency_function(
+                student_v_at_r, student_x_r, video_r_sigma
+            )
+            with torch.no_grad():
+                teacher_video_pred = self._consistency_function(
+                    teacher_v_at_r, teacher_x_r, video_r_sigma
+                )
+            video_diff = student_video_pred.float() - teacher_video_pred.detach().float()
+        elif video_transition_param == 'x0':
+            sigma_r = video_r_sigma[:, None, :, None, None].to(student_v_at_r)
+            student_video_pred = student_x_r - sigma_r * student_v_at_r
+            teacher_video_pred = teacher_x_r - sigma_r * teacher_v_at_r
+            video_diff = student_video_pred.float() - teacher_video_pred.detach().float()
+        else:
+            video_diff = student_v_at_r.float() - teacher_v_at_r.detach().float()
+
+        if transition_loss_type == "huber":
+            abs_diff = video_diff.abs()
+            per_sample_loss = torch.where(
+                abs_diff < transition_huber_c,
+                0.5 * video_diff ** 2,
+                transition_huber_c * (abs_diff - 0.5 * transition_huber_c),
+            ).mean(dim=[1, 2, 3, 4])
+        else:
+            per_sample_loss = (video_diff ** 2).mean(dim=[1, 2, 3, 4])
+
+        weight_type = getattr(self.config, 'weight_type', 'uniform')
+        weight = self._get_timestep_weight(video_t.mean(dim=-1), weight_type).to(self.device)
+        video_transition_loss = (per_sample_loss * weight).mean()
+
+        local_fm_loss = torch.tensor(0.0, device=self.device)
+        local_fm_weight = getattr(self.config, 'local_fm_weight', 0.05)
+        if local_fm_weight > 0:
+            video_v_target_at_r = self.train_scheduler_latent.training_target(
+                batch['latents'], video_noise, video_r
+            )
+            local_fm_loss = (
+                student_v_at_r.float() - video_v_target_at_r.detach().float()
+            ).pow(2).mean()
+
+        opd_action_transition_loss = torch.tensor(0.0, device=self.device)
+        opd_action_local_fm_loss = torch.tensor(0.0, device=self.device)
+        use_opd_aux_action = getattr(self.config, 'opd_aux_action', True)
+        if use_opd_aux_action and (self.distill_action or self.action_aware):
+            action_noisy_ds = action_noisy_latents[:, :, ::_ACTION_DS]
+            video_context_r = student_x_r.detach()
+            from modules.model import FlexAttnFunc
+            action_r_ds = action_r[:, ::_ACTION_DS]
+            action_t_ds = action_t[:, ::_ACTION_DS]
+            action_frames_ds = action_noisy_ds.shape[2]
+            actions_mask_ds = actions_mask[:, :, ::_ACTION_DS]
+            actions_gt_ds = batch['actions'][:, :, ::_ACTION_DS]
+            mask = actions_mask_ds.float()
+            action_denom = (mask.sum() * actions_gt_ds.shape[1]).clamp(min=1)
+
+            def _build_action_rollout_input(action_x, action_timesteps):
+                action_input = {
+                    'latent_dict': {
+                        **input_dict['latent_dict'],
+                        'noisy_latents': video_context_r,
+                        'timesteps': video_r,
+                    },
+                    'action_dict': {
+                        'noisy_latents': action_x,
+                        'latent': actions_gt_ds,
+                        'timesteps': action_timesteps,
+                        'cond_timesteps': input_dict['action_dict']['cond_timesteps'][:, ::_ACTION_DS],
+                        'text_emb': input_dict['action_dict']['text_emb'],
+                    },
+                    'chunk_size': input_dict['chunk_size'],
+                    'window_size': input_dict['window_size'],
+                }
+                if 'grid_id' in input_dict['action_dict'] and input_dict['action_dict']['grid_id'] is not None:
+                    action_input['action_dict']['grid_id'] = _downsample_action_grid_id(
+                        input_dict['action_dict']['grid_id'], batch['actions'], _ACTION_DS)
+                if 'actions_mask' in input_dict['action_dict'] and input_dict['action_dict']['actions_mask'] is not None:
+                    action_input['action_dict']['actions_mask'] = actions_mask_ds
+                return action_input
+
+            def _init_action_mask(action_input):
+                _ld = action_input['latent_dict']
+                _ad = action_input['action_dict']
+                _total_length = (
+                    _ld['noisy_latents'].flatten(0, 1).shape[0] * 2 +
+                    _ad['noisy_latents'].flatten(0, 1).shape[0] * 2
+                )
+                _padded_length = (128 - _total_length % 128) % 128
+                FlexAttnFunc.init_mask(
+                    _ld['noisy_latents'].shape,
+                    _ad['noisy_latents'].shape,
+                    _padded_length,
+                    action_input['chunk_size'],
+                    window_size=action_input['window_size'],
+                    patch_size=self.patch_size,
+                    device=self.device,
+                )
+
+            def _student_action_forward(model, action_x, action_timesteps, action_r_timestep):
+                action_input = _build_action_rollout_input(action_x, action_timesteps)
+                _init_action_mask(action_input)
+                saved_blocks = None
+                if model is self.student and getattr(self, '_student_blocks_compiled', False):
+                    saved_blocks = list(self.student.blocks)
+                    for bi, block in enumerate(saved_blocks):
+                        if hasattr(block, '_orig_mod'):
+                            self.student.blocks[bi] = block._orig_mod
+                try:
+                    _, action_v_seq = model(
+                        action_input, train_mode=True,
+                        r_timestep=video_r,
+                        action_r_timestep=action_r_timestep,
+                    )
+                finally:
+                    if saved_blocks is not None:
+                        for bi, block in enumerate(saved_blocks):
+                            self.student.blocks[bi] = block
+                return self._extract_action_v(action_v_seq, action_frames_ds)
+
+            def _teacher_action_forward(action_x, action_timesteps, action_r_timestep):
+                teacher_input = _build_action_rollout_input(action_x, action_timesteps)
+                teacher_input['action_dict']['timesteps'] = action_timesteps
+                with torch.no_grad():
+                    _, _, action_v_cond = self._batched_cfg_forward(teacher_input, empty_emb)
+                    return self._extract_action_v(action_v_cond, action_frames_ds)
+
+            if self.distill_action:
+                with torch.no_grad():
+                    action_student_path = self._build_timestep_path(
+                        action_t_ds.float(), action_r_ds.float(), max(1, K_steps))
+                    student_action_x = action_noisy_ds
+                    for i in range(max(1, K_steps)):
+                        t_i = action_student_path[i]
+                        r_i = action_student_path[i + 1]
+                        action_v_i = _student_action_forward(self.student, student_action_x, t_i, r_i)
+                        sigma_i = t_i[:, None, :, None, None] / self.config.num_train_timesteps
+                        sigma_next = r_i[:, None, :, None, None] / self.config.num_train_timesteps
+                        student_action_x = student_action_x + action_v_i * (
+                            sigma_next.to(action_v_i) - sigma_i.to(action_v_i))
+                    student_action_x_r = student_action_x.detach()
+
+                    action_teacher_path = self._build_timestep_path(
+                        action_t_ds.float(), action_r_ds.float(), max(1, N_steps))
+                    teacher_action_x = action_noisy_ds
+                    for i in range(max(1, N_steps)):
+                        t_i = action_teacher_path[i]
+                        r_i = action_teacher_path[i + 1]
+                        action_v_i = _teacher_action_forward(teacher_action_x, t_i, r_i)
+                        sigma_i = t_i[:, None, :, None, None] / self.config.num_train_timesteps
+                        sigma_next = r_i[:, None, :, None, None] / self.config.num_train_timesteps
+                        teacher_action_x = teacher_action_x + action_v_i * (
+                            sigma_next.to(action_v_i) - sigma_i.to(action_v_i))
+                    teacher_action_x_r = teacher_action_x.detach()
+                    target_action_v = _teacher_action_forward(
+                        teacher_action_x_r, action_r_ds, action_r_ds)
+
+                student_action_v = _student_action_forward(
+                    self.student, student_action_x_r, action_r_ds, action_r_ds)
+                sigma_r_a_5d = action_r_sigma[:, None, ::_ACTION_DS, None, None].to(
+                    student_action_v)
+                student_action_pred = student_action_x_r - sigma_r_a_5d * student_action_v
+                target_action_pred = teacher_action_x_r - sigma_r_a_5d.to(
+                    target_action_v) * target_action_v
+
+                action_diff = (
+                    student_action_pred.float() * mask -
+                    target_action_pred.detach().float() * mask
+                )
+                opd_action_transition_loss = (action_diff ** 2).sum() / action_denom
+
+            if self.action_aware:
+                action_targets = self.train_scheduler_action.training_target(
+                    batch['actions'], action_noise, action_r)[:, :, ::_ACTION_DS]
+                if not self.distill_action:
+                    student_action_v = _student_action_forward(
+                        self.student, action_noisy_ds, action_t_ds, action_r_ds)
+                action_local_diff = (
+                    student_action_v.float() - action_targets.float().detach()
+                ) * mask
+                opd_action_local_fm_loss = (
+                    action_local_diff ** 2
+                ).sum() / action_denom
+
+        video_transition_weight = getattr(self.config, 'video_transition_weight', 1.0)
+        action_block_weight = getattr(self.config, 'action_block_weight', 1.0)
+        action_transition_weight = getattr(self.config, 'action_loss_weight', 1.0)
+        action_local_fm_weight = getattr(self.config, 'action_aware_weight', 0.0)
+        raw_aux_loss = (
+            video_transition_weight * video_transition_loss
+            + local_fm_weight * local_fm_loss
+            + action_block_weight * (
+                action_transition_weight * opd_action_transition_loss
+                + action_local_fm_weight * opd_action_local_fm_loss
+            )
+        )
+        opd_aux_weight = float(getattr(self.config, 'opd_aux_weight', 0.1))
+        weighted_aux_loss = raw_aux_loss * opd_aux_weight
+        loss = weighted_aux_loss / self.gradient_accumulation_steps
+
+        loss_clip_value = getattr(self.config, 'opd_aux_loss_clip_value', None)
+        if loss_clip_value is not None and getattr(self.config, 'loss_clip_enabled', True):
+            loss = torch.clamp(loss, min=0.0, max=loss_clip_value)
+
+        if not torch.isfinite(loss):
+            if self.config.rank == 0:
+                logger.warning(f"[step {self.step}] NaN/Inf OPD aux loss, skipping")
+            zero_loss = torch.zeros((), device=self.device)
+            return {
+                'loss': zero_loss,
+                'opd_aux_loss': weighted_aux_loss.detach(),
+                'opd_video_transition_loss': video_transition_loss.detach(),
+                'opd_local_fm_loss': local_fm_loss.detach(),
+                'opd_action_transition_loss': opd_action_transition_loss.detach(),
+                'opd_action_local_fm_loss': opd_action_local_fm_loss.detach(),
+                'should_sync': should_sync,
+                'skip_step': True,
+            }
+
+        loss.backward()
+
+        return {
+            'loss': loss.detach(),
+            'opd_aux_loss': weighted_aux_loss.detach(),
+            'opd_video_transition_loss': video_transition_loss.detach(),
+            'opd_local_fm_loss': local_fm_loss.detach(),
+            'opd_action_transition_loss': opd_action_transition_loss.detach(),
+            'opd_action_local_fm_loss': opd_action_local_fm_loss.detach(),
+            'rollout_steps': K_steps,
+            'teacher_steps': effective_teacher_steps,
             'should_sync': should_sync,
             'skip_step': False,
         }

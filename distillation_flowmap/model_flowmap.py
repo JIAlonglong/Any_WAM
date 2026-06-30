@@ -315,7 +315,14 @@ def patch_model_forward(model):
     model._time_embed = patched_time_embed
 
     @wraps(original_forward_train)
-    def patched_forward_train(input_dict, fdm=False, r_timestep=None, action_r_timestep=None, update_cache=0):
+    def patched_forward_train(
+        input_dict,
+        fdm=False,
+        r_timestep=None,
+        action_r_timestep=None,
+        update_cache=0,
+        cache_name="pos",
+    ):
         """为 forward_train 添加 r_timestep 和 action_r_timestep 支持。
 
         当 r_timestep 不为 None 时，将其传递给 latent 的 _time_embed 以启用 Flow Map 蒸馏。
@@ -329,6 +336,7 @@ def patch_model_forward(model):
             action_r_timestep: action 的独立参考时间步，形状 [B, T]，
                 为 None 时退化为使用 r_timestep
             update_cache: KV cache 模式 (0=只读, 1=追加, 2=覆盖)
+            cache_name: KV cache 名称
         """
         # 转换 dtype 到局部变量，避免原地修改调用者的 input_dict
         latent_dict = {
@@ -461,6 +469,7 @@ def patch_model_forward(model):
                 timestep_proj,
                 rotary_emb,
                 update_cache=update_cache,
+                cache_name=cache_name,
             )
             if i == 0:
                 pass  # Removed debug print
@@ -522,6 +531,7 @@ def patch_model_forward(model):
                 input_dict, fdm=fdm, r_timestep=r_timestep,
                 action_r_timestep=action_r_timestep,
                 update_cache=update_cache,
+                cache_name=cache_name,
             )
         # Non-train mode: inject r_timestep via model attributes so
         # patched_time_embed can pick them up inside original_forward.

@@ -324,6 +324,13 @@ class VideoGenerator:
             adapter_state = load_file(adapter_weights_path)
             model_keys = set(self.transformer.state_dict().keys())
             loadable = {k: v for k, v in adapter_state.items() if k in model_keys}
+            dropped = sorted(set(adapter_state.keys()) - set(loadable.keys()))
+            if dropped:
+                preview = ", ".join(dropped[:8])
+                raise RuntimeError(
+                    f"LoRA checkpoint has {len(dropped)} keys that do not match the model "
+                    f"(first keys: {preview}). Refusing to run with a partially loaded adapter."
+                )
             missing, unexpected = self.transformer.load_state_dict(loadable, strict=False)
             logger.info(
                 f"LoRA weights: {len(loadable)} keys loaded, "
@@ -349,6 +356,7 @@ class VideoGenerator:
             "num_train_timesteps": ckpt_config.get("num_train_timesteps", 1000),
             "snr_shift": ckpt_config.get("snr_shift", self.config.snr_shift),
             "action_snr_shift": ckpt_config.get("action_snr_shift", self.config.action_snr_shift),
+            "action_downsample_factor": ckpt_config.get("action_downsample_factor", 4),
         })
         self.flowmap_kwargs = create_inference_kwargs(_inf_cfg)
         logger.info("FlowMap setup complete.")
@@ -584,8 +592,10 @@ class VideoGenerator:
             self.config.frame_chunk_size * self.latent_height * self.latent_width
         ) // (patch_size[0] * patch_size[1] * patch_size[2])
         action_token_per_chunk = self.config.frame_chunk_size * self.action_per_frame
-        # Standard denoising always uses _repeat_input_for_cfg → B=2 when CFG
-        _cache_bs = 2 if self.use_cfg else 1
+        # Teacher standard denoising keeps CFG as a real batch. Student FlowMap
+        # joint inference calls forward_train, which packs CFG samples into one
+        # long sequence, so the attention cache batch dimension must stay 1.
+        _cache_bs = 1 if self.mode == "student" else (2 if self.use_cfg else 1)
         self.transformer.create_empty_cache(
             self.cache_name, self.config.attn_window,
             latent_token_per_chunk, action_token_per_chunk,
@@ -744,97 +754,33 @@ class VideoGenerator:
             device=self.device, dtype=self.dtype,
         )
 
-        video_inference_step = self.num_steps
-        action_inference_step = self.config.action_num_inference_steps
-        video_step = self.config.video_exec_step
+        logger.info(
+            "Student FlowMap joint inference: video_steps=%s, action_steps=%s, frame_st_id=%s",
+            self.num_steps,
+            self.config.action_num_inference_steps,
+            frame_st_id,
+        )
+        init_latent = self.init_latent if frame_st_id == 0 else None
+        latents, actions = flowmap_inference(
+            model=self.transformer,
+            noisy_latent=latents,
+            noisy_action=actions,
+            text_emb=self.prompt_embeds,
+            empty_emb=self.negative_prompt_embeds,
+            num_steps=self.num_steps,
+            action_num_steps=self.config.action_num_inference_steps,
+            cfg_scale=self.config.guidance_scale,
+            init_latent=init_latent,
+            action_mask=self.action_mask,
+            update_cache=1,
+            cache_name=self.cache_name,
+            frame_st_id=frame_st_id,
+            **self.flowmap_kwargs,
+        )
 
-        self.scheduler.set_timesteps(video_inference_step)
-        self.action_scheduler.set_timesteps(action_inference_step)
-        timesteps = self.scheduler.timesteps
-        action_timesteps = self.action_scheduler.timesteps
-
-        timesteps = F.pad(timesteps, (0, 1), mode="constant", value=0)
-        if video_step != -1:
-            timesteps = timesteps[:video_step]
-        action_timesteps = F.pad(action_timesteps, (0, 1), mode="constant", value=0)
-
-        init_latent = self.init_latent
-
-        # --- Video denoising loop (8 steps, with delta_embedder) ---
-        for i, t in enumerate(tqdm(timesteps, desc=f"Video (chunk {frame_st_id})")):
-            last_step = i == len(timesteps) - 1
-            latent_cond = init_latent[:, :, 0:1].to(self.dtype) if frame_st_id == 0 else None
-
-            # r_timestep: target noise level for FlowMap delta_embedder
-            # Batch must match CFG (2x when guidance_scale > 1)
-            r_t = timesteps[i + 1] if not last_step else 0.0
-            _b = 2 if self.use_cfg else 1
-            r_tensor = torch.full((_b, frame_chunk_size), r_t, device=self.device, dtype=self.dtype)
-            if frame_st_id == 0:
-                r_tensor[:, 0:1] = 0.0  # first frame stays clean
-
-            input_dict = self._prepare_latent_input(
-                latents, None, t, t, latent_cond, None, frame_st_id=frame_st_id,
-            )
-
-            video_noise_pred = self.transformer(
-                self._repeat_input_for_cfg(input_dict["latent_res_lst"]),
-                update_cache=1 if last_step else 0,
-                cache_name=self.cache_name,
-                action_mode=False,
-                r_timestep=r_tensor,
-            )
-
-            if not last_step or video_step != -1:
-                video_noise_pred = data_seq_to_patch(
-                    self.config.patch_size, video_noise_pred,
-                    frame_chunk_size, self.latent_height, self.latent_width,
-                    batch_size=2 if self.use_cfg else 1,
-                )
-                if self.config.guidance_scale > 1:
-                    video_noise_pred = (
-                        video_noise_pred[1:]
-                        + self.config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
-                    )
-                else:
-                    video_noise_pred = video_noise_pred[:1]
-                latents = self.scheduler.step(video_noise_pred, t, latents, return_dict=False)
-
-            latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
-
-        # --- Action denoising loop (50 steps, no delta_embedder for action) ---
-        for i, t in enumerate(tqdm(action_timesteps, desc=f"Action (chunk {frame_st_id})")):
-            last_step = i == len(action_timesteps) - 1
-            action_cond = torch.zeros(
-                [1, self.config.action_dim, 1, self.action_per_frame, 1],
-                device=self.device, dtype=self.dtype,
-            ) if frame_st_id == 0 else None
-
-            input_dict = self._prepare_latent_input(
-                None, actions, t, t, None, action_cond, frame_st_id=frame_st_id,
-            )
-            action_noise_pred = self.transformer(
-                self._repeat_input_for_cfg(input_dict["action_res_lst"]),
-                update_cache=1 if last_step else 0,
-                cache_name=self.cache_name,
-                action_mode=True,
-            )
-
-            if not last_step:
-                action_noise_pred = rearrange(
-                    action_noise_pred, "b (f n) c -> b c f n 1", f=frame_chunk_size
-                )
-                if self.config.action_guidance_scale > 1:
-                    action_noise_pred = (
-                        action_noise_pred[1:]
-                        + self.config.action_guidance_scale
-                        * (action_noise_pred[:1] - action_noise_pred[1:])
-                    )
-                else:
-                    action_noise_pred = action_noise_pred[:1]
-                actions = self.action_scheduler.step(action_noise_pred, t, actions, return_dict=False)
-
-            actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+        if frame_st_id == 0:
+            latents[:, :, 0:1] = self.init_latent[:, :, 0:1].to(self.dtype)
+            actions[:, :, 0:1] = 0.0
 
         actions[:, ~self.action_mask] *= 0
         actions_np = self.postprocess_action(actions)
@@ -940,6 +886,10 @@ def main():
         help="Override inference steps (teacher=20, student=8 by default)",
     )
     parser.add_argument(
+        "--action-num-steps", type=int, default=None,
+        help="Override action inference steps (default: keep config value)",
+    )
+    parser.add_argument(
         "--example-dir", type=str,
         default=None,  # auto-selected by --env
         help="Directory containing observation PNG files",
@@ -1001,13 +951,16 @@ def main():
     config.save_root = os.path.dirname(args.output) or "."
     if args.prompt is not None:
         config.prompt = args.prompt
+    if args.action_num_steps is not None:
+        config.action_num_inference_steps = args.action_num_steps
 
     # Set num steps
+    generator_num_steps = args.num_steps
     if args.mode == "teacher":
         if args.num_steps is not None:
             config.num_inference_steps = args.num_steps
     else:
-        num_steps = args.num_steps or (25 if env_type == "robotwin" else 8)
+        generator_num_steps = args.num_steps or (25 if env_type == "robotwin" else 8)
 
     # Override checkpoint for student
     checkpoint_path = args.checkpoint_path if args.mode == "student" else None
@@ -1021,7 +974,7 @@ def main():
         config=config,
         mode=args.mode,
         checkpoint_path=checkpoint_path,
-        num_steps=args.num_steps,
+        num_steps=generator_num_steps,
     )
     gen.generate(output_path=args.output)
     logger.info("Done!")

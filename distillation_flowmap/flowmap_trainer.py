@@ -146,6 +146,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.use_dmd = getattr(config, 'use_dmd', False)
         self.use_onpolicy_transition = getattr(config, 'use_onpolicy_transition', False)
         self.use_opd_aux = getattr(config, 'use_opd_aux', False)
+        self.opd_aux_variant = str(getattr(config, 'opd_aux_variant', 'default')).lower()
+        if self.opd_aux_variant not in ('default', 'kto_paopd', 'kto_paopd_norm_focal'):
+            raise ValueError(
+                f"Unsupported opd_aux_variant={self.opd_aux_variant!r}; "
+                "expected 'default', 'kto_paopd', or 'kto_paopd_norm_focal'."
+            )
         self.discriminator = None
         self.discriminator_optimizer = None
 
@@ -218,6 +224,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info(f"  use_lora           = {self.use_lora} (LoRA 微调)")
             logger.info(f"  use_opd_aux        = {self.use_opd_aux} (teacher-transition auxiliary)")
             if self.use_opd_aux:
+                logger.info(f"  opd_aux_variant    = {self.opd_aux_variant}")
                 logger.info(f"  opd_aux_weight     = {getattr(config, 'opd_aux_weight', 0.1)}")
                 logger.info(f"  opd_aux_interval   = {getattr(config, 'opd_aux_interval', 1)}")
                 logger.info(f"  flowmap_aux_weight = {getattr(config, 'flowmap_aux_weight', 1.0)}")
@@ -1925,6 +1932,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         f"{getattr(config, 'dmd_rollout_steps_max', 8)}]")
         if self.use_opd_aux:
             logger.info(f"  OPD aux enabled: weight={getattr(config, 'opd_aux_weight', 0.1)}, "
+                        f"variant={self.opd_aux_variant}, "
                         f"warmup={getattr(config, 'opd_aux_warmup_steps', 0)}, "
                         f"interval={getattr(config, 'opd_aux_interval', 1)}, "
                         f"prob={getattr(config, 'opd_aux_prob', 1.0)}, "
@@ -2030,6 +2038,17 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         acc_opd_anchor_scales = []
         acc_opd_transition_group_ratios = []
         acc_opd_anchor_group_ratios = []
+        acc_kto_good_ratios = []
+        acc_kto_weight_means = []
+        acc_kto_weight_mins = []
+        acc_kto_weight_maxs = []
+        acc_kto_thresholds = []
+        acc_kto_main_actives = []
+        acc_kto_main_good_ratios = []
+        acc_kto_main_weight_means = []
+        acc_kto_main_weight_mins = []
+        acc_kto_main_weight_maxs = []
+        acc_kto_main_thresholds = []
         step_in_acc = 0              # 当前累积步数
         # DMD 参数
         dmd_weight = getattr(config, 'dmd_weight', 0.1)
@@ -2076,7 +2095,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         use_opd_aux_now = torch.rand(1).item() < opd_aux_prob
 
             if use_opd_aux_now:
-                opd_aux_result = self._opd_aux_transition_step(batch, step_in_acc)
+                if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
+                    opd_aux_result = self._opd_aux_transition_step_kto_paopd(batch, step_in_acc)
+                else:
+                    opd_aux_result = self._opd_aux_transition_step(batch, step_in_acc)
                 result["loss"] = result["loss"] + opd_aux_result.get("loss", zero_tensor)
                 result["skip_step"] = (
                     result.get("skip_step", False) or
@@ -2163,6 +2185,27 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             acc_opd_anchor_group_ratios.append(
                 opd_aux_result.get("opd_anchor_group_ratio", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
+            acc_kto_good_ratios.append(
+                opd_aux_result.get("kto_good_ratio", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_kto_weight_means.append(
+                opd_aux_result.get("kto_weight_mean", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_kto_weight_mins.append(
+                opd_aux_result.get("kto_weight_min", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_kto_weight_maxs.append(
+                opd_aux_result.get("kto_weight_max", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_kto_thresholds.append(
+                opd_aux_result.get("kto_threshold", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_kto_main_actives.append(result.get("kto_main_active", zero_tensor))
+            acc_kto_main_good_ratios.append(result.get("kto_main_good_ratio", zero_tensor))
+            acc_kto_main_weight_means.append(result.get("kto_main_weight_mean", zero_tensor))
+            acc_kto_main_weight_mins.append(result.get("kto_main_weight_min", zero_tensor))
+            acc_kto_main_weight_maxs.append(result.get("kto_main_weight_max", zero_tensor))
+            acc_kto_main_thresholds.append(result.get("kto_main_threshold", zero_tensor))
             step_in_acc += 1
 
             # ---- 第二阶段：DMD（条件满足时执行）----
@@ -2240,7 +2283,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
                 # 计算平均损失（跨所有进程）
                 lr = self.lr_scheduler.get_last_lr()[0]
-                metric_values = torch.stack([
+                metric_tensors = [
                     torch.stack(acc_losses).sum(),
                     torch.stack(acc_video_losses).sum(),
                     torch.stack(acc_video_local_fm_losses).sum(),
@@ -2272,7 +2315,28 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     torch.stack(acc_opd_anchor_scales).sum(),
                     torch.stack(acc_opd_transition_group_ratios).sum(),
                     torch.stack(acc_opd_anchor_group_ratios).sum(),
-                ]).float()
+                ]
+                kto_main_enabled = bool(getattr(self.config, 'kto_main_video_reweight', False))
+                if kto_main_enabled:
+                    metric_tensors.extend([
+                        torch.stack(acc_kto_main_actives).sum(),
+                        torch.stack(acc_kto_main_good_ratios).sum(),
+                        torch.stack(acc_kto_main_weight_means).sum(),
+                        torch.stack(acc_kto_main_weight_mins).sum(),
+                        torch.stack(acc_kto_main_weight_maxs).sum(),
+                        torch.stack(acc_kto_main_thresholds).sum(),
+                    ])
+                if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
+                    metric_tensors.extend([
+                        torch.stack(acc_kto_good_ratios).sum(),
+                        torch.stack(acc_kto_weight_means).sum(),
+                        torch.stack(acc_kto_weight_mins).sum(),
+                        torch.stack(acc_kto_weight_maxs).sum(),
+                        torch.stack(acc_kto_thresholds).sum(),
+                    ])
+                metric_values = torch.stack(metric_tensors).float()
+                metric_results = dist_mean(metric_values).tolist()
+                base_metric_count = 31
                 (
                     avg_loss,
                     avg_video_loss,
@@ -2305,7 +2369,39 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     avg_opd_anchor_scale,
                     avg_opd_transition_group_ratio,
                     avg_opd_anchor_group_ratio,
-                ) = dist_mean(metric_values).tolist()
+                ) = metric_results[:base_metric_count]
+                metric_cursor = base_metric_count
+                if kto_main_enabled:
+                    (
+                        avg_kto_main_active,
+                        avg_kto_main_good_ratio,
+                        avg_kto_main_weight_mean,
+                        avg_kto_main_weight_min,
+                        avg_kto_main_weight_max,
+                        avg_kto_main_threshold,
+                    ) = metric_results[metric_cursor:metric_cursor + 6]
+                    metric_cursor += 6
+                else:
+                    avg_kto_main_active = 0.0
+                    avg_kto_main_good_ratio = 0.0
+                    avg_kto_main_weight_mean = 0.0
+                    avg_kto_main_weight_min = 0.0
+                    avg_kto_main_weight_max = 0.0
+                    avg_kto_main_threshold = 0.0
+                if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
+                    (
+                        avg_kto_good_ratio,
+                        avg_kto_weight_mean,
+                        avg_kto_weight_min,
+                        avg_kto_weight_max,
+                        avg_kto_threshold,
+                    ) = metric_results[metric_cursor:]
+                else:
+                    avg_kto_good_ratio = 0.0
+                    avg_kto_weight_mean = 0.0
+                    avg_kto_weight_min = 0.0
+                    avg_kto_weight_max = 0.0
+                    avg_kto_threshold = 0.0
                 action_total_raw = (
                     avg_action_loss
                     + self.gt_regression_weight * avg_gt_regression_loss
@@ -2344,6 +2440,17 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_opd_anchor_scales = []
                 acc_opd_transition_group_ratios = []
                 acc_opd_anchor_group_ratios = []
+                acc_kto_good_ratios = []
+                acc_kto_weight_means = []
+                acc_kto_weight_mins = []
+                acc_kto_weight_maxs = []
+                acc_kto_thresholds = []
+                acc_kto_main_actives = []
+                acc_kto_main_good_ratios = []
+                acc_kto_main_weight_means = []
+                acc_kto_main_weight_mins = []
+                acc_kto_main_weight_maxs = []
+                acc_kto_main_thresholds = []
                 step_in_acc = 0
 
                 # 定期清理显存；只在真正清理时同步，避免每个 optimizer step 强制等待 GPU。
@@ -2377,6 +2484,14 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         else:
                             postfix["v"] = f"{avg_video_loss:.4f}"
                             log_dict["loss/video_consistency"] = avg_video_loss
+                    if kto_main_enabled:
+                        postfix["mkto"] = f"{avg_kto_main_good_ratio:.2f}/{avg_kto_main_weight_mean:.2f}"
+                        log_dict["kto_main/active"] = avg_kto_main_active
+                        log_dict["kto_main/good_ratio"] = avg_kto_main_good_ratio
+                        log_dict["kto_main/adaptive_weight_mean"] = avg_kto_main_weight_mean
+                        log_dict["kto_main/adaptive_weight_min"] = avg_kto_main_weight_min
+                        log_dict["kto_main/adaptive_weight_max"] = avg_kto_main_weight_max
+                        log_dict["kto_main/threshold"] = avg_kto_main_threshold
                     if self.distill_action:
                         postfix["a"] = f"{avg_action_loss:.4f}"
                         postfix["at"] = f"{action_total:.4f}"
@@ -2413,6 +2528,13 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         log_dict["loss_ratio/opd_video_transition"] = avg_opd_video_transition_ratio
                         log_dict["loss_ratio/opd_endpoint_aux"] = avg_opd_endpoint_aux_ratio
                         log_dict["loss_ratio/opd_local_fm"] = avg_opd_local_fm_ratio
+                        if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
+                            postfix["kto"] = f"{avg_kto_good_ratio:.2f}/{avg_kto_weight_mean:.2f}"
+                            log_dict["kto/good_ratio"] = avg_kto_good_ratio
+                            log_dict["kto/adaptive_weight_mean"] = avg_kto_weight_mean
+                            log_dict["kto/adaptive_weight_min"] = avg_kto_weight_min
+                            log_dict["kto/adaptive_weight_max"] = avg_kto_weight_max
+                            log_dict["kto/threshold"] = avg_kto_threshold
                         if self.distill_action:
                             postfix["oat"] = f"{avg_opd_action_transition_loss:.2e}"
                             postfix["woat"] = f"{avg_opd_action_transition_contrib:.2e}"

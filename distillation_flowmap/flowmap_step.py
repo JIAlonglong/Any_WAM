@@ -27,6 +27,7 @@ Flow Map 蒸馏的训练步实现（FlowMapStepMixin）。
 """
 
 import contextlib
+import math
 import time
 import torch
 import torch.distributed as dist
@@ -60,6 +61,10 @@ from einops import rearrange
 
 from utils import data_seq_to_patch, logger
 from distillation.consistency import scalings_for_boundary_conditions
+from distillation_flowmap.kto_reweighting import (
+    compute_normalized_focal_weights,
+    piecewise_linear_scale,
+)
 
 
 class FlowMapStepMixin:
@@ -1548,6 +1553,12 @@ class FlowMapStepMixin:
         weight_type = getattr(self.config, 'weight_type', 'uniform')
         # video_t 形状为 [B, T]，取帧平均得到 [B] 用于 per-sample 加权
         weight = self._get_timestep_weight(video_t.mean(dim=-1), weight_type).to(self.device)  # [B]
+        kto_main_active = torch.tensor(0.0, device=self.device)
+        kto_main_good_ratio = torch.tensor(0.0, device=self.device)
+        kto_main_weight_mean = torch.tensor(0.0, device=self.device)
+        kto_main_weight_min = torch.tensor(0.0, device=self.device)
+        kto_main_weight_max = torch.tensor(0.0, device=self.device)
+        kto_main_threshold = torch.tensor(0.0, device=self.device)
 
         # 对视频 loss 按样本加权
         if self.distill_video:
@@ -1558,14 +1569,69 @@ class FlowMapStepMixin:
             if loss_type == "huber":
                 # Huber loss: |x| < c -> 0.5*x^2; otherwise c*(|x|-0.5*c)
                 abs_diff = video_diff.abs()
-                per_sample_video_loss = torch.where(
+                video_token_loss = torch.where(
                     abs_diff < huber_c,
                     0.5 * video_diff ** 2,
                     huber_c * (abs_diff - 0.5 * huber_c)
-                ).mean(dim=[1, 2, 3, 4])  # [B]
+                ).mean(dim=1)
+                per_sample_video_loss = video_token_loss.flatten(1).mean(dim=1)  # [B]
             else:
                 # MSE loss（原始行为）
-                per_sample_video_loss = (video_diff ** 2).mean(dim=[1, 2, 3, 4])  # [B]
+                video_token_loss = (video_diff ** 2).mean(dim=1)
+                per_sample_video_loss = video_token_loss.flatten(1).mean(dim=1)  # [B]
+
+            if bool(getattr(self.config, 'kto_main_video_reweight', False)):
+                with torch.no_grad():
+                    token_error = video_diff.detach().float().abs().mean(dim=1)
+                    token_ref = video_target.detach().float().abs().mean(dim=1)
+                    threshold_tensor = None
+                    if bool(getattr(self.config, 'kto_main_use_ema_threshold', True)):
+                        error_ratio = token_error / (
+                            token_ref + float(getattr(self.config, 'kto_eps', 1e-5)))
+                        q = float(getattr(self.config, 'kto_main_threshold_quantile', 0.70))
+                        current_threshold = torch.quantile(
+                            error_ratio.detach().float().flatten(), q)
+                        ema_decay = float(getattr(
+                            self.config, 'kto_main_threshold_ema_decay', 0.90))
+                        ema_decay = min(max(ema_decay, 0.0), 0.9999)
+                        previous_threshold = getattr(
+                            self, '_kto_main_error_threshold_ema', None)
+                        if previous_threshold is None:
+                            threshold_tensor = current_threshold.detach()
+                        else:
+                            threshold_tensor = (
+                                previous_threshold.to(current_threshold.device) * ema_decay
+                                + current_threshold.detach() * (1.0 - ema_decay)
+                            )
+                        self._kto_main_error_threshold_ema = threshold_tensor.detach()
+
+                    main_focal = compute_normalized_focal_weights(
+                        token_error,
+                        token_ref,
+                        threshold=threshold_tensor,
+                        threshold_quantile=float(getattr(
+                            self.config, 'kto_main_threshold_quantile', 0.70)),
+                        eps=float(getattr(self.config, 'kto_eps', 1e-5)),
+                        alpha=float(getattr(self.config, 'kto_main_alpha', 1.0)),
+                        temperature=float(getattr(
+                            self.config, 'kto_main_temperature',
+                            getattr(self.config, 'kto_temperature', 0.10))),
+                        min_weight=float(getattr(
+                            self.config, 'kto_main_min_weight',
+                            getattr(self.config, 'kto_min_weight', 0.5))),
+                        max_weight=float(getattr(
+                            self.config, 'kto_main_max_weight',
+                            getattr(self.config, 'kto_max_weight', 1.8))),
+                    )
+                    kto_main_active = torch.tensor(1.0, device=self.device)
+                    kto_main_good_ratio = main_focal.hard_ratio
+                    kto_main_weight_mean = main_focal.weights.float().mean()
+                    kto_main_weight_min = main_focal.weights.float().min()
+                    kto_main_weight_max = main_focal.weights.float().max()
+                    kto_main_threshold = main_focal.threshold.float().mean()
+                per_sample_video_loss = (
+                    video_token_loss * main_focal.weights.detach()
+                ).flatten(1).mean(dim=1)
 
             # AnyFlow 技巧：用扩散样本的 loss 均值缩放非扩散样本
             # 这有助于平衡不同模式的梯度贡献
@@ -1621,6 +1687,12 @@ class FlowMapStepMixin:
                 "action_local_fm_loss": action_local_fm_loss.detach() if self.action_aware else action_local_fm_loss,
                 "action_aware_loss": action_aware_loss.detach() if self.action_aware else action_aware_loss,
                 "gt_regression_loss": gt_regression_loss.detach() if self.distill_action else gt_regression_loss,
+                "kto_main_active": kto_main_active.detach(),
+                "kto_main_good_ratio": kto_main_good_ratio.detach(),
+                "kto_main_weight_mean": kto_main_weight_mean.detach(),
+                "kto_main_weight_min": kto_main_weight_min.detach(),
+                "kto_main_weight_max": kto_main_weight_max.detach(),
+                "kto_main_threshold": kto_main_threshold.detach(),
                 "should_sync": should_sync,
                 "skip_step": True,
             }
@@ -1635,6 +1707,12 @@ class FlowMapStepMixin:
             "action_local_fm_loss": action_local_fm_loss.detach() if self.action_aware else action_local_fm_loss,
             "action_aware_loss": action_aware_loss.detach() if self.action_aware else action_aware_loss,
             "gt_regression_loss": gt_regression_loss.detach() if self.distill_action else gt_regression_loss,
+            "kto_main_active": kto_main_active.detach(),
+            "kto_main_good_ratio": kto_main_good_ratio.detach(),
+            "kto_main_weight_mean": kto_main_weight_mean.detach(),
+            "kto_main_weight_min": kto_main_weight_min.detach(),
+            "kto_main_weight_max": kto_main_weight_max.detach(),
+            "kto_main_threshold": kto_main_threshold.detach(),
             "should_sync": should_sync,
             "skip_step": False,
         }
@@ -2418,7 +2496,14 @@ class FlowMapStepMixin:
             'skip_step': False,
         }
 
-    def _opd_aux_transition_step(self, batch, batch_idx):
+    def _opd_aux_transition_step_kto_paopd(self, batch, batch_idx):
+        return self._opd_aux_transition_step(
+            batch,
+            batch_idx,
+            kto_paopd=True,
+        )
+
+    def _opd_aux_transition_step(self, batch, batch_idx, kto_paopd=False):
         """
         Auxiliary teacher-transition loss on top of the regular FlowMap step.
 
@@ -2558,6 +2643,11 @@ class FlowMapStepMixin:
 
         opd_action_transition_loss = torch.tensor(0.0, device=self.device)
         opd_action_local_fm_loss = torch.tensor(0.0, device=self.device)
+        kto_good_ratio = torch.tensor(0.0, device=self.device)
+        kto_weight_mean = torch.tensor(0.0, device=self.device)
+        kto_weight_min = torch.tensor(0.0, device=self.device)
+        kto_weight_max = torch.tensor(0.0, device=self.device)
+        kto_threshold_value = torch.tensor(0.0, device=self.device)
         use_opd_aux_action = getattr(self.config, 'opd_aux_action', True)
         action_opd_active = use_opd_aux_action and (self.distill_action or self.action_aware)
         target_action_v_from_fused = None
@@ -2845,7 +2935,141 @@ class FlowMapStepMixin:
 
         weight_type = getattr(self.config, 'weight_type', 'uniform')
         weight = self._get_timestep_weight(video_t.mean(dim=-1), weight_type).to(self.device)
-        video_transition_loss = (per_sample_loss * weight).mean()
+        if kto_paopd and bool(getattr(self.config, 'kto_adaptive', True)):
+            kto_eps = float(getattr(self.config, 'kto_eps', 1e-5))
+            reweight_mode = str(getattr(self.config, 'kto_reweight_mode', 'hard')).lower()
+            kto_video_loss_scale = 1.0
+
+            if transition_loss_type == "huber":
+                token_loss = torch.where(
+                    abs_diff < transition_huber_c,
+                    0.5 * video_diff ** 2,
+                    transition_huber_c * (abs_diff - 0.5 * transition_huber_c),
+                ).mean(dim=1)
+            else:
+                token_loss = (video_diff ** 2).mean(dim=1)
+
+            with torch.no_grad():
+                if video_transition_param == 'velocity':
+                    teacher_ref = teacher_v_at_r.detach().float()
+                else:
+                    teacher_ref = teacher_video_pred.detach().float()
+                token_error = video_diff.detach().float().abs().mean(dim=1)
+                token_teacher_ref = teacher_ref.abs().mean(dim=1)
+                if reweight_mode in ('normalized_focal', 'norm_focal'):
+                    fixed_threshold = getattr(self.config, 'kto_threshold', None)
+                    threshold_tensor = None
+                    if fixed_threshold is not None:
+                        threshold_tensor = torch.as_tensor(
+                            fixed_threshold,
+                            device=token_error.device,
+                            dtype=token_error.dtype,
+                        )
+                    elif bool(getattr(self.config, 'kto_use_ema_threshold', True)):
+                        error_ratio = token_error / (token_teacher_ref + kto_eps)
+                        q = float(getattr(self.config, 'kto_threshold_quantile', 0.70))
+                        current_threshold = torch.quantile(
+                            error_ratio.detach().float().flatten(), q
+                        )
+                        ema_decay = float(getattr(self.config, 'kto_threshold_ema_decay', 0.90))
+                        ema_decay = min(max(ema_decay, 0.0), 0.9999)
+                        previous_threshold = getattr(self, '_kto_error_threshold_ema', None)
+                        if previous_threshold is None:
+                            threshold_tensor = current_threshold.detach()
+                        else:
+                            threshold_tensor = (
+                                previous_threshold.to(current_threshold.device) * ema_decay
+                                + current_threshold.detach() * (1.0 - ema_decay)
+                            )
+                        self._kto_error_threshold_ema = threshold_tensor.detach()
+
+                    alpha = float(getattr(self.config, 'kto_alpha', 1.0))
+                    warmup_steps = int(getattr(self.config, 'kto_warmup_steps', 0))
+                    ramp_steps = int(getattr(self.config, 'kto_ramp_steps', 0))
+                    current_step = int(getattr(self, 'step', 0))
+                    if current_step < warmup_steps:
+                        effective_alpha = 0.0
+                    elif ramp_steps > 0:
+                        effective_alpha = alpha * min(
+                            1.0,
+                            float(current_step - warmup_steps + 1) / float(ramp_steps),
+                        )
+                    else:
+                        effective_alpha = alpha
+                    decay_hold_steps = int(getattr(
+                        self.config, 'kto_alpha_decay_hold_steps', -1))
+                    if decay_hold_steps >= 0:
+                        decay_scale = piecewise_linear_scale(
+                            current_step,
+                            start=1.0,
+                            end=0.0,
+                            hold_steps=decay_hold_steps,
+                            ramp_steps=int(getattr(
+                                self.config, 'kto_alpha_decay_ramp_steps', 0)),
+                        )
+                        effective_alpha = effective_alpha * decay_scale
+
+                    focal = compute_normalized_focal_weights(
+                        token_error,
+                        token_teacher_ref,
+                        threshold=threshold_tensor,
+                        threshold_quantile=float(getattr(
+                            self.config, 'kto_threshold_quantile', 0.70)),
+                        eps=kto_eps,
+                        alpha=effective_alpha,
+                        temperature=float(getattr(self.config, 'kto_temperature', 0.10)),
+                        min_weight=float(getattr(self.config, 'kto_min_weight', 0.5)),
+                        max_weight=float(getattr(self.config, 'kto_max_weight', 1.8)),
+                    )
+                    token_weights = focal.weights
+                    kto_good_ratio = focal.hard_ratio
+                    kto_weight_mean = token_weights.float().mean()
+                    kto_weight_min = token_weights.float().min()
+                    kto_weight_max = token_weights.float().max()
+                    kto_threshold_value = focal.threshold.float().mean()
+                    kto_video_loss_scale = piecewise_linear_scale(
+                        current_step,
+                        start=float(getattr(self.config, 'kto_video_scale_start', 0.65)),
+                        end=float(getattr(self.config, 'kto_video_scale_end', 1.0)),
+                        hold_steps=int(getattr(self.config, 'kto_video_scale_hold_steps', 25)),
+                        ramp_steps=int(getattr(self.config, 'kto_video_scale_ramp_steps', 25)),
+                    )
+                else:
+                    good_weight_value = float(getattr(self.config, 'kto_good_weight', 0.3))
+                    bad_weight_value = float(getattr(self.config, 'kto_bad_weight', 1.0))
+                    if not math.isfinite(good_weight_value) or not math.isfinite(bad_weight_value):
+                        raise ValueError("kto_good_weight and kto_bad_weight must be finite")
+                    if good_weight_value < 0.0 or bad_weight_value < 0.0:
+                        raise ValueError("kto_good_weight and kto_bad_weight must be non-negative")
+                    token_similarity = (
+                        1.0 - token_error / (token_teacher_ref + kto_eps)
+                    ).clamp(0.0, 1.0)
+                    threshold = getattr(self.config, 'kto_threshold', None)
+                    if threshold is None:
+                        threshold_tensor = token_similarity.median()
+                    else:
+                        threshold_tensor = torch.as_tensor(
+                            threshold,
+                            device=token_similarity.device,
+                            dtype=token_similarity.dtype,
+                        )
+                    threshold_tensor = threshold_tensor.clamp(1e-6, 1.0)
+                    is_good = token_similarity > threshold_tensor
+                    token_weights = torch.where(
+                        is_good,
+                        torch.full_like(token_similarity, good_weight_value),
+                        torch.full_like(token_similarity, bad_weight_value),
+                    )
+                    kto_good_ratio = is_good.float().mean()
+                    kto_weight_mean = token_weights.mean()
+                    kto_weight_min = token_weights.min()
+                    kto_weight_max = token_weights.max()
+                    kto_threshold_value = threshold_tensor.float().mean()
+
+            per_sample_loss = (token_loss * token_weights.detach()).flatten(1).mean(dim=1)
+            video_transition_loss = (per_sample_loss * weight).mean() * kto_video_loss_scale
+        else:
+            video_transition_loss = (per_sample_loss * weight).mean()
 
         opd_endpoint_aux_loss = torch.tensor(0.0, device=self.device)
         opd_endpoint_aux_weight = float(getattr(self.config, 'opd_endpoint_aux_weight', 0.0))
@@ -2992,7 +3216,7 @@ class FlowMapStepMixin:
             if self.config.rank == 0:
                 logger.warning(f"[step {self.step}] NaN/Inf OPD aux loss, skipping")
             zero_loss = torch.zeros((), device=self.device)
-            return {
+            result = {
                 'loss': zero_loss,
                 'opd_aux_loss': weighted_aux_loss.detach(),
                 'opd_video_transition_loss': video_transition_loss.detach(),
@@ -3019,6 +3243,15 @@ class FlowMapStepMixin:
                 'should_sync': should_sync,
                 'skip_step': True,
             }
+            if kto_paopd:
+                result.update({
+                    'kto_good_ratio': kto_good_ratio.detach(),
+                    'kto_weight_mean': kto_weight_mean.detach(),
+                    'kto_weight_min': kto_weight_min.detach(),
+                    'kto_weight_max': kto_weight_max.detach(),
+                    'kto_threshold': kto_threshold_value.detach(),
+                })
+            return result
 
         _profile_mark('loss_build')
         loss.backward()
@@ -3030,7 +3263,7 @@ class FlowMapStepMixin:
                 )
             )
 
-        return {
+        result = {
             'loss': loss.detach(),
             'opd_aux_loss': weighted_aux_loss.detach(),
             'opd_video_transition_loss': video_transition_loss.detach(),
@@ -3059,6 +3292,15 @@ class FlowMapStepMixin:
             'should_sync': should_sync,
             'skip_step': False,
         }
+        if kto_paopd:
+            result.update({
+                'kto_good_ratio': kto_good_ratio.detach(),
+                'kto_weight_mean': kto_weight_mean.detach(),
+                'kto_weight_min': kto_weight_min.detach(),
+                'kto_weight_max': kto_weight_max.detach(),
+                'kto_threshold': kto_threshold_value.detach(),
+            })
+        return result
 
     def _on_policy_rollout(self, batch, num_steps=None, cfg_scale=None, retain_grad=False):
         """

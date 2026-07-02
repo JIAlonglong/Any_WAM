@@ -2,7 +2,7 @@ import math
 from collections import defaultdict
 
 import torch
-from torch.utils.data import Sampler
+from torch.utils.data import DistributedSampler, Sampler
 
 
 def normalize_group_ids(group_ids, expected_length):
@@ -12,6 +12,46 @@ def normalize_group_ids(group_ids, expected_length):
     if not out:
         raise ValueError("group ids must be non-empty")
     return out
+
+
+def build_stage2_sampler(train_dataset, config):
+    sampler_name = str(getattr(config, "stage2_sampler", "default")).lower()
+    world_size = int(getattr(config, "world_size", 1))
+    rank = int(getattr(config, "rank", 0))
+    seed = int(getattr(config, "seed", 0))
+
+    if sampler_name in ("default", "", "distributed"):
+        if world_size <= 1:
+            return None
+        return DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=seed,
+        )
+
+    if sampler_name in ("group_balanced", "group-balanced", "balanced"):
+        if not hasattr(train_dataset, "get_group_ids"):
+            raise ValueError(
+                "stage2_sampler='group_balanced' requires dataset.get_group_ids()"
+            )
+        group_by = str(getattr(config, "stage2_group_by", "task")).lower()
+        group_ids = train_dataset.get_group_ids(group_by)
+        samples_per_group = getattr(config, "stage2_samples_per_group", None)
+        return DistributedGroupBalancedSampler(
+            group_ids,
+            num_replicas=max(1, world_size),
+            rank=rank,
+            shuffle=True,
+            seed=seed,
+            samples_per_group=samples_per_group,
+        )
+
+    raise ValueError(
+        "stage2_sampler must be 'default' or 'group_balanced', "
+        f"got {sampler_name!r}"
+    )
 
 
 class DistributedGroupBalancedSampler(Sampler):

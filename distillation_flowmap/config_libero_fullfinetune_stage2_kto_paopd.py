@@ -42,6 +42,15 @@ cfg.kto_main_threshold_ema_decay = float(os.environ.get("KTO_MAIN_THRESHOLD_EMA_
 cfg.kto_main_use_ema_threshold = os.environ.get(
     "KTO_MAIN_USE_EMA_THRESHOLD", "1").lower() in ("1", "true", "yes", "on")
 
+cfg.stage2_sampler = os.environ.get("STAGE2_SAMPLER", "default").lower()
+cfg.stage2_group_by = os.environ.get("STAGE2_GROUP_BY", "task").lower()
+_stage2_samples_per_group = os.environ.get("STAGE2_SAMPLES_PER_GROUP")
+cfg.stage2_samples_per_group = (
+    int(_stage2_samples_per_group)
+    if _stage2_samples_per_group not in (None, "")
+    else None
+)
+
 cfg.output_dir = os.environ.get(
     "OUTPUT_DIR",
     os.path.join(_this_dir, "output_libero_fullft_stage2_kto_paopd_norm_focal"),

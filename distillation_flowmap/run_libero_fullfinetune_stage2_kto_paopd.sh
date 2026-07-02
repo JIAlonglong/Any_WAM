@@ -56,6 +56,7 @@ echo "KTO alpha-decay: hold=${KTO_ALPHA_DECAY_HOLD_STEPS:-20}, ramp=${KTO_ALPHA_
 echo "KTO v-scale:   ${KTO_VIDEO_SCALE_START:-0.85} hold ${KTO_VIDEO_SCALE_HOLD_STEPS:-20} -> ${KTO_VIDEO_SCALE_END:-1.0} over ${KTO_VIDEO_SCALE_RAMP_STEPS:-20} steps"
 echo "KTO main:      enabled=${KTO_MAIN_VIDEO_REWEIGHT:-0}, alpha=${KTO_MAIN_ALPHA:-1.0}, temp=${KTO_MAIN_TEMPERATURE:-${KTO_TEMPERATURE:-0.10}}, clip=[${KTO_MAIN_MIN_WEIGHT:-${KTO_MIN_WEIGHT:-0.5}},${KTO_MAIN_MAX_WEIGHT:-${KTO_MAX_WEIGHT:-1.8}}], q=${KTO_MAIN_THRESHOLD_QUANTILE:-0.70}, ema=${KTO_MAIN_THRESHOLD_EMA_DECAY:-0.90}"
 echo "KTO hard mode: good=${KTO_GOOD_WEIGHT:-0.3}, bad=${KTO_BAD_WEIGHT:-1.0}, threshold=${KTO_THRESHOLD:-auto}"
+echo "Stage2 sampler: ${STAGE2_SAMPLER:-default}, group_by=${STAGE2_GROUP_BY:-task}, samples_per_group=${STAGE2_SAMPLES_PER_GROUP:-auto}"
 echo "=========================================="
 
 CONFIG_FILE=distillation_flowmap.config_libero_fullfinetune_stage2_kto_paopd \

@@ -30,10 +30,11 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
 )
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from safetensors.torch import save_file
 
+from distillation_flowmap.samplers import build_stage2_sampler
 from distributed.fsdp import shard_model, apply_ac
 from wan_va.distributed.fsdp import shard_model_fsdp1
 from distributed.util import _configure_model, dist_mean
@@ -742,11 +743,13 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         from distillation.patches import SafeMultiLatentLeRobotDataset as MultiLatentLeRobotDataset
         train_dataset = MultiLatentLeRobotDataset(config=config)
         # 分布式采样器：确保每个 GPU 看到不同的数据子集
-        train_sampler = (
-            DistributedSampler(train_dataset, num_replicas=config.world_size,
-                               rank=config.rank, shuffle=True, seed=config.seed)
-            if config.world_size > 1 else None
-        )
+        train_sampler = build_stage2_sampler(train_dataset, config)
+        if config.rank == 0:
+            logger.info(
+                "Stage2 sampler: %s (group_by=%s)",
+                getattr(config, "stage2_sampler", "default"),
+                getattr(config, "stage2_group_by", "task"),
+            )
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,

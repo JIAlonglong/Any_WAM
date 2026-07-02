@@ -156,6 +156,47 @@ class SafeMultiLatentLeRobotDataset:
             acc_dset_num[did] = acc_nums[did]
         return item_id_to_dataset_id, acc_dset_num
 
+    def _resolve_dataset_index(self, idx):
+        assert idx < len(self)
+        dset_id = self.item_id_to_dataset_id[idx]
+        local_idx = idx - self.acc_dset_num[dset_id]
+        return dset_id, self._datasets[dset_id], local_idx
+
+    def get_sample_meta(self, idx):
+        dset_id, cur_dset, local_idx = self._resolve_dataset_index(idx)
+        metas = getattr(cur_dset, "new_metas", None)
+        if metas is None:
+            meta = {}
+        else:
+            meta = dict(metas[local_idx])
+        meta["dataset_id"] = dset_id
+        meta["local_index"] = local_idx
+        meta["repo_id"] = str(getattr(cur_dset, "repo_id", dset_id))
+        return meta
+
+    def get_group_ids(self, group_by="task"):
+        group_by = str(group_by).lower()
+        out = []
+        for idx in range(len(self)):
+            meta = self.get_sample_meta(idx)
+            if group_by in ("task", "tasks"):
+                tasks = meta.get("tasks") or meta.get("task") or meta.get("action_text")
+                if isinstance(tasks, (list, tuple)):
+                    group_id = tasks[0] if tasks else "task:unknown"
+                else:
+                    group_id = tasks or "task:unknown"
+            elif group_by == "episode":
+                group_id = f"episode:{meta.get('episode_index', 'unknown')}"
+            elif group_by == "dataset":
+                group_id = meta.get("repo_id", f"dataset:{meta.get('dataset_id', 'unknown')}")
+            else:
+                raise ValueError(
+                    "group_by must be one of 'task', 'episode', or 'dataset', "
+                    f"got {group_by!r}"
+                )
+            out.append(str(group_id))
+        return out
+
     def __getitem__(self, idx):
         """
         通过全局索引获取样本。
@@ -168,10 +209,8 @@ class SafeMultiLatentLeRobotDataset:
 
         查找过程：
           1. 通过 item_id_to_dataset_id 找到子数据集 ID
-          2. 计算局部索引 = 全局索引 - 子数据集起始索引
-          3. 从子数据集中获取样本
+            2. 计算局部索引 = 全局索引 - 子数据集起始索引
+            3. 从子数据集中获取样本
         """
-        assert idx < len(self)
-        cur_dset = self._datasets[self.item_id_to_dataset_id[idx]]
-        local_idx = idx - self.acc_dset_num[self.item_id_to_dataset_id[idx]]
+        _, cur_dset, local_idx = self._resolve_dataset_index(idx)
         return cur_dset[local_idx]

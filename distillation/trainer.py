@@ -35,6 +35,12 @@ try:
 except ImportError:
     HAS_WANDB = False
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    HAS_TENSORBOARD = True
+except ImportError:
+    HAS_TENSORBOARD = False
+
 from data import DataMixin
 from step import StepMixin
 from ema import update_ema
@@ -97,6 +103,13 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                 entity=getattr(config, "wandb_entity", None),
                 config=dict(config),
             )
+
+        self.tb_writer = None
+        if HAS_TENSORBOARD and config.rank == 0:
+            tb_dir = Path(config.output_dir) / "tensorboard"
+            tb_dir.mkdir(parents=True, exist_ok=True)
+            self.tb_writer = SummaryWriter(log_dir=str(tb_dir))
+            print(f"[TensorBoard] Logging to {tb_dir}")
 
         # ==============================================================
         # 调度器初始化 — 与 wan_va/train.py 完全一致
@@ -424,6 +437,10 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                     progress_bar.set_postfix(postfix)
                     if config.enable_wandb and HAS_WANDB:
                         wandb.log(log_dict, step=self.step)
+                    if self.tb_writer is not None:
+                        for key, value in log_dict.items():
+                            self.tb_writer.add_scalar(key, value, self.step)
+                        self.tb_writer.flush()
 
                 self.step += 1
 
@@ -441,3 +458,5 @@ class FlashWAMDistiller(DataMixin, StepMixin):
         # 保存最终检查点
         self._save_checkpoint("online_student")
         self._save_checkpoint("target_student")
+        if self.tb_writer is not None:
+            self.tb_writer.close()

@@ -36,6 +36,7 @@ from easydict import EasyDict
 _server_dir = os.path.dirname(os.path.abspath(__file__))
 _project_root = os.path.dirname(_server_dir)
 
+sys.path.insert(0, _project_root)
 sys.path.insert(0, _server_dir)
 sys.path.insert(0, os.path.join(_project_root, "distillation_flowmap"))
 
@@ -250,14 +251,20 @@ class VA_Server:
                 "action_snr_shift": ckpt_config.get(
                     "action_snr_shift", job_config.action_snr_shift
                 ),
+                "action_downsample_factor": ckpt_config.get(
+                    "action_downsample_factor",
+                    getattr(job_config, "action_downsample_factor", 1),
+                ),
             })
         else:
             _inf_cfg = EasyDict({
                 "num_train_timesteps": 1000,
                 "snr_shift": job_config.snr_shift,
                 "action_snr_shift": job_config.action_snr_shift,
+                "action_downsample_factor": getattr(job_config, "action_downsample_factor", 1),
             })
         self.flowmap_kwargs = create_inference_kwargs(_inf_cfg)
+        logger.info(f"FlowMap inference kwargs: {self.flowmap_kwargs}")
 
         # ------------------------------------------------------------------
         # 6b. Initialize FlowMatchSchedulers for standard denoising
@@ -827,6 +834,68 @@ class VA_Server:
             return dict(action=action)
 
 
+    def decode_one_video(self, latents, output_type):
+        from diffusers.video_processor import VideoProcessor
+
+        if not hasattr(self, "video_processor"):
+            self.video_processor = VideoProcessor(vae_scale_factor=1)
+        latents = latents.to(device=next(self.vae.parameters()).device, dtype=self.vae.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+            1, self.vae.config.z_dim, 1, 1, 1
+        ).to(latents.device, latents.dtype)
+        latents = latents / latents_std + latents_mean
+        video = self.vae.decode(latents, return_dict=False)[0]
+        return self.video_processor.postprocess_video(video, output_type=output_type)
+
+    def load_init_obs(self):
+        from PIL import Image
+
+        image_dict = {
+            key: np.array(
+                Image.open(os.path.join(self.job_config.input_img_path, f"{key}.png")).convert("RGB")
+            )
+            for key in self.job_config.obs_cam_keys
+        }
+        return {"obs": [image_dict]}
+
+    @torch.no_grad()
+    def generate(self):
+        from diffusers.utils import export_to_video
+
+        os.makedirs(self.job_config.save_root, exist_ok=True)
+        from diffusers.video_processor import VideoProcessor
+
+        self.video_processor = VideoProcessor(vae_scale_factor=1)
+        self._reset(self.job_config.prompt)
+        init_obs = self.load_init_obs()
+
+        pred_latents = []
+        for chunk_id in range(self.job_config.num_chunks_to_infer):
+            frame_st_id = chunk_id * self.job_config.frame_chunk_size
+            _, latents = self._infer(init_obs, frame_st_id=frame_st_id)
+            pred_latents.append(latents.detach())
+
+        pred_latent = torch.cat(pred_latents, dim=2)
+        self.transformer.clear_cache(self.cache_name)
+        self.streaming_vae.clear_cache()
+        if self.streaming_vae_half:
+            self.streaming_vae_half.clear_cache()
+        torch.cuda.empty_cache()
+
+        if self.enable_offload:
+            self.vae = self.vae.to(self.device).to(self.dtype)
+
+        decoded_video = self.decode_one_video(pred_latent, "np")[0]
+        output_path = os.path.join(self.job_config.save_root, "demo.mp4")
+        export_to_video(decoded_video, output_path, fps=10)
+        logger.info(f"Generated i2va demo video: {output_path}")
+
+
 # =========================================================================
 # Entry point
 # =========================================================================
@@ -845,6 +914,12 @@ def run(args):
         config.action_num_steps = args.action_num_steps
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.input_img_path is not None:
+        config.input_img_path = args.input_img_path
+    if args.prompt is not None:
+        config.prompt = args.prompt
+    if args.num_chunks_to_infer is not None:
+        config.num_chunks_to_infer = args.num_chunks_to_infer
 
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -861,7 +936,13 @@ def run(args):
     logger.info(f"Port: {port}")
 
     model = VA_Server(config)
-    run_async_server_mode(model, local_rank, config.host, port)
+    if getattr(config, "infer_mode", "server") == "i2va":
+        logger.info("Running i2va demo generation mode")
+        model.generate()
+    elif getattr(config, "infer_mode", "server") == "server":
+        run_async_server_mode(model, local_rank, config.host, port)
+    else:
+        raise ValueError(f"Unknown infer mode: {config.infer_mode}")
 
 
 def main():
@@ -873,8 +954,8 @@ def main():
         type=str,
         required=False,
         default="robotwin",
-        choices=["libero", "robotwin"],
-        help="Environment config name (libero or robotwin).",
+        choices=["libero", "robotwin", "libero_i2av"],
+        help="Environment config name.",
     )
     parser.add_argument(
         "--port",
@@ -909,6 +990,24 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving inference outputs.",
+    )
+    parser.add_argument(
+        "--input-img-path",
+        type=str,
+        default=None,
+        help="Directory containing initial observation PNGs for i2va mode.",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Prompt override for i2va mode.",
+    )
+    parser.add_argument(
+        "--num-chunks-to-infer",
+        type=int,
+        default=None,
+        help="Number of chunks to generate in i2va mode.",
     )
     args = parser.parse_args()
     run(args)

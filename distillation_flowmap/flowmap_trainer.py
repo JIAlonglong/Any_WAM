@@ -187,6 +187,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # ==============================================================
         # 打印 Flow Map 蒸馏特有配置信息
         # ==============================================================
+        self._last_ema_decay = float(getattr(config, 'ema_decay', 0.995))
+
         if config.rank == 0:
             logger.info(f"Flow Map Distiller 初始化")
             logger.info(f"LCM stride k = {self.k} "
@@ -218,7 +220,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             if self.use_opd_aux:
                 logger.info(f"  opd_aux_weight     = {getattr(config, 'opd_aux_weight', 0.1)}")
                 logger.info(f"  opd_aux_interval   = {getattr(config, 'opd_aux_interval', 1)}")
-                logger.info(f"  one_step_focus     = {getattr(config, 'one_step_focus_ratio', 0.0)}")
+                logger.info(f"  flowmap_aux_weight = {getattr(config, 'flowmap_aux_weight', 1.0)}")
+                logger.info(f"  endpoint_aux_weight= {getattr(config, 'opd_endpoint_aux_weight', 0.0)}")
+                logger.info(f"  opd_target_mode    = {getattr(config, 'opd_teacher_target_mode', 'student_state')}")
+                logger.info(f"  opd_grad_mode      = {getattr(config, 'opd_rollout_grad_mode', 'endpoint')}")
+                logger.info(f"  action_transition_block = {getattr(config, 'action_transition_block_weight', getattr(config, 'action_block_weight', 1.0))}")
+                logger.info(f"  action_local_fm_block   = {getattr(config, 'action_local_fm_block_weight', 1.0)}")
+                logger.info(f"  action_local_fm_weight  = {getattr(config, 'action_aware_weight', 0.0)}")
+                logger.info(f"  opd_transition_group_weight = {getattr(config, 'opd_transition_group_weight', 1.0)}")
+                logger.info(f"  opd_anchor_cap_ratio = {getattr(config, 'opd_anchor_cap_ratio', -1.0)}")
+                logger.info(f"  opd_query_bias     = {getattr(config, 'opd_query_bias', 'none')}")
+                logger.info(f"  opd_query_ratio    = {getattr(config, 'opd_query_bias_ratio', 0.0)}")
+                logger.info(f"  opd_low_noise_max  = {getattr(config, 'opd_low_noise_max_sigma', 0.25)}")
             if self.use_lora:
                 logger.info(f"  lora_rank          = {config.lora_rank}")
                 logger.info(f"  lora_alpha         = {config.lora_alpha}")
@@ -312,10 +325,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     )
             else:
                 raise FileNotFoundError(f"Missing checkpoint config: {student_config_path}")
+            resume_online_from_target = bool(getattr(config, "resume_online_from_target", False))
+            if resume_online_from_target:
+                target_config_path = os.path.join(target_path, "config.json")
+                if not os.path.exists(target_config_path):
+                    raise FileNotFoundError(f"Missing target checkpoint config: {target_config_path}")
+                student_path = target_path
             if config.rank == 0:
                 logger.info(f"Resuming from path: {resume_path}")
                 logger.info(f"  Online student: {student_path}")
                 logger.info(f"  Target student: {target_path}")
+                if resume_online_from_target:
+                    logger.info("  Initializing online student from Stage-1 target/EMA checkpoint")
                 if reset_resume_step:
                     logger.info(f"  Resetting resumed checkpoint step to 0 for a new training stage")
                 logger.info(f"  Starting step: {self.step}")
@@ -351,10 +372,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     )
             else:
                 raise FileNotFoundError(f"Missing checkpoint config: {student_config_path}")
+            resume_online_from_target = bool(getattr(config, "resume_online_from_target", False))
+            if resume_online_from_target:
+                target_config_path = os.path.join(target_path, "config.json")
+                if not os.path.exists(target_config_path):
+                    raise FileNotFoundError(f"Missing target checkpoint config: {target_config_path}")
+                student_path = target_path
             if config.rank == 0:
                 logger.info(f"Resuming from step {resume_step}")
                 logger.info(f"  Online student: {student_path}")
                 logger.info(f"  Target student: {target_path}")
+                if resume_online_from_target:
+                    logger.info("  Initializing online student from target/EMA checkpoint")
         else:
             # 从教师权重初始化（标准 LCM 蒸馏初始化）
             student_path = teacher_path
@@ -380,6 +409,14 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.student = setup_flowmap_model(
             self.student, gate_value=config.gate_value, deltatime_type=config.deltatime_type)
         self.student = patch_model_forward(self.student)
+        self.student._flowmap_gradient_checkpointing = bool(
+            getattr(config, "gradient_checkpointing", True)
+        )
+        if config.rank == 0:
+            logger.info(
+                "Student gradient checkpointing: %s",
+                self.student._flowmap_gradient_checkpointing,
+            )
 
         def load_flowmap_delta_weights(model, transformer_dir, label):
             """Restore FlowMap-only weights dropped by the base Wan loader."""
@@ -1825,7 +1862,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
     def _move_eval_batch_to_device(self, batch):
         # Keep cached eval batches on CPU; convert a shallow copy each eval run.
         return {
-            key: value.to(self.device) if isinstance(value, torch.Tensor) else value
+            key: value.to(self.device, non_blocking=True) if isinstance(value, torch.Tensor) else value
             for key, value in batch.items()
         }
 
@@ -1874,6 +1911,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info(f"  action_block_weight = {self.action_block_weight}")
         logger.info(f"  Teacher CFG: [{config.cfg_min}, {config.cfg_max}]")
         logger.info(f"  EMA decay: {config.ema_decay}")
+        logger.info(f"  EMA warmup steps: {getattr(config, 'ema_warmup_steps', 0)}")
         logger.info(f"  Loss: {config.loss_type}")
         # Flow Map 特有日志
         logger.info(f"  diffusion_ratio  = {self.diffusion_ratio}")
@@ -1889,10 +1927,19 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info(f"  OPD aux enabled: weight={getattr(config, 'opd_aux_weight', 0.1)}, "
                         f"warmup={getattr(config, 'opd_aux_warmup_steps', 0)}, "
                         f"interval={getattr(config, 'opd_aux_interval', 1)}, "
-                        f"prob={getattr(config, 'opd_aux_prob', 1.0)}")
-            logger.info(f"  one_step_focus: video={getattr(config, 'video_one_step_focus_ratio', getattr(config, 'one_step_focus_ratio', 0.0))}, "
-                        f"action={getattr(config, 'action_one_step_focus_ratio', getattr(config, 'one_step_focus_ratio', 0.0))}, "
-                        f"opd_aux={getattr(config, 'opd_aux_one_step_focus_ratio', getattr(config, 'one_step_focus_ratio', 0.0))}")
+                        f"prob={getattr(config, 'opd_aux_prob', 1.0)}, "
+                        f"target={getattr(config, 'opd_teacher_target_mode', 'student_state')}, "
+                        f"grad={getattr(config, 'opd_rollout_grad_mode', 'endpoint')}, "
+                        f"flowmap_aux={getattr(config, 'flowmap_aux_weight', 1.0)}, "
+                        f"endpoint_aux={getattr(config, 'opd_endpoint_aux_weight', 0.0)}, "
+                        f"action_transition_block={getattr(config, 'action_transition_block_weight', getattr(config, 'action_block_weight', 1.0))}, "
+                        f"action_local_fm_block={getattr(config, 'action_local_fm_block_weight', 1.0)}, "
+                        f"action_local_fm_weight={getattr(config, 'action_aware_weight', 0.0)}, "
+                        f"transition_group_weight={getattr(config, 'opd_transition_group_weight', 1.0)}, "
+                        f"anchor_cap_ratio={getattr(config, 'opd_anchor_cap_ratio', -1.0)}, "
+                        f"query_bias={getattr(config, 'opd_query_bias', 'none')}, "
+                        f"query_ratio={getattr(config, 'opd_query_bias_ratio', 0.0)}, "
+                        f"low_noise_max={getattr(config, 'opd_low_noise_max_sigma', 0.25)}")
 
         if bool(getattr(config, "enable_stage1_start_eval", False)):
             try:
@@ -1963,9 +2010,26 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         acc_dmd_grad_norms = []      # 累积的 DMD 梯度范数（DMD 特有）
         acc_opd_aux_losses = []
         acc_opd_video_transition_losses = []
+        acc_opd_endpoint_aux_losses = []
         acc_opd_local_fm_losses = []
         acc_opd_action_transition_losses = []
         acc_opd_action_local_fm_losses = []
+        acc_opd_video_transition_contribs = []
+        acc_opd_endpoint_aux_contribs = []
+        acc_opd_local_fm_contribs = []
+        acc_opd_action_transition_contribs = []
+        acc_opd_action_local_fm_contribs = []
+        acc_opd_video_transition_ratios = []
+        acc_opd_endpoint_aux_ratios = []
+        acc_opd_local_fm_ratios = []
+        acc_opd_action_transition_ratios = []
+        acc_opd_action_local_fm_ratios = []
+        acc_opd_transition_group_scaled = []
+        acc_opd_anchor_group_scaled = []
+        acc_opd_transition_scales = []
+        acc_opd_anchor_scales = []
+        acc_opd_transition_group_ratios = []
+        acc_opd_anchor_group_ratios = []
         step_in_acc = 0              # 当前累积步数
         # DMD 参数
         dmd_weight = getattr(config, 'dmd_weight', 0.1)
@@ -1997,6 +2061,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             opd_aux_result = None
             use_opd_aux_now = False
             if (self.use_opd_aux and not use_onpolicy_now and
+                    result.get("should_sync", False) and
                     self.step >= getattr(self.config, 'opd_aux_warmup_steps', 0) and
                     not result.get("skip_step", False)):
                 opd_aux_interval = max(1, int(getattr(self.config, 'opd_aux_interval', 1)))
@@ -2038,6 +2103,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             acc_opd_video_transition_losses.append(
                 opd_aux_result.get("opd_video_transition_loss", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
+            acc_opd_endpoint_aux_losses.append(
+                opd_aux_result.get("opd_endpoint_aux_loss", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
             acc_opd_local_fm_losses.append(
                 opd_aux_result.get("opd_local_fm_loss", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
@@ -2046,6 +2114,54 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 if opd_aux_result is not None else zero_tensor)
             acc_opd_action_local_fm_losses.append(
                 opd_aux_result.get("opd_action_local_fm_loss", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_video_transition_contribs.append(
+                opd_aux_result.get("opd_video_transition_contrib", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_endpoint_aux_contribs.append(
+                opd_aux_result.get("opd_endpoint_aux_contrib", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_local_fm_contribs.append(
+                opd_aux_result.get("opd_local_fm_contrib", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_action_transition_contribs.append(
+                opd_aux_result.get("opd_action_transition_contrib", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_action_local_fm_contribs.append(
+                opd_aux_result.get("opd_action_local_fm_contrib", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_video_transition_ratios.append(
+                opd_aux_result.get("opd_video_transition_ratio", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_endpoint_aux_ratios.append(
+                opd_aux_result.get("opd_endpoint_aux_ratio", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_local_fm_ratios.append(
+                opd_aux_result.get("opd_local_fm_ratio", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_action_transition_ratios.append(
+                opd_aux_result.get("opd_action_transition_ratio", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_action_local_fm_ratios.append(
+                opd_aux_result.get("opd_action_local_fm_ratio", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_transition_group_scaled.append(
+                opd_aux_result.get("opd_transition_group_scaled", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_anchor_group_scaled.append(
+                opd_aux_result.get("opd_anchor_group_scaled", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_transition_scales.append(
+                opd_aux_result.get("opd_transition_scale", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_anchor_scales.append(
+                opd_aux_result.get("opd_anchor_scale", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_transition_group_ratios.append(
+                opd_aux_result.get("opd_transition_group_ratio", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_anchor_group_ratios.append(
+                opd_aux_result.get("opd_anchor_group_ratio", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
             step_in_acc += 1
 
@@ -2113,33 +2229,83 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         # 避免将异常梯度产生的错误权重传播到目标学生）
                         # FSDP1 with use_orig_params=True preserves original parameter names,
                         # so model.parameters() works directly (no .module needed)
+                        ema_warmup_steps = int(getattr(config, 'ema_warmup_steps', 0))
+                        ema_decay = 0.0 if self.step < ema_warmup_steps else config.ema_decay
+                        self._last_ema_decay = float(ema_decay)
                         update_ema(
                             self.target_student.parameters(),
                             self.student.parameters(),
-                            rate=config.ema_decay,
+                            rate=ema_decay,
                         )
 
                 # 计算平均损失（跨所有进程）
                 lr = self.lr_scheduler.get_last_lr()[0]
-                avg_loss = dist_mean(torch.stack(acc_losses).sum()).item()
-                avg_video_loss = dist_mean(torch.stack(acc_video_losses).sum()).item()
-                avg_video_local_fm_loss = dist_mean(torch.stack(acc_video_local_fm_losses).sum()).item()
-                avg_action_loss = dist_mean(torch.stack(acc_action_losses).sum()).item()
-                avg_action_local_fm_loss = dist_mean(torch.stack(acc_action_local_fm_losses).sum()).item()
-                avg_action_aware_loss = dist_mean(torch.stack(acc_action_aware_losses).sum()).item()
-                avg_gt_regression_loss = dist_mean(
-                    torch.stack(acc_gt_regression_losses).sum()).item()
-                avg_d_loss = dist_mean(torch.stack(acc_d_losses).sum()).item()
-                avg_dmd_grad_norm = dist_mean(torch.stack(acc_dmd_grad_norms).sum()).item()
-                avg_opd_aux_loss = dist_mean(torch.stack(acc_opd_aux_losses).sum()).item()
-                avg_opd_video_transition_loss = dist_mean(
-                    torch.stack(acc_opd_video_transition_losses).sum()).item()
-                avg_opd_local_fm_loss = dist_mean(
-                    torch.stack(acc_opd_local_fm_losses).sum()).item()
-                avg_opd_action_transition_loss = dist_mean(
-                    torch.stack(acc_opd_action_transition_losses).sum()).item()
-                avg_opd_action_local_fm_loss = dist_mean(
-                    torch.stack(acc_opd_action_local_fm_losses).sum()).item()
+                metric_values = torch.stack([
+                    torch.stack(acc_losses).sum(),
+                    torch.stack(acc_video_losses).sum(),
+                    torch.stack(acc_video_local_fm_losses).sum(),
+                    torch.stack(acc_action_losses).sum(),
+                    torch.stack(acc_action_local_fm_losses).sum(),
+                    torch.stack(acc_action_aware_losses).sum(),
+                    torch.stack(acc_gt_regression_losses).sum(),
+                    torch.stack(acc_d_losses).sum(),
+                    torch.stack(acc_dmd_grad_norms).sum(),
+                    torch.stack(acc_opd_aux_losses).sum(),
+                    torch.stack(acc_opd_video_transition_losses).sum(),
+                    torch.stack(acc_opd_endpoint_aux_losses).sum(),
+                    torch.stack(acc_opd_local_fm_losses).sum(),
+                    torch.stack(acc_opd_action_transition_losses).sum(),
+                    torch.stack(acc_opd_action_local_fm_losses).sum(),
+                    torch.stack(acc_opd_video_transition_contribs).sum(),
+                    torch.stack(acc_opd_endpoint_aux_contribs).sum(),
+                    torch.stack(acc_opd_local_fm_contribs).sum(),
+                    torch.stack(acc_opd_action_transition_contribs).sum(),
+                    torch.stack(acc_opd_action_local_fm_contribs).sum(),
+                    torch.stack(acc_opd_video_transition_ratios).sum(),
+                    torch.stack(acc_opd_endpoint_aux_ratios).sum(),
+                    torch.stack(acc_opd_local_fm_ratios).sum(),
+                    torch.stack(acc_opd_action_transition_ratios).sum(),
+                    torch.stack(acc_opd_action_local_fm_ratios).sum(),
+                    torch.stack(acc_opd_transition_group_scaled).sum(),
+                    torch.stack(acc_opd_anchor_group_scaled).sum(),
+                    torch.stack(acc_opd_transition_scales).sum(),
+                    torch.stack(acc_opd_anchor_scales).sum(),
+                    torch.stack(acc_opd_transition_group_ratios).sum(),
+                    torch.stack(acc_opd_anchor_group_ratios).sum(),
+                ]).float()
+                (
+                    avg_loss,
+                    avg_video_loss,
+                    avg_video_local_fm_loss,
+                    avg_action_loss,
+                    avg_action_local_fm_loss,
+                    avg_action_aware_loss,
+                    avg_gt_regression_loss,
+                    avg_d_loss,
+                    avg_dmd_grad_norm,
+                    avg_opd_aux_loss,
+                    avg_opd_video_transition_loss,
+                    avg_opd_endpoint_aux_loss,
+                    avg_opd_local_fm_loss,
+                    avg_opd_action_transition_loss,
+                    avg_opd_action_local_fm_loss,
+                    avg_opd_video_transition_contrib,
+                    avg_opd_endpoint_aux_contrib,
+                    avg_opd_local_fm_contrib,
+                    avg_opd_action_transition_contrib,
+                    avg_opd_action_local_fm_contrib,
+                    avg_opd_video_transition_ratio,
+                    avg_opd_endpoint_aux_ratio,
+                    avg_opd_local_fm_ratio,
+                    avg_opd_action_transition_ratio,
+                    avg_opd_action_local_fm_ratio,
+                    avg_opd_transition_group_scaled,
+                    avg_opd_anchor_group_scaled,
+                    avg_opd_transition_scale,
+                    avg_opd_anchor_scale,
+                    avg_opd_transition_group_ratio,
+                    avg_opd_anchor_group_ratio,
+                ) = dist_mean(metric_values).tolist()
                 action_total_raw = (
                     avg_action_loss
                     + self.gt_regression_weight * avg_gt_regression_loss
@@ -2158,19 +2324,38 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_dmd_grad_norms = []
                 acc_opd_aux_losses = []
                 acc_opd_video_transition_losses = []
+                acc_opd_endpoint_aux_losses = []
                 acc_opd_local_fm_losses = []
                 acc_opd_action_transition_losses = []
                 acc_opd_action_local_fm_losses = []
+                acc_opd_video_transition_contribs = []
+                acc_opd_endpoint_aux_contribs = []
+                acc_opd_local_fm_contribs = []
+                acc_opd_action_transition_contribs = []
+                acc_opd_action_local_fm_contribs = []
+                acc_opd_video_transition_ratios = []
+                acc_opd_endpoint_aux_ratios = []
+                acc_opd_local_fm_ratios = []
+                acc_opd_action_transition_ratios = []
+                acc_opd_action_local_fm_ratios = []
+                acc_opd_transition_group_scaled = []
+                acc_opd_anchor_group_scaled = []
+                acc_opd_transition_scales = []
+                acc_opd_anchor_scales = []
+                acc_opd_transition_group_ratios = []
+                acc_opd_anchor_group_ratios = []
                 step_in_acc = 0
 
-                # 定期清理显存
-                torch.cuda.synchronize()
+                # 定期清理显存；只在真正清理时同步，避免每个 optimizer step 强制等待 GPU。
                 if self.step % config.gc_interval == 0:
+                    torch.cuda.synchronize()
                     torch.cuda.empty_cache()
                     gc.collect()
 
                 # 记录日志（仅主进程）
-                if config.rank == 0:
+                log_interval = max(1, int(getattr(config, "log_interval", 1)))
+                should_log = (self.step % log_interval == 0) or (self.step + 1 >= config.max_train_steps)
+                if config.rank == 0 and should_log:
                     progress_bar.n = self.step + 1
                     postfix = {
                         "loss": f"{avg_loss:.4f}",
@@ -2181,6 +2366,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         "loss/total": avg_loss,
                         "train/grad_norm": total_norm.item(),
                         "train/lr": lr,
+                        "train/ema_decay": getattr(self, '_last_ema_decay', config.ema_decay),
                     }
                     if self.distill_video:
                         if use_onpolicy_now:
@@ -2204,17 +2390,41 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         log_dict["loss/action_aware"] = avg_action_aware_loss
                     if avg_opd_aux_loss > 0:
                         postfix["opd"] = f"{avg_opd_aux_loss:.4f}"
-                        postfix["ovt"] = f"{avg_opd_video_transition_loss:.4f}"
-                        postfix["ovlfm"] = f"{avg_opd_local_fm_loss:.4f}"
+                        postfix["ovt"] = f"{avg_opd_video_transition_loss:.2e}"
+                        postfix["oep"] = f"{avg_opd_endpoint_aux_loss:.2e}"
+                        postfix["ovlfm"] = f"{avg_opd_local_fm_loss:.2e}"
+                        postfix["wovt"] = f"{avg_opd_video_transition_contrib:.2e}"
+                        postfix["rat"] = f"{avg_opd_video_transition_ratio:.2f}/{avg_opd_action_transition_ratio:.2f}/{avg_opd_action_local_fm_ratio:.2f}"
+                        postfix["gtr"] = f"{avg_opd_transition_group_ratio:.2f}/{avg_opd_anchor_group_ratio:.2f}"
+                        postfix["gsc"] = f"{avg_opd_transition_scale:.1f}/{avg_opd_anchor_scale:.2f}"
                         log_dict["loss/opd_aux"] = avg_opd_aux_loss
                         log_dict["loss/opd_video_transition"] = avg_opd_video_transition_loss
+                        log_dict["loss/opd_endpoint_aux"] = avg_opd_endpoint_aux_loss
                         log_dict["loss/opd_local_fm"] = avg_opd_local_fm_loss
+                        log_dict["loss_weighted/opd_video_transition"] = avg_opd_video_transition_contrib
+                        log_dict["loss_weighted/opd_endpoint_aux"] = avg_opd_endpoint_aux_contrib
+                        log_dict["loss_weighted/opd_local_fm"] = avg_opd_local_fm_contrib
+                        log_dict["loss_weighted/opd_transition_group_scaled"] = avg_opd_transition_group_scaled
+                        log_dict["loss_weighted/opd_anchor_group_scaled"] = avg_opd_anchor_group_scaled
+                        log_dict["loss_scale/opd_transition"] = avg_opd_transition_scale
+                        log_dict["loss_scale/opd_anchor"] = avg_opd_anchor_scale
+                        log_dict["loss_ratio/opd_transition_total"] = avg_opd_transition_group_ratio
+                        log_dict["loss_ratio/opd_anchor_total"] = avg_opd_anchor_group_ratio
+                        log_dict["loss_ratio/opd_video_transition"] = avg_opd_video_transition_ratio
+                        log_dict["loss_ratio/opd_endpoint_aux"] = avg_opd_endpoint_aux_ratio
+                        log_dict["loss_ratio/opd_local_fm"] = avg_opd_local_fm_ratio
                         if self.distill_action:
-                            postfix["oat"] = f"{avg_opd_action_transition_loss:.4f}"
+                            postfix["oat"] = f"{avg_opd_action_transition_loss:.2e}"
+                            postfix["woat"] = f"{avg_opd_action_transition_contrib:.2e}"
                             log_dict["loss/opd_action_transition"] = avg_opd_action_transition_loss
+                            log_dict["loss_weighted/opd_action_transition"] = avg_opd_action_transition_contrib
+                            log_dict["loss_ratio/opd_action_transition"] = avg_opd_action_transition_ratio
                         if self.action_aware:
-                            postfix["oalfm"] = f"{avg_opd_action_local_fm_loss:.4f}"
+                            postfix["oalfm"] = f"{avg_opd_action_local_fm_loss:.2e}"
+                            postfix["woalfm"] = f"{avg_opd_action_local_fm_contrib:.2e}"
                             log_dict["loss/opd_action_local_fm"] = avg_opd_action_local_fm_loss
+                            log_dict["loss_weighted/opd_action_local_fm"] = avg_opd_action_local_fm_contrib
+                            log_dict["loss_ratio/opd_action_local_fm"] = avg_opd_action_local_fm_ratio
                     postfix["gt"] = f"{avg_gt_regression_loss:.4f}"
                     log_dict["loss/gt_regression"] = avg_gt_regression_loss
                     # DMD 日志
@@ -2230,6 +2440,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     if self.tb_writer is not None:
                         for key, value in log_dict.items():
                             self.tb_writer.add_scalar(key, value, self.step)
+                        tb_flush_interval = max(1, int(getattr(config, "tb_flush_interval", 50)))
+                        if self.step % tb_flush_interval == 0:
+                            self.tb_writer.flush()
 
                 self.step += 1
 
@@ -2281,8 +2494,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     self._save_checkpoint("target_student")
 
 
-            # 分布式同步屏障
-            if dist.is_initialized():
+            # 常规训练不需要每个 microbatch barrier；仅保留可选 debug barrier。
+            train_barrier_interval = int(getattr(config, "train_barrier_interval", 0))
+            if (dist.is_initialized() and train_barrier_interval > 0 and
+                    result.get("should_sync", False) and self.step % train_barrier_interval == 0):
                 dist.barrier(device_ids=[torch.cuda.current_device()])
 
         progress_bar.close()
@@ -2292,4 +2507,5 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self._save_checkpoint("target_student")
         # 关闭 TensorBoard writer
         if self.tb_writer is not None:
+            self.tb_writer.flush()
             self.tb_writer.close()

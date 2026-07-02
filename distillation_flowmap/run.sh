@@ -18,7 +18,7 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 # 多卡时自动换算 gradient_accumulation_steps，保持等效 batch size 不变
 # 原始配置：batch_size=1, gradient_accumulation_steps=8, 等效 batch=8
 # 多卡等效 batch = batch_size × (8/NGPU) × NGPU = 8
-ORIG_ACCUM=8
+ORIG_ACCUM="${ORIG_ACCUM:-8}"
 ACCUM=$((ORIG_ACCUM / NGPU))
 [ "$ACCUM" -lt 1 ] && ACCUM=1
 

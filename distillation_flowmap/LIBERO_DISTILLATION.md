@@ -178,33 +178,127 @@ torchrun \
 
 ### 检查点保存
 
-检查点保存在：
+检查点保存在当前配置的 `cfg.output_dir` 下。例如：
 ```
-output_libero/checkpoints/
-├── step_1000/
-│   ├── online_student/transformer/   # 在线学生模型
-│   └── target_student/transformer/   # 目标学生模型（EMA）
-├── step_2000/
-│   └── ...
-└── ...
+distillation_flowmap/output_libero_fullft_stage1_warmup/checkpoints/
+distillation_flowmap/output_libero_fullft_stage2_anyflow/checkpoints/
 ```
+每个 step 通常包含 `online_student/transformer/` 和 `target_student/transformer/`。
 
 ## 推理测试
 
-训练完成后，可以使用 `distillation_flowmap/inference.py` 进行推理测试：
+训练完成后，真实 LIBERO 环境视频和成功率评估使用统一入口：
 
 ```bash
-python distillation_flowmap/inference.py \
-    --model-path output_libero/checkpoints/step_10000/target_student/transformer \
-    --config-name libero \
-    --port 29056
+bash evaluation/libero/run_eval_new.sh step_5000 online_student
+EVAL_MODE=success TEST_NUM=50 bash evaluation/libero/run_eval_new.sh step_5000 online_student
 ```
 
-然后使用评测脚本：
+离线 teacher/student rollout 指标使用：
+
 ```bash
-bash evaluation/libero/launch_server.sh
-bash evaluation/libero/launch_client.sh
+python distillation_flowmap/rollout_eval_stage2.py --help
 ```
+
+
+## Stage 1 / Stage 2 OPD 与 i2va Demo 说明
+
+本节记录当前 LIBERO full-parameter Stage 1 -> Stage 2 的固定用法。不要把这些入口当作临时 debug 代码删除；如果改 OPD 或 demo 生成逻辑，需要同步更新这里。
+
+更完整的中文 method 风格说明见 `distillation_flowmap/FLOWMAP_METHOD_CN.md`。
+
+### Stage 1 checkpoint 结构
+
+Stage 1 warmup checkpoint 目录形如：
+
+```text
+distillation_flowmap/output_libero_fullft_stage1_warmup/checkpoints/step_N/
+├── online_student/transformer/
+└── target_student/transformer/
+```
+
+Stage 2 continuation 的 `RESUME_FROM_PATH` 应该指向 `step_N` 目录本身，而不是内部的 `target_student/transformer` 或 `online_student/transformer`。当前常用起点是：
+
+```text
+/kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_fullft_stage1_warmup/checkpoints/step_1000
+```
+
+通常设置 `RESUME_ONLINE_FROM_TARGET=1`，让 Stage 2 的 online/target student 都从 Stage 1 target 权重起步。
+
+### Stage 2 OPD 启动命令
+
+从 Stage 1 `step_1000` 启动 Stage 2 的一行命令：
+
+```bash
+source /kpfs-intern/jialongliu/miniforge3/bin/activate && conda activate flashwam && cd /kpfs-intern/jialongliu/projects/Flash-WAM && CONFIG_FILE=distillation_flowmap.config_libero_fullfinetune_stage2_anyflow RESUME_FROM_PATH=/kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_fullft_stage1_warmup/checkpoints/step_1000 RESUME_ONLINE_FROM_TARGET=1 OUTPUT_DIR=/kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_fullft_stage2_anyflow_from_stage1_step1000 MAX_TRAIN_STEPS=10000 WANDB_MODE=offline torchrun --nproc_per_node=8 --master_port=29620 distillation_flowmap/train.py --teacher-model-path /kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero --dataset-path /kpfs-intern/jialongliu/projects/Flash-WAM/training_data/libero-long-lerobot
+```
+
+关键默认值：
+
+- `MAX_TRAIN_STEPS`: Stage 2 总迭代数。默认在 `config_libero_fullfinetune_stage2_anyflow.py` 中是 `5000`；上面命令显式设为 `10000`。
+- `SAVE_INTERVAL`: checkpoint 保存间隔，默认 `1000`。
+- `GRADIENT_CHECKPOINTING=0`: 已在 config 中默认关闭。OPD 有额外 student backward 路径，PyTorch FSDP2 在 activation checkpoint recompute 中可能触发 `aten.addmm.default: got mixed torch.Tensor and DTensor`。
+- `SKIP_TEACHER_COMPILE=1`: 已在 config 中默认开启，Stage 2 不再额外编译 teacher。
+- `OPD_AUX_INTERVAL=8`: 已在 config 中默认设置。每 8 个 optimizer step 跑一次 OPD，并且只在 gradient accumulation 的最后一个 microbatch 跑，避免被 `ACCUM` 放大。
+- `OPD_ROLLOUT_STEP_PAIRS=1,1;1,2;1,4`: 已在 config 中默认设置。在 `student_state` 模式下保留 1-step/2-step/4-step student-induced state。此模式里 teacher 不做 N-step endpoint rollout，pair 的第一项不会增加 teacher 步数；若要做 endpoint teacher rollout，需要切 `OPD_TEACHER_TARGET_MODE=endpoint`，同时 transition 语义会回到 x0/endpoint。
+- OPD 性能约束：不要改回每个 microbatch 都跑，否则耗时会乘以 `gradient_accumulation_steps`。由于 OPD 只跑最后一个 microbatch，OPD loss 本身不再除以 `gradient_accumulation_steps`。
+- action teacher transition 使用 conditional-only teacher forward；action transition 不使用 CFG uncond 分支，避免一整次无用 teacher forward。
+- `OPD_PROFILE=1`: 临时打开 OPD 分段计时，会同步 CUDA 并打印 `prepare_batch/video_student_rollout/video_teacher/action_opd/backward` 等耗时。只用于诊断，不建议常开。
+
+### 当前 Stage 2 OPD 默认语义
+
+当前 Stage 2 配置让 OPD 的 transition/field matching 主导，endpoint/local-FM 只做 anchor：
+
+```text
+OPD_TEACHER_TARGET_MODE=student_state
+VIDEO_TRANSITION_PARAM=velocity
+ACTION_TRANSITION_PARAM=velocity
+LOCAL_FM_WEIGHT=1e-4
+ACTION_LOCAL_FM_WEIGHT=0.003
+ACTION_TRANSITION_BLOCK_WEIGHT=4.0
+ACTION_LOCAL_FM_BLOCK_WEIGHT=1.0
+OPD_TRANSITION_GROUP_WEIGHT=25.0
+OPD_ANCHOR_CAP_RATIO=0.25
+OPD_QUERY_BIAS=low_t
+OPD_AUX_INTERVAL=8
+OPD_ROLLOUT_STEP_PAIRS=1,1;1,2;1,4
+```
+
+`student_state` 模式下，video/action 的 teacher 和 student 应该在同一个 student-induced state 上比较 velocity。不要把 action transition 改回 teacher endpoint rollout 后仍保留 velocity loss；如果切 endpoint 语义，transition 参数也要对应回 x0/endpoint。
+
+### LIBERO i2va 直接生成长视频
+
+仓库里保留了 LingBot 风格的 i2va demo 入口：
+
+- `wan_va/configs/va_libero_i2va.py`: LIBERO i2va 配置。
+- `wan_va/configs/__init__.py`: 注册 `libero_i2av`。
+- `wan_va/wan_va_server.py`: `generate()`、`load_init_obs()`、`decode_one_video()`。
+- `wan_va/configs/va_libero_cfg.py`: LIBERO 推理必须保持 `action_downsample_factor=4`，和 Stage 1 训练对齐。
+
+这个模式会生成多个 chunk 的 latent，先沿时间维拼 latent，再一次性 VAE decode 成 `demo.mp4`。这比逐段 decode 后再拼 MP4 更接近原 LingBot demo。它是生成视频，不是 LIBERO 环境 rollout。
+
+Target student 示例：
+
+```bash
+source /kpfs-intern/jialongliu/miniforge3/bin/activate && conda activate flashwam && cd /kpfs-intern/jialongliu/projects/Flash-WAM && WAN22_PRETRAINED_PATH=/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=29616 wan_va/wan_va_server.py --config-name libero_i2av --checkpoint-path /kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_fullft_stage1_warmup/checkpoints/step_1000/target_student/transformer --num-steps 8 --action-num-steps 8 --input-img-path /kpfs-intern/jialongliu/projects/lingbot-va/example/libero --num-chunks-to-infer 10 --save-root /kpfs-intern/jialongliu/projects/Flash-WAM/evaluation/outputs/libero_i2va_stage1_step1000_target_aligned_s8
+```
+
+Online student 只需要把 checkpoint 和输出目录换成：
+
+```bash
+--checkpoint-path /kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_fullft_stage1_warmup/checkpoints/step_1000/online_student/transformer
+--save-root /kpfs-intern/jialongliu/projects/Flash-WAM/evaluation/outputs/libero_i2va_stage1_step1000_online_aligned_s8
+```
+
+判断 checkpoint 是否正确加载，看日志里是否有：
+
+```text
+Full model weights loaded: 847 keys, 0 missing, 0 unexpected
+FlowMap inference kwargs: {..., action_downsample_factor: 4}
+```
+
+Stage 1 `step_1000` 的 `2-step` i2va 可能仍然偏糊，`8-step`/`16-step` 更适合作诊断。2-step 糊不代表 checkpoint 没加载。
+
 
 ## 常见问题
 
@@ -213,8 +307,8 @@ bash evaluation/libero/launch_client.sh
 如果遇到 OOM，可以尝试：
 - 减小 `batch_size`（已设为 1）
 - 增加 `gradient_accumulation_steps`（已设为 8）
-- 减小 `lora_rank`（如从 256 降到 128）
-- 启用 `gradient_checkpointing`（已通过 `apply_ac` 启用）
+- Stage 1 可以按需启用 `gradient_checkpointing`
+- Stage 2 OPD 默认必须保持 `GRADIENT_CHECKPOINTING=0`；如果显存不够，优先调 batch/accumulation，不要直接打开 checkpointing，否则可能触发 FSDP2 DTensor recompute 报错
 
 ### 2. empty_emb.pt 缺失
 

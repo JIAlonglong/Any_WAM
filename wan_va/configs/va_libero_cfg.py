@@ -21,6 +21,7 @@ va_libero_cfg.height = 128
 va_libero_cfg.width = 128
 va_libero_cfg.action_dim = 30
 va_libero_cfg.action_per_frame = 4
+va_libero_cfg.action_downsample_factor = 4
 va_libero_cfg.obs_cam_keys = [
     'observation.images.agentview_rgb', 'observation.images.eye_in_hand_rgb'
 ]

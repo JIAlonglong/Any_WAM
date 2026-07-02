@@ -17,7 +17,7 @@ conda activate "${CONDA_ENV:-/root/nas/junjie/conda_envs/any_wam}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-export TEACHER_PATH="${TEACHER_PATH:-${PROJECT_ROOT}/checkpoints/lingbot-va-posttrain-libero}"
+export TEACHER_PATH="${TEACHER_PATH:-/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero}"
 export DATASET_PATH="${DATASET_PATH:-${PROJECT_ROOT}/training_data/libero-long-lerobot}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_DATASETS_OFFLINE=1
@@ -63,12 +63,16 @@ torchrun \
     --output-dir "${STAGE1_OUTPUT}" \
     --gradient-accumulation-steps "${ACCUM}"
 
-if [ ! -d "${STAGE1_CKPT}" ]; then
-    echo "ERROR: missing Stage 1 checkpoint: ${STAGE1_CKPT}" >&2
+if [ ! -d "${STAGE1_CKPT}/online_student/transformer" ] || [ ! -d "${STAGE1_CKPT}/target_student/transformer" ]; then
+    echo "ERROR: missing complete Stage 1 checkpoint: ${STAGE1_CKPT}" >&2
+    echo "Expected online_student/transformer and target_student/transformer" >&2
     exit 1
 fi
 
-echo "[Stage 2] AnyFlow-style continuation with rollout_step_pairs=[[1,1],[2,1]]"
+python -c 'import json,sys; from pathlib import Path; p=Path(sys.argv[1]); expected=int(sys.argv[2]); assert p.exists(), f"missing Stage 1 target config: {p}"; actual=int(json.loads(p.read_text()).get("checkpoint_step", -1)); assert actual == expected, f"Stage 1 target checkpoint_step={actual}, expected {expected}"; print(f"Stage 1 EMA target checkpoint verified at step {actual}")' "${STAGE1_CKPT}/target_student/transformer/config.json" "${STAGE1_STEPS}"
+
+export RESUME_ONLINE_FROM_TARGET="${RESUME_ONLINE_FROM_TARGET:-1}"
+echo "[Stage 2] AnyFlow-style continuation from Stage-1 EMA target checkpoint"
 CONFIG_FILE=distillation_flowmap.config_libero_fullfinetune_stage2_anyflow \
 RESUME_FROM_PATH="${STAGE1_CKPT}" \
 OUTPUT_DIR="${STAGE2_OUTPUT}" \

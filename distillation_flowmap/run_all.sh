@@ -73,7 +73,7 @@ log "Run RobotWin: ${RUN_ROBOTWIN}"
 log "Run LIBERO:   ${RUN_LIBERO}"
 
 # 多卡 gradient_accumulation_steps 换算
-ORIG_ACCUM=8
+ORIG_ACCUM="${ORIG_ACCUM:-8}"
 ACCUM=$((ORIG_ACCUM / NGPU))
 [ "$ACCUM" -lt 1 ] && ACCUM=1
 log "gradient_accumulation_steps: ${ACCUM} (effective batch factor: $((ACCUM * NGPU)))"
@@ -125,7 +125,7 @@ TASK2_STATUS="SKIPPED"
 if [ "$RUN_LIBERO" = "1" ]; then
     separator "Task 2/2: LIBERO FlowMap Distillation"
 
-    export TEACHER_PATH="${LIBERO_TEACHER_PATH:-${PROJECT_ROOT}/checkpoints/libero}"
+    export TEACHER_PATH="${LIBERO_TEACHER_PATH:-/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero}"
     export DATASET_PATH="${LIBERO_DATASET_PATH:-${PROJECT_ROOT}/training_data/libero-long-lerobot}"
     export OUTPUT_DIR="${LIBERO_OUTPUT_DIR:-${OUTPUT_ROOT}/output_libero}"
     export CONFIG_FILE="distillation_flowmap.config_libero"

@@ -1,6 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.datasets.utils import get_episode_data_index
+from lerobot.datasets.utils import get_episode_data_index, get_safe_version
 from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
 import numpy as np
 from pathlib import Path
@@ -114,7 +114,8 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.repo_id = repo_id
         
         # 检查是否是本地路径（绝对路径或相对路径存在）
-        if os.path.isabs(repo_id) or os.path.exists(repo_id):
+        self._is_local_repo = os.path.isabs(repo_id) or os.path.exists(repo_id)
+        if self._is_local_repo:
             self.root = Path(repo_id)
         else:
             self.root = HF_LEROBOT_HOME / repo_id
@@ -143,11 +144,12 @@ class LatentLeRobotDataset(LeRobotDataset):
             episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
             self.stats = aggregate_stats(episodes_stats)
         
-        try:
-            assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
-        except (AssertionError, FileNotFoundError, NotADirectoryError):
-            self.revision = get_safe_version(self.repo_id, self.revision)
-            self.download_episodes(download_videos)
+        if not self._is_local_repo:
+            try:
+                assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
+            except (AssertionError, FileNotFoundError, NotADirectoryError):
+                self.revision = get_safe_version(self.repo_id, self.revision)
+                self.download_episodes(download_videos)
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
 
         # 用 pandas 直接加载 parquet（绕过 HuggingFace datasets 对 List feature 的兼容性问题）

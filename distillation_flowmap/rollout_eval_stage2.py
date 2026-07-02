@@ -1,3 +1,11 @@
+"""Offline Stage 2 rollout metrics.
+
+This script compares student rollouts with teacher/reference states on the
+training dataset. It does not step a LIBERO environment and therefore does not
+produce real robot execution videos. Use evaluation/libero/run_eval_new.sh for
+LIBERO environment videos and success-rate evaluation.
+"""
+
 import argparse
 import importlib
 import json

@@ -190,12 +190,21 @@ class DataMixin:
         cond_timesteps_video = torch.zeros(B, F_video, device=self.device)
         cond_timesteps_action = torch.zeros(B, F_action, device=self.device)
 
+        text_emb = batch_dict['text_emb']
+        drop_text_ratio = float(getattr(self.config, 'drop_text_ratio', 0.0))
+        if drop_text_ratio > 0 and hasattr(self, 'empty_emb'):
+            drop_mask = torch.rand(B, device=self.device) < drop_text_ratio
+            if drop_mask.any():
+                empty_emb = self.empty_emb.to(device=text_emb.device, dtype=text_emb.dtype)
+                text_emb = text_emb.clone()
+                text_emb[drop_mask] = empty_emb.expand(B, -1, -1)[drop_mask]
+
         # 构建 latent_dict（不含 noisy_latents 和 targets）
         latent_dict = {
             'latent': batch_dict['latents'],  # 干净样本
             'cond_timesteps': cond_timesteps_video,
             'grid_id': latent_grid_id,
-            'text_emb': batch_dict['text_emb'],
+            'text_emb': text_emb,
         }
 
         # 构建 action_dict（不含 noisy_latents 和 targets）
@@ -203,7 +212,7 @@ class DataMixin:
             'latent': batch_dict['actions'],  # 干净样本
             'cond_timesteps': cond_timesteps_action,
             'grid_id': action_grid_id,
-            'text_emb': batch_dict['text_emb'],
+            'text_emb': text_emb,
             'actions_mask': batch_dict.get('actions_mask'),
         }
 
@@ -282,5 +291,5 @@ class DataMixin:
             移动到 GPU 后的数据批次字典
         """
         for key, value in input_dict.items():
-            input_dict[key] = value.to(self.device)
+            input_dict[key] = value.to(self.device, non_blocking=True)
         return input_dict

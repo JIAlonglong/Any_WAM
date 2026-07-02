@@ -1,105 +1,65 @@
-请帮我评估 Flash-WAM Flow Map 蒸馏的阶段一效果。项目路径：/kpfs-intern/jialongliu/projects/Flash-WAM
+# LIBERO Evaluation Guide
 
-## 背景
-- 阶段一训练已完成，checkpoint 在 distillation_flowmap/output_libero/checkpoints/ 下（step_500 到 step_3500）
-- 使用 flashwam conda 环境（/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python）
-- 评估 client 需要 libero 环境（/kpfs-intern/jialongliu/miniforge3/envs/libero/bin/python）
-- 评估架构：server（加载模型，WebSocket 推理）+ client（LIBERO 仿真，发观测收动作）
-- GPU: A800 80GB
+当前保留两条评估链路：
 
-## 需要做的三件事
+1. 离线 checkpoint 指标：`distillation_flowmap/rollout_eval_stage2.py` 和 `rollout_eval_video_stage2.py`。
+   这类评估在训练数据 latent/action 上比较 student 和 teacher，不会和 LIBERO 环境交互，也不会生成真实机器人执行视频。
 
-### 1. 视频可视化（快速 sanity check）
-用 step_3500 的 student checkpoint 生成视频，看效果是否合理。
+2. 真实 LIBERO 环境评估：`evaluation/libero/run_eval_new.sh`。
+   这条链路会启动 `wan_va_server.py`，再用 `evaluation/libero/client.py` 跑 LIBERO 环境，输出真实环境视频和 `succ_rate` JSON。
+
+## 快速视频检查
 
 ```bash
-# Terminal 1: 启动 server
 cd /kpfs-intern/jialongliu/projects/Flash-WAM
-PYTHONPATH="$(pwd):$PYTHONPATH" \
-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python -m torch.distributed.run \
-    --nproc_per_node 1 --master_port 29062 \
-    wan_va/wan_va_server.py \
-    --config-name libero --port 29056 \
-    --checkpoint-path distillation_flowmap/output_libero/checkpoints/step_3500/online_student/transformer \
-    --num-steps 2 \
-    --save-root evaluation/outputs/step_3500/visualization
-
-# Terminal 2: 等 server 加载完（约 60s）后跑 client
-cd /kpfs-intern/jialongliu/projects/Flash-WAM
-/kpfs-intern/jialongliu/miniforge3/envs/libero/bin/python evaluation/libero/client.py \
-    --libero-benchmark libero_10 --port 29056 --test-num 5 \
-    --task-range 0 3 --out-dir evaluation/outputs/step_3500/videos
+bash evaluation/libero/run_eval_new.sh
 ```
 
-视频保存在 evaluation/outputs/step_3500/videos/ 下，检查：
-- 视频是否清晰（不是纯噪声/模糊）
-- 机械臂是否朝目标移动
-- 是否有帧间闪烁
+默认评估 `distillation_flowmap/output_libero_fullft_stage2_anyflow/checkpoints/step_5000/online_student/transformer`，跑 `libero_10` 的任务 `0..3`，每个任务 3 个 episode。
 
-### 2. 量化精度（student vs teacher 动作对比）
-分别用 teacher 和 student checkpoint 跑推理，保存 .pt 文件，然后对比。
+输出：
+
+```text
+evaluation/outputs/libero_env_step_5000_online_student/videos/
+```
+
+## 成功率评估
 
 ```bash
-# Teacher server
 cd /kpfs-intern/jialongliu/projects/Flash-WAM
-PYTHONPATH="$(pwd):$PYTHONPATH" \
-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python -m torch.distributed.run \
-    --nproc_per_node 1 --master_port 29063 \
-    wan_va/wan_va_server.py \
-    --config-name libero --port 29057 \
-    --checkpoint-path checkpoints/libero/transformer \
-    --num-steps 2 \
-    --save-root evaluation/outputs/step_3500/actions/teacher
-
-# Teacher client
-/kpfs-intern/jialongliu/miniforge3/envs/libero/bin/python evaluation/libero/client.py \
-    --libero-benchmark libero_10 --port 29057 --test-num 5 \
-    --task-range 0 3 --out-dir evaluation/outputs/step_3500/videos_teacher
-
-# Student server（换 checkpoint 和端口）
-PYTHONPATH="$(pwd):$PYTHONPATH" \
-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python -m torch.distributed.run \
-    --nproc_per_node 1 --master_port 29064 \
-    wan_va/wan_va_server.py \
-    --config-name libero --port 29058 \
-    --checkpoint-path distillation_flowmap/output_libero/checkpoints/step_3500/online_student/transformer \
-    --num-steps 2 \
-    --save-root evaluation/outputs/step_3500/actions/student
-
-# Student client
-/kpfs-intern/jialongliu/miniforge3/envs/libero/bin/python evaluation/libero/client.py \
-    --libero-benchmark libero_10 --port 29058 --test-num 5 \
-    --task-range 0 3 --out-dir evaluation/outputs/step_3500/videos_student
-
-# 对比
-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python evaluation/libero/compare_actions.py \
-    --teacher-dir evaluation/outputs/step_3500/actions/teacher \
-    --student-dir evaluation/outputs/step_3500/actions/student \
-    --output-file evaluation/outputs/step_3500/action_comparison.json
+EVAL_MODE=success TEST_NUM=50 bash evaluation/libero/run_eval_new.sh
 ```
 
-### 3. LIBERO 任务成功率（最终指标）
-用 step_3500 跑 libero_10 的全部 10 个任务，每个任务 50 episode。
+输出 JSON：
+
+```text
+evaluation/outputs/libero_env_step_5000_online_student/results/libero_eval/*.json
+```
+
+## Teacher/Student Action 对比
 
 ```bash
-# Server（同上，用 step_3500）
-# Client:
-/kpfs-intern/jialongliu/miniforge3/envs/libero/bin/python evaluation/libero/client.py \
-    --libero-benchmark libero_10 --port 29056 --test-num 50 \
-    --task-range 0 10 --out-dir evaluation/outputs/step_3500/success_rate
+cd /kpfs-intern/jialongliu/projects/Flash-WAM
+EVAL_MODE=compare TEST_NUM=5 bash evaluation/libero/run_eval_new.sh
 ```
 
-成功率 JSON 在 evaluation/outputs/step_3500/success_rate/ 下。
+输出：
 
-## 注意事项
-- server 和 client 必须用不同的终端（server 要常驻）
-- server 启动后等 60s 再跑 client（模型加载需要时间）
-- 如果要评估不同 step 的 checkpoint，换 --checkpoint-path 即可
-- 可以同时评估 target_student（EMA 版本）：checkpoint 路径改为 step_3500/target_student/transformer
-- 如果遇到 port 冲突，换 --master_port 和 --port
+```text
+evaluation/outputs/libero_env_step_5000_online_student/results/action_comparison.json
+```
 
-## 期望输出
-请把以下结果汇总给我：
-1. 视频可视化：生成的视频路径列表 + 肉眼评估（是否清晰、动作是否合理）
-2. 量化精度：MSE、L1、余弦相似度（从 action_comparison.json 读取）
-3. 任务成功率：每个任务的成功率 + 平均成功率
+## 常用覆盖项
+
+```bash
+OUTPUT_ROOT=distillation_flowmap/output_libero_fullft_stage1_warmup \
+EVAL_MODE=success TEST_NUM=20 TASK_START=0 TASK_END=10 \
+bash evaluation/libero/run_eval_new.sh step_500 target_student
+```
+
+- `OUTPUT_ROOT`：切换 stage1/stage2 输出目录。
+- `TEACHER_CKPT`：覆盖 teacher transformer 路径。
+- `NUM_STEPS`：视频推理步数，默认 20。
+- `ACTION_NUM_STEPS`：action 推理步数，默认 50。
+- `TASK_START/TASK_END`：LIBERO task 范围。
+- `SAVE_ROOT`：覆盖输出目录。

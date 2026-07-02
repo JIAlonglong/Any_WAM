@@ -1,73 +1,131 @@
 #!/bin/bash
 # ============================================================
-# LIBERO 阶段一评估编排脚本
+# LIBERO 真实环境评估编排脚本
 #
 # 用法：
-#   bash evaluation/libero/run_eval.sh                    # 评估 step_1000 online_student
-#   bash evaluation/libero/run_eval.sh step_2000          # 评估指定 step
-#   bash evaluation/libero/run_eval.sh step_1000 target   # 评估 target_student
-#   EVAL_MODE=compare bash evaluation/libero/run_eval.sh  # 对比 teacher vs student
-#   EVAL_MODE=success bash evaluation/libero/run_eval.sh  # 跑任务成功率
+#   bash evaluation/libero/run_eval_new.sh
+#   bash evaluation/libero/run_eval_new.sh step_5000
+#   bash evaluation/libero/run_eval_new.sh step_5000 target_student
+#   EVAL_MODE=compare bash evaluation/libero/run_eval_new.sh
+#   EVAL_MODE=success TEST_NUM=50 bash evaluation/libero/run_eval_new.sh
 #
 # 环境变量：
-#   EVAL_MODE:   visualize | compare | success | all (默认 visualize)
-#   NUM_STEPS:   推理步数 (默认 2)
-#   TEST_NUM:    每任务测试 episode 数 (默认 10，快速验证用)
-#   PORT:        WebSocket 端口 (默认 29056)
+#   OUTPUT_ROOT:      distillation 输出目录，默认 stage2 anyflow 输出
+#   TEACHER_CKPT:     teacher transformer 路径，默认 /kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero/transformer
+#   EVAL_MODE:        visualize | compare | success | all，默认 visualize
+#   NUM_STEPS:        视频推理步数，默认 20
+#   ACTION_NUM_STEPS: action 推理步数，默认 50
+#   TEST_NUM:         每任务 episode 数，默认 3，正式成功率建议 50
+#   TASK_START/END:   任务范围 [start, end)，默认 visualize/compare 跑 0..3，success 跑 0..10
+#   PORT:             WebSocket 端口，默认 29057
+#   CHECK_ONLY=1:     只检查路径和参数，不启动模型
+#
+# 说明：
+#   distillation_flowmap/rollout_eval_stage2.py 是离线 teacher/student rollout
+#   指标，不会也不应该生成真正的 LIBERO 环境视频。真正的视频和成功率
+#   评估走本脚本：wan_va_server.py + evaluation/libero/client.py。
 # ============================================================
 
 set -e
 
-# 使用 OSMesa 软件渲染（无 GPU 显示）
 export MUJOCO_GL=osmesa
 export PYOPENGL_PLATFORM=osmesa
 
 # Server 用 flashwam（有 diffusers/peft），Client 用 libero（有 robosuite）
-SERVER_PYTHON="conda run -n flashwam python"
-CLIENT_PYTHON="conda run -n libero python"
+SERVER_PYTHON="${SERVER_PYTHON:-conda run -n flashwam python}"
+CLIENT_PYTHON="${CLIENT_PYTHON:-conda run -n libero python}"
 
-STEP="${1:-step_8500}"
+STEP="${1:-}"
 VARIANT="${2:-online_student}"
 EVAL_MODE="${EVAL_MODE:-visualize}"
 NUM_STEPS="${NUM_STEPS:-20}"
-ACTION_NUM_STEPS="${ACTION_NUM_STEPS:-20}"
+ACTION_NUM_STEPS="${ACTION_NUM_STEPS:-50}"
 TEST_NUM="${TEST_NUM:-3}"
 PORT="${PORT:-29057}"
+TASK_START="${TASK_START:-0}"
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-export PYTHONPATH="${PROJECT_ROOT}/wan_va:${PROJECT_ROOT}/distillation_flowmap:${PYTHONPATH}"
+DEFAULT_OUTPUT_ROOT="${PROJECT_ROOT}/distillation_flowmap/output_libero_fullft_stage2_anyflow"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${DEFAULT_OUTPUT_ROOT}}"
+export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/wan_va:${PROJECT_ROOT}/distillation_flowmap:${PYTHONPATH}"
 
-STUDENT_CKPT="${PROJECT_ROOT}/distillation_flowmap/output_libero_new/checkpoints/${STEP}/${VARIANT}/transformer"
-TEACHER_CKPT="${PROJECT_ROOT}/checkpoints/libero/transformer"
-SAVE_ROOT="${PROJECT_ROOT}/evaluation/outputs/${STEP}_${VARIANT}"
+latest_step() {
+    local best=""
+    local best_num=-1
+    local d base num
+    for d in "${OUTPUT_ROOT}"/checkpoints/step_*; do
+        [ -d "$d" ] || continue
+        base="${d##*/}"
+        num="${base#step_}"
+        case "$num" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        if [ "$num" -gt "$best_num" ]; then
+            best_num="$num"
+            best="$base"
+        fi
+    done
+    printf '%s\n' "$best"
+}
+
+if [ -z "$STEP" ]; then
+    STEP="$(latest_step)"
+fi
+if [ -z "$STEP" ] || [ "$STEP" = "step_" ]; then
+    echo "ERROR: Could not infer STEP because no checkpoints were found under ${OUTPUT_ROOT}/checkpoints"
+    echo "Run training first, or set OUTPUT_ROOT to an existing distillation output dir, or pass a step explicitly."
+    exit 1
+fi
+
+STUDENT_CKPT="${OUTPUT_ROOT}/checkpoints/${STEP}/${VARIANT}/transformer"
+TEACHER_CKPT="${TEACHER_CKPT:-/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero/transformer}"
+SAVE_ROOT="${SAVE_ROOT:-${PROJECT_ROOT}/evaluation/outputs/libero_env_${STEP}_${VARIANT}}"
 VIDEO_DIR="${SAVE_ROOT}/videos"
 ACTION_DIR="${SAVE_ROOT}/actions"
 RESULT_DIR="${SAVE_ROOT}/results"
 
-echo "============================================"
-echo "  LIBERO Phase 1 Evaluation"
-echo "============================================"
-echo "  Step:           ${STEP} / ${VARIANT}"
-echo "  Eval mode:      ${EVAL_MODE}"
-echo "  Video steps:    ${NUM_STEPS}"
-echo "  Action steps:   ${ACTION_NUM_STEPS}"
-echo "  Test num:       ${TEST_NUM}"
-echo "  Port:           ${PORT}"
-echo "  Student:        ${STUDENT_CKPT}"
-echo "  Teacher:        ${TEACHER_CKPT}"
-echo "============================================"
-
-# 检查 checkpoint
-if [ ! -d "$STUDENT_CKPT" ]; then
-    echo "ERROR: Student checkpoint not found: $STUDENT_CKPT"
-    echo "Available checkpoints:"
-    ls "${PROJECT_ROOT}/distillation_flowmap/output_libero_new/checkpoints/"
-    exit 1
+if [ -z "${TASK_END:-}" ]; then
+    if [ "$EVAL_MODE" = "success" ] || [ "$EVAL_MODE" = "all" ]; then
+        TASK_END=10
+    else
+        TASK_END=3
+    fi
 fi
 
-# ============================================================
-# 函数：启动推理服务器
-# ============================================================
+MASTER_PORT="${MASTER_PORT:-29062}"
+
+log_header() {
+    echo "============================================"
+    echo "  LIBERO Environment Evaluation"
+    echo "============================================"
+    echo "  Step:           ${STEP} / ${VARIANT}"
+    echo "  Output root:    ${OUTPUT_ROOT}"
+    echo "  Eval mode:      ${EVAL_MODE}"
+    echo "  Video steps:    ${NUM_STEPS}"
+    echo "  Action steps:   ${ACTION_NUM_STEPS}"
+    echo "  Test num:       ${TEST_NUM}"
+    echo "  Task range:     ${TASK_START}..${TASK_END}"
+    echo "  Port:           ${PORT}"
+    echo "  Master port:    ${MASTER_PORT}"
+    echo "  Student:        ${STUDENT_CKPT}"
+    echo "  Teacher:        ${TEACHER_CKPT}"
+    echo "  Save root:      ${SAVE_ROOT}"
+    echo "============================================"
+}
+
+check_inputs() {
+    if [ ! -d "$STUDENT_CKPT" ]; then
+        echo "ERROR: Student checkpoint not found: $STUDENT_CKPT"
+        echo "Available checkpoints:"
+        ls "${OUTPUT_ROOT}/checkpoints/" 2>/dev/null || true
+        exit 1
+    fi
+    if [ ! -d "$TEACHER_CKPT" ]; then
+        echo "ERROR: Teacher checkpoint not found: $TEACHER_CKPT"
+        exit 1
+    fi
+}
+
 start_server() {
     local ckpt_path="$1"
     local save_root="$2"
@@ -81,7 +139,7 @@ start_server() {
 
     $SERVER_PYTHON -m torch.distributed.run \
         --nproc_per_node 1 \
-        --master_port 29062 \
+        --master_port "$MASTER_PORT" \
         wan_va/wan_va_server.py \
         --config-name libero \
         --port "$PORT" \
@@ -92,41 +150,36 @@ start_server() {
 
     SERVER_PID=$!
     echo "[Server] PID: $SERVER_PID"
-    echo "[Server] Waiting 60s for model loading..."
-    sleep 60
+    echo "[Server] Waiting ${SERVER_WAIT_SECONDS:-60}s for model loading..."
+    sleep "${SERVER_WAIT_SECONDS:-60}"
 }
 
-# ============================================================
-# 函数：停止服务器
-# ============================================================
 stop_server() {
-    if [ -n "$SERVER_PID" ]; then
+    if [ -n "${SERVER_PID:-}" ]; then
         echo "[Server] Stopping PID $SERVER_PID"
-        kill $SERVER_PID 2>/dev/null || true
-        wait $SERVER_PID 2>/dev/null || true
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+        SERVER_PID=""
     fi
 }
 
 trap stop_server EXIT
 
-# ============================================================
-# 模式 1: 视频可视化
-# ============================================================
-run_visualize() {
-    echo ""
-    echo "=== Mode: Video Visualization ==="
-
-    # 用 student checkpoint 启动服务器
-    start_server "$STUDENT_CKPT" "$VIDEO_DIR" "$NUM_STEPS" "$ACTION_NUM_STEPS"
-
-    # 跑少量 episode 生成视频
+run_client() {
+    local out_dir="$1"
     $CLIENT_PYTHON evaluation/libero/client.py \
         --libero-benchmark libero_10 \
         --port "$PORT" \
         --test-num "$TEST_NUM" \
-        --task-range 0 3 \
-        --out-dir "$VIDEO_DIR"
+        --task-range "$TASK_START" "$TASK_END" \
+        --out-dir "$out_dir"
+}
 
+run_visualize() {
+    echo ""
+    echo "=== Mode: Video Visualization ==="
+    start_server "$STUDENT_CKPT" "$VIDEO_DIR" "$NUM_STEPS" "$ACTION_NUM_STEPS"
+    run_client "$VIDEO_DIR"
     stop_server
 
     echo ""
@@ -135,83 +188,56 @@ run_visualize() {
     echo "Total videos: $(find "$VIDEO_DIR" -name "*.mp4" | wc -l)"
 }
 
-# ============================================================
-# 模式 2: 量化精度对比 (student vs teacher)
-# ============================================================
 run_compare() {
     echo ""
-    echo "=== Mode: Quantitative Comparison ==="
+    echo "=== Mode: Quantitative Action Comparison ==="
 
-    local TEACHER_SAVE="${ACTION_DIR}/teacher"
-    local STUDENT_SAVE="${ACTION_DIR}/student"
+    local teacher_save="${ACTION_DIR}/teacher"
+    local student_save="${ACTION_DIR}/student"
 
-    # Teacher inference
     echo "[Compare] Running teacher inference..."
-    start_server "$TEACHER_CKPT" "$TEACHER_SAVE" "$NUM_STEPS" "$ACTION_NUM_STEPS"
-
-    $CLIENT_PYTHON evaluation/libero/client.py \
-        --libero-benchmark libero_10 \
-        --port "$PORT" \
-        --test-num "$TEST_NUM" \
-        --task-range 0 3 \
-        --out-dir "${VIDEO_DIR}/teacher"
-
+    start_server "$TEACHER_CKPT" "$teacher_save" "$NUM_STEPS" "$ACTION_NUM_STEPS"
+    run_client "${VIDEO_DIR}/teacher"
     stop_server
     sleep 5
 
-    # Student inference
     echo "[Compare] Running student inference..."
-    start_server "$STUDENT_CKPT" "$STUDENT_SAVE" "$NUM_STEPS" "$ACTION_NUM_STEPS"
-
-    $CLIENT_PYTHON evaluation/libero/client.py \
-        --libero-benchmark libero_10 \
-        --port "$PORT" \
-        --test-num "$TEST_NUM" \
-        --task-range 0 3 \
-        --out-dir "${VIDEO_DIR}/student"
-
+    start_server "$STUDENT_CKPT" "$student_save" "$NUM_STEPS" "$ACTION_NUM_STEPS"
+    run_client "${VIDEO_DIR}/student"
     stop_server
     sleep 5
 
-    # Compare actions
     echo "[Compare] Computing metrics..."
-    $CLIENT_PYTHON evaluation/libero/compare_actions.py \
-        --teacher-dir "$TEACHER_SAVE" \
-        --student-dir "$STUDENT_SAVE" \
+    $SERVER_PYTHON evaluation/libero/compare_actions.py \
+        --teacher-dir "$teacher_save" \
+        --student-dir "$student_save" \
         --output-file "${RESULT_DIR}/action_comparison.json"
 }
 
-# ============================================================
-# 模式 3: LIBERO 任务成功率
-# ============================================================
 run_success() {
     echo ""
     echo "=== Mode: LIBERO Task Success Rate ==="
-
     start_server "$STUDENT_CKPT" "$ACTION_DIR" "$NUM_STEPS" "$ACTION_NUM_STEPS"
-
-    $CLIENT_PYTHON evaluation/libero/client.py \
-        --libero-benchmark libero_10 \
-        --port "$PORT" \
-        --test-num "$TEST_NUM" \
-        --task-range 0 10 \
-        --out-dir "${RESULT_DIR}/libero_eval"
-
+    run_client "${RESULT_DIR}/libero_eval"
     stop_server
 
     echo ""
     echo "=== Results ==="
     for f in "${RESULT_DIR}"/libero_eval/*.json; do
         if [ -f "$f" ]; then
-            echo "$(basename $f): $(cat $f)"
+            echo "$(basename "$f"): $(cat "$f")"
         fi
     done
 }
 
-# ============================================================
-# 执行
-# ============================================================
 mkdir -p "$VIDEO_DIR" "$ACTION_DIR" "$RESULT_DIR"
+log_header
+check_inputs
+
+if [ "${CHECK_ONLY:-0}" = "1" ]; then
+    echo "CHECK_ONLY=1: inputs look valid; not starting server."
+    exit 0
+fi
 
 case "$EVAL_MODE" in
     visualize)
@@ -237,6 +263,6 @@ esac
 
 echo ""
 echo "============================================"
-echo "  Evaluation complete!"
+echo "  Evaluation complete"
 echo "  Results: $RESULT_DIR"
 echo "============================================"

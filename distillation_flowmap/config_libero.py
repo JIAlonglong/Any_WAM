@@ -26,7 +26,7 @@ _project_root = os.path.dirname(_this_dir)
 # 教师模型路径：libero 后训练 checkpoint
 cfg.teacher_model_path = os.environ.get(
     "TEACHER_PATH",
-    os.path.join(_project_root, "checkpoints", "libero"))
+    "/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero")
 
 # 输出目录
 cfg.output_dir = os.environ.get(

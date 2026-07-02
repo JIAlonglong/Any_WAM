@@ -22,6 +22,7 @@ _stage1_warmup_ckpt = os.path.join(
 )
 
 cfg.resume_from_path = os.environ.get("RESUME_FROM_PATH", _stage1_warmup_ckpt)
+cfg.resume_online_from_target = _env_bool("RESUME_ONLINE_FROM_TARGET", True)
 cfg.output_dir = os.environ.get(
     "OUTPUT_DIR",
     os.path.join(_this_dir, "output_libero_fullft_stage2_anyflow"),
@@ -38,18 +39,30 @@ cfg.lora_dropout = 0.0
 # auxiliary teacher correction queried on the student-visited state.
 cfg.use_onpolicy_transition = _env_bool("USE_ONPOLICY_TRANSITION", False)
 cfg.use_opd_aux = _env_bool("USE_OPD_AUX", True)
-cfg.opd_aux_weight = float(os.environ.get("OPD_AUX_WEIGHT", 0.05))
+cfg.opd_aux_weight = float(os.environ.get("OPD_AUX_WEIGHT", 1.0))
 cfg.opd_aux_warmup_steps = int(os.environ.get("OPD_AUX_WARMUP_STEPS", 0))
-cfg.opd_aux_interval = int(os.environ.get("OPD_AUX_INTERVAL", 8))
+cfg.opd_aux_interval = int(os.environ.get("OPD_AUX_INTERVAL", 16))
 cfg.opd_aux_prob = float(os.environ.get("OPD_AUX_PROB", 1.0))
 cfg.opd_aux_use_nofsdp_rollout = _env_bool("OPD_AUX_USE_NOFSDP_ROLLOUT", False)
+cfg.opd_profile = _env_bool("OPD_PROFILE", False)
+cfg.opd_teacher_target_mode = os.environ.get("OPD_TEACHER_TARGET_MODE", "student_state").lower()
+cfg.opd_rollout_grad_mode = os.environ.get("OPD_ROLLOUT_GRAD_MODE", "endpoint").lower()
+cfg.opd_action_rollout_grad_mode = os.environ.get("OPD_ACTION_ROLLOUT_GRAD_MODE", cfg.opd_rollout_grad_mode).lower()
+cfg.flowmap_aux_weight = float(os.environ.get("FLOWMAP_AUX_WEIGHT", 0.25))
 _opd_aux_loss_clip = os.environ.get("OPD_AUX_LOSS_CLIP_VALUE")
 cfg.opd_aux_loss_clip_value = (
     float(_opd_aux_loss_clip) if _opd_aux_loss_clip is not None else None
 )
+cfg.auto_scale_gradient_accumulation = _env_bool("AUTO_SCALE_GRADIENT_ACCUMULATION", True)
+cfg.gradient_accumulation_reference = int(os.environ.get(
+    "GRADIENT_ACCUMULATION_REFERENCE",
+    cfg.gradient_accumulation_steps,
+))
 
-# Use the broader low-step rollout curriculum again. Pairs are [teacher_steps,
-# student_steps], so these keep the teacher at least as strong as the student.
+# Keep the OPD default lightweight enough for full-model FSDP runs. In the
+# default student_state target mode, teacher_steps are ignored and K_steps is
+# the only expensive rollout multiplier. Broader curricula can be enabled with
+# OPD_ROLLOUT_STEP_PAIRS/ROLLOUT_STEP_PAIRS once speed and ratios look sane.
 cfg.rollout_step_pairs = [
     [1, 1],
     [2, 1],
@@ -93,24 +106,22 @@ cfg.stage1_start_eval_transition_pairs = [
     (1000, 0),
 ]
 
-# Keep AnyFlow mixed sampling as the default; no explicit v1/a1 endpoint bias.
-cfg.one_step_focus_ratio = float(os.environ.get("ONE_STEP_FOCUS_RATIO", 0.0))
-cfg.one_step_t_min = float(os.environ.get("ONE_STEP_T_MIN", 0.85))
-cfg.video_one_step_focus_ratio = float(os.environ.get(
-    "VIDEO_ONE_STEP_FOCUS_RATIO", cfg.one_step_focus_ratio))
-cfg.video_one_step_t_min = float(os.environ.get(
-    "VIDEO_ONE_STEP_T_MIN", cfg.one_step_t_min))
-cfg.action_one_step_focus_ratio = float(os.environ.get(
-    "ACTION_ONE_STEP_FOCUS_RATIO", cfg.one_step_focus_ratio))
-cfg.action_one_step_t_min = float(os.environ.get(
-    "ACTION_ONE_STEP_T_MIN", 0.995))
-cfg.opd_aux_one_step_focus_ratio = float(os.environ.get(
-    "OPD_AUX_ONE_STEP_FOCUS_RATIO", cfg.one_step_focus_ratio))
-cfg.opd_aux_one_step_t_min = float(os.environ.get(
-    "OPD_AUX_ONE_STEP_T_MIN", cfg.one_step_t_min))
+# DanceOPD-style OPD query bias: train teacher/student matching mostly on
+# low-noise student states instead of forcing high-noise one-step endpoints.
+cfg.opd_query_bias = os.environ.get("OPD_QUERY_BIAS", "low_t").lower()
+cfg.opd_query_bias_ratio = float(os.environ.get("OPD_QUERY_BIAS_RATIO", 1.0))
+cfg.opd_low_noise_alpha = float(os.environ.get("OPD_LOW_NOISE_ALPHA", 5.0))
+cfg.opd_low_noise_beta = float(os.environ.get("OPD_LOW_NOISE_BETA", 2.0))
+cfg.opd_low_noise_max_sigma = float(os.environ.get("OPD_LOW_NOISE_MAX_SIGMA", 0.25))
 
 # Conservative full-model continuation LR.
 cfg.learning_rate = float(os.environ.get("LEARNING_RATE", 5e-7))
+cfg.beta1 = float(os.environ.get("BETA1", 0.0))
+cfg.beta2 = float(os.environ.get("BETA2", 0.999))
+cfg.ema_decay = float(os.environ.get("EMA_DECAY", 0.99))
+cfg.ema_warmup_steps = int(os.environ.get("EMA_WARMUP_STEPS", 200))
+cfg.drop_text_ratio = float(os.environ.get("DROP_TEXT_RATIO", 0.1))
+cfg.fuse_guidance_scale = float(os.environ.get("FUSE_GUIDANCE_SCALE", 3.0))
 cfg.warmup_steps = int(os.environ.get("WARMUP_STEPS", 100))
 cfg.max_train_steps = int(os.environ.get("MAX_TRAIN_STEPS", 5000))
 cfg.save_interval = int(os.environ.get("SAVE_INTERVAL", 1000))
@@ -121,23 +132,35 @@ cfg.reset_resume_step = (
     not in ("0", "false", "no", "off")
 )
 cfg.skip_teacher_compile = os.environ.get(
-    "SKIP_TEACHER_COMPILE", "0").lower() in ("1", "true", "yes", "on")
+    "SKIP_TEACHER_COMPILE", "1").lower() in ("1", "true", "yes", "on")
+# OPD aux does an additional student backward path; PyTorch FSDP2 DTensor can
+# hit mixed Tensor/DTensor dispatch during activation-checkpoint recompute.
+# Keep it off by default for Stage 2 unless explicitly re-enabled.
+cfg.gradient_checkpointing = os.environ.get(
+    "GRADIENT_CHECKPOINTING", "0").lower() in ("1", "true", "yes", "on")
 
 # Make OPD/local-FM a regularizer rather than the dominant Stage 2 signal.
-# Stage 2 trajectory distillation compares K-step student endpoints against
-# N-step teacher endpoints, so the video transition target is x0/endpoint-style
-# rather than same-state velocity matching.
-cfg.video_transition_param = os.environ.get("VIDEO_TRANSITION_PARAM", "x0")
+# In the default student-state OPD mode, the primary DanceOPD-style video
+# signal is same-state velocity matching. A small endpoint/x0 auxiliary keeps
+# clean-latent predictions anchored without replacing the field loss.
+cfg.video_transition_param = os.environ.get("VIDEO_TRANSITION_PARAM", "velocity")
+cfg.action_transition_param = os.environ.get("ACTION_TRANSITION_PARAM", "velocity")
 cfg.video_transition_weight = float(os.environ.get("VIDEO_TRANSITION_WEIGHT", 1.0))
-cfg.local_fm_weight = float(os.environ.get("LOCAL_FM_WEIGHT", 0.001))
+cfg.opd_endpoint_aux_weight = float(os.environ.get("OPD_ENDPOINT_AUX_WEIGHT", 0.1))
+cfg.local_fm_weight = float(os.environ.get("LOCAL_FM_WEIGHT", 1e-4))
 cfg.action_loss_weight = float(os.environ.get("ACTION_LOSS_WEIGHT", 1.0))
-cfg.action_aware_weight = float(os.environ.get("ACTION_LOCAL_FM_WEIGHT", 0.1))
+cfg.action_aware_weight = float(os.environ.get("ACTION_LOCAL_FM_WEIGHT", 0.003))
 cfg.gt_regression_weight = float(os.environ.get("GT_REGRESSION_WEIGHT", 0.15))
-cfg.action_block_weight = float(os.environ.get("ACTION_BLOCK_WEIGHT", 4.0))
-cfg.cfg_min = float(os.environ.get("CFG_MIN", cfg.cfg_min))
-cfg.cfg_max = float(os.environ.get("CFG_MAX", cfg.cfg_max))
+cfg.action_transition_block_weight = float(os.environ.get("ACTION_TRANSITION_BLOCK_WEIGHT", 4.0))
+cfg.action_local_fm_block_weight = float(os.environ.get("ACTION_LOCAL_FM_BLOCK_WEIGHT", 1.0))
+cfg.opd_transition_group_weight = float(os.environ.get("OPD_TRANSITION_GROUP_WEIGHT", 25.0))
+cfg.opd_anchor_cap_ratio = float(os.environ.get("OPD_ANCHOR_CAP_RATIO", 0.25))
+# Kept for older configs/scripts; Stage 2 OPD uses the split weights above.
+cfg.action_block_weight = float(os.environ.get("ACTION_BLOCK_WEIGHT", cfg.action_transition_block_weight))
+cfg.cfg_min = float(os.environ.get("CFG_MIN", cfg.fuse_guidance_scale))
+cfg.cfg_max = float(os.environ.get("CFG_MAX", cfg.fuse_guidance_scale))
 cfg.opd_aux_action = (
-    os.environ.get("OPD_AUX_ACTION", "1").lower()
+    os.environ.get("OPD_AUX_ACTION", "0").lower()
     not in ("0", "false", "no", "off")
 )
 

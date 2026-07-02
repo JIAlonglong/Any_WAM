@@ -9,30 +9,21 @@ This directory contains evaluation benchmarks for Flash-WAM model.
 LIBERO benchmark for evaluating robot manipulation policies.
 
 **Files:**
-- `client.py` - Main evaluation client
-- `launch_client.sh` - Script to launch evaluation client
-- `launch_server.sh` - Script to launch inference server
+- `run_eval_new.sh` - Main real-environment evaluation wrapper
+- `client.py` - LIBERO environment client used by the wrapper
+- `compare_actions.py` - Optional teacher/student action comparison
 
 **Usage:**
 
-1. Start the inference server:
 ```bash
-bash evaluation/libero/launch_server.sh
-```
+# Quick real-environment video sanity check
+bash evaluation/libero/run_eval_new.sh
 
-2. Run evaluation:
-```bash
-bash evaluation/libero/launch_client.sh
-```
+# Full success-rate evaluation
+EVAL_MODE=success TEST_NUM=50 bash evaluation/libero/run_eval_new.sh
 
-Or run directly:
-```bash
-python evaluation/libero/client.py \
-    --libero-benchmark libero_10 \
-    --port 29056 \
-    --test-num 50 \
-    --task-range 0 10 \
-    --out-dir outputs/libero
+# Optional teacher/student action comparison
+EVAL_MODE=compare TEST_NUM=5 bash evaluation/libero/run_eval_new.sh
 ```
 
 ### 2. RobotWin

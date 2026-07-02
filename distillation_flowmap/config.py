@@ -24,6 +24,13 @@ from easydict import EasyDict
 
 cfg = EasyDict(__name__="Config: Flash-WAM FlowMap Distillation")
 
+
+def _env_bool(name, default):
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.lower() in ("1", "true", "yes", "on")
+
 # ============================================================
 # 路径配置（与原配置完全一致）
 # ============================================================
@@ -55,6 +62,7 @@ cfg.height = 256                    # 视频高度（像素）
 cfg.width = 320                     # 视频宽度（像素）
 cfg.action_dim = 30                 # 动作维度（机器人自由度）
 cfg.action_per_frame = 16           # 每帧对应的动作步数
+cfg.num_frames = int(os.environ.get("NUM_FRAMES", 128))       # 限制每个样本的原始帧数；避免按最长 episode pad 到超长序列
 cfg.frame_chunk_size = 2            # 帧分块大小（注意力窗口的分块单位）
 cfg.attn_window = 72                # 注意力窗口大小（滑动窗口注意力）
 
@@ -122,11 +130,11 @@ cfg.distill_video = _mode in ("video", "joint", "video_action_aware", "flashwam"
 cfg.distill_action = _mode in ("action", "joint", "flashwam")                        # 是否蒸馏动作
 cfg.action_aware = _mode in ("video_action_aware", "flashwam")                       # 是否使用动作感知正则
 
-cfg.num_ddim_timesteps_action = 2   # 动作的锚点数（k_action = 1000/2 = 500）
-cfg.action_loss_weight = 1.0        # 动作一致性损失的权重
-cfg.action_block_weight = 1.0       # 动作分支总权重；用于显式控制 action 整体梯度强度
+cfg.num_ddim_timesteps_action = int(os.environ.get("NUM_DDIM_TIMESTEPS_ACTION", 2))   # 动作的锚点数（k_action = 1000/2 = 500）
+cfg.action_loss_weight = float(os.environ.get("ACTION_LOSS_WEIGHT", 1.0))        # 动作一致性损失的权重
+cfg.action_block_weight = float(os.environ.get("ACTION_BLOCK_WEIGHT", 1.0))       # 动作分支总权重；用于显式控制 action 整体梯度强度
 cfg.action_distill_mode = "x0"      # 动作一致性函数的参数化方式（"x0" 直接预测干净样本）
-cfg.action_aware_weight = 0.1       # 动作感知正则化损失的权重（较小，仅起辅助作用）
+cfg.action_aware_weight = float(os.environ.get("ACTION_AWARE_WEIGHT", 0.1))       # 动作感知正则化损失的权重（较小，仅起辅助作用）
                                     # 改进：从 0.01 增加到 0.1，加强动作正则化
 
 # ============================================================
@@ -139,32 +147,32 @@ cfg.action_aware_weight = 0.1       # 动作感知正则化损失的权重（较
 #
 # 三种目标的比例之和应为 1.0，通过随机采样 r 来决定每次迭代使用哪种目标。
 
-cfg.diffusion_ratio = 0.5           # 扩散目标占比（r=t，标准 FlowMatch）
+cfg.diffusion_ratio = float(os.environ.get("DIFFUSION_RATIO", 0.5))           # 扩散目标占比（r=t，标准 FlowMatch）
                                      # 当采样的 r 比例落入此区间时，使用标准扩散去噪目标
-cfg.consistency_ratio = 0.25         # 一致性目标占比（r=0，LCM 端点映射）
+cfg.consistency_ratio = float(os.environ.get("CONSISTENCY_RATIO", 0.25))         # 一致性目标占比（r=0，LCM 端点映射）
                                      # 当采样的 r 比例落入此区间时，使用 LCM 一致性目标
-cfg.flowmap_ratio = 0.25            # 流映射目标占比（r<t，AnyFlow 核心）
+cfg.flowmap_ratio = float(os.environ.get("FLOWMAP_RATIO", 0.25))            # 流映射目标占比（r<t，AnyFlow 核心）
                                      # 当采样的 r 比例落入此区间时，使用 flow map 中间映射目标
 
-cfg.epsilon = 1.0                   # 中心差分的扰动步长
+cfg.epsilon = float(os.environ.get("EPSILON", 1.0))                   # 中心差分的扰动步长
                                      # 用于计算 flow map 的数值梯度：f(x+eps) - f(x-eps) / (2*eps)
                                      # 较大的 epsilon 提供更稳定的梯度估计，但可能引入偏差
 
-cfg.gate_value = 0.1                # delta_emb_gate 初始值（0 = 初期不使用 r 信息）
+cfg.gate_value = float(os.environ.get("GATE_VALUE", 0.1))                # delta_emb_gate 初始值（0 = 初期不使用 r 信息）
                                      # 控制时间差嵌入（delta embedding）的初始门控值
                                      # 设为 0 表示训练初期不引入 r 相关信息，随训练逐渐打开
                                      # 改进：从 0.0 增加到 0.1，让模型尽早学习 r 信息
 
-cfg.deltatime_type = 'r'            # delta 时间步类型
+cfg.deltatime_type = os.environ.get("DELTATIME_TYPE", "r")            # delta 时间步类型
                                      # 'r'   — 使用 r 作为 delta 时间步（直接使用采样的中间时间步）
                                      # 't-r' — 使用 t-r 作为 delta 时间步（使用从起点到 r 的距离）
 
-cfg.weight_type = 'beta08'          # 时间步采样权重策略
+cfg.weight_type = os.environ.get("WEIGHT_TYPE", "beta08")          # 时间步采样权重策略
                                      # 'gaussian' — 高斯权重，中间时间步权重较高
                                      # 'beta08'   — Beta(0.8, 0.8) 分布权重，两端权重较高（推荐）
                                      # 'uniform'  — 均匀权重，所有时间步等概率采样
 
-cfg.gt_regression_weight = 0.5      # GT 回归 loss 权重
+cfg.gt_regression_weight = float(os.environ.get("GT_REGRESSION_WEIGHT", 0.5))      # GT 回归 loss 权重
                                      # 辅助损失：直接回归到 ground truth 的 MSE 损失
                                      # 改进：从 0.1 增加到 0.5，加强 GT 回归的正则化作用
 
@@ -179,32 +187,33 @@ cfg.gt_regression_weight = 0.5      # GT 回归 loss 权重
 #   Ablation 5: epsilon=0.1/0.5/1.0                       → 不同中心差分步长
 #   Ablation 6: selective_cdiff=True/False                 → 选择性 vs 全量中心差分
 
-cfg.use_flowmap = True              # 是否使用流映射目标（False = 退化为 LCM 一致性）
+cfg.use_flowmap = _env_bool("USE_FLOWMAP", True)              # 是否使用流映射目标（False = 退化为 LCM 一致性）
                                     # 控制训练时是否采样 r<t 的中间映射目标
                                     # 关闭后，flowmap_ratio 自动失效，仅保留 diffusion + consistency
 
-cfg.use_gt_regression = True        # 是否使用 GT 动作回归 loss
+cfg.use_gt_regression = _env_bool("USE_GT_REGRESSION", True)        # 是否使用 GT 动作回归 loss
                                     # 开启时，额外计算动作的 MSE 回归损失（权重由 gt_regression_weight 控制）
                                     # 关闭后，仅依赖一致性目标学习动作映射
 
-cfg.use_central_diff = True         # 是否使用中心差分法（False = 不计算 dF/dt，退化为标准 FlowMatch）
+cfg.use_central_diff = _env_bool("USE_CENTRAL_DIFF", True)         # 是否使用中心差分法（False = 不计算 dF/dt，退化为标准 FlowMatch）
                                     # 中心差分是 AnyFlow 流映射目标的核心：通过数值微分
                                     # f(x+eps) - f(x-eps) / (2*eps) 近似 flow map 的梯度
                                     # 关闭后，流映射目标退化为标准的 FlowMatch 单点去噪
 
-cfg.selective_cdiff = True          # 是否使用选择性中心差分（True = 只对流映射 batch 计算）
+cfg.selective_cdiff = _env_bool("SELECTIVE_CDIFF", True)          # 是否使用选择性中心差分（True = 只对流映射 batch 计算）
                                     # True  — 仅对采样到流映射目标（r<t）的 batch 计算中心差分，
                                     #          节约计算开销（扩散和一致性 batch 不需要）
                                     # False — 对所有 batch 都计算中心差分（消融用，验证是否需要全量计算）
 
-cfg.action_use_flowmap = False      # 动作是否使用流映射目标（False = 动作用 GT 回归 + x0）
+cfg.action_use_flowmap = _env_bool("ACTION_USE_FLOWMAP", False)      # 动作是否使用流映射目标（False = 动作用 GT 回归 + x0）
+cfg.action_downsample_factor = int(os.environ.get("ACTION_DOWNSAMPLE_FACTOR", 4))  # student action token 下采样倍率
 cfg.action_epsilon = getattr(cfg, "epsilon", 1.0)  # action-side central-difference radius
 
                                     # 动作维度低（30 维），中心差分信号可能不稳定，默认关闭
                                     # True  — 动作也使用流映射中间目标（与视频对称）
                                     # False — 动作仅使用 GT 回归 + x0 一致性目标
 
-cfg.use_action_distill = True       # 是否对 action 使用教师蒸馏（核心改进）
+cfg.use_action_distill = _env_bool("USE_ACTION_DISTILL", True)       # 是否对 action 使用教师蒸馏（核心改进）
                                     # True  — 使用教师 Euler 步推进 + target_student 生成目标（原始 LCM 蒸馏）
                                     # False — 直接使用 GT 动作作为目标（原始 FlowMap 行为）
                                     # 这是解决阶段1 action 质量差的关键开关
@@ -250,37 +259,48 @@ cfg.lora_target_modules = [         # LoRA 目标模块名称（匹配 nn.Linear
 # ============================================================
 # LCM 超参数（与原配置基本一致，loss_type 有变更）
 # ============================================================
-cfg.ema_decay = 0.995               # EMA 衰减系数（target student 的更新速度）
+cfg.ema_decay = float(os.environ.get("EMA_DECAY", 0.995))               # EMA 衰减系数（target student 的更新速度）
 cfg.loss_type = "l2"                # 损失类型：FlowMap 蒸馏使用 "l2"（MSE），而非原配置的 "huber"
                                      # 原因：FlowMap 的混合目标对损失函数更敏感，L2 更稳定
 cfg.huber_c = 0.001                 # Huber 损失的阈值参数（保留向后兼容，l2 模式下不使用）
 cfg.sigma_data = 0.5                # 数据噪声水平（用于边界条件缩放）
-cfg.cfg_min = 2.0                   # 教师 CFG 引导强度的最小值
-cfg.cfg_max = 10.0                  # 教师 CFG 引导强度的最大值
+cfg.cfg_min = float(os.environ.get("CFG_MIN", 2.0))                   # 教师 CFG 引导强度的最小值
+cfg.cfg_max = float(os.environ.get("CFG_MAX", 10.0))                  # 教师 CFG 引导强度的最大值
 
 # ============================================================
 # 训练超参数（与原配置完全一致）
 # ============================================================
-cfg.learning_rate = 5e-6            # 学习率
+cfg.learning_rate = float(os.environ.get("LEARNING_RATE", 5e-6))            # 学习率
 cfg.beta1 = 0.9                     # AdamW 的 beta1
 cfg.beta2 = 0.999                   # AdamW 的 beta2
 cfg.weight_decay = 0.0              # 权重衰减
 cfg.max_grad_norm = 2.0             # 梯度裁剪范数上限
-cfg.warmup_steps = 100              # 学习率预热步数
-cfg.max_train_steps = 10000         # 最大训练步数
-cfg.batch_size = 1                  # 每个 GPU 的 batch size
-cfg.gradient_accumulation_steps = 8 # 梯度累积步数（等效 batch = 1×8 = 8）
-cfg.load_worker = 8                 # 数据加载的 worker 数量
+cfg.warmup_steps = int(os.environ.get("WARMUP_STEPS", 100))              # 学习率预热步数
+cfg.max_train_steps = int(os.environ.get("MAX_TRAIN_STEPS", 10000))         # 最大训练步数
+cfg.batch_size = int(os.environ.get("BATCH_SIZE", 1))                  # 每个 GPU 的 batch size
+cfg.gradient_accumulation_steps = int(os.environ.get("GRADIENT_ACCUMULATION_STEPS", 8)) # 梯度累积步数
+cfg.load_worker = int(os.environ.get("LOAD_WORKER", 8))                 # 数据加载的 worker 数量
                                     # 改进：从 0 增加到 8，避免数据加载成为瓶颈
 cfg.pin_memory = True               # 启用 pin_memory 加速 CPU->GPU 传输
 cfg.prefetch_factor = 4             # 预取 4 个 batch
 cfg.persistent_workers = True       # 保持 worker 进程，避免每 epoch 重新 fork
-cfg.cache_dataset_in_memory = True  # 缓存数据集到内存（如果内存允许）
+cfg.cache_dataset_in_memory = _env_bool("CACHE_DATASET_IN_MEMORY", True)  # 缓存数据集到内存（如果内存允许）
+cfg.allow_partial_datasets = _env_bool("ALLOW_PARTIAL_DATASETS", True)  # 本地 RobotWin 数据常有部分子集缺失，默认跳过坏子集
 
 cfg.use_torch_compile = False       # 是否使用 torch.compile 加速（实验性）
                                     # True  — 使用 torch.compile 编译学生模型，可能加速 10-30%
                                     # False — 不使用编译（默认，更稳定）
                                     # 注意：torch.compile 可能导致某些 PyTorch 版本下出现问题
+
+cfg.gradient_checkpointing = os.environ.get(
+    "GRADIENT_CHECKPOINTING", "1").lower() in ("1", "true", "yes", "on")
+                                    # 训练学生模型时对 transformer blocks 启用 activation checkpointing
+                                    # 以降低显存峰值。可用 GRADIENT_CHECKPOINTING=0 关闭。
+
+cfg.memory_safe_teacher_forward = os.environ.get(
+    "MEMORY_SAFE_TEACHER_FORWARD", "1").lower() in ("1", "true", "yes", "on")
+                                    # teacher CFG/central-diff 默认拆成单 B forward，避免长序列
+                                    # FlexAttention mask 在 2B/3B 下 OOM。
 
 # 训练时的数据增强概率（蒸馏时不使用）
 cfg.noisy_cond_prob = 0.0           # 条件加噪概率（蒸馏时关闭）
@@ -289,8 +309,11 @@ cfg.cfg_prob = 0.0                  # CFG 随机丢弃概率（蒸馏时关闭�
 # ============================================================
 # 检查点与日志（与原配置完全一致）
 # ============================================================
-cfg.save_interval = 1000            # 每隔多少步保存一次检查点
-cfg.gc_interval = 50                # 每隔多少步做一次垃圾回收和显存清理
-cfg.enable_wandb = True             # 是否启用 WandB 日志记录
+cfg.save_interval = int(os.environ.get("SAVE_INTERVAL", 1000))            # 每隔多少步保存一次检查点
+cfg.gc_interval = int(os.environ.get("GC_INTERVAL", 50))                # 每隔多少步做一次垃圾回收和显存清理
+cfg.log_interval = int(os.environ.get("LOG_INTERVAL", 1))               # 每隔多少 optimizer step 写一次训练日志
+cfg.tb_flush_interval = int(os.environ.get("TB_FLUSH_INTERVAL", 50))     # TensorBoard flush 间隔；避免每步同步磁盘
+cfg.train_barrier_interval = int(os.environ.get("TRAIN_BARRIER_INTERVAL", 0))  # 训练循环 debug barrier；0 表示关闭
+cfg.enable_wandb = _env_bool("ENABLE_WANDB", True)             # 是否启用 WandB 日志记录
 cfg.wandb_entity = None             # WandB 实体名（团队/个人）
 cfg.seed = 42                       # 随机种子

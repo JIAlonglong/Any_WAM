@@ -10,6 +10,7 @@ from typing import Optional
 import einops
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from diffusers.models.embeddings import (
     PixArtAlphaTextProjection,
     TimestepEmbedding,
@@ -462,15 +463,57 @@ def patch_model_forward(model):
             fdm=fdm,
         )
 
-        for i, block in enumerate(model.blocks):
-            hidden_states = block(
-                hidden_states,
-                text_hidden_states,
-                timestep_proj,
-                rotary_emb,
-                update_cache=update_cache,
-                cache_name=cache_name,
+        use_gradient_checkpointing = (
+            bool(getattr(model, "_flowmap_gradient_checkpointing", True))
+            and model.training
+            and torch.is_grad_enabled()
+            and update_cache == 0
+        )
+
+        def _refresh_flex_mask():
+            # Checkpoint recomputation re-enters each block during backward. The
+            # FlexAttention mask is stored as class-level state, so refresh it
+            # inside the checkpointed function to keep the B-sized student mask
+            # from being replaced by a previous 2B teacher/CFG mask.
+            FlexAttnFunc.init_mask(
+                latent_dict["noisy_latents"].shape,
+                action_dict["noisy_latents"].shape,
+                padded_length,
+                input_dict["chunk_size"],
+                window_size=input_dict["window_size"],
+                patch_size=model.patch_size,
+                device=hidden_states.device,
+                fdm=fdm,
             )
+
+        for i, block in enumerate(model.blocks):
+            if use_gradient_checkpointing:
+                def _block_forward(h, block=block):
+                    _refresh_flex_mask()
+                    return block(
+                        h,
+                        text_hidden_states,
+                        timestep_proj,
+                        rotary_emb,
+                        update_cache=update_cache,
+                        cache_name=cache_name,
+                    )
+
+                hidden_states = checkpoint(
+                    _block_forward,
+                    hidden_states,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                hidden_states = block(
+                    hidden_states,
+                    text_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    update_cache=update_cache,
+                    cache_name=cache_name,
+                )
             if i == 0:
                 pass  # Removed debug print
 

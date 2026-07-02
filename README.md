@@ -77,13 +77,23 @@ export TEACHER_PATH=/path/to/teacher
 export DATASET_PATH=/path/to/dataset
 export OUTPUT_DIR=/path/to/output
 DISTILL_MODE=flashwam bash distillation_flowmap/run.sh
+
+# RobotWin fast Stage-1 diagnostic run. This keeps action distillation on,
+# but reduces expensive central-diff frequency and teacher CFG cost.
+TEACHER_PATH=/path/to/lingbot-va-posttrain-robotwin \
+DATASET_PATH=/path/to/robotwin-clean-and-aug-lerobot \
+OUTPUT_DIR=distillation_flowmap/output_robotwin_stage1_fast \
+NGPU=8 ORIG_ACCUM=8 DISTILL_MODE=flashwam \
+DIFFUSION_RATIO=0.8 CONSISTENCY_RATIO=0.1 FLOWMAP_RATIO=0.1 \
+CFG_MIN=3.0 CFG_MAX=3.0 ACTION_USE_FLOWMAP=0 ACTION_DOWNSAMPLE_FACTOR=4 \
+WANDB_MODE=offline bash distillation_flowmap/run.sh
 ```
 
 Key features of FlowMap distillation:
 - **Teacher Euler step**: Teacher model generates pseudo ground truth via Euler step
 - **Target student (EMA)**: EMA model generates distillation target at reference timestep
 - **Merged central difference**: 4B batch for efficient flow map gradient computation
-- **Selective central difference**: Only compute for non-diffusion samples (25% of batch)
+- **Selective central difference**: Only compute for non-diffusion samples. RobotWin Stage-1 is expensive because 256x320 video, long attention windows, teacher CFG, and central difference compound; use the fast diagnostic command above before full training.
 - **DataLoader optimization**: 8 workers, pin_memory, prefetch_factor=4
 - **EMA fused kernel**: `torch._foreach_lerp_` for faster EMA updates
 
@@ -92,6 +102,9 @@ Configuration files:
 - `distillation_flowmap/config_libero.py`: LIBERO environment configuration
 - `distillation_flowmap/config_libero_optimized.py`: Optimized LIBERO configuration
 
+LIBERO Stage-1/Stage-2 continuation, OPD training, and i2va demo-video generation are documented in distillation_flowmap/LIBERO_DISTILLATION.md. In particular, Stage 2 OPD currently defaults to GRADIENT_CHECKPOINTING=0 to avoid PyTorch FSDP2 DTensor/Tensor mixing during activation-checkpoint recompute.
+A Chinese method-style description of distillation FlowMap is available in distillation_flowmap/FLOWMAP_METHOD_CN.md.
+
 ## 📊 Benchmarks
 
 ### LIBERO
@@ -99,11 +112,11 @@ Configuration files:
 Evaluation code for LIBERO benchmark is available in `evaluation/libero/`:
 
 ```bash
-# Launch evaluation server
-bash evaluation/libero/launch_server.sh
+# Quick real-environment video sanity check
+bash evaluation/libero/run_eval_new.sh
 
-# Run evaluation client
-bash evaluation/libero/run_eval.sh
+# Full success-rate evaluation
+EVAL_MODE=success TEST_NUM=50 bash evaluation/libero/run_eval_new.sh
 ```
 
 ### RoboTwin

@@ -29,6 +29,74 @@ from utils import init_logger, logger
 from flowmap_trainer import FlowMapDistiller
 
 
+_LIBERO_TEACHER_PATH = "/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero"
+_STALE_LIBERO_TEACHER_PATHS = {
+    "/kpfs-intern/jialongliu/projects/Flash-WAM/checkpoints/lingbot-va-posttrain-libero",
+    "/root/intern/jialongliu/projects/Flash-WAM/checkpoints/lingbot-va-posttrain-libero",
+}
+
+
+def _normalize_teacher_model_path(path):
+    """Return the teacher root directory expected by FlowMapDistiller."""
+    if path is None:
+        return path
+
+    path = os.path.abspath(os.path.expanduser(path))
+    if path in _STALE_LIBERO_TEACHER_PATHS:
+        logger.warning(
+            "Teacher path %s is the old LIBERO location; using %s instead.",
+            path,
+            _LIBERO_TEACHER_PATH,
+        )
+        path = _LIBERO_TEACHER_PATH
+
+    # Accept both the teacher root and the transformer subdirectory on CLI.
+    if os.path.basename(path) == "transformer" and os.path.isfile(os.path.join(path, "config.json")):
+        path = os.path.dirname(path)
+
+    transformer_config = os.path.join(path, "transformer", "config.json")
+    if not os.path.isfile(transformer_config):
+        raise FileNotFoundError(
+            "Invalid teacher_model_path: expected "
+            f"{transformer_config}. For LIBERO use {_LIBERO_TEACHER_PATH}."
+        )
+
+    return path
+
+
+def _maybe_auto_scale_gradient_accumulation(config, args, world_size, rank=0):
+    """Scale single-node accumulation defaults for multi-GPU torchrun launches."""
+    if args.gradient_accumulation_steps is not None:
+        return False
+    if world_size <= 1:
+        return False
+    if not bool(getattr(config, "auto_scale_gradient_accumulation", False)):
+        return False
+
+    reference = int(getattr(
+        config,
+        "gradient_accumulation_reference",
+        getattr(config, "gradient_accumulation_steps", 1),
+    ))
+    scaled = max(1, reference // world_size)
+    current = int(getattr(config, "gradient_accumulation_steps", scaled))
+    if current == scaled:
+        return False
+
+    config.gradient_accumulation_steps = scaled
+    if rank == 0:
+        logger.info(
+            "Auto-scaled gradient_accumulation_steps: %d -> %d "
+            "(reference=%d, world_size=%d). Pass --gradient-accumulation-steps "
+            "to override.",
+            current,
+            scaled,
+            reference,
+            world_size,
+        )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # 入口函数
 # ---------------------------------------------------------------------------
@@ -67,6 +135,7 @@ def run(args):
         config.output_dir = args.output_dir
     if args.teacher_model_path is not None:
         config.teacher_model_path = args.teacher_model_path
+    config.teacher_model_path = _normalize_teacher_model_path(config.teacher_model_path)
     if args.dataset_path is not None:
         config.dataset_path = args.dataset_path
         config.empty_emb_path = os.path.join(args.dataset_path, "empty_emb.pt")
@@ -76,6 +145,7 @@ def run(args):
         config.resume_from_path = args.resume_from_path
     if args.gradient_accumulation_steps is not None:
         config.gradient_accumulation_steps = args.gradient_accumulation_steps
+    _maybe_auto_scale_gradient_accumulation(config, args, world_size, rank)
     if args.batch_size is not None:
         config.batch_size = args.batch_size
     if args.load_worker is not None:

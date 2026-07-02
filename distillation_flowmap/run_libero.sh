@@ -37,7 +37,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # ============================================================
 # 路径配置
 # ============================================================
-export TEACHER_PATH="${TEACHER_PATH:-${PROJECT_ROOT}/checkpoints/lingbot-va-posttrain-libero}"
+export TEACHER_PATH="${TEACHER_PATH:-/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero}"
 export DATASET_PATH="${DATASET_PATH:-${PROJECT_ROOT}/training_data/libero-long-lerobot}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/output_libero_stage1_retrain_20260623}"
 export CONFIG_FILE="${CONFIG_FILE:-distillation_flowmap.config_libero_optimized}"

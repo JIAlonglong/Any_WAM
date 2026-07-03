@@ -3,6 +3,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -54,6 +55,96 @@ def test_cosmos_policy_action_teacher_returns_wanva_action_tokens(tmp_path):
     assert torch.allclose(tokens[:, 0], action_target[:, :, 0, 0, 0])
 
 
+def test_libero_state_to_cosmos_proprio_uses_official_order():
+    from distillation_flowmap.cosmos_policy_adapter import libero_state_to_cosmos_proprio
+
+    state = torch.tensor([1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.25, -0.25])
+    proprio = libero_state_to_cosmos_proprio(state)
+
+    assert proprio.shape == (9,)
+    assert torch.allclose(
+        torch.as_tensor(proprio),
+        torch.tensor([0.25, -0.25, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]),
+        atol=1e-6,
+    )
+
+
+def test_cosmos_actions_map_to_flowmap_x0_with_quantile_norm():
+    from distillation_flowmap.cosmos_policy_adapter import cosmos_actions_to_flowmap_x0
+
+    actions = torch.tensor(
+        [[[0.25, 0.50, 0.75, 0.00, 1.00, -0.50, 0.10],
+          [0.50, 0.25, 0.00, 1.00, 0.50, 0.25, -0.10]]],
+        dtype=torch.float32,
+    )
+    inverse_ids = list(range(7)) + [7] * 23
+    x0 = cosmos_actions_to_flowmap_x0(
+        actions,
+        target_shape=(1, 30, 2, 4, 1),
+        q01=[0.0] * 30,
+        q99=[1.0] * 30,
+        inverse_used_action_channel_ids=inverse_ids,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert x0.shape == (1, 30, 2, 4, 1)
+    flat = x0.permute(0, 2, 3, 4, 1).reshape(1, 8, 30)
+    assert torch.allclose(flat[0, 0, :7], actions[0, 0] * 2.0 - 1.0, atol=2e-6)
+    assert torch.allclose(flat[0, 1, :7], actions[0, 1] * 2.0 - 1.0, atol=2e-6)
+    assert torch.count_nonzero(flat[0, :, 7:]) == 0
+    assert torch.count_nonzero(flat[0, 2:]) == 0
+
+
+def test_raw_cosmos_teacher_uses_provider_action_x0(tmp_path):
+    from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+    cfg = SimpleNamespace(
+        cosmos_policy_use_raw_inference=True,
+        norm_stat={"q01": [0.0] * 30, "q99": [1.0] * 30},
+        inverse_used_action_channel_ids=list(range(7)) + [7] * 23,
+    )
+    teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32, config=cfg)
+    teacher._raw_action_provider = lambda raw_batch: torch.ones(1, 2, 7) * 0.5
+
+    x0 = teacher.action_target_x0(
+        {"latent": torch.zeros(1, 30, 2, 4, 1)},
+        raw_batch={
+            "raw_primary_image": torch.zeros(1, 128, 128, 3, dtype=torch.uint8),
+            "raw_wrist_image": torch.zeros(1, 128, 128, 3, dtype=torch.uint8),
+            "raw_proprio": torch.zeros(1, 9),
+            "raw_task": ["dummy task"],
+        },
+    )
+
+    flat = x0.permute(0, 2, 3, 4, 1).reshape(1, 8, 30)
+    assert torch.allclose(flat[0, :2, :7], torch.zeros(2, 7), atol=2e-6)
+    assert torch.count_nonzero(flat[0, :, 7:]) == 0
+
+
+def test_convert_input_format_preserves_raw_non_tensor_fields():
+    from distillation.data import DataMixin
+
+    class Dummy(DataMixin):
+        pass
+
+    mixin = Dummy()
+    mixin.device = torch.device("cpu")
+    batch = {
+        "latents": torch.ones(1),
+        "raw_task": ["open the drawer"],
+        "raw_meta": {"episode": 3},
+    }
+
+    converted = mixin.convert_input_format(batch)
+
+    assert torch.equal(converted["latents"], torch.ones(1))
+    assert converted["raw_task"] == ["open the drawer"]
+    assert converted["raw_meta"] == {"episode": 3}
+
+
 def test_libero_cosmos_policy_configs_are_action_only(monkeypatch):
     monkeypatch.setenv("COSMOS_POLICY_PATH", "/tmp/cosmos-policy")
     monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")
@@ -71,3 +162,5 @@ def test_libero_cosmos_policy_configs_are_action_only(monkeypatch):
         assert cfg.distill_action is True
         assert cfg.enable_light_eval is False
         assert cfg.use_opd_aux is False
+        assert cfg.cosmos_policy_use_raw_inference is False
+        assert cfg.return_raw_observation is False

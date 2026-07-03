@@ -1141,9 +1141,15 @@ class FlowMapStepMixin:
         if not hasattr(teacher, 'action_target_tokens'):
             raise RuntimeError("Cosmos Policy backend requires a teacher with action_target_tokens().")
         with torch.no_grad():
-            teacher_action_v_seq = teacher.action_target_tokens(input_dict['action_dict'])
-            teacher_action_v = self._extract_action_v(teacher_action_v_seq, num_frames)
-            teacher_action_pred = action_noisy_ds - sigma_r * teacher_action_v[:, :, ::action_ds]
+            teacher_action_x0 = None
+            if hasattr(teacher, 'action_target_x0') and getattr(teacher, 'raw_inference_enabled', False):
+                teacher_action_x0 = teacher.action_target_x0(input_dict['action_dict'], raw_batch=batch)
+            if teacher_action_x0 is not None:
+                teacher_action_pred = teacher_action_x0[:, :, ::action_ds]
+            else:
+                teacher_action_v_seq = teacher.action_target_tokens(input_dict['action_dict'])
+                teacher_action_v = self._extract_action_v(teacher_action_v_seq, num_frames)
+                teacher_action_pred = action_noisy_ds - sigma_r * teacher_action_v[:, :, ::action_ds]
 
         action_diff = (student_action_pred.float() - teacher_action_pred.detach().float()) * mask
         action_loss = (action_diff ** 2).sum() / action_denom

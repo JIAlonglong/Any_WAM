@@ -136,6 +136,14 @@ class LatentLeRobotDataset(LeRobotDataset):
         # 内存缓存选项
         self.cache_in_memory = getattr(config, 'cache_dataset_in_memory', False)
         self._memory_cache = {}  # {idx: data_dict}
+        self.return_raw_observation = bool(
+            getattr(config, 'return_raw_observation', False)
+            or getattr(config, 'cosmos_policy_use_raw_inference', False)
+        )
+        self.raw_primary_image_key = getattr(
+            config, 'raw_primary_image_key', 'observation.images.agentview_rgb')
+        self.raw_wrist_image_key = getattr(
+            config, 'raw_wrist_image_key', 'observation.images.eye_in_hand_rgb')
         
         self.meta = LeRobotDatasetMetadata(
             self.repo_id, self.root, self.revision, force_cache_sync=False
@@ -263,6 +271,63 @@ class LatentLeRobotDataset(LeRobotDataset):
         action = torch.tensor(np.stack(df_slice['action'].values), dtype=torch.float32)
         return {'action': action}
 
+    def _get_video_frame_path(self, video_key, episode_index):
+        episode_chunk = self.meta.get_episode_chunk(episode_index)
+        return (
+            self.root
+            / "videos"
+            / f"chunk-{episode_chunk:03d}"
+            / video_key
+            / f"episode_{episode_index:06d}.mp4"
+        )
+
+    def _read_video_frame_rgb(self, video_key, episode_index, local_frame_index):
+        import cv2
+
+        video_path = self._get_video_frame_path(video_key, episode_index)
+        if not video_path.is_file():
+            raise FileNotFoundError(f"Missing raw video file: {video_path}")
+        cap = cv2.VideoCapture(str(video_path))
+        try:
+            if not cap.isOpened():
+                raise RuntimeError(f"Failed to open raw video file: {video_path}")
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(local_frame_index))
+            ok, frame_bgr = cap.read()
+            if not ok or frame_bgr is None:
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                raise IndexError(
+                    f"Failed to read frame {local_frame_index} from {video_path} "
+                    f"(frame_count={frame_count})"
+                )
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            return np.ascontiguousarray(frame_rgb)
+        finally:
+            cap.release()
+
+    def _get_raw_policy_observation(self, cur_meta, local_frame_index):
+        from distillation_flowmap.cosmos_policy_adapter import libero_state_to_cosmos_proprio
+
+        episode_index = cur_meta["episode_index"]
+        global_frame_index = self._get_global_idx(episode_index, local_frame_index)
+        state = self._action_df.iloc[int(global_frame_index)]['observation.state']
+        proprio = libero_state_to_cosmos_proprio(state)
+        task = cur_meta.get("action_text")
+        if task is None:
+            tasks = cur_meta.get("tasks", [])
+            task = tasks[0] if tasks else ""
+        return {
+            'raw_primary_image': torch.from_numpy(
+                self._read_video_frame_rgb(self.raw_primary_image_key, episode_index, local_frame_index)
+            ),
+            'raw_wrist_image': torch.from_numpy(
+                self._read_video_frame_rgb(self.raw_wrist_image_key, episode_index, local_frame_index)
+            ),
+            'raw_proprio': torch.from_numpy(np.asarray(proprio, dtype=np.float32)),
+            'raw_task': str(task),
+            'raw_episode_index': torch.tensor(int(episode_index), dtype=torch.long),
+            'raw_frame_index': torch.tensor(int(local_frame_index), dtype=torch.long),
+        }
+
     def _flatten_latent_dict(self, latent_dict):
         out = {}
         for key, value in latent_dict.items():
@@ -364,6 +429,8 @@ class LatentLeRobotDataset(LeRobotDataset):
         ori_data_dict = self._get_range_latent_data(start_frame, end_frame, episode_index)
 
         latent_frame_ids = ori_data_dict[f"{self.used_video_keys[0]}.frame_ids"]
+        raw_frame_index = int(latent_frame_ids[0]) if len(latent_frame_ids) > 0 else int(local_start_frame)
+        raw_frame_index = max(int(local_start_frame), min(raw_frame_index, int(local_end_frame) - 1))
         start_frame = self._get_global_idx(episode_index, start_frame)
         end_frame = self._get_global_idx(episode_index, end_frame)
 
@@ -405,6 +472,9 @@ class LatentLeRobotDataset(LeRobotDataset):
                 out_dict['actions'] = torch.cat([out_dict['actions'], act_pad_n], dim=2)
                 mask_pad_n = torch.zeros(out_dict['actions_mask'].shape[0], out_dict['actions_mask'].shape[1], target_N - N, out_dict['actions_mask'].shape[3], dtype=out_dict['actions_mask'].dtype)
                 out_dict['actions_mask'] = torch.cat([out_dict['actions_mask'], mask_pad_n], dim=2)
+
+        if self.return_raw_observation:
+            out_dict.update(self._get_raw_policy_observation(cur_meta, raw_frame_index))
         
         # 缓存到内存
         if self.cache_in_memory:

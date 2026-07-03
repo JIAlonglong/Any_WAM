@@ -277,7 +277,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         if self.is_cosmos_policy_teacher:
             logger.info("Loading Cosmos Policy action teacher metadata ...")
             self.teacher = CosmosPolicyActionTeacher(
-                config.teacher_model_path, dtype=self.dtype, device="cpu")
+                config.teacher_model_path, dtype=self.dtype, device="cpu", config=config)
             if bool(getattr(config, 'cosmos_policy_validate_weights', False)):
                 metadata = self.teacher.load_state_metadata()
                 if config.rank == 0:

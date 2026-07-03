@@ -122,4 +122,30 @@ cfg.opd_aux_action = (
 )
 
 cfg.enable_light_eval = _env_bool("ENABLE_LIGHT_EVAL", False)
+cfg.light_eval_interval = int(os.environ.get("LIGHT_EVAL_INTERVAL", cfg.save_interval))
+cfg.light_eval_num_batches = int(os.environ.get("LIGHT_EVAL_NUM_BATCHES", 1))
+cfg.light_eval_seed = int(os.environ.get("LIGHT_EVAL_SEED", 42))
+cfg.light_eval_start_index = int(os.environ.get("LIGHT_EVAL_START_INDEX", 0))
+cfg.light_eval_pairs = [(1000, 1000), (1000, 0), (750, 250)]
+
 cfg.enable_rollout_eval = _env_bool("ENABLE_ROLLOUT_EVAL", False)
+cfg.rollout_eval_interval = int(os.environ.get("ROLLOUT_EVAL_INTERVAL", 1000))
+cfg.rollout_eval_num_batches = int(os.environ.get("ROLLOUT_EVAL_NUM_BATCHES", 1))
+cfg.rollout_eval_seed = int(os.environ.get("ROLLOUT_EVAL_SEED", cfg.light_eval_seed))
+cfg.rollout_eval_cfg_scale = float(os.environ.get("ROLLOUT_EVAL_CFG_SCALE", 5.0))
+cfg.rollout_eval_teacher_steps = int(os.environ.get("ROLLOUT_EVAL_TEACHER_STEPS", 4))
+_rollout_eval_student_steps = os.environ.get("ROLLOUT_EVAL_STUDENT_STEPS", "1,2")
+cfg.rollout_eval_student_steps = [
+    int(v) for v in _rollout_eval_student_steps.split(",") if v.strip()
+]
+_rollout_eval_pairs = os.environ.get("ROLLOUT_EVAL_PAIRS", "1000,0")
+cfg.rollout_eval_pairs = [
+    tuple(float(v) for v in pair.split(","))
+    for pair in _rollout_eval_pairs.split(";")
+    if pair.strip()
+]
+cfg.rollout_eval_save_videos = _env_bool("ROLLOUT_EVAL_SAVE_VIDEOS", False)
+cfg.rollout_eval_video_dir = os.environ.get("ROLLOUT_EVAL_VIDEO_DIR")
+cfg.rollout_eval_video_fps = int(os.environ.get("ROLLOUT_EVAL_VIDEO_FPS", 10))
+cfg.rollout_eval_video_max_pairs = int(os.environ.get("ROLLOUT_EVAL_VIDEO_MAX_PAIRS", 1))
+cfg.rollout_eval_video_sample_index = int(os.environ.get("ROLLOUT_EVAL_VIDEO_SAMPLE_INDEX", 0))

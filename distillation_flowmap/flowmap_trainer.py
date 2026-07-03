@@ -40,6 +40,7 @@ from wan_va.distributed.fsdp import shard_model_fsdp1
 from distributed.util import _configure_model, dist_mean
 from modules.utils import load_transformer
 from utils import logger, warmup_constant_lambda, FlowMatchScheduler
+from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
 
 try:
     import wandb
@@ -121,6 +122,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.distill_action = getattr(config, 'distill_action', False)   # 是否蒸馏动作
         self.action_distill_mode = getattr(config, 'action_distill_mode', 'consistency')  # 动作参数化方式
         self.action_aware = getattr(config, 'action_aware', False)       # 是否使用动作感知正则
+        self.teacher_backend = str(getattr(config, 'teacher_backend', 'wanva')).lower()
+        self.is_cosmos_policy_teacher = self.teacher_backend in (
+            'cosmos', 'cosmos_policy', 'cosmos-policy')
         # 动作的跳步数（可能与视频不同）
         self.k_action = config.num_train_timesteps // getattr(
             config, 'num_ddim_timesteps_action', config.num_ddim_timesteps)
@@ -248,47 +252,85 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # ==============================================================
         # 三个模型的初始化
         # ==============================================================
-        teacher_path = os.path.join(config.teacher_model_path, "transformer")
+        if self.is_cosmos_policy_teacher:
+            student_base_model_path = getattr(config, 'student_base_model_path', None)
+            if student_base_model_path is None:
+                raise ValueError(
+                    "teacher_backend='cosmos_policy' requires cfg.student_base_model_path "
+                    "pointing to a WanVA teacher/checkpoint root for student initialization."
+                )
+            student_base_model_path = os.path.abspath(os.path.expanduser(student_base_model_path))
+            if os.path.basename(student_base_model_path) == "transformer":
+                teacher_path = student_base_model_path
+            else:
+                teacher_path = os.path.join(student_base_model_path, "transformer")
+            if not os.path.isfile(os.path.join(teacher_path, "config.json")):
+                raise FileNotFoundError(
+                    "Invalid student_base_model_path for Cosmos Policy backend: "
+                    f"expected {os.path.join(teacher_path, 'config.json')}"
+                )
+        else:
+            teacher_path = os.path.join(config.teacher_model_path, "transformer")
 
         # 1. 教师模型（frozen）：预训练好的 LingBot-VA，不参与训练
         #    注意：教师模型保持原始结构，不添加 delta_embedder
-        logger.info("Loading teacher (frozen) ...")
-        self.teacher = load_transformer(teacher_path, torch_dtype=self.dtype, torch_device="cpu")
-        self.teacher.requires_grad_(False)  # 冻结所有参数
-        self.teacher.eval()                 # 评估模式
-        self.teacher = self.teacher.to(self.dtype)
-
-        # 创建非 FSDP 教师副本（用于纯推理 forward，避免 FSDP all-gather 通信开销）
-        # 教师 frozen + eval，不需要梯度同步，非 FSDP forward 结果完全一致
-        import copy
-        logger.info("Creating non-FSDP teacher copy for inference ...")
-        self._teacher_nofsdp = copy.deepcopy(self.teacher)
-        self._teacher_nofsdp = self._teacher_nofsdp.to(self.dtype)
-        self._teacher_nofsdp.eval()
-        for p in self._teacher_nofsdp.parameters():
-            p.requires_grad_(False)
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self._teacher_nofsdp = self._teacher_nofsdp.to(f"cuda:{local_rank}")
-        logger.info(f"Non-FSDP teacher copy created (on cuda:{local_rank}).")
-        if self.use_onpolicy_transition:
-            # On-policy mode: use FSDP1 (no DTensor issues)
-            self.teacher = shard_model_fsdp1(self.teacher, param_dtype=self.dtype)
-            logger.info("Teacher wrapped with FSDP1 (on-policy mode)")
-        else:
-            # FSDP2 mode
-            self.teacher = _configure_model(
-                model=self.teacher, shard_fn=shard_model,
-                param_dtype=self.dtype, device=self.device, eval_mode=True,
+        if self.is_cosmos_policy_teacher:
+            logger.info("Loading Cosmos Policy action teacher metadata ...")
+            self.teacher = CosmosPolicyActionTeacher(
+                config.teacher_model_path, dtype=self.dtype, device="cpu")
+            if bool(getattr(config, 'cosmos_policy_validate_weights', False)):
+                metadata = self.teacher.load_state_metadata()
+                if config.rank == 0:
+                    logger.info(
+                        "Cosmos Policy checkpoint readable: %s keys, sample=%s",
+                        metadata["num_keys"],
+                        metadata["sample_keys"],
+                    )
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self._teacher_nofsdp = self.teacher.to(f"cuda:{local_rank}")
+            self.teacher.requires_grad_(False).eval()
+            logger.info(
+                "Cosmos Policy action teacher ready; WanVA student base: %s",
+                teacher_path,
             )
-            if not getattr(config, 'skip_teacher_compile', False):
-                logger.info("Compiling teacher model with torch.compile ...")
-                self.teacher = torch.compile(self.teacher, mode="default")
-                logger.info("Teacher model compiled.")
-            # 释放 FSDP teacher（推理用 _teacher_nofsdp），省 ~10GB/卡
-            if self._teacher_nofsdp is not None:
-                del self.teacher
-                self.teacher = None
-                logger.info("FSDP teacher released (inference uses non-FSDP copy).")
+        else:
+            logger.info("Loading teacher (frozen) ...")
+            self.teacher = load_transformer(teacher_path, torch_dtype=self.dtype, torch_device="cpu")
+            self.teacher.requires_grad_(False)  # 冻结所有参数
+            self.teacher.eval()                 # 评估模式
+            self.teacher = self.teacher.to(self.dtype)
+
+            # 创建非 FSDP 教师副本（用于纯推理 forward，避免 FSDP all-gather 通信开销）
+            # 教师 frozen + eval，不需要梯度同步，非 FSDP forward 结果完全一致
+            import copy
+            logger.info("Creating non-FSDP teacher copy for inference ...")
+            self._teacher_nofsdp = copy.deepcopy(self.teacher)
+            self._teacher_nofsdp = self._teacher_nofsdp.to(self.dtype)
+            self._teacher_nofsdp.eval()
+            for p in self._teacher_nofsdp.parameters():
+                p.requires_grad_(False)
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self._teacher_nofsdp = self._teacher_nofsdp.to(f"cuda:{local_rank}")
+            logger.info(f"Non-FSDP teacher copy created (on cuda:{local_rank}).")
+            if self.use_onpolicy_transition:
+                # On-policy mode: use FSDP1 (no DTensor issues)
+                self.teacher = shard_model_fsdp1(self.teacher, param_dtype=self.dtype)
+                logger.info("Teacher wrapped with FSDP1 (on-policy mode)")
+            else:
+                # FSDP2 mode
+                self.teacher = _configure_model(
+                    model=self.teacher, shard_fn=shard_model,
+                    param_dtype=self.dtype, device=self.device, eval_mode=True,
+                )
+                if not getattr(config, 'skip_teacher_compile', False):
+                    logger.info("Compiling teacher model with torch.compile ...")
+                    self.teacher = torch.compile(self.teacher, mode="default")
+                    logger.info("Teacher model compiled.")
+                # 释放 FSDP teacher（推理用 _teacher_nofsdp），省 ~10GB/卡
+                if self._teacher_nofsdp is not None:
+                    del self.teacher
+                    self.teacher = None
+                    logger.info("FSDP teacher released (inference uses non-FSDP copy).")
 
         # 确定学生模型的初始化路径（从检查点恢复或从教师初始化）
         resume_path = getattr(config, "resume_from_path", None)

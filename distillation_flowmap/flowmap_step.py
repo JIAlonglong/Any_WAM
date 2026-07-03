@@ -1026,6 +1026,195 @@ class FlowMapStepMixin:
     # ==================================================================
     # 核心训练步：Flow Map 蒸馏
     # ==================================================================
+    def _cosmos_policy_train_step(self, batch, batch_idx):
+        """Action-only stage step for Cosmos Policy checkpoints.
+
+        Cosmos Policy is an action policy checkpoint, not a WanVA video latent
+        teacher. This step keeps the FlowMap student plumbing/checkpoint format
+        intact while avoiding WanVA teacher video CFG and VAE paths.
+        """
+        batch = self.convert_input_format(batch)
+
+        B = batch['latents'].shape[0]
+        ref_shape = batch['latents'].shape
+        num_frames = ref_shape[2]
+        actions_mask = batch.get('actions_mask')
+        input_dict = self._prepare_base_dict(batch)
+
+        video_t, video_r, _ = self.sample_timestep_mixed(
+            B, num_frames, dtype=torch.float32, device=self.device,
+        )
+        action_t, action_r, _ = self.sample_timestep_mixed(
+            B, num_frames, dtype=torch.float32, device=self.device,
+            scheduler=self.train_scheduler_action,
+        )
+        action_r_sigma = action_r / self.config.num_train_timesteps
+
+        video_noise = torch.randn_like(batch['latents'])
+        video_noisy_latents = self.train_scheduler_latent.add_noise(
+            batch['latents'], video_noise, video_t, t_dim=2
+        )
+        video_v_target = self.train_scheduler_latent.training_target(
+            batch['latents'], video_noise, video_t
+        )
+        input_dict['latent_dict']['noisy_latents'] = video_noisy_latents
+        input_dict['latent_dict']['timesteps'] = video_t
+        input_dict['latent_dict']['targets'] = video_v_target
+
+        action_noise = torch.randn_like(batch['actions'])
+        action_noisy_latents = self.train_scheduler_action.add_noise(
+            batch['actions'], action_noise, action_t, t_dim=2
+        )
+        action_v_target = self.train_scheduler_action.training_target(
+            batch['actions'], action_noise, action_t
+        )
+        input_dict['action_dict']['noisy_latents'] = action_noisy_latents
+        input_dict['action_dict']['timesteps'] = action_t
+        input_dict['action_dict']['targets'] = action_v_target
+
+        should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
+        if hasattr(self.student, 'set_requires_gradient_sync'):
+            self.student.set_requires_gradient_sync(should_sync)
+
+        action_ds = getattr(self.config, 'action_downsample_factor', 4)
+        action_noisy_ds = action_noisy_latents[:, :, ::action_ds]
+        actions_gt_ds = batch['actions'][:, :, ::action_ds]
+        action_r_ds = action_r[:, ::action_ds]
+
+        student_input = {
+            'latent_dict': {
+                **input_dict['latent_dict'],
+                'timesteps': video_t,
+            },
+            'action_dict': {
+                'noisy_latents': action_noisy_ds,
+                'latent': actions_gt_ds,
+                'timesteps': action_t[:, ::action_ds],
+                'cond_timesteps': input_dict['action_dict']['cond_timesteps'][:, ::action_ds],
+                'text_emb': input_dict['action_dict']['text_emb'],
+            },
+            'chunk_size': input_dict['chunk_size'],
+            'window_size': input_dict['window_size'],
+        }
+        if 'grid_id' in input_dict['action_dict'] and input_dict['action_dict']['grid_id'] is not None:
+            student_input['action_dict']['grid_id'] = _downsample_action_grid_id(
+                input_dict['action_dict']['grid_id'], batch['actions'], action_ds)
+        if 'actions_mask' in input_dict['action_dict'] and input_dict['action_dict']['actions_mask'] is not None:
+            student_input['action_dict']['actions_mask'] = input_dict['action_dict']['actions_mask'][:, :, ::action_ds]
+
+        from modules.model import FlexAttnFunc
+        ld = student_input['latent_dict']
+        ad = student_input['action_dict']
+        total_length = (
+            ld['noisy_latents'].flatten(0, 1).shape[0] * 2 +
+            ad['noisy_latents'].flatten(0, 1).shape[0] * 2
+        )
+        padded_length = (128 - total_length % 128) % 128
+        FlexAttnFunc.init_mask(
+            ld['noisy_latents'].shape,
+            ad['noisy_latents'].shape,
+            padded_length,
+            student_input['chunk_size'],
+            window_size=student_input['window_size'],
+            patch_size=self.patch_size,
+            device=self.device,
+        )
+
+        _, student_action_v_seq = self.student(
+            student_input, train_mode=True,
+            r_timestep=video_r,
+            action_r_timestep=action_r_ds,
+        )
+        student_action_v = self._extract_action_v(
+            student_action_v_seq, student_input['action_dict']['noisy_latents'].shape[2])
+
+        if actions_mask is None:
+            mask = torch.ones_like(actions_gt_ds[:, :1]).float()
+        else:
+            mask = actions_mask[:, :, ::action_ds].float()
+        action_denom = (mask.sum() * student_action_v.shape[1]).clamp(min=1)
+
+        sigma_r = action_r_sigma[:, None, ::action_ds, None, None].to(student_action_v)
+        student_action_pred = action_noisy_ds - sigma_r * student_action_v
+
+        teacher = self._teacher_model
+        if not hasattr(teacher, 'action_target_tokens'):
+            raise RuntimeError("Cosmos Policy backend requires a teacher with action_target_tokens().")
+        with torch.no_grad():
+            teacher_action_v_seq = teacher.action_target_tokens(input_dict['action_dict'])
+            teacher_action_v = self._extract_action_v(teacher_action_v_seq, num_frames)
+            teacher_action_pred = action_noisy_ds - sigma_r * teacher_action_v[:, :, ::action_ds]
+
+        action_diff = (student_action_pred.float() - teacher_action_pred.detach().float()) * mask
+        action_loss = (action_diff ** 2).sum() / action_denom
+
+        gt_regression_loss = torch.tensor(0.0, device=self.device)
+        if getattr(self.config, 'use_gt_regression', True) and self.gt_regression_weight > 0:
+            gt_diff = (student_action_pred.float() - actions_gt_ds.float()) * mask
+            gt_regression_loss = (gt_diff ** 2).sum() / action_denom
+
+        action_local_fm_loss = torch.tensor(0.0, device=self.device)
+        action_aware_loss = torch.tensor(0.0, device=self.device)
+        if self.action_aware:
+            action_targets = action_v_target[:, :, ::action_ds]
+            aa_diff = (student_action_v.float() - action_targets.float().detach()) * mask
+            action_local_fm_loss = (aa_diff ** 2).sum() / action_denom
+            action_aware_loss = action_local_fm_loss
+
+        video_loss = torch.tensor(0.0, device=self.device)
+        loss = getattr(self.config, 'action_block_weight', 1.0) * (
+            self.config.action_loss_weight * action_loss
+            + self.gt_regression_weight * gt_regression_loss
+            + getattr(self.config, 'action_aware_weight', 0.0) * action_aware_loss
+        )
+        loss = loss / self.gradient_accumulation_steps
+
+        loss_clip_value = getattr(self.config, 'loss_clip_value', None)
+        if loss_clip_value is not None and getattr(self.config, 'loss_clip_enabled', True):
+            loss_clip_value = float(loss_clip_value)
+            if loss_clip_value >= 0:
+                scale = (loss_clip_value / loss.detach().clamp(min=1e-12)).clamp(max=1.0)
+                loss = loss * scale
+
+        zero_metric = torch.tensor(0.0, device=self.device)
+        if not torch.isfinite(loss):
+            if self.config.rank == 0:
+                logger.warning(f"[step {self.step}] NaN/Inf loss, skipping")
+            return {
+                "loss": zero_metric,
+                "video_loss": video_loss.detach(),
+                "action_loss": action_loss.detach(),
+                "action_local_fm_loss": action_local_fm_loss.detach(),
+                "action_aware_loss": action_aware_loss.detach(),
+                "gt_regression_loss": gt_regression_loss.detach(),
+                "kto_main_active": zero_metric,
+                "kto_main_good_ratio": zero_metric,
+                "kto_main_weight_mean": zero_metric,
+                "kto_main_weight_min": zero_metric,
+                "kto_main_weight_max": zero_metric,
+                "kto_main_threshold": zero_metric,
+                "should_sync": should_sync,
+                "skip_step": True,
+            }
+
+        loss.backward()
+        return {
+            "loss": loss.detach(),
+            "video_loss": video_loss.detach(),
+            "action_loss": action_loss.detach(),
+            "action_local_fm_loss": action_local_fm_loss.detach(),
+            "action_aware_loss": action_aware_loss.detach(),
+            "gt_regression_loss": gt_regression_loss.detach(),
+            "kto_main_active": zero_metric,
+            "kto_main_good_ratio": zero_metric,
+            "kto_main_weight_mean": zero_metric,
+            "kto_main_weight_min": zero_metric,
+            "kto_main_weight_max": zero_metric,
+            "kto_main_threshold": zero_metric,
+            "should_sync": should_sync,
+            "skip_step": False,
+        }
+
     def _train_step(self, batch, batch_idx):
         """
         执行一步 Flow Map 蒸馏训练。
@@ -1045,6 +1234,9 @@ class FlowMapStepMixin:
         返回:
             包含损失值和是否需要梯度同步的字典
         """
+        if getattr(self, 'is_cosmos_policy_teacher', False):
+            return self._cosmos_policy_train_step(batch, batch_idx)
+
         batch = self.convert_input_format(batch)
 
         # ==============================================================

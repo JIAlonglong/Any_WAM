@@ -64,6 +64,10 @@ def _normalize_teacher_model_path(path):
     return path
 
 
+def _resolve_empty_emb_path(dataset_path):
+    return os.environ.get("EMPTY_EMB_PATH", os.path.join(dataset_path, "empty_emb.pt"))
+
+
 def _maybe_auto_scale_gradient_accumulation(config, args, world_size, rank=0):
     """Scale single-node accumulation defaults for multi-GPU torchrun launches."""
     if args.gradient_accumulation_steps is not None:
@@ -138,7 +142,7 @@ def run(args):
     config.teacher_model_path = _normalize_teacher_model_path(config.teacher_model_path)
     if args.dataset_path is not None:
         config.dataset_path = args.dataset_path
-        config.empty_emb_path = os.path.join(args.dataset_path, "empty_emb.pt")
+        config.empty_emb_path = _resolve_empty_emb_path(args.dataset_path)
     if args.resume_from_step is not None:
         config.resume_from_step = args.resume_from_step
     if args.resume_from_path is not None:

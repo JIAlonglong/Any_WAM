@@ -50,7 +50,8 @@ cfg.dataset_path = os.environ.get(
     "DATASET_PATH", os.path.join(_project_root, "training_data", "lerobot_robotwin_eef_aug_500"))
 
 # 空文本嵌入路径（用于 CFG 无条件推理时替换文本嵌入）
-cfg.empty_emb_path = os.path.join(cfg.dataset_path, "empty_emb.pt")
+cfg.empty_emb_path = os.environ.get(
+    "EMPTY_EMB_PATH", os.path.join(cfg.dataset_path, "empty_emb.pt"))
 
 # ============================================================
 # 模型架构配置（来自 va_robotwin_cfg，与原配置完全一致）

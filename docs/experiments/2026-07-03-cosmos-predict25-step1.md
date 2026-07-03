@@ -52,25 +52,20 @@ The minimal first-pass files identified from HF metadata are:
 - `tokenizer.pth`
 - `README.md`
 
-The target directory currently contains only:
+The target directory now contains the minimal robot/action-cond assets:
 
 - `README.md`
+- `tokenizer.pth` (508 MB)
+- `robot/action-cond/38c6c645-7d41-4560-8eeb-6f4ddc0e6574_ema_bf16.pt` (4.3 GB)
+- `robot/action-cond/cr1_empty_string_text_embeddings.pt` (103 MB)
 
-## Current Blocker
+The empty-string embedding loads as a `torch.bfloat16` tensor with shape `[1, 512, 100352]`.
 
-Downloading the robot/action-cond checkpoint failed with:
+The official action-conditioned path also instantiates Reason1/Qwen text encoders even when the sample prompt is `null` and `guidance=0`. A local copy already exists at:
 
-```text
-403 Cannot access gated repo
-Access to model nvidia/Cosmos-Predict2.5-2B is restricted and the current token is not authorized.
-```
+- `/root/nas/junjie/weights/Cosmos-Reason1-7B` (16 GB)
 
-The root Hugging Face token is present and `whoami` reports the account as `JIAlonglong`, but that account does not currently have access to `nvidia/Cosmos-Predict2.5-2B`.
-
-Required action before downloading:
-
-1. Accept/request access for `nvidia/Cosmos-Predict2.5-2B` on Hugging Face for the token account, or provide/use a token that already has access.
-2. Re-run the selective snapshot download with `HF_ENDPOINT=https://hf-mirror.com`.
+No extra download was needed for Reason1.
 
 ## Environment Check
 
@@ -81,47 +76,91 @@ Machine:
 - CUDA toolkit: 12.8
 - Free NAS space at check time: about 5.9T
 
-The existing Any_WAM env has `torch`, `transformers`, `diffusers`, and `huggingface_hub`, but it is not enough for Cosmos-Predict2.5:
+The existing Any_WAM env has useful packages, but Predict2.5 needs the official CUDA extra. A separate Python 3.10 uv environment was prepared at:
+
+- `/root/nas/junjie/cosmos_predict2_5/envs/predict2_py310`
+
+Installed special CUDA 12.8 wheels from local wheelhouse:
+
+- `flash_attn-2.7.3+cu128.torch27-cp310-cp310-linux_x86_64.whl`
+- `natten-0.21.0+cu128.torch27-cp310-cp310-linux_x86_64.whl`
+- `transformer_engine-2.2+cu128.torch27-cp310-cp310-linux_x86_64.whl`
+
+Verified imports:
 
 ```text
-RuntimeError CUDA extra not installed. Please run 'uv sync --extra=<cuda_name>'
+torch 2.7.0+cu128
+torchvision 0.22.0+cu128
+flash_attn 2.7.3
+natten 0.21.0
+transformer_engine 2.2+cu128.torch27
+cosmos_predict2 1.5.0
+cuda available True, devices 2
 ```
 
-Predict2.5 repo supports CUDA 12.8 via:
+`mediapy` could not find `ffmpeg` by default. The env now has:
 
-```bash
-uv sync --extra=cu128
-```
+- `/root/nas/junjie/cosmos_predict2_5/envs/predict2_py310/bin/ffmpeg`
 
-The older `/root/nas/xicheng/cosmos_mixed_vla_vlmqa` workspace has local CUDA 12.8 wheel references and can be used as a setup reference, but it targets Cosmos3/cosmos-framework rather than Predict2.5 directly.
+as a symlink to the `imageio_ffmpeg` bundled binary.
 
-## Next Command After HF Access Is Fixed
+## Local Runtime Patch
+
+The official `checkpoint_db.py` always calls `uvx hf download` for registered HF checkpoints. On this machine that caused slow/stuck downloads for files already present locally.
+
+A small env-gated patch was added in the Cosmos clone:
+
+- `COSMOS_PREDICT25_LOCAL_MODEL_DIR`: return `${DIR}/${filename}` for single-file HF checkpoints when the file exists.
+- `COSMOS_PREDICT25_LOCAL_HF_REPOS`: map `repo_id=/local/path` for directory HF checkpoints.
+
+This leaves default behavior unchanged when the env vars are not set.
+
+## Smoke Test
+
+Official sample assets in the git clone were LFS pointers because `git-lfs` is not installed. Only sample `0` was materialized, and a clean one-sample input root was created:
+
+- `/root/nas/junjie/cosmos_predict2_5/smoke_assets/basic/bridge`
+
+Passing command:
 
 ```bash
 cd /root/nas/junjie/cosmos_predict2_5/repos/cosmos-predict2.5
-HF_ENDPOINT=https://hf-mirror.com /root/nas/junjie/conda_envs/any_wam/bin/python - <<'PY'
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id="nvidia/Cosmos-Predict2.5-2B",
-    local_dir="/root/nas/junjie/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Predict2.5-2B",
-    allow_patterns=[
-        "robot/action-cond/*",
-        "tokenizer.pth",
-        "README.md",
-    ],
-    endpoint="https://hf-mirror.com",
-    max_workers=4,
-)
-PY
+PATH=/root/nas/junjie/cosmos_predict2_5/envs/predict2_py310/bin:/root/.local/bin:$PATH \
+HF_ENDPOINT=https://hf-mirror.com \
+HF_HOME=/root/nas/junjie/cosmos_predict2_5/.hf_cache \
+COSMOS_PREDICT25_LOCAL_MODEL_DIR=/root/nas/junjie/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Predict2.5-2B \
+COSMOS_PREDICT25_LOCAL_HF_REPOS=nvidia/Cosmos-Reason1-7B=/root/nas/junjie/weights/Cosmos-Reason1-7B \
+CUDA_VISIBLE_DEVICES=0 \
+TORCHINDUCTOR_COMPILE_THREADS=4 \
+/root/nas/junjie/cosmos_predict2_5/envs/predict2_py310/bin/python examples/action_conditioned.py \
+  -i assets/action_conditioned/basic/inference_params.json \
+  -o /root/nas/junjie/cosmos_predict2_5/outputs/action_conditioned_smoke_single0_ffmpeg \
+  --checkpoint-path /root/nas/junjie/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Predict2.5-2B/robot/action-cond/38c6c645-7d41-4560-8eeb-6f4ddc0e6574_ema_bf16.pt \
+  --experiment ac_reason_embeddings_rectified_flow_2b_256_320 \
+  --input-root /root/nas/junjie/cosmos_predict2_5/smoke_assets/basic/bridge \
+  --save-root /root/nas/junjie/cosmos_predict2_5/outputs/action_conditioned_smoke_single0_ffmpeg/generated \
+  --num-steps 2 \
+  --end 1 \
+  --single-chunk True \
+  --disable-guardrails
 ```
 
-After weights are present, set up the Predict2.5 CUDA 12.8 environment and run the official single-GPU action-cond example:
+Result:
 
-```bash
-python examples/action_conditioned.py \
-  -i assets/action_conditioned/basic/inference_params.json \
-  -o outputs/action_conditioned/basic \
-  --config-file cosmos_predict2/_src/predict2/action/configs/action_conditioned/config.py \
-  --checkpoint-path /root/nas/junjie/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Predict2.5-2B/robot/action-cond/38c6c645-7d41-4560-8eeb-6f4ddc0e6574_ema_bf16.pt \
-  --experiment ac_reason_embeddings_rectified_flow_2b_256_320
+- generated video:
+  `/root/nas/junjie/cosmos_predict2_5/outputs/action_conditioned_smoke_single0_ffmpeg/generated/0_single_chunk.mp4`
+- size: `54802` bytes
+- readable via `mediapy.read_video`
+- video shape: `(13, 256, 320, 3)`
+
+No Cosmos smoke process was left running after the test.
+
+## Follow-Up
+
+For Any_WAM integration, the next useful step is not to train yet. First add a thin adapter around the official action-conditioned model that can:
+
+- load the Cosmos Predict2.5 action-cond model from the prepared paths;
+- accept Any_WAM/LeRobot observations and actions;
+- return predicted frames or latent/video tensors in the format needed by the existing distillation code;
+- keep all Cosmos-specific env vars and paths in one config block.
 ```

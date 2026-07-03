@@ -163,4 +163,35 @@ For Any_WAM integration, the next useful step is not to train yet. First add a t
 - accept Any_WAM/LeRobot observations and actions;
 - return predicted frames or latent/video tensors in the format needed by the existing distillation code;
 - keep all Cosmos-specific env vars and paths in one config block.
+
+## Policy Checkpoints
+
+Downloaded the official Cosmos Policy Predict2 2B checkpoints for LIBERO and RoboCasa:
+
+- LIBERO:
+  `/root/nas/junjie/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B`
+- RoboCasa:
+  `/root/nas/junjie/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-RoboCasa-Predict2-2B`
+
+LIBERO files:
+
+- `Cosmos-Policy-LIBERO-Predict2-2B.pt` (`3913017345` bytes)
+- `config.json`
+- `libero_dataset_statistics.json`
+- `libero_t5_embeddings.pkl`
+- `README.md`
+
+RoboCasa files:
+
+- `Cosmos-Policy-RoboCasa-Predict2-2B.pt` (`3913017345` bytes)
+- `config.json`
+- `robocasa_dataset_statistics.json`
+- `robocasa_t5_embeddings.pkl`
+- `README.md`
+
+Verification:
+
+- both `.pt` files load with `torch.load(..., map_location="cpu")`;
+- both are state dicts with expected `net.*` keys;
+- representative tensor `net.x_embedder.proj.1.weight` has shape `[2048, 72]` and dtype `torch.bfloat16`.
 ```

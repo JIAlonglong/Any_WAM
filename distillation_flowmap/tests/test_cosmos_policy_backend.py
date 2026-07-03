@@ -124,6 +124,25 @@ def test_raw_cosmos_teacher_uses_provider_action_x0(tmp_path):
     assert torch.count_nonzero(flat[0, :, 7:]) == 0
 
 
+def test_raw_teacher_stats_use_action_mask_and_channels():
+    from distillation_flowmap.cosmos_policy_adapter import compute_masked_action_stats
+
+    teacher = torch.tensor(
+        [[[[[1.0], [2.0]], [[3.0], [4.0]]],
+          [[[2.0], [4.0]], [[6.0], [8.0]]]]],
+        dtype=torch.float32,
+    )
+    target = torch.ones_like(teacher)
+    mask = torch.tensor([[[[[1.0], [0.0]], [[1.0], [0.0]]]]])
+
+    stats = compute_masked_action_stats(teacher, target, mask)
+
+    assert torch.allclose(stats["mse"], torch.tensor(7.5))
+    assert torch.allclose(stats["l1"], torch.tensor(2.0))
+    assert torch.allclose(stats["teacher_abs_mean"], torch.tensor(3.0))
+    assert torch.allclose(stats["target_abs_mean"], torch.tensor(1.0))
+
+
 def test_convert_input_format_preserves_raw_non_tensor_fields():
     from distillation.data import DataMixin
 

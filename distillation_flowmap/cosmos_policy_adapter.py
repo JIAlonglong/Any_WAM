@@ -179,6 +179,29 @@ def cosmos_actions_to_flowmap_x0(
     return x0.to(dtype=dtype)
 
 
+def compute_masked_action_stats(teacher_x0, target_x0, mask=None):
+    """Return masked action x0 diagnostics normalized over valid tokens/channels."""
+    teacher = teacher_x0.detach().float()
+    target = target_x0.detach().float()
+    if teacher.shape != target.shape:
+        raise ValueError(
+            f"teacher_x0 shape {tuple(teacher.shape)} does not match target_x0 {tuple(target.shape)}"
+        )
+
+    if mask is None:
+        mask = torch.ones_like(target[:, :1])
+    else:
+        mask = mask.detach().to(device=target.device, dtype=torch.float32)
+    denom = (mask.sum() * teacher.shape[1]).clamp(min=1)
+    diff = (teacher - target) * mask
+    return {
+        "mse": (diff.square().sum() / denom).to(device=teacher_x0.device),
+        "l1": (diff.abs().sum() / denom).to(device=teacher_x0.device),
+        "teacher_abs_mean": ((teacher.abs() * mask).sum() / denom).to(device=teacher_x0.device),
+        "target_abs_mean": ((target.abs() * mask).sum() / denom).to(device=teacher_x0.device),
+    }
+
+
 class CosmosPolicyActionTeacher:
     """Action teacher with latent fallback and optional official raw inference."""
 

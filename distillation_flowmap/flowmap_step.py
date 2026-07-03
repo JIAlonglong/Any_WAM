@@ -61,6 +61,7 @@ from einops import rearrange
 
 from utils import data_seq_to_patch, logger
 from distillation.consistency import scalings_for_boundary_conditions
+from distillation_flowmap.cosmos_policy_adapter import compute_masked_action_stats
 from distillation_flowmap.kto_reweighting import (
     compute_normalized_focal_weights,
     piecewise_linear_scale,
@@ -1133,6 +1134,12 @@ class FlowMapStepMixin:
         else:
             mask = actions_mask[:, :, ::action_ds].float()
         action_denom = (mask.sum() * student_action_v.shape[1]).clamp(min=1)
+        zero_metric = torch.tensor(0.0, device=self.device)
+        raw_teacher_enabled = zero_metric
+        raw_teacher_gt_mse = zero_metric
+        raw_teacher_gt_l1 = zero_metric
+        raw_teacher_abs_mean = zero_metric
+        raw_gt_abs_mean = zero_metric
 
         sigma_r = action_r_sigma[:, None, ::action_ds, None, None].to(student_action_v)
         student_action_pred = action_noisy_ds - sigma_r * student_action_v
@@ -1150,6 +1157,13 @@ class FlowMapStepMixin:
                 teacher_action_v_seq = teacher.action_target_tokens(input_dict['action_dict'])
                 teacher_action_v = self._extract_action_v(teacher_action_v_seq, num_frames)
                 teacher_action_pred = action_noisy_ds - sigma_r * teacher_action_v[:, :, ::action_ds]
+        if teacher_action_x0 is not None:
+            raw_stats = compute_masked_action_stats(teacher_action_pred, actions_gt_ds, mask)
+            raw_teacher_enabled = torch.tensor(1.0, device=self.device)
+            raw_teacher_gt_mse = raw_stats["mse"]
+            raw_teacher_gt_l1 = raw_stats["l1"]
+            raw_teacher_abs_mean = raw_stats["teacher_abs_mean"]
+            raw_gt_abs_mean = raw_stats["target_abs_mean"]
 
         action_diff = (student_action_pred.float() - teacher_action_pred.detach().float()) * mask
         action_loss = (action_diff ** 2).sum() / action_denom
@@ -1182,7 +1196,6 @@ class FlowMapStepMixin:
                 scale = (loss_clip_value / loss.detach().clamp(min=1e-12)).clamp(max=1.0)
                 loss = loss * scale
 
-        zero_metric = torch.tensor(0.0, device=self.device)
         if not torch.isfinite(loss):
             if self.config.rank == 0:
                 logger.warning(f"[step {self.step}] NaN/Inf loss, skipping")
@@ -1193,6 +1206,11 @@ class FlowMapStepMixin:
                 "action_local_fm_loss": action_local_fm_loss.detach(),
                 "action_aware_loss": action_aware_loss.detach(),
                 "gt_regression_loss": gt_regression_loss.detach(),
+                "raw_teacher_gt_mse": raw_teacher_gt_mse.detach(),
+                "raw_teacher_gt_l1": raw_teacher_gt_l1.detach(),
+                "raw_teacher_abs_mean": raw_teacher_abs_mean.detach(),
+                "raw_gt_abs_mean": raw_gt_abs_mean.detach(),
+                "raw_teacher_enabled": raw_teacher_enabled.detach(),
                 "kto_main_active": zero_metric,
                 "kto_main_good_ratio": zero_metric,
                 "kto_main_weight_mean": zero_metric,
@@ -1211,6 +1229,11 @@ class FlowMapStepMixin:
             "action_local_fm_loss": action_local_fm_loss.detach(),
             "action_aware_loss": action_aware_loss.detach(),
             "gt_regression_loss": gt_regression_loss.detach(),
+            "raw_teacher_gt_mse": raw_teacher_gt_mse.detach(),
+            "raw_teacher_gt_l1": raw_teacher_gt_l1.detach(),
+            "raw_teacher_abs_mean": raw_teacher_abs_mean.detach(),
+            "raw_gt_abs_mean": raw_gt_abs_mean.detach(),
+            "raw_teacher_enabled": raw_teacher_enabled.detach(),
             "kto_main_active": zero_metric,
             "kto_main_good_ratio": zero_metric,
             "kto_main_weight_mean": zero_metric,

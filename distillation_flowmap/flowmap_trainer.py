@@ -2059,6 +2059,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         acc_action_local_fm_losses = []  # 累积的动作 local FM 损失
         acc_action_aware_losses = [] # 累积的动作感知损失
         acc_gt_regression_losses = []  # 累积的 GT 回归损失（Flow Map 特有）
+        acc_raw_teacher_gt_mses = []
+        acc_raw_teacher_gt_l1s = []
+        acc_raw_teacher_abs_means = []
+        acc_raw_gt_abs_means = []
+        acc_raw_teacher_enabled = []
         acc_d_losses = []            # 累积的判别器损失（DMD 特有）
         acc_dmd_grad_norms = []      # 累积的 DMD 梯度范数（DMD 特有）
         acc_opd_aux_losses = []
@@ -2164,6 +2169,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             acc_action_aware_losses.append(result["action_aware_loss"])
             acc_gt_regression_losses.append(result.get(
                 "gt_regression_loss", zero_tensor))
+            acc_raw_teacher_gt_mses.append(result.get(
+                "raw_teacher_gt_mse", zero_tensor))
+            acc_raw_teacher_gt_l1s.append(result.get(
+                "raw_teacher_gt_l1", zero_tensor))
+            acc_raw_teacher_abs_means.append(result.get(
+                "raw_teacher_abs_mean", zero_tensor))
+            acc_raw_gt_abs_means.append(result.get(
+                "raw_gt_abs_mean", zero_tensor))
+            acc_raw_teacher_enabled.append(result.get(
+                "raw_teacher_enabled", zero_tensor))
             acc_opd_aux_losses.append(
                 opd_aux_result.get("opd_aux_loss", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
@@ -2336,6 +2351,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     torch.stack(acc_action_local_fm_losses).sum(),
                     torch.stack(acc_action_aware_losses).sum(),
                     torch.stack(acc_gt_regression_losses).sum(),
+                    torch.stack(acc_raw_teacher_gt_mses).sum(),
+                    torch.stack(acc_raw_teacher_gt_l1s).sum(),
+                    torch.stack(acc_raw_teacher_abs_means).sum(),
+                    torch.stack(acc_raw_gt_abs_means).sum(),
+                    torch.stack(acc_raw_teacher_enabled).sum(),
                     torch.stack(acc_d_losses).sum(),
                     torch.stack(acc_dmd_grad_norms).sum(),
                     torch.stack(acc_opd_aux_losses).sum(),
@@ -2381,7 +2401,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     ])
                 metric_values = torch.stack(metric_tensors).float()
                 metric_results = dist_mean(metric_values).tolist()
-                base_metric_count = 31
+                base_metric_count = 36
                 (
                     avg_loss,
                     avg_video_loss,
@@ -2390,6 +2410,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     avg_action_local_fm_loss,
                     avg_action_aware_loss,
                     avg_gt_regression_loss,
+                    avg_raw_teacher_gt_mse_sum,
+                    avg_raw_teacher_gt_l1_sum,
+                    avg_raw_teacher_abs_mean_sum,
+                    avg_raw_gt_abs_mean_sum,
+                    avg_raw_teacher_enabled,
                     avg_d_loss,
                     avg_dmd_grad_norm,
                     avg_opd_aux_loss,
@@ -2453,6 +2478,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     + getattr(self.config, "action_aware_weight", 0.0) * avg_action_aware_loss
                 )
                 action_total = self.action_block_weight * action_total_raw
+                raw_teacher_count = max(avg_raw_teacher_enabled, 1e-12)
+                avg_raw_teacher_gt_mse = avg_raw_teacher_gt_mse_sum / raw_teacher_count
+                avg_raw_teacher_gt_l1 = avg_raw_teacher_gt_l1_sum / raw_teacher_count
+                avg_raw_teacher_abs_mean = avg_raw_teacher_abs_mean_sum / raw_teacher_count
+                avg_raw_gt_abs_mean = avg_raw_gt_abs_mean_sum / raw_teacher_count
                 # 重置累积器
                 acc_losses = []
                 acc_video_losses = []
@@ -2461,6 +2491,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_action_local_fm_losses = []
                 acc_action_aware_losses = []
                 acc_gt_regression_losses = []
+                acc_raw_teacher_gt_mses = []
+                acc_raw_teacher_gt_l1s = []
+                acc_raw_teacher_abs_means = []
+                acc_raw_gt_abs_means = []
+                acc_raw_teacher_enabled = []
                 acc_d_losses = []
                 acc_dmd_grad_norms = []
                 acc_opd_aux_losses = []
@@ -2543,6 +2578,13 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         log_dict["loss/action_consistency"] = avg_action_loss
                         log_dict["loss/action_total_raw"] = action_total_raw
                         log_dict["loss/action_total"] = action_total
+                    if avg_raw_teacher_enabled > 0:
+                        postfix["ctgt"] = f"{avg_raw_teacher_gt_mse:.3f}/{avg_raw_teacher_gt_l1:.3f}"
+                        log_dict["cosmos_raw/teacher_gt_mse"] = avg_raw_teacher_gt_mse
+                        log_dict["cosmos_raw/teacher_gt_l1"] = avg_raw_teacher_gt_l1
+                        log_dict["cosmos_raw/teacher_abs_mean"] = avg_raw_teacher_abs_mean
+                        log_dict["cosmos_raw/gt_abs_mean"] = avg_raw_gt_abs_mean
+                        log_dict["cosmos_raw/enabled_microbatches"] = avg_raw_teacher_enabled
                     if self.action_aware:
                         postfix["alfm"] = f"{avg_action_local_fm_loss:.4f}"
                         postfix["aa"] = f"{avg_action_aware_loss:.4f}"

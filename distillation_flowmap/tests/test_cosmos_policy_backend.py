@@ -185,6 +185,27 @@ def test_save_cosmos_future_video_writes_prediction_comparison(tmp_path):
     assert save_path.stat().st_size > 0
 
 
+def test_save_cosmos_future_chunk_video_writes_one_prediction_per_chunk(tmp_path):
+    from evaluation.libero.rollout_cosmos_policy import save_cosmos_future_chunk_video
+
+    future_predictions = [
+        {
+            "future_image": np.full((8, 8, 3), 50, dtype=np.uint8),
+            "future_wrist_image": np.full((8, 8, 3), 60, dtype=np.uint8),
+        },
+        {
+            "future_image": np.full((8, 8, 3), 70, dtype=np.uint8),
+            "future_wrist_image": np.full((8, 8, 3), 80, dtype=np.uint8),
+        },
+    ]
+    save_path = tmp_path / "future_chunks.mp4"
+
+    save_cosmos_future_chunk_video(future_predictions, save_path, fps=2)
+
+    assert save_path.is_file()
+    assert save_path.stat().st_size > 0
+
+
 def test_raw_teacher_stats_use_action_mask_and_channels():
     from distillation_flowmap.cosmos_policy_adapter import compute_masked_action_stats
 

@@ -123,6 +123,61 @@ def save_cosmos_future_video(real_obs_list, future_prediction_list, save_path, f
     imageio.mimsave(str(save_path), frames, fps=fps)
 
 
+def _first_prediction_size(future_prediction_list):
+    for prediction in future_prediction_list:
+        if not prediction:
+            continue
+        for key in ("future_wrist_image", "future_image"):
+            image = prediction.get(key)
+            if image is not None:
+                arr = np.asarray(image)
+                return (arr.shape[1], arr.shape[0])
+    raise RuntimeError("Cosmos future predictions did not contain future image fields.")
+
+
+def save_cosmos_future_chunk_video(future_prediction_list, save_path, fps=2):
+    if not future_prediction_list:
+        raise RuntimeError("No Cosmos future predictions were collected; cannot save chunk video.")
+
+    target_size = _first_prediction_size(future_prediction_list)
+    target_w, target_h = target_size
+    has_future_primary = any(
+        pred is not None and pred.get("future_image") is not None for pred in future_prediction_list
+    )
+    has_future_wrist = any(
+        pred is not None and pred.get("future_wrist_image") is not None for pred in future_prediction_list
+    )
+    if not has_future_primary and not has_future_wrist:
+        raise RuntimeError("Cosmos future predictions did not contain future image fields.")
+
+    black = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    frames = []
+    for chunk_idx, prediction in enumerate(future_prediction_list):
+        prediction = prediction or {}
+        columns = []
+        if has_future_wrist:
+            future_wrist = prediction.get("future_wrist_image")
+            columns.append(
+                (
+                    f"chunk {chunk_idx} wrist",
+                    _resize_uint8_image(future_wrist, target_size) if future_wrist is not None else black,
+                )
+            )
+        if has_future_primary:
+            future_primary = prediction.get("future_image")
+            columns.append(
+                (
+                    f"chunk {chunk_idx} primary",
+                    _resize_uint8_image(future_primary, target_size) if future_primary is not None else black,
+                )
+            )
+        frames.append(_labeled_frame(columns))
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.mimsave(str(save_path), frames, fps=fps)
+
+
 def official_metainfo_path(cosmos_repo, libero_benchmark):
     return str(
         Path(cosmos_repo)
@@ -279,6 +334,7 @@ def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args)
             "num_chunks": 0,
             "video_path": None,
             "cosmos_future_video_path": None,
+            "cosmos_future_chunks_video_path": None,
             "actions_path": None,
         }
 
@@ -339,6 +395,7 @@ def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args)
         save_video(frames, video_path, fps=args.fps)
 
         cosmos_future_video_path = None
+        cosmos_future_chunks_video_path = None
         if args.save_cosmos_future_video and future_prediction_frames:
             cosmos_future_video_path = video_path.with_name(video_path.stem + "_cosmos_future.mp4")
             save_cosmos_future_video(
@@ -346,6 +403,15 @@ def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args)
                 future_prediction_frames,
                 cosmos_future_video_path,
                 fps=args.fps,
+            )
+        if args.save_cosmos_future_video and future_prediction_chunks:
+            cosmos_future_chunks_video_path = video_path.with_name(
+                video_path.stem + "_cosmos_future_chunks.mp4"
+            )
+            save_cosmos_future_chunk_video(
+                future_prediction_chunks,
+                cosmos_future_chunks_video_path,
+                fps=args.cosmos_future_chunk_fps,
             )
 
         actions_path = video_path.with_suffix(".actions.pt")
@@ -384,7 +450,11 @@ def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args)
             "initial_state_source": initial_state_source,
             "video_path": str(video_path),
             "cosmos_future_video_path": str(cosmos_future_video_path) if cosmos_future_video_path else None,
+            "cosmos_future_chunks_video_path": (
+                str(cosmos_future_chunks_video_path) if cosmos_future_chunks_video_path else None
+            ),
             "num_future_prediction_frames": len(future_prediction_frames),
+            "num_future_prediction_chunks": len(future_prediction_chunks),
             "actions_path": str(actions_path),
         }
     finally:
@@ -434,6 +504,12 @@ def main():
         help="Also save a comparison MP4 with Cosmos future image predictions beside env rollout frames.",
     )
     parser.add_argument(
+        "--cosmos-future-chunk-fps",
+        type=float,
+        default=2.0,
+        help="FPS for the chunk-only Cosmos future prediction MP4.",
+    )
+    parser.add_argument(
         "--official-libero-eval",
         action="store_true",
         help="Use NVIDIA Cosmos LIBERO eval defaults: seed 195, env.seed(0), 10 dummy steps, official initial-state metainfo, and suite max steps.",
@@ -481,6 +557,7 @@ def main():
         "max_env_steps": args.max_env_steps,
         "initial_states_json": args.initial_states_json,
         "save_cosmos_future_video": bool(args.save_cosmos_future_video),
+        "cosmos_future_chunk_fps": args.cosmos_future_chunk_fps,
         "success_count": success_count,
         "total": len(attempted),
         "skipped_count": len(results) - len(attempted),

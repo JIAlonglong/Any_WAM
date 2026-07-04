@@ -183,3 +183,63 @@ def test_libero_cosmos_policy_configs_are_action_only(monkeypatch):
         assert cfg.use_opd_aux is False
         assert cfg.cosmos_policy_use_raw_inference is False
         assert cfg.return_raw_observation is False
+
+
+def test_cosmos_teacher_official_eval_defaults_match_nvidia_libero_settings():
+    from evaluation.libero.rollout_cosmos_policy import apply_eval_defaults
+
+    args = SimpleNamespace(
+        official_libero_eval=True,
+        libero_benchmark="libero_10",
+        cosmos_repo="/opt/cosmos",
+        seed=None,
+        env_seed=None,
+        warmup_steps=None,
+        warmup_gripper=None,
+        max_env_steps=None,
+        initial_states_json=None,
+    )
+
+    apply_eval_defaults(args)
+
+    assert args.seed == 195
+    assert args.env_seed == 0
+    assert args.warmup_steps == 10
+    assert args.warmup_gripper == -1.0
+    assert args.max_env_steps == 530
+    assert args.initial_states_json == (
+        "/opt/cosmos/"
+        "cosmos_predict2/_src/predict2/cosmos_policy/experiments/robot/libero/"
+        "libero_10_metainfo.json"
+    )
+
+
+def test_cosmos_teacher_official_initial_state_loader_skips_failed_demos(tmp_path):
+    from evaluation.libero.rollout_cosmos_policy import load_initial_state_from_metainfo
+
+    metainfo = {
+        "put_the_bowl_on_the_plate": {
+            "demo_0": {"success": True, "initial_state": [1.0, 2.0, 3.0]},
+            "demo_1": {"success": False, "initial_state": [4.0, 5.0, 6.0]},
+        }
+    }
+    path = tmp_path / "libero_10_metainfo.json"
+    path.write_text(json.dumps(metainfo))
+
+    state, source, skipped = load_initial_state_from_metainfo(
+        str(path),
+        "put the bowl on the plate",
+        episode_idx=0,
+    )
+    failed_state, failed_source, failed_skipped = load_initial_state_from_metainfo(
+        str(path),
+        "put the bowl on the plate",
+        episode_idx=1,
+    )
+
+    assert state.tolist() == [1.0, 2.0, 3.0]
+    assert source.endswith("libero_10_metainfo.json:put_the_bowl_on_the_plate/demo_0")
+    assert skipped is False
+    assert failed_state is None
+    assert failed_source.endswith("libero_10_metainfo.json:put_the_bowl_on_the_plate/demo_1")
+    assert failed_skipped is True

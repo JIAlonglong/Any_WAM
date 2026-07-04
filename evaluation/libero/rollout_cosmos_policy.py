@@ -53,6 +53,76 @@ def save_video(real_obs_list, save_path, fps=15):
     imageio.mimsave(str(save_path), frames, fps=fps)
 
 
+def _resize_uint8_image(image, target_size):
+    image = np.asarray(image)
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+    return cv2.resize(image, target_size)
+
+
+def _labeled_frame(columns):
+    if not columns:
+        raise RuntimeError("No columns were provided for video frame composition.")
+    height, width = columns[0][1].shape[:2]
+    label_height = 32
+    strip = np.full((label_height, width * len(columns), 3), 255, dtype=np.uint8)
+    body = np.hstack([image for _, image in columns]).astype(np.uint8)
+    for col_idx, (label, _) in enumerate(columns):
+        x = col_idx * width + 8
+        cv2.putText(strip, label, (x, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+    return np.vstack([strip, body])
+
+
+def save_cosmos_future_video(real_obs_list, future_prediction_list, save_path, fps=15):
+    if not real_obs_list:
+        raise RuntimeError("No observation frames were collected; cannot save future video.")
+    if not future_prediction_list:
+        raise RuntimeError("No Cosmos future predictions were collected; cannot save future video.")
+
+    names = ["observation.images.agentview_rgb", "observation.images.eye_in_hand_rgb"]
+    first = real_obs_list[0]
+    base_h, base_w = first[names[0]].shape[:2]
+    target_size = (base_w, base_h)
+    has_future_primary = any(
+        pred is not None and pred.get("future_image") is not None for pred in future_prediction_list
+    )
+    has_future_wrist = any(
+        pred is not None and pred.get("future_wrist_image") is not None for pred in future_prediction_list
+    )
+    if not has_future_primary and not has_future_wrist:
+        raise RuntimeError("Cosmos future predictions did not contain future image fields.")
+
+    black = np.zeros((base_h, base_w, 3), dtype=np.uint8)
+    frames = []
+    for obs, prediction in zip(real_obs_list, future_prediction_list):
+        prediction = prediction or {}
+        primary = _resize_uint8_image(obs[names[0]], target_size)
+        wrist = _resize_uint8_image(obs[names[1]], target_size)
+        columns = [("real wrist", wrist)]
+        if has_future_wrist:
+            future_wrist = prediction.get("future_wrist_image")
+            columns.append(
+                (
+                    "cosmos wrist",
+                    _resize_uint8_image(future_wrist, target_size) if future_wrist is not None else black,
+                )
+            )
+        columns.append(("real primary", primary))
+        if has_future_primary:
+            future_primary = prediction.get("future_image")
+            columns.append(
+                (
+                    "cosmos primary",
+                    _resize_uint8_image(future_primary, target_size) if future_primary is not None else black,
+                )
+            )
+        frames.append(_labeled_frame(columns))
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.mimsave(str(save_path), frames, fps=fps)
+
+
 def official_metainfo_path(cosmos_repo, libero_benchmark):
     return str(
         Path(cosmos_repo)
@@ -208,6 +278,7 @@ def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args)
             "env_steps": 0,
             "num_chunks": 0,
             "video_path": None,
+            "cosmos_future_video_path": None,
             "actions_path": None,
         }
 
@@ -220,13 +291,28 @@ def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args)
     )
     frames = []
     action_chunks = []
+    future_prediction_frames = []
+    future_prediction_chunks = []
     done = False
     chunk_idx = 0
 
     try:
         while env.env.timestep < args.max_env_steps and not done:
             raw_batch = extract_raw_batch(obs, prompt)
-            actions = teacher.predict_raw_actions(raw_batch).detach().cpu().numpy()
+            if args.save_cosmos_future_video:
+                action_result = teacher.predict_raw_action_result(raw_batch, include_future=True)
+                actions = action_result["actions"].detach().cpu().numpy()
+                chunk_predictions = action_result.get("future_image_predictions") or []
+                if isinstance(chunk_predictions, dict):
+                    future_prediction = chunk_predictions
+                elif len(chunk_predictions) > 0:
+                    future_prediction = chunk_predictions[0]
+                else:
+                    future_prediction = None
+                future_prediction_chunks.append(future_prediction)
+            else:
+                actions = teacher.predict_raw_actions(raw_batch).detach().cpu().numpy()
+                future_prediction = None
             if actions.ndim == 3:
                 actions = actions[0]
             if actions.ndim != 2 or actions.shape[-1] != 7:
@@ -237,6 +323,8 @@ def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args)
             for action in actions[start_idx:]:
                 obs, _, done, _ = env.step(action.astype(np.float32))
                 frames.append(extract_video_obs(obs))
+                if args.save_cosmos_future_video:
+                    future_prediction_frames.append(future_prediction)
                 if done or env.env.timestep >= args.max_env_steps:
                     break
             chunk_idx += 1
@@ -250,10 +338,28 @@ def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args)
         )
         save_video(frames, video_path, fps=args.fps)
 
+        cosmos_future_video_path = None
+        if args.save_cosmos_future_video and future_prediction_frames:
+            cosmos_future_video_path = video_path.with_name(video_path.stem + "_cosmos_future.mp4")
+            save_cosmos_future_video(
+                frames,
+                future_prediction_frames,
+                cosmos_future_video_path,
+                fps=args.fps,
+            )
+
         actions_path = video_path.with_suffix(".actions.pt")
         torch.save(
             {
                 "action_chunks": [torch.from_numpy(a) for a in action_chunks],
+                "future_prediction_keys": sorted(
+                    {
+                        key
+                        for prediction in future_prediction_chunks
+                        if prediction is not None
+                        for key in prediction.keys()
+                    }
+                ),
                 "prompt": prompt,
                 "task_idx": task_idx,
                 "episode_idx": episode_idx,
@@ -277,6 +383,8 @@ def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args)
             "num_chunks": len(action_chunks),
             "initial_state_source": initial_state_source,
             "video_path": str(video_path),
+            "cosmos_future_video_path": str(cosmos_future_video_path) if cosmos_future_video_path else None,
+            "num_future_prediction_frames": len(future_prediction_frames),
             "actions_path": str(actions_path),
         }
     finally:
@@ -320,6 +428,11 @@ def main():
     parser.add_argument("--camera-size", type=int, default=128)
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--skip-first-action", action="store_true")
+    parser.add_argument(
+        "--save-cosmos-future-video",
+        action="store_true",
+        help="Also save a comparison MP4 with Cosmos future image predictions beside env rollout frames.",
+    )
     parser.add_argument(
         "--official-libero-eval",
         action="store_true",
@@ -367,6 +480,7 @@ def main():
         "warmup_gripper": args.warmup_gripper,
         "max_env_steps": args.max_env_steps,
         "initial_states_json": args.initial_states_json,
+        "save_cosmos_future_video": bool(args.save_cosmos_future_video),
         "success_count": success_count,
         "total": len(attempted),
         "skipped_count": len(results) - len(attempted),

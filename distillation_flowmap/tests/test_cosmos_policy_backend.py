@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 
@@ -122,6 +123,66 @@ def test_raw_cosmos_teacher_uses_provider_action_x0(tmp_path):
     flat = x0.permute(0, 2, 3, 4, 1).reshape(1, 8, 30)
     assert torch.allclose(flat[0, :2, :7], torch.zeros(2, 7), atol=2e-6)
     assert torch.count_nonzero(flat[0, :, 7:]) == 0
+
+
+def test_raw_cosmos_teacher_result_provider_preserves_future_predictions(tmp_path):
+    from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+    teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32)
+    future_image = np.full((4, 4, 3), 128, dtype=np.uint8)
+    teacher._raw_action_provider = lambda raw_batch: {
+        "actions": torch.ones(1, 2, 7) * 0.25,
+        "future_image_predictions": [{"future_image": future_image}],
+        "value_prediction": [0.75],
+    }
+
+    result = teacher.predict_raw_action_result(
+        {
+            "raw_primary_image": torch.zeros(1, 128, 128, 3, dtype=torch.uint8),
+            "raw_wrist_image": torch.zeros(1, 128, 128, 3, dtype=torch.uint8),
+            "raw_proprio": torch.zeros(1, 9),
+            "raw_task": ["dummy task"],
+        },
+        include_future=True,
+    )
+
+    assert torch.allclose(result["actions"], torch.ones(1, 2, 7) * 0.25)
+    assert result["future_image_predictions"][0]["future_image"].shape == (4, 4, 3)
+    assert result["future_image_predictions"][0]["future_image"].dtype == np.uint8
+    assert result["value_prediction"] == [0.75]
+
+
+def test_save_cosmos_future_video_writes_prediction_comparison(tmp_path):
+    from evaluation.libero.rollout_cosmos_policy import save_cosmos_future_video
+
+    obs_frames = [
+        {
+            "observation.images.agentview_rgb": np.full((16, 16, 3), 10, dtype=np.uint8),
+            "observation.images.eye_in_hand_rgb": np.full((16, 16, 3), 20, dtype=np.uint8),
+        },
+        {
+            "observation.images.agentview_rgb": np.full((16, 16, 3), 30, dtype=np.uint8),
+            "observation.images.eye_in_hand_rgb": np.full((16, 16, 3), 40, dtype=np.uint8),
+        },
+    ]
+    future_predictions = [
+        {
+            "future_image": np.full((8, 8, 3), 50, dtype=np.uint8),
+            "future_wrist_image": np.full((8, 8, 3), 60, dtype=np.uint8),
+        },
+        {
+            "future_image": np.full((8, 8, 3), 70, dtype=np.uint8),
+            "future_wrist_image": np.full((8, 8, 3), 80, dtype=np.uint8),
+        },
+    ]
+    save_path = tmp_path / "future.mp4"
+
+    save_cosmos_future_video(obs_frames, future_predictions, save_path, fps=5)
+
+    assert save_path.is_file()
+    assert save_path.stat().st_size > 0
 
 
 def test_raw_teacher_stats_use_action_mask_and_channels():

@@ -105,6 +105,9 @@ def main():
             proprio = data["proprio"].astype(np.float32)
             tasks = request["tasks"]
             actions = []
+            include_future = bool(request.get("include_future_predictions", False))
+            future_predictions = []
+            value_predictions = []
             with torch.no_grad():
                 for idx, task in enumerate(tasks):
                     obs = {
@@ -121,15 +124,41 @@ def main():
                         seed=int(request.get("seed", args.seed)),
                         randomize_seed=False,
                         num_denoising_steps_action=args.num_denoising_steps_action,
-                        generate_future_state_and_value_in_parallel=False,
+                        generate_future_state_and_value_in_parallel=include_future,
                         worker_id=0,
                         batch_size=1,
                     )
                     actions.append(np.asarray(result["actions"], dtype=np.float32))
+                    if include_future:
+                        future_predictions.append(
+                            {
+                                key: np.asarray(value, dtype=np.uint8)
+                                for key, value in result.get("future_image_predictions", {}).items()
+                                if value is not None
+                            }
+                        )
+                        value_predictions.append(float(result.get("value_prediction", 0.0)))
 
             actions = np.stack(actions, axis=0)
             actions_path = request["actions_path"]
-            np.savez_compressed(actions_path, actions=actions)
+            fields = {"actions": actions}
+            if include_future:
+                keys = sorted(
+                    {
+                        key
+                        for prediction in future_predictions
+                        for key, value in prediction.items()
+                        if value is not None
+                    }
+                )
+                fields["future_prediction_keys"] = np.asarray(keys)
+                fields["value_prediction"] = np.asarray(value_predictions, dtype=np.float32)
+                for key in keys:
+                    fields[f"future_{key}"] = np.stack(
+                        [prediction[key] for prediction in future_predictions],
+                        axis=0,
+                    )
+            np.savez_compressed(actions_path, **fields)
             print(json.dumps({"ok": True, "actions_path": actions_path}), file=response_out, flush=True)
         except Exception:
             print(

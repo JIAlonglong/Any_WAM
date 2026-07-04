@@ -447,9 +447,34 @@ class CosmosPolicyActionTeacher:
         self._official_cfg = cfg
 
     def _predict_raw_actions_inprocess(self, raw_batch):
+        return self._predict_raw_action_result_inprocess(raw_batch, include_future=False)["actions"]
+
+    def _coerce_raw_action_result(self, result):
+        if isinstance(result, dict):
+            if "actions" not in result:
+                raise KeyError("Raw action result dictionary must contain an 'actions' entry.")
+            coerced = dict(result)
+            coerced["actions"] = torch.as_tensor(coerced["actions"], dtype=torch.float32)
+            return coerced
+        return {"actions": torch.as_tensor(result, dtype=torch.float32)}
+
+    @staticmethod
+    def _future_predictions_from_official_result(result):
+        predictions = result.get("future_image_predictions")
+        if predictions is None:
+            return None
+        return {
+            key: np.asarray(value, dtype=np.uint8)
+            for key, value in predictions.items()
+            if value is not None
+        }
+
+    def _predict_raw_action_result_inprocess(self, raw_batch, include_future=False):
         primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
         self._ensure_official_inprocess()
         actions = []
+        future_predictions = []
+        value_predictions = []
         with torch.no_grad():
             for idx, task in enumerate(tasks):
                 obs = {
@@ -466,12 +491,19 @@ class CosmosPolicyActionTeacher:
                     seed=self.raw_seed,
                     randomize_seed=False,
                     num_denoising_steps_action=self.num_denoising_steps_action,
-                    generate_future_state_and_value_in_parallel=False,
+                    generate_future_state_and_value_in_parallel=bool(include_future),
                     worker_id=self.device.index or 0,
                     batch_size=1,
                 )
                 actions.append(np.asarray(result["actions"], dtype=np.float32))
-        return torch.from_numpy(np.stack(actions, axis=0))
+                if include_future:
+                    future_predictions.append(self._future_predictions_from_official_result(result))
+                    value_predictions.append(result.get("value_prediction"))
+        output = {"actions": torch.from_numpy(np.stack(actions, axis=0))}
+        if include_future:
+            output["future_image_predictions"] = future_predictions
+            output["value_prediction"] = value_predictions
+        return output
 
     def _ensure_raw_worker(self):
         if self._raw_worker is not None and self._raw_worker.poll() is None:
@@ -518,6 +550,9 @@ class CosmosPolicyActionTeacher:
         atexit.register(self.close)
 
     def _predict_raw_actions_subprocess(self, raw_batch):
+        return self._predict_raw_action_result_subprocess(raw_batch, include_future=False)["actions"]
+
+    def _predict_raw_action_result_subprocess(self, raw_batch, include_future=False):
         primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
         self._ensure_raw_worker()
         req_dir = self._raw_worker_tmpdir or tempfile.mkdtemp(prefix="cosmos_policy_raw_")
@@ -530,6 +565,7 @@ class CosmosPolicyActionTeacher:
             "actions_path": actions_path,
             "tasks": tasks,
             "seed": self.raw_seed,
+            "include_future_predictions": bool(include_future),
         }
         try:
             self._raw_worker.stdin.write(json.dumps(payload) + "\n")
@@ -546,23 +582,38 @@ class CosmosPolicyActionTeacher:
         response = json.loads(line)
         if not response.get("ok", False):
             raise RuntimeError("Cosmos Policy raw worker failed:\n" + response.get("error", "unknown error"))
-        data = np.load(response["actions_path"])
-        actions = torch.from_numpy(data["actions"].astype(np.float32))
+        with np.load(response["actions_path"]) as data:
+            actions = torch.from_numpy(data["actions"].astype(np.float32))
+            result = {"actions": actions}
+            if include_future and "future_prediction_keys" in data.files:
+                keys = [str(key) for key in data["future_prediction_keys"].tolist()]
+                futures = [dict() for _ in range(actions.shape[0])]
+                for key in keys:
+                    values = data[f"future_{key}"].astype(np.uint8)
+                    for batch_idx in range(values.shape[0]):
+                        futures[batch_idx][key] = values[batch_idx]
+                result["future_image_predictions"] = futures
+                if "value_prediction" in data.files:
+                    result["value_prediction"] = [
+                        float(value) for value in data["value_prediction"].astype(np.float32).tolist()
+                    ]
         for path in (npz_path, response["actions_path"]):
             try:
                 os.remove(path)
             except OSError:
                 pass
-        return actions
+        return result
 
     def predict_raw_actions(self, raw_batch):
+        return self.predict_raw_action_result(raw_batch, include_future=False)["actions"]
+
+    def predict_raw_action_result(self, raw_batch, include_future=False):
         if self._raw_action_provider is not None:
-            actions = self._raw_action_provider(raw_batch)
-            return torch.as_tensor(actions, dtype=torch.float32)
+            return self._coerce_raw_action_result(self._raw_action_provider(raw_batch))
         if self.raw_inference_mode == "inprocess":
-            return self._predict_raw_actions_inprocess(raw_batch)
+            return self._predict_raw_action_result_inprocess(raw_batch, include_future=include_future)
         if self.raw_inference_mode == "subprocess":
-            return self._predict_raw_actions_subprocess(raw_batch)
+            return self._predict_raw_action_result_subprocess(raw_batch, include_future=include_future)
         raise ValueError(
             f"Unsupported cosmos_policy_inference_mode={self.raw_inference_mode!r}; "
             "expected 'subprocess' or 'inprocess'."

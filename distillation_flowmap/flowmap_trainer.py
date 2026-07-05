@@ -130,6 +130,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.video_teacher = None
         self._video_teacher_nofsdp = None
         self.cosmos_video_target = bool(getattr(config, 'cosmos_video_target', False))
+        self.cosmos_video_cdiff_aux = bool(
+            getattr(config, 'cosmos_video_cdiff_aux', False)
+        )
         self.cosmos_video_vae = None
         self.cosmos_video_streaming_vae = None
         # 动作的跳步数（可能与视频不同）
@@ -219,6 +222,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info(f"Video teacher backend: {self.teacher_roles.video_backend}")
             logger.info(f"Video teacher path: {self.teacher_roles.video_model_path}")
             logger.info(f"Cosmos video target: {self.cosmos_video_target}")
+            logger.info(f"Cosmos video central-diff aux: {self.cosmos_video_cdiff_aux}")
             if self.distill_action:
                 logger.info(f"  k_action = {self.k_action}, "
                             f"action_loss_weight = {config.action_loss_weight}, "
@@ -333,6 +337,38 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 self.cosmos_video_vae.eval()
                 self.cosmos_video_streaming_vae = WanVAEStreamingWrapper(self.cosmos_video_vae)
                 logger.info("WanVA VAE encoder ready for Cosmos future video targets.")
+                if self.cosmos_video_cdiff_aux:
+                    video_root = getattr(
+                        config, 'cosmos_video_cdiff_teacher_model_path', None)
+                    if video_root is None:
+                        video_root = getattr(config, 'student_base_model_path', None)
+                    video_root = os.path.abspath(os.path.expanduser(video_root))
+                    if os.path.basename(video_root) == "transformer":
+                        video_teacher_path = video_root
+                    else:
+                        video_teacher_path = os.path.join(video_root, "transformer")
+                    if not os.path.isfile(os.path.join(video_teacher_path, "config.json")):
+                        raise FileNotFoundError(
+                            "Invalid cosmos_video_cdiff_teacher_model_path: "
+                            f"expected {os.path.join(video_teacher_path, 'config.json')}"
+                        )
+                    logger.info(
+                        "Loading WanVA video teacher for Cosmos central-diff aux ..."
+                    )
+                    self.video_teacher = load_transformer(
+                        video_teacher_path,
+                        torch_dtype=self.dtype,
+                        torch_device="cpu",
+                    )
+                    self.video_teacher.requires_grad_(False)
+                    self.video_teacher.eval()
+                    self.video_teacher = self.video_teacher.to(self.dtype)
+                    self._video_teacher_nofsdp = self.video_teacher.to(
+                        f"cuda:{local_rank}")
+                    self.video_teacher = None
+                    logger.info(
+                        "WanVA video teacher ready for Cosmos central-diff aux."
+                    )
             if self.teacher_roles.uses_separate_video_teacher:
                 video_root = os.path.abspath(os.path.expanduser(self.teacher_roles.video_model_path))
                 if os.path.basename(video_root) == "transformer":
@@ -2117,6 +2153,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.optimizer.zero_grad()
         acc_losses = []              # 累积的总损失
         acc_video_losses = []        # 累积的视频损失
+        acc_cosmos_video_endpoint_losses = []
+        acc_cosmos_video_cdiff_losses = []
         acc_video_local_fm_losses = []  # 累积的视频 local FM 损失
         acc_action_losses = []       # 累积的动作损失
         acc_action_local_fm_losses = []  # 累积的动作 local FM 损失
@@ -2224,6 +2262,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_video_losses.append(result.get("video_transition_loss", torch.tensor(0.0, device=self.device)))
             else:
                 acc_video_losses.append(result["video_loss"])
+            acc_cosmos_video_endpoint_losses.append(result.get(
+                "cosmos_video_endpoint_loss", zero_tensor))
+            acc_cosmos_video_cdiff_losses.append(result.get(
+                "cosmos_video_cdiff_loss", zero_tensor))
             acc_video_local_fm_losses.append(result.get(
                 "local_fm_loss", zero_tensor))
             acc_action_losses.append(result["action_loss"])
@@ -2409,6 +2451,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 metric_tensors = [
                     torch.stack(acc_losses).sum(),
                     torch.stack(acc_video_losses).sum(),
+                    torch.stack(acc_cosmos_video_endpoint_losses).sum(),
+                    torch.stack(acc_cosmos_video_cdiff_losses).sum(),
                     torch.stack(acc_video_local_fm_losses).sum(),
                     torch.stack(acc_action_losses).sum(),
                     torch.stack(acc_action_local_fm_losses).sum(),
@@ -2464,10 +2508,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     ])
                 metric_values = torch.stack(metric_tensors).float()
                 metric_results = dist_mean(metric_values).tolist()
-                base_metric_count = 36
+                base_metric_count = 38
                 (
                     avg_loss,
                     avg_video_loss,
+                    avg_cosmos_video_endpoint_loss,
+                    avg_cosmos_video_cdiff_loss,
                     avg_video_local_fm_loss,
                     avg_action_loss,
                     avg_action_local_fm_loss,
@@ -2549,6 +2595,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 # 重置累积器
                 acc_losses = []
                 acc_video_losses = []
+                acc_cosmos_video_endpoint_losses = []
+                acc_cosmos_video_cdiff_losses = []
                 acc_video_local_fm_losses = []
                 acc_action_losses = []
                 acc_action_local_fm_losses = []
@@ -2627,6 +2675,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         else:
                             postfix["v"] = f"{avg_video_loss:.4f}"
                             log_dict["loss/video_consistency"] = avg_video_loss
+                            if bool(getattr(self.config, 'cosmos_video_cdiff_aux', False)):
+                                postfix["vep"] = f"{avg_cosmos_video_endpoint_loss:.4f}"
+                                postfix["vcd"] = f"{avg_cosmos_video_cdiff_loss:.4f}"
+                                log_dict["loss/cosmos_video_endpoint"] = avg_cosmos_video_endpoint_loss
+                                log_dict["loss/cosmos_video_cdiff"] = avg_cosmos_video_cdiff_loss
                     if kto_main_enabled:
                         postfix["mkto"] = f"{avg_kto_main_good_ratio:.2f}/{avg_kto_main_weight_mean:.2f}"
                         log_dict["kto_main/active"] = avg_kto_main_active

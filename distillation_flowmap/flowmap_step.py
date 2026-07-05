@@ -1264,6 +1264,73 @@ class FlowMapStepMixin:
             # 均匀权重（默认）
             return torch.ones_like(t)
 
+    @torch.no_grad()
+    def _cosmos_video_cdiff_target(
+        self,
+        input_dict,
+        batch,
+        video_noisy_latents,
+        video_noise,
+        video_t,
+        video_r,
+        ref_shape,
+        batch_size,
+        cfg_scale,
+    ):
+        """Return WanVA/LingBotVA central-diff FlowMap target for Cosmos x0 anchors."""
+        if getattr(self, "_video_teacher_nofsdp", None) is None:
+            raise RuntimeError(
+                "cfg.cosmos_video_cdiff_aux=True requires a WanVA video teacher. "
+                "Set cfg.cosmos_video_cdiff_teacher_model_path."
+            )
+
+        v_pred = video_noise - batch["latents"]
+        t_plus = (video_t + self.epsilon).clamp(
+            max=self.config.num_train_timesteps)
+        t_minus = (video_t - self.epsilon).clamp(min=0)
+        noisy_latents_plus = video_noisy_latents + v_pred * (
+            self.epsilon / self.config.num_train_timesteps)
+        noisy_latents_minus = video_noisy_latents - v_pred * (
+            self.epsilon / self.config.num_train_timesteps)
+
+        if bool(getattr(self.config, "use_central_diff", True)):
+            (
+                video_v_cfg_seq,
+                _action_cond_t,
+                v_plus_seq,
+                v_minus_seq,
+                _action_cond_plus,
+                _action_cond_minus,
+            ) = self._merged_cfg_central_diff_unified(
+                input_dict,
+                self.empty_emb,
+                cfg_scale,
+                noisy_latents_plus,
+                noisy_latents_minus,
+                t_plus,
+                t_minus,
+                batch["latents"],
+            )
+            video_v_cfg_5d = self._extract_video_v(
+                video_v_cfg_seq, ref_shape, batch_size)
+            video_v_plus_5d = self._extract_video_v(
+                v_plus_seq, ref_shape, batch_size)
+            video_v_minus_5d = self._extract_video_v(
+                v_minus_seq, ref_shape, batch_size)
+            dF_dt = (video_v_plus_5d - video_v_minus_5d) / (2 * self.epsilon)
+        else:
+            video_v_cond, video_v_uncond, _ = self._batched_cfg_forward(
+                input_dict, self.empty_emb)
+            video_v_cfg = video_v_uncond + cfg_scale * (
+                video_v_cond - video_v_uncond)
+            video_v_cfg_5d = self._extract_video_v(
+                video_v_cfg, ref_shape, batch_size)
+            dF_dt = torch.zeros_like(video_v_cfg_5d)
+
+        t_5d = video_t[:, None, :, None, None].to(video_v_cfg_5d)
+        r_5d = video_r[:, None, :, None, None].to(video_v_cfg_5d)
+        return (video_v_cfg_5d - (t_5d - r_5d) * dF_dt).detach()
+
     # ==================================================================
     # 核心训练步：Flow Map 蒸馏
     # ==================================================================
@@ -1321,6 +1388,8 @@ class FlowMapStepMixin:
             scheduler=self.train_scheduler_action,
         )
         action_r_sigma = action_r / self.config.num_train_timesteps
+        cfg_scale = self.config.cfg_min + torch.rand(1).item() * (
+            self.config.cfg_max - self.config.cfg_min)
 
         video_noise = torch.randn_like(batch['latents'])
         video_noisy_latents = self.train_scheduler_latent.add_noise(
@@ -1413,6 +1482,8 @@ class FlowMapStepMixin:
         raw_teacher_gt_l1 = zero_metric
         raw_teacher_abs_mean = zero_metric
         raw_gt_abs_mean = zero_metric
+        cosmos_video_endpoint_loss = zero_metric
+        cosmos_video_cdiff_loss = zero_metric
 
         sigma_r = action_r_sigma[:, None, ::action_ds, None, None].to(student_action_v)
         student_action_pred = action_noisy_ds - sigma_r * student_action_v
@@ -1460,7 +1531,45 @@ class FlowMapStepMixin:
             )[:, None, :, None, None].to(student_video_v)
             student_video_pred = video_noisy_latents - video_sigma_r * student_video_v
             video_diff = student_video_pred.float() - batch['latents'].detach().float()
-            video_loss = (video_diff ** 2).mean()
+            cosmos_video_endpoint_loss = (video_diff ** 2).mean()
+            video_loss = (
+                float(getattr(self.config, "cosmos_video_endpoint_loss_weight", 1.0))
+                * cosmos_video_endpoint_loss
+            )
+
+            if bool(getattr(self.config, "cosmos_video_cdiff_aux", False)):
+                cdiff_target = self._cosmos_video_cdiff_target(
+                    input_dict=input_dict,
+                    batch=batch,
+                    video_noisy_latents=video_noisy_latents,
+                    video_noise=video_noise,
+                    video_t=video_t,
+                    video_r=video_r,
+                    ref_shape=ref_shape,
+                    batch_size=B,
+                    cfg_scale=cfg_scale,
+                )
+                cdiff_diff = student_video_v.float() - cdiff_target.float()
+                loss_type = getattr(self.config, "loss_type", "l2")
+                if loss_type == "huber":
+                    huber_c = float(getattr(self.config, "huber_c", 0.001))
+                    abs_diff = cdiff_diff.abs()
+                    token_loss = torch.where(
+                        abs_diff < huber_c,
+                        0.5 * cdiff_diff ** 2,
+                        huber_c * (abs_diff - 0.5 * huber_c),
+                    ).mean(dim=1)
+                else:
+                    token_loss = (cdiff_diff ** 2).mean(dim=1)
+                per_sample_loss = token_loss.flatten(1).mean(dim=1)
+                weight_type = getattr(self.config, "weight_type", "uniform")
+                weight = self._get_timestep_weight(
+                    video_t.mean(dim=-1), weight_type).to(self.device)
+                cosmos_video_cdiff_loss = (per_sample_loss * weight).mean()
+                video_loss = video_loss + (
+                    float(getattr(self.config, "cosmos_video_cdiff_loss_weight", 0.0))
+                    * cosmos_video_cdiff_loss
+                )
 
         loss = getattr(self.config, 'video_loss_weight', 1.0) * video_loss \
                + getattr(self.config, 'action_block_weight', 1.0) * (
@@ -1492,6 +1601,8 @@ class FlowMapStepMixin:
                 "raw_teacher_abs_mean": raw_teacher_abs_mean.detach(),
                 "raw_gt_abs_mean": raw_gt_abs_mean.detach(),
                 "raw_teacher_enabled": raw_teacher_enabled.detach(),
+                "cosmos_video_endpoint_loss": cosmos_video_endpoint_loss.detach(),
+                "cosmos_video_cdiff_loss": cosmos_video_cdiff_loss.detach(),
                 "kto_main_active": zero_metric,
                 "kto_main_good_ratio": zero_metric,
                 "kto_main_weight_mean": zero_metric,
@@ -1515,6 +1626,8 @@ class FlowMapStepMixin:
             "raw_teacher_abs_mean": raw_teacher_abs_mean.detach(),
             "raw_gt_abs_mean": raw_gt_abs_mean.detach(),
             "raw_teacher_enabled": raw_teacher_enabled.detach(),
+            "cosmos_video_endpoint_loss": cosmos_video_endpoint_loss.detach(),
+            "cosmos_video_cdiff_loss": cosmos_video_cdiff_loss.detach(),
             "kto_main_active": zero_metric,
             "kto_main_good_ratio": zero_metric,
             "kto_main_weight_mean": zero_metric,

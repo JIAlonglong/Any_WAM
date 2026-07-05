@@ -29,8 +29,14 @@ cfg.output_dir = os.environ.get(
 )
 cfg.wandb_name_prefix = "stage1_cosmos_wanva_cdiff"
 
-# Keep Cosmos endpoint supervision, and add the LingBotVA/WanVA FlowMap local
-# vector field as an auxiliary target.
+# Use the LingBotVA/WanVA FlowMap local vector field as the primary video
+# target, while keeping Cosmos future-image endpoints as a small anchor.
+cfg.cosmos_video_cdiff_mode = os.environ.get(
+    "COSMOS_VIDEO_CDIFF_MODE", "primary").lower()
+if cfg.cosmos_video_cdiff_mode not in ("primary", "aux"):
+    raise ValueError(
+        "COSMOS_VIDEO_CDIFF_MODE must be either 'primary' or 'aux'."
+    )
 cfg.cosmos_video_cdiff_aux = _env_bool("COSMOS_VIDEO_CDIFF_AUX", True)
 cfg.cosmos_video_cdiff_teacher_model_path = os.environ.get(
     "COSMOS_VIDEO_CDIFF_TEACHER_MODEL_PATH",
@@ -39,8 +45,9 @@ cfg.cosmos_video_cdiff_teacher_model_path = os.environ.get(
 cfg.cosmos_video_cdiff_loss_weight = float(
     os.environ.get("COSMOS_VIDEO_CDIFF_LOSS_WEIGHT", 1.0)
 )
+_default_endpoint_weight = 1e-3 if cfg.cosmos_video_cdiff_mode == "primary" else 1.0
 cfg.cosmos_video_endpoint_loss_weight = float(
-    os.environ.get("COSMOS_VIDEO_ENDPOINT_LOSS_WEIGHT", 1.0)
+    os.environ.get("COSMOS_VIDEO_ENDPOINT_LOSS_WEIGHT", _default_endpoint_weight)
 )
 
 cfg.use_central_diff = _env_bool("USE_CENTRAL_DIFF", True)

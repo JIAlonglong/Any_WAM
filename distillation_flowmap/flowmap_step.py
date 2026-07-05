@@ -1280,7 +1280,7 @@ class FlowMapStepMixin:
         """Return WanVA/LingBotVA central-diff FlowMap target for Cosmos x0 anchors."""
         if getattr(self, "_video_teacher_nofsdp", None) is None:
             raise RuntimeError(
-                "cfg.cosmos_video_cdiff_aux=True requires a WanVA video teacher. "
+                "Cosmos video central-diff requires a WanVA video teacher. "
                 "Set cfg.cosmos_video_cdiff_teacher_model_path."
             )
 
@@ -1526,16 +1526,31 @@ class FlowMapStepMixin:
 
         video_loss = torch.tensor(0.0, device=self.device)
         if self.distill_video:
+            cdiff_mode = str(
+                getattr(self.config, "cosmos_video_cdiff_mode", "aux")
+            ).lower()
+            if cdiff_mode not in ("primary", "aux"):
+                raise ValueError(
+                    "cfg.cosmos_video_cdiff_mode must be either 'primary' or 'aux'."
+                )
+            if cdiff_mode == "primary" and not bool(
+                getattr(self.config, "cosmos_video_cdiff_aux", False)
+            ):
+                raise RuntimeError(
+                    "cfg.cosmos_video_cdiff_mode='primary' requires "
+                    "cfg.cosmos_video_cdiff_aux=True."
+                )
+            endpoint_loss_weight = float(
+                getattr(self.config, "cosmos_video_endpoint_loss_weight", 1.0))
+            cdiff_loss_weight = float(
+                getattr(self.config, "cosmos_video_cdiff_loss_weight", 0.0))
             video_sigma_r = (
                 video_r / self.config.num_train_timesteps
             )[:, None, :, None, None].to(student_video_v)
             student_video_pred = video_noisy_latents - video_sigma_r * student_video_v
             video_diff = student_video_pred.float() - batch['latents'].detach().float()
             cosmos_video_endpoint_loss = (video_diff ** 2).mean()
-            video_loss = (
-                float(getattr(self.config, "cosmos_video_endpoint_loss_weight", 1.0))
-                * cosmos_video_endpoint_loss
-            )
+            video_loss = endpoint_loss_weight * cosmos_video_endpoint_loss
 
             if bool(getattr(self.config, "cosmos_video_cdiff_aux", False)):
                 cdiff_target = self._cosmos_video_cdiff_target(
@@ -1566,10 +1581,7 @@ class FlowMapStepMixin:
                 weight = self._get_timestep_weight(
                     video_t.mean(dim=-1), weight_type).to(self.device)
                 cosmos_video_cdiff_loss = (per_sample_loss * weight).mean()
-                video_loss = video_loss + (
-                    float(getattr(self.config, "cosmos_video_cdiff_loss_weight", 0.0))
-                    * cosmos_video_cdiff_loss
-                )
+                video_loss = video_loss + cdiff_loss_weight * cosmos_video_cdiff_loss
 
         loss = getattr(self.config, 'video_loss_weight', 1.0) * video_loss \
                + getattr(self.config, 'action_block_weight', 1.0) * (

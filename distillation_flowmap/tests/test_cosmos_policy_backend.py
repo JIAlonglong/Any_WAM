@@ -523,10 +523,27 @@ def test_cosmos_stage1_wanva_cdiff_config_imports(monkeypatch):
     assert cfg.distill_action is True
     assert cfg.cosmos_video_cdiff_aux is True
     assert cfg.cosmos_video_cdiff_teacher_model_path == "/tmp/wanva-base"
-    assert cfg.cosmos_video_cdiff_loss_weight > 0
+    assert cfg.cosmos_video_cdiff_mode == "primary"
+    assert cfg.cosmos_video_cdiff_loss_weight == 1.0
+    assert cfg.cosmos_video_endpoint_loss_weight == 1e-3
     assert cfg.use_central_diff is True
     assert cfg.action_use_flowmap is False
     assert cfg.use_opd_aux is False
+
+
+def test_cosmos_stage1_wanva_cdiff_aux_mode_keeps_endpoint_primary(monkeypatch):
+    monkeypatch.setenv("COSMOS_POLICY_PATH", "/tmp/cosmos-policy")
+    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")
+    monkeypatch.setenv("COSMOS_VIDEO_CDIFF_MODE", "aux")
+    sys.modules.pop(
+        "distillation_flowmap.config_libero_cosmos_policy_stage1_wanva_cdiff", None)
+
+    cfg = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage1_wanva_cdiff"
+    ).cfg
+
+    assert cfg.cosmos_video_cdiff_mode == "aux"
+    assert cfg.cosmos_video_endpoint_loss_weight == 1.0
 
 
 def test_cosmos_dual_teacher_stage2_config_imports(monkeypatch):

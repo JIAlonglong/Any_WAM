@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import traceback
 from types import SimpleNamespace
 
@@ -70,6 +71,15 @@ def _make_cfg(args):
 
 def _time_view(tensor):
     return tensor[:, None, :, None, None]
+
+
+def _profile_enabled():
+    return os.environ.get("COSMOS_POLICY_WORKER_PROFILE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def _velocity_from_x0_fn(model, x0_fn, x_t, t):
@@ -187,6 +197,8 @@ def main():
             latent_epsilon = float(request.get("cosmos_latent_epsilon", 0.001))
             latent_center_velocity_mode = request.get(
                 "cosmos_latent_center_velocity_mode", "exact")
+            profile = _profile_enabled()
+            request_t0 = time.perf_counter() if profile else None
             future_predictions = []
             value_predictions = []
             latent_x0 = []
@@ -194,11 +206,13 @@ def main():
             latent_velocities = []
             with torch.no_grad():
                 for idx, task in enumerate(tasks):
+                    sample_t0 = time.perf_counter() if profile else None
                     obs = {
                         "primary_image": primary[idx],
                         "wrist_image": wrist[idx],
                         "proprio": proprio[idx],
                     }
+                    action_t0 = time.perf_counter() if profile else None
                     result = get_action(
                         cfg,
                         model,
@@ -212,8 +226,16 @@ def main():
                         worker_id=0,
                         batch_size=1,
                     )
+                    if profile:
+                        print(
+                            "[cosmos_worker_profile] "
+                            f"sample={idx} get_action_s={time.perf_counter() - action_t0:.3f}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     actions.append(np.asarray(result["actions"], dtype=np.float32))
                     if include_latent_cdiff:
+                        cdiff_t0 = time.perf_counter() if profile else None
                         cdiff = _compute_latent_cdiff(
                             model,
                             result["data_batch"],
@@ -224,6 +246,14 @@ def main():
                             latent_epsilon,
                             latent_center_velocity_mode,
                         )
+                        if profile:
+                            print(
+                                "[cosmos_worker_profile] "
+                                f"sample={idx} latent_cdiff_s={time.perf_counter() - cdiff_t0:.3f} "
+                                f"center_mode={latent_center_velocity_mode}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
                         latent_x0.append(cdiff["x0"])
                         latent_cdiff_targets.append(cdiff["target"])
                         latent_velocities.append(cdiff["velocity"])
@@ -236,6 +266,13 @@ def main():
                             }
                         )
                         value_predictions.append(float(result.get("value_prediction", 0.0)))
+                    if profile:
+                        print(
+                            "[cosmos_worker_profile] "
+                            f"sample={idx} total_s={time.perf_counter() - sample_t0:.3f}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
 
             actions = np.stack(actions, axis=0)
             actions_path = request["actions_path"]
@@ -261,6 +298,14 @@ def main():
                 fields["cosmos_latent_cdiff_target"] = np.concatenate(latent_cdiff_targets, axis=0)
                 fields["cosmos_latent_velocity"] = np.concatenate(latent_velocities, axis=0)
             np.savez_compressed(actions_path, **fields)
+            if profile:
+                print(
+                    "[cosmos_worker_profile] "
+                    f"request_total_s={time.perf_counter() - request_t0:.3f} "
+                    f"batch={len(tasks)} latent_cdiff={include_latent_cdiff}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             print(json.dumps({"ok": True, "actions_path": actions_path}), file=response_out, flush=True)
         except Exception:
             print(

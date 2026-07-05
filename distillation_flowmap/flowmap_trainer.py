@@ -169,6 +169,32 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 f"Unsupported opd_aux_variant={self.opd_aux_variant!r}; "
                 "expected 'default', 'kto_paopd', or 'kto_paopd_norm_focal'."
             )
+        self.target_student = None
+        self.skip_target_student = bool(
+            getattr(config, 'skip_target_student_for_cosmos_latent', False)
+        )
+        if self.skip_target_student:
+            blockers = []
+            if not self.cosmos_latent_target:
+                blockers.append("cosmos_latent_target=False")
+            if getattr(config, 'use_action_distill', True):
+                blockers.append("use_action_distill=True")
+            if getattr(config, 'action_use_flowmap', False):
+                blockers.append("action_use_flowmap=True")
+            if self.use_dmd:
+                blockers.append("use_dmd=True")
+            if self.use_onpolicy_transition:
+                blockers.append("use_onpolicy_transition=True")
+            if self.use_opd_aux:
+                blockers.append("use_opd_aux=True")
+            if getattr(config, 'opd_aux_use_nofsdp_rollout', False):
+                blockers.append("opd_aux_use_nofsdp_rollout=True")
+            if blockers:
+                raise ValueError(
+                    "skip_target_student_for_cosmos_latent is only valid for "
+                    "the pure Cosmos latent target path without EMA/target-student "
+                    f"losses; blockers: {', '.join(blockers)}"
+                )
         self.discriminator = None
         self.discriminator_optimizer = None
 
@@ -226,6 +252,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info(f"Cosmos video target: {self.cosmos_video_target}")
             logger.info(f"Cosmos latent target: {self.cosmos_latent_target}")
             logger.info(f"Cosmos video central-diff aux: {self.cosmos_video_cdiff_aux}")
+            logger.info(f"Skip target student: {self.skip_target_student}")
             if self.distill_action:
                 logger.info(f"  k_action = {self.k_action}, "
                             f"action_loss_weight = {config.action_loss_weight}, "
@@ -758,72 +785,77 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             self._student_blocks_compiled = True
         # 3. 目标学生（EMA, frozen）：在线学生的指数移动平均副本
         # 如果从 LoRA checkpoint 恢复，需要先加载基座模型，再加载 LoRA adapter
-        if self._is_lora_resume:
-            logger.info("Loading target student from LoRA checkpoint ...")
-            logger.info("  Step 1: Loading base model from teacher ...")
-            self.target_student = load_transformer(teacher_path, torch_dtype=self.dtype, torch_device="cpu")
-        else:
-            logger.info("Loading target student (EMA, frozen) ...")
-            self.target_student = load_transformer(target_path, torch_dtype=self.dtype, torch_device="cpu")
-        self.target_student = self.target_student.to(self.dtype)
-        self.target_student = adapt_cosmos_latent_video_heads(self.target_student, "target student")
-
-        # 为目标学生模型添加 Flow Map 能力（与学生模型相同的改造）
-        logger.info("Setting up Flow Map for target student ...")
-        self.target_student = setup_flowmap_model(
-            self.target_student, gate_value=config.gate_value, deltatime_type=config.deltatime_type)
-        self.target_student = patch_model_forward(self.target_student)
-        if not self._is_lora_resume:
-            load_flowmap_delta_weights(self.target_student, target_path, "target student")
-
-        # 如果从 LoRA checkpoint 恢复，为目标学生也添加 LoRA 并加载权重
-        if self._is_lora_resume and self.use_lora:
-            logger.info("  Step 2: Adding LoRA to target student ...")
-            target_lora_config = LoraConfig(
-                r=config.lora_rank,
-                lora_alpha=config.lora_alpha,
-                target_modules=config.lora_target_modules,
-                lora_dropout=getattr(config, 'lora_dropout', 0.0),
-                bias='none',
+        if self.skip_target_student:
+            logger.info(
+                "Skipping target student load/EMA for pure Cosmos latent path."
             )
-            self.target_student = get_peft_model(self.target_student, target_lora_config, adapter_name='default')
-
-            # 加载目标学生的 LoRA adapter 权重
-            target_adapter_path = os.path.join(target_path, "diffusion_pytorch_model.safetensors")
-            if os.path.exists(target_adapter_path):
-                from safetensors.torch import load_file as safetensors_load_file
-                target_adapter_state = safetensors_load_file(target_adapter_path)
-                missing, unexpected = self.target_student.load_state_dict(target_adapter_state, strict=False)
-                if config.rank == 0:
-                    logger.info(f"  Loaded {len(target_adapter_state)} target adapter parameters")
+        else:
+            if self._is_lora_resume:
+                logger.info("Loading target student from LoRA checkpoint ...")
+                logger.info("  Step 1: Loading base model from teacher ...")
+                self.target_student = load_transformer(teacher_path, torch_dtype=self.dtype, torch_device="cpu")
             else:
-                logger.warning(f"  Target adapter weights not found: {target_adapter_path}")
-        elif self.use_lora:
-            # 非 LoRA 恢复模式：正常为目标学生添加 LoRA
-            target_lora_config = LoraConfig(
-                r=config.lora_rank,
-                lora_alpha=config.lora_alpha,
-                target_modules=config.lora_target_modules,
-                lora_dropout=getattr(config, 'lora_dropout', 0.0),
-                bias='none',
-            )
-            self.target_student = get_peft_model(self.target_student, target_lora_config, adapter_name='default')
+                logger.info("Loading target student (EMA, frozen) ...")
+                self.target_student = load_transformer(target_path, torch_dtype=self.dtype, torch_device="cpu")
+            self.target_student = self.target_student.to(self.dtype)
+            self.target_student = adapt_cosmos_latent_video_heads(self.target_student, "target student")
 
-        # Cast entire model (including LoRA parameters) to uniform dtype
-        # before FSDP wrapping (same reason as online student above).
-        self.target_student = self.target_student.to(self.dtype)
+            # 为目标学生模型添加 Flow Map 能力（与学生模型相同的改造）
+            logger.info("Setting up Flow Map for target student ...")
+            self.target_student = setup_flowmap_model(
+                self.target_student, gate_value=config.gate_value, deltatime_type=config.deltatime_type)
+            self.target_student = patch_model_forward(self.target_student)
+            if not self._is_lora_resume:
+                load_flowmap_delta_weights(self.target_student, target_path, "target student")
 
-        if self.use_onpolicy_transition:
-            # On-policy mode: use FSDP1 (shards parameters across GPUs)
-            self.target_student = shard_model_fsdp1(self.target_student, param_dtype=self.dtype)
-            logger.info("Target student wrapped with FSDP1 (on-policy mode)")
-        else:
-            self.target_student = _configure_model(
-                model=self.target_student, shard_fn=shard_model,
-                param_dtype=self.dtype, device=self.device, eval_mode=False,
-            )
-        self.target_student.requires_grad_(False)  # 冻结，仅用于推理
-        self.target_student.eval()
+            # 如果从 LoRA checkpoint 恢复，为目标学生也添加 LoRA 并加载权重
+            if self._is_lora_resume and self.use_lora:
+                logger.info("  Step 2: Adding LoRA to target student ...")
+                target_lora_config = LoraConfig(
+                    r=config.lora_rank,
+                    lora_alpha=config.lora_alpha,
+                    target_modules=config.lora_target_modules,
+                    lora_dropout=getattr(config, 'lora_dropout', 0.0),
+                    bias='none',
+                )
+                self.target_student = get_peft_model(self.target_student, target_lora_config, adapter_name='default')
+
+                # 加载目标学生的 LoRA adapter 权重
+                target_adapter_path = os.path.join(target_path, "diffusion_pytorch_model.safetensors")
+                if os.path.exists(target_adapter_path):
+                    from safetensors.torch import load_file as safetensors_load_file
+                    target_adapter_state = safetensors_load_file(target_adapter_path)
+                    missing, unexpected = self.target_student.load_state_dict(target_adapter_state, strict=False)
+                    if config.rank == 0:
+                        logger.info(f"  Loaded {len(target_adapter_state)} target adapter parameters")
+                else:
+                    logger.warning(f"  Target adapter weights not found: {target_adapter_path}")
+            elif self.use_lora:
+                # 非 LoRA 恢复模式：正常为目标学生添加 LoRA
+                target_lora_config = LoraConfig(
+                    r=config.lora_rank,
+                    lora_alpha=config.lora_alpha,
+                    target_modules=config.lora_target_modules,
+                    lora_dropout=getattr(config, 'lora_dropout', 0.0),
+                    bias='none',
+                )
+                self.target_student = get_peft_model(self.target_student, target_lora_config, adapter_name='default')
+
+            # Cast entire model (including LoRA parameters) to uniform dtype
+            # before FSDP wrapping (same reason as online student above).
+            self.target_student = self.target_student.to(self.dtype)
+
+            if self.use_onpolicy_transition:
+                # On-policy mode: use FSDP1 (shards parameters across GPUs)
+                self.target_student = shard_model_fsdp1(self.target_student, param_dtype=self.dtype)
+                logger.info("Target student wrapped with FSDP1 (on-policy mode)")
+            else:
+                self.target_student = _configure_model(
+                    model=self.target_student, shard_fn=shard_model,
+                    param_dtype=self.dtype, device=self.device, eval_mode=False,
+                )
+            self.target_student.requires_grad_(False)  # 冻结，仅用于推理
+            self.target_student.eval()
 
         # ==============================================================
         # 优化器和学习率调度器
@@ -1026,6 +1058,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         恢复时可以直接加载，无需再次调用 setup_flowmap_model。
         """
         model = self.student if which == "online_student" else self.target_student
+        if model is None:
+            if self.config.rank == 0:
+                logger.info(f"  Skipped {which} checkpoint because target student is disabled.")
+            if dist.is_initialized():
+                dist.barrier(device_ids=[torch.cuda.current_device()])
+            return
         try:
             if self.use_lora:
                 # LoRA 模式：只保存 adapter 权重（不含基座模型权重，文件更小）
@@ -1362,7 +1400,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
         was_training = self.student.training
         self.student.eval()
-        self.target_student.eval()
+        if self.target_student is not None:
+            self.target_student.eval()
         if getattr(self, "_student_nofsdp", None) is not None:
             self._student_nofsdp.eval()
 
@@ -2513,11 +2552,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         ema_warmup_steps = int(getattr(config, 'ema_warmup_steps', 0))
                         ema_decay = 0.0 if self.step < ema_warmup_steps else config.ema_decay
                         self._last_ema_decay = float(ema_decay)
-                        update_ema(
-                            self.target_student.parameters(),
-                            self.student.parameters(),
-                            rate=ema_decay,
-                        )
+                        if self.target_student is not None:
+                            update_ema(
+                                self.target_student.parameters(),
+                                self.student.parameters(),
+                                rate=ema_decay,
+                            )
 
                 # 计算平均损失（跨所有进程）
                 lr = self.lr_scheduler.get_last_lr()[0]
@@ -2889,7 +2929,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 # 定期保存检查点（保留最近 3 个 + 最佳 loss 的）
                 if self.step % config.save_interval == 0:
                     self._save_checkpoint("online_student")
-                    self._save_checkpoint("target_student")
+                    if self.target_student is not None:
+                        self._save_checkpoint("target_student")
 
 
             # 常规训练不需要每个 microbatch barrier；仅保留可选 debug barrier。
@@ -2902,7 +2943,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         logger.info("Flow Map distillation completed!")
         # 保存最终检查点
         self._save_checkpoint("online_student")
-        self._save_checkpoint("target_student")
+        if self.target_student is not None:
+            self._save_checkpoint("target_student")
         # 关闭 TensorBoard writer
         if self.tb_writer is not None:
             self.tb_writer.flush()

@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -672,6 +673,13 @@ class CosmosPolicyActionTeacher:
     def _predict_raw_latent_cdiff_subprocess(self, raw_batch, noise, t, r, epsilon):
         primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
         self._ensure_raw_worker()
+        profile = os.environ.get("COSMOS_POLICY_WORKER_PROFILE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        request_t0 = time.perf_counter() if profile else None
         req_dir = self._raw_worker_tmpdir or tempfile.mkdtemp(prefix="cosmos_policy_raw_")
         fd, npz_path = tempfile.mkstemp(prefix="request_", suffix=".npz", dir=req_dir)
         os.close(fd)
@@ -699,9 +707,17 @@ class CosmosPolicyActionTeacher:
             "cosmos_latent_center_velocity_mode": self.cosmos_latent_center_velocity_mode,
         }
         try:
+            wait_t0 = time.perf_counter() if profile else None
             self._raw_worker.stdin.write(json.dumps(payload) + "\n")
             self._raw_worker.stdin.flush()
             line = self._raw_worker.stdout.readline()
+            if profile:
+                print(
+                    "[cosmos_adapter_profile] "
+                    f"worker_wait_s={time.perf_counter() - wait_t0:.3f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         except BrokenPipeError as exc:
             raise RuntimeError("Cosmos Policy raw worker exited before responding.") from exc
         if not line:
@@ -725,6 +741,13 @@ class CosmosPolicyActionTeacher:
                 os.remove(path)
             except OSError:
                 pass
+        if profile:
+            print(
+                "[cosmos_adapter_profile] "
+                f"request_total_s={time.perf_counter() - request_t0:.3f} batch={len(tasks)}",
+                file=sys.stderr,
+                flush=True,
+            )
         return self._coerce_raw_latent_cdiff_result(result)
 
     def predict_raw_actions(self, raw_batch):

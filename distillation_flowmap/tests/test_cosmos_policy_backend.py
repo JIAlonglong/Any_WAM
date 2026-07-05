@@ -678,8 +678,9 @@ def test_cosmos_latent_cdiff_stage1_config_imports(monkeypatch):
     assert abs(cfg.cosmos_latent_t_max - (80.0 / 81.0)) < 1e-9
     assert cfg.cosmos_latent_cdiff_loss_weight == 1.0
     assert cfg.cosmos_policy_worker_cuda_visible_devices == "1"
-    assert cfg.gradient_checkpointing is True
+    assert cfg.gradient_checkpointing is False
     assert cfg.cosmos_latent_center_velocity_mode == "symmetric_average"
+    assert cfg.skip_target_student_for_cosmos_latent is True
 
 
 def test_cosmos_latent_cdiff_stage2_config_imports(monkeypatch):
@@ -711,15 +712,16 @@ def test_cosmos_latent_cdiff_stage2_config_imports(monkeypatch):
     assert cfg.use_action_distill is False
     assert cfg.use_gt_regression is False
     assert cfg.action_use_flowmap is False
-    assert cfg.resume_online_from_target is True
+    assert cfg.resume_online_from_target is False
     assert cfg.reset_resume_step is True
     assert cfg.resume_optimizer_state is False
     assert "output_libero_cosmos_policy_stage1_cosmos_latent_cdiff" in cfg.resume_from_path
     assert cfg.resume_from_path.endswith("/checkpoints/step_5000")
     assert cfg.output_dir.endswith("output_libero_cosmos_policy_stage2_cosmos_latent_cdiff")
     assert cfg.cosmos_policy_worker_cuda_visible_devices == "4,5,6,7"
-    assert cfg.gradient_checkpointing is True
+    assert cfg.gradient_checkpointing is False
     assert cfg.cosmos_latent_center_velocity_mode == "symmetric_average"
+    assert cfg.skip_target_student_for_cosmos_latent is True
 
 
 def test_cosmos_all_cosmos_stage1_resume_env_overrides(monkeypatch):

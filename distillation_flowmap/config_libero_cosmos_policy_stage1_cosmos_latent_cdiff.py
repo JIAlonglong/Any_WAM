@@ -49,7 +49,10 @@ cfg.cosmos_latent_center_velocity_mode = os.environ.get(
 cfg.cosmos_policy_worker_cuda_visible_devices = (
     os.environ.get("COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES") or None
 )
-cfg.gradient_checkpointing = _env_bool("GRADIENT_CHECKPOINTING", True)
+cfg.gradient_checkpointing = _env_bool("GRADIENT_CHECKPOINTING", False)
+cfg.skip_target_student_for_cosmos_latent = _env_bool(
+    "SKIP_TARGET_STUDENT_FOR_COSMOS_LATENT", True
+)
 
 cfg.action_aware = False
 cfg.use_action_distill = False

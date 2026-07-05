@@ -79,3 +79,19 @@ def test_normal_wanva_config_keeps_single_teacher():
     assert roles.video_backend == "wanva"
     assert roles.video_model_path == "/ckpts/wanva"
     assert roles.uses_separate_video_teacher is False
+
+
+def test_dual_teacher_uses_student_base_as_default_video_teacher_when_requested():
+    cfg = SimpleNamespace(
+        teacher_backend="cosmos_policy",
+        teacher_model_path="/ckpts/cosmos",
+        student_base_model_path="/ckpts/wanva",
+        distill_video=True,
+        use_student_base_as_video_teacher=True,
+    )
+
+    roles = resolve_teacher_roles(cfg)
+
+    assert roles.video_backend == "wanva"
+    assert roles.video_model_path == "/ckpts/wanva"
+    assert roles.uses_separate_video_teacher is True

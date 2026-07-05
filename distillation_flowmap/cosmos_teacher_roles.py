@@ -63,6 +63,8 @@ def resolve_teacher_roles(config: Any) -> TeacherRoles:
                 "Cosmos Policy cannot be used as the FlowMap video teacher; "
                 "provide a WanVA video_teacher_model_path."
             )
+        if not video_model_path and bool(_get(config, "use_student_base_as_video_teacher", False)):
+            video_model_path = _get(config, "student_base_model_path", None)
         if not video_model_path:
             raise ValueError(
                 "distill_video=True with teacher_backend='cosmos_policy' requires "

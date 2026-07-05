@@ -450,6 +450,52 @@ def test_libero_cosmos_policy_configs_are_action_only(monkeypatch):
         assert cfg.return_raw_observation is False
 
 
+def test_cosmos_dual_teacher_stage1_config_imports(monkeypatch):
+    monkeypatch.setenv("COSMOS_POLICY_PATH", "/tmp/cosmos-policy")
+    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")
+    sys.modules.pop(
+        "distillation_flowmap.config_libero_cosmos_policy_stage1_dual_teacher", None)
+
+    cfg = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage1_dual_teacher"
+    ).cfg
+
+    assert cfg.teacher_backend == "cosmos_policy"
+    assert cfg.action_teacher_backend == "cosmos_policy"
+    assert cfg.teacher_model_path == "/tmp/cosmos-policy"
+    assert cfg.student_base_model_path == "/tmp/wanva-base"
+    assert cfg.video_teacher_backend == "wanva"
+    assert cfg.video_teacher_model_path == "/tmp/wanva-base"
+    assert cfg.distill_video is True
+    assert cfg.distill_action is True
+    assert cfg.action_use_flowmap is True
+    assert cfg.diffusion_ratio == 0.5
+    assert cfg.consistency_ratio == 0.25
+    assert cfg.flowmap_ratio == 0.25
+
+
+def test_cosmos_dual_teacher_stage2_config_imports(monkeypatch):
+    monkeypatch.setenv("COSMOS_POLICY_PATH", "/tmp/cosmos-policy")
+    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")
+    sys.modules.pop(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_dual_teacher", None)
+
+    cfg = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_dual_teacher"
+    ).cfg
+
+    assert cfg.teacher_backend == "cosmos_policy"
+    assert cfg.action_teacher_backend == "cosmos_policy"
+    assert cfg.teacher_model_path == "/tmp/cosmos-policy"
+    assert cfg.student_base_model_path == "/tmp/wanva-base"
+    assert cfg.video_teacher_backend == "wanva"
+    assert cfg.video_teacher_model_path == "/tmp/wanva-base"
+    assert cfg.distill_video is True
+    assert cfg.distill_action is True
+    assert cfg.action_use_flowmap is True
+    assert cfg.use_opd_aux is True
+
+
 def test_rollout_video_conditioning_keeps_first_frame_clean():
     from distillation_flowmap.rollout_eval_video_stage2 import apply_first_frame_condition
 

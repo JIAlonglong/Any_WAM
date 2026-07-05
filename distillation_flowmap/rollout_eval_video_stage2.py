@@ -63,6 +63,34 @@ def masked_mse_l1(diff, mask):
             (diff.float().abs() * mask).sum() / denom)
 
 
+def apply_first_frame_condition(noisy_latents, timesteps, target_timesteps, clean_latents):
+    """Keep frame 0 clean and mark it as t=r=0, matching streaming inference."""
+    if noisy_latents.shape[:3] != clean_latents.shape[:3]:
+        raise ValueError(
+            "noisy_latents and clean_latents must agree on batch/channel/frame shape: "
+            f"{tuple(noisy_latents.shape)} vs {tuple(clean_latents.shape)}"
+        )
+    if timesteps.ndim != 2 or target_timesteps.ndim != 2:
+        raise ValueError("timesteps and target_timesteps must be [B, F] tensors")
+    if timesteps.shape[0] != noisy_latents.shape[0] or timesteps.shape[1] != noisy_latents.shape[2]:
+        raise ValueError(
+            "timesteps must match noisy_latents batch/frame dimensions: "
+            f"{tuple(timesteps.shape)} vs {tuple(noisy_latents.shape)}"
+        )
+    if target_timesteps.shape != timesteps.shape:
+        raise ValueError(
+            "target_timesteps must have the same shape as timesteps: "
+            f"{tuple(target_timesteps.shape)} vs {tuple(timesteps.shape)}"
+        )
+    noisy_latents[:, :, 0:1] = clean_latents[:, :, 0:1].to(
+        device=noisy_latents.device,
+        dtype=noisy_latents.dtype,
+    )
+    timesteps[:, 0] = 0.0
+    target_timesteps[:, 0] = 0.0
+    return noisy_latents, timesteps, target_timesteps
+
+
 def decode_latents_to_np(vae, video_processor, latents):
     latents = latents.detach().to(next(vae.parameters()).device, dtype=vae.dtype)
     latents_mean = (
@@ -142,6 +170,11 @@ def main():
     parser.add_argument("--video-fps", type=int, default=10)
     parser.add_argument("--video-max-pairs", type=int, default=1)
     parser.add_argument("--video-sample-index", type=int, default=0)
+    parser.add_argument(
+        "--condition-first-frame",
+        action="store_true",
+        help="Keep frame 0 clean with t=r=0, matching WanVA/Cosmos streaming inference.",
+    )
     args = parser.parse_args()
 
     init_logger()
@@ -234,6 +267,21 @@ def main():
                 batch["actions"], action_noise, action_r, t_dim=2)
             action_v_target_t = trainer.train_scheduler_action.training_target(
                 batch["actions"], action_noise, action_t)
+
+            if args.condition_first_frame:
+                video_noisy_t, video_t, video_r = apply_first_frame_condition(
+                    video_noisy_t, video_t, video_r, batch["latents"]
+                )
+                video_noisy_r, _, _ = apply_first_frame_condition(
+                    video_noisy_r, video_r, video_r, batch["latents"]
+                )
+                zero_action = torch.zeros_like(batch["actions"])
+                action_noisy_t, action_t, action_r = apply_first_frame_condition(
+                    action_noisy_t, action_t, action_r, zero_action
+                )
+                action_noisy_r, _, _ = apply_first_frame_condition(
+                    action_noisy_r, action_r, action_r, zero_action
+                )
 
             input_dict = {
                 "latent_dict": {

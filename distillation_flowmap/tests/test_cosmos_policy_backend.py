@@ -267,6 +267,29 @@ def test_libero_cosmos_policy_configs_are_action_only(monkeypatch):
         assert cfg.return_raw_observation is False
 
 
+def test_rollout_video_conditioning_keeps_first_frame_clean():
+    from distillation_flowmap.rollout_eval_video_stage2 import apply_first_frame_condition
+
+    clean_latents = torch.randn(2, 3, 4, 5, 6)
+    noisy_latents = torch.randn_like(clean_latents)
+    timesteps = torch.full((2, 4), 1000.0)
+    target_timesteps = torch.full((2, 4), 250.0)
+
+    conditioned, conditioned_t, conditioned_r = apply_first_frame_condition(
+        noisy_latents.clone(),
+        timesteps.clone(),
+        target_timesteps.clone(),
+        clean_latents,
+    )
+
+    assert torch.allclose(conditioned[:, :, 0:1], clean_latents[:, :, 0:1])
+    assert torch.allclose(conditioned[:, :, 1:], noisy_latents[:, :, 1:])
+    assert torch.equal(conditioned_t[:, 0], torch.zeros(2))
+    assert torch.equal(conditioned_r[:, 0], torch.zeros(2))
+    assert torch.equal(conditioned_t[:, 1:], timesteps[:, 1:])
+    assert torch.equal(conditioned_r[:, 1:], target_timesteps[:, 1:])
+
+
 def test_cosmos_teacher_official_eval_defaults_match_nvidia_libero_settings():
     from evaluation.libero.rollout_cosmos_policy import apply_eval_defaults
 

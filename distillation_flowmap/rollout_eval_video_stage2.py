@@ -25,6 +25,10 @@ from distributed.util import init_distributed, dist_mean
 from utils import init_logger, logger
 from distillation_flowmap.flowmap_trainer import FlowMapDistiller
 from distillation_flowmap.flowmap_step import _downsample_action_grid_id
+from distillation_flowmap.cosmos_future_video import (
+    OFFICIAL_COSMOS_FUTURE_VIDEO_SOURCE,
+    predict_official_future_prediction,
+)
 from modules.utils import load_vae
 
 
@@ -151,6 +155,26 @@ def save_contact_sheet(named_videos, path):
     sheet.save(path)
 
 
+def future_prediction_to_video_np(prediction):
+    prediction = prediction or {}
+    images = []
+    for key in ("future_wrist_image", "future_image"):
+        image = prediction.get(key)
+        if image is not None:
+            images.append(frame_to_uint8(image))
+    if not images:
+        raise RuntimeError("Official Cosmos future prediction did not contain future image fields.")
+
+    base_h, base_w = images[0].shape[:2]
+    resized = []
+    for image in images:
+        if image.shape[:2] != (base_h, base_w):
+            image = np.asarray(Image.fromarray(image).resize((base_w, base_h)))
+        resized.append(image.astype(np.uint8))
+    frame = np.hstack(resized).astype(np.uint8)
+    return np.stack([frame], axis=0)
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
@@ -203,6 +227,15 @@ def main():
     cfg.light_eval_start_index = 0
     # Keep memory closer to training but avoid the full no-FSDP student copy for this offline pass.
     cfg.opd_aux_use_nofsdp_rollout = False
+    is_cosmos_policy_teacher_cfg = str(getattr(cfg, "teacher_backend", "wanva")).lower() in (
+        "cosmos",
+        "cosmos_policy",
+        "cosmos-policy",
+    )
+    if is_cosmos_policy_teacher_cfg and args.video_dir is not None:
+        cfg.cosmos_policy_use_raw_inference = True
+        cfg.return_raw_observation = True
+        cfg.cache_dataset_in_memory = False
 
     trainer = FlowMapDistiller(cfg)
     trainer.student.eval()
@@ -218,10 +251,16 @@ def main():
     vae = None
     video_processor = None
     saved_video_pairs = 0
+    is_cosmos_policy_teacher = bool(getattr(trainer, "is_cosmos_policy_teacher", False))
     if rank == 0 and video_dir is not None:
         video_dir.mkdir(parents=True, exist_ok=True)
+        vae_model_root = (
+            getattr(cfg, "student_base_model_path", args.teacher_model_path)
+            if is_cosmos_policy_teacher
+            else args.teacher_model_path
+        )
         vae = load_vae(
-            os.path.join(args.teacher_model_path, "vae"),
+            os.path.join(vae_model_root, "vae"),
             torch_dtype=torch.float16,
             torch_device=trainer.device,
         )
@@ -320,23 +359,34 @@ def main():
             }
 
             pair_name = f"t{int(t_value)}_r{int(r_value)}"
-            teacher_x_r, teacher_v_r = trainer._teacher_integrate_to_r(
-                noisy_latents=video_noisy_t,
-                timesteps=video_t,
-                target_r=video_r,
-                input_dict=input_dict,
-                empty_emb=empty_emb,
-                cfg_scale=args.cfg_scale,
-                ref_shape=ref_shape,
-                B=B,
-                num_frames=num_frames,
-                num_steps=args.teacher_steps,
-            )
+            teacher_x_r = None
+            teacher_v_r = None
+            if not is_cosmos_policy_teacher:
+                teacher_x_r, teacher_v_r = trainer._teacher_integrate_to_r(
+                    noisy_latents=video_noisy_t,
+                    timesteps=video_t,
+                    target_r=video_r,
+                    input_dict=input_dict,
+                    empty_emb=empty_emb,
+                    cfg_scale=args.cfg_scale,
+                    ref_shape=ref_shape,
+                    B=B,
+                    num_frames=num_frames,
+                    num_steps=args.teacher_steps,
+                )
             videos_to_save = {}
+            official_future_videos_to_save = {}
             if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
                 sample_idx = min(max(args.video_sample_index, 0), B - 1)
                 videos_to_save["gt_r"] = video_noisy_r[sample_idx:sample_idx + 1].detach().cpu()
-                videos_to_save[f"teacher_t{args.teacher_steps}"] = teacher_x_r[sample_idx:sample_idx + 1].detach().cpu()
+                if is_cosmos_policy_teacher:
+                    official_future_videos_to_save["cosmos_teacher_official_future"] = (
+                        predict_official_future_prediction(trainer.teacher, batch)
+                    )
+                else:
+                    videos_to_save[f"teacher_t{args.teacher_steps}"] = (
+                        teacher_x_r[sample_idx:sample_idx + 1].detach().cpu()
+                    )
 
             for k_steps in args.student_steps:
                 student_x_r, student_v_r = trainer._student_euler_integrate(
@@ -356,10 +406,11 @@ def main():
                     sample_idx = min(max(args.video_sample_index, 0), B - 1)
                     videos_to_save[f"student_s{k_steps}"] = student_x_r[sample_idx:sample_idx + 1].detach().cpu()
                 prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{args.teacher_steps}"
-                add(prefix + "/video_teacher_x_mse", (student_x_r.float() - teacher_x_r.float()).pow(2).mean())
-                add(prefix + "/video_teacher_x_l1", (student_x_r.float() - teacher_x_r.float()).abs().mean())
-                add(prefix + "/video_teacher_v_mse", (student_v_r.float() - teacher_v_r.float()).pow(2).mean())
-                add(prefix + "/video_teacher_v_l1", (student_v_r.float() - teacher_v_r.float()).abs().mean())
+                if teacher_x_r is not None and teacher_v_r is not None:
+                    add(prefix + "/video_teacher_x_mse", (student_x_r.float() - teacher_x_r.float()).pow(2).mean())
+                    add(prefix + "/video_teacher_x_l1", (student_x_r.float() - teacher_x_r.float()).abs().mean())
+                    add(prefix + "/video_teacher_v_mse", (student_v_r.float() - teacher_v_r.float()).pow(2).mean())
+                    add(prefix + "/video_teacher_v_l1", (student_v_r.float() - teacher_v_r.float()).abs().mean())
                 add(prefix + "/video_gt_x_mse", (student_x_r.float() - video_noisy_r.float()).pow(2).mean())
                 add(prefix + "/video_gt_x_l1", (student_x_r.float() - video_noisy_r.float()).abs().mean())
                 add(prefix + "/video_gt_v_mse", (student_v_r.float() - video_v_target_r.float()).pow(2).mean())
@@ -411,6 +462,16 @@ def main():
                     out_path = video_dir / f"{pair_name}_{name}.mp4"
                     export_to_video(video_np, str(out_path), fps=args.video_fps)
                     logger.info("Saved rollout video: %s", out_path)
+                for name, prediction in official_future_videos_to_save.items():
+                    video_np = future_prediction_to_video_np(prediction)
+                    decoded[name] = video_np
+                    out_path = video_dir / f"{pair_name}_{name}.mp4"
+                    export_to_video(video_np, str(out_path), fps=args.video_fps)
+                    logger.info(
+                        "Saved rollout video from %s: %s",
+                        OFFICIAL_COSMOS_FUTURE_VIDEO_SOURCE,
+                        out_path,
+                    )
                 sheet_path = video_dir / f"{pair_name}_contact_sheet.png"
                 save_contact_sheet(decoded, sheet_path)
                 logger.info("Saved rollout contact sheet: %s", sheet_path)

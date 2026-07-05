@@ -26,6 +26,10 @@ from distillation_flowmap.cosmos_policy_adapter import (  # noqa: E402
     CosmosPolicyActionTeacher,
     resolve_cosmos_policy_assets,
 )
+from distillation_flowmap.cosmos_future_video import (  # noqa: E402
+    OFFICIAL_COSMOS_FUTURE_VIDEO_SOURCE,
+    select_first_future_prediction,
+)
 
 TASK_MAX_STEPS = {
     "libero_spatial": 220,
@@ -335,6 +339,7 @@ def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args)
             "video_path": None,
             "cosmos_future_video_path": None,
             "cosmos_future_chunks_video_path": None,
+            "cosmos_future_video_source": None,
             "actions_path": None,
         }
 
@@ -358,13 +363,7 @@ def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args)
             if args.save_cosmos_future_video:
                 action_result = teacher.predict_raw_action_result(raw_batch, include_future=True)
                 actions = action_result["actions"].detach().cpu().numpy()
-                chunk_predictions = action_result.get("future_image_predictions") or []
-                if isinstance(chunk_predictions, dict):
-                    future_prediction = chunk_predictions
-                elif len(chunk_predictions) > 0:
-                    future_prediction = chunk_predictions[0]
-                else:
-                    future_prediction = None
+                future_prediction = select_first_future_prediction(action_result)
                 future_prediction_chunks.append(future_prediction)
             else:
                 actions = teacher.predict_raw_actions(raw_batch).detach().cpu().numpy()
@@ -436,6 +435,9 @@ def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args)
                 "env_seed": args.env_seed,
                 "warmup_steps": args.warmup_steps,
                 "warmup_gripper": args.warmup_gripper,
+                "cosmos_future_video_source": (
+                    OFFICIAL_COSMOS_FUTURE_VIDEO_SOURCE if args.save_cosmos_future_video else None
+                ),
             },
             actions_path,
         )
@@ -452,6 +454,9 @@ def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args)
             "cosmos_future_video_path": str(cosmos_future_video_path) if cosmos_future_video_path else None,
             "cosmos_future_chunks_video_path": (
                 str(cosmos_future_chunks_video_path) if cosmos_future_chunks_video_path else None
+            ),
+            "cosmos_future_video_source": (
+                OFFICIAL_COSMOS_FUTURE_VIDEO_SOURCE if args.save_cosmos_future_video else None
             ),
             "num_future_prediction_frames": len(future_prediction_frames),
             "num_future_prediction_chunks": len(future_prediction_chunks),
@@ -501,7 +506,10 @@ def main():
     parser.add_argument(
         "--save-cosmos-future-video",
         action="store_true",
-        help="Also save a comparison MP4 with Cosmos future image predictions beside env rollout frames.",
+        help=(
+            "Also save comparison MP4s built from official Cosmos Policy "
+            "future_image_predictions beside env rollout frames."
+        ),
     )
     parser.add_argument(
         "--cosmos-future-chunk-fps",
@@ -557,6 +565,9 @@ def main():
         "max_env_steps": args.max_env_steps,
         "initial_states_json": args.initial_states_json,
         "save_cosmos_future_video": bool(args.save_cosmos_future_video),
+        "cosmos_future_video_source": (
+            OFFICIAL_COSMOS_FUTURE_VIDEO_SOURCE if args.save_cosmos_future_video else None
+        ),
         "cosmos_future_chunk_fps": args.cosmos_future_chunk_fps,
         "success_count": success_count,
         "total": len(attempted),

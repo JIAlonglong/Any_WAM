@@ -154,6 +154,106 @@ def test_raw_cosmos_teacher_result_provider_preserves_future_predictions(tmp_pat
     assert result["value_prediction"] == [0.75]
 
 
+def test_official_cosmos_future_prediction_selector_accepts_dict_and_batch_list():
+    from distillation_flowmap.cosmos_future_video import (
+        OFFICIAL_COSMOS_FUTURE_VIDEO_SOURCE,
+        select_first_future_prediction,
+    )
+
+    prediction = {"future_image": np.full((4, 4, 3), 11, dtype=np.uint8)}
+
+    assert OFFICIAL_COSMOS_FUTURE_VIDEO_SOURCE == "official_cosmos_future_image_predictions"
+    assert select_first_future_prediction({"future_image_predictions": prediction}) is prediction
+    assert select_first_future_prediction({"future_image_predictions": [prediction]}) is prediction
+    assert select_first_future_prediction({"future_image_predictions": []}) is None
+    assert select_first_future_prediction({}) is None
+
+
+def test_raw_cosmos_batch_for_official_future_video_requires_raw_fields():
+    from distillation_flowmap.cosmos_future_video import build_raw_cosmos_batch
+
+    batch = {
+        "latents": torch.zeros(1),
+        "raw_primary_image": torch.zeros(1, 8, 8, 3, dtype=torch.uint8),
+        "raw_wrist_image": torch.zeros(1, 8, 8, 3, dtype=torch.uint8),
+        "raw_task": ["open the drawer"],
+    }
+
+    try:
+        build_raw_cosmos_batch(batch)
+    except KeyError as exc:
+        message = str(exc)
+        assert "raw_proprio" in message
+        assert "COSMOS_POLICY_USE_RAW_INFERENCE=1" in message
+    else:
+        raise AssertionError("expected official future video batch construction to require raw_proprio")
+
+
+def test_raw_cosmos_batch_for_official_future_video_keeps_only_policy_inputs():
+    from distillation_flowmap.cosmos_future_video import build_raw_cosmos_batch
+
+    batch = {
+        "latents": torch.ones(1),
+        "actions": torch.ones(1),
+        "raw_primary_image": torch.zeros(1, 8, 8, 3, dtype=torch.uint8),
+        "raw_wrist_image": torch.zeros(1, 8, 8, 3, dtype=torch.uint8),
+        "raw_proprio": torch.zeros(1, 9),
+        "raw_task": ["open the drawer"],
+    }
+
+    raw_batch = build_raw_cosmos_batch(batch)
+
+    assert set(raw_batch) == {"raw_primary_image", "raw_wrist_image", "raw_proprio", "raw_task"}
+    assert raw_batch["raw_task"] == ["open the drawer"]
+
+
+def test_predict_official_cosmos_future_uses_include_future_flag():
+    from distillation_flowmap.cosmos_future_video import predict_official_future_prediction
+
+    prediction = {"future_image": np.full((4, 4, 3), 88, dtype=np.uint8)}
+
+    class FakeTeacher:
+        def __init__(self):
+            self.calls = []
+
+        def predict_raw_action_result(self, raw_batch, include_future=False):
+            self.calls.append((raw_batch, include_future))
+            return {"actions": torch.zeros(1, 2, 7), "future_image_predictions": [prediction]}
+
+    batch = {
+        "latents": torch.ones(1),
+        "raw_primary_image": torch.zeros(1, 8, 8, 3, dtype=torch.uint8),
+        "raw_wrist_image": torch.zeros(1, 8, 8, 3, dtype=torch.uint8),
+        "raw_proprio": torch.zeros(1, 9),
+        "raw_task": ["open the drawer"],
+    }
+    teacher = FakeTeacher()
+
+    selected = predict_official_future_prediction(teacher, batch)
+
+    assert selected is prediction
+    assert len(teacher.calls) == 1
+    raw_batch, include_future = teacher.calls[0]
+    assert include_future is True
+    assert set(raw_batch) == {"raw_primary_image", "raw_wrist_image", "raw_proprio", "raw_task"}
+
+
+def test_future_prediction_to_video_np_stacks_official_wrist_and_primary():
+    from distillation_flowmap.rollout_eval_video_stage2 import future_prediction_to_video_np
+
+    prediction = {
+        "future_wrist_image": np.full((4, 6, 3), 10, dtype=np.uint8),
+        "future_image": np.full((2, 3, 3), 20, dtype=np.uint8),
+    }
+
+    video = future_prediction_to_video_np(prediction)
+
+    assert video.shape == (1, 4, 12, 3)
+    assert video.dtype == np.uint8
+    assert np.all(video[0, :, :6] == 10)
+    assert np.all(video[0, :, 6:] == 20)
+
+
 def test_save_cosmos_future_video_writes_prediction_comparison(tmp_path):
     from evaluation.libero.rollout_cosmos_policy import save_cosmos_future_video
 

@@ -265,6 +265,66 @@ def test_future_prediction_to_video_np_repeats_to_reference_frame_count():
     assert np.all(video == 20)
 
 
+def test_future_predictions_to_video_np_resamples_multiple_predictions():
+    from distillation_flowmap.rollout_eval_video_stage2 import future_predictions_to_video_np
+
+    predictions = [
+        {"future_image": np.full((4, 6, 3), 10, dtype=np.uint8)},
+        {"future_image": np.full((4, 6, 3), 20, dtype=np.uint8)},
+        {"future_image": np.full((4, 6, 3), 30, dtype=np.uint8)},
+    ]
+
+    video = future_predictions_to_video_np(predictions, num_frames=6)
+
+    assert video.shape == (6, 4, 6, 3)
+    assert [int(video[i, 0, 0, 0]) for i in range(6)] == [10, 10, 20, 20, 30, 30]
+
+
+def test_predict_official_future_sequence_reads_multiple_raw_dataset_frames():
+    from distillation_flowmap.rollout_eval_video_stage2 import predict_official_future_prediction_sequence
+
+    class FakeDataset:
+        new_metas = [{"episode_index": 0, "start_frame": 10, "end_frame": 14, "tasks": ["open"]}]
+
+        def __len__(self):
+            return 1
+
+        def _get_raw_policy_observation(self, cur_meta, local_frame_index):
+            return {
+                "raw_primary_image": torch.zeros(8, 8, 3, dtype=torch.uint8),
+                "raw_wrist_image": torch.zeros(8, 8, 3, dtype=torch.uint8),
+                "raw_proprio": torch.full((9,), float(local_frame_index)),
+                "raw_task": "open",
+            }
+
+    class FakeTeacher:
+        def __init__(self):
+            self.frame_ids = []
+
+        def predict_raw_action_result(self, raw_batch, include_future=False):
+            assert include_future is True
+            frame_id = int(raw_batch["raw_proprio"][0].item())
+            self.frame_ids.append(frame_id)
+            return {
+                "actions": torch.zeros(1, 2, 7),
+                "future_image_predictions": {
+                    "future_image": np.full((4, 4, 3), frame_id, dtype=np.uint8),
+                },
+            }
+
+    teacher = FakeTeacher()
+
+    predictions = predict_official_future_prediction_sequence(
+        teacher,
+        FakeDataset(),
+        sample_index=0,
+        num_predictions=3,
+    )
+
+    assert teacher.frame_ids == [10, 12, 13]
+    assert [int(pred["future_image"][0, 0, 0]) for pred in predictions] == [10, 12, 13]
+
+
 def test_pad_frames_to_min_duration_repeats_last_frame():
     from distillation_flowmap.cosmos_future_video import pad_frames_to_min_duration
 

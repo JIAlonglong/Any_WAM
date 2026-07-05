@@ -156,7 +156,7 @@ def save_contact_sheet(named_videos, path):
     sheet.save(path)
 
 
-def future_prediction_to_video_np(prediction, num_frames=1):
+def future_prediction_to_frame_np(prediction):
     prediction = prediction or {}
     images = []
     for key in ("future_wrist_image", "future_image"):
@@ -172,9 +172,62 @@ def future_prediction_to_video_np(prediction, num_frames=1):
         if image.shape[:2] != (base_h, base_w):
             image = np.asarray(Image.fromarray(image).resize((base_w, base_h)))
         resized.append(image.astype(np.uint8))
-    frame = np.hstack(resized).astype(np.uint8)
+    return np.hstack(resized).astype(np.uint8)
+
+
+def future_predictions_to_video_np(predictions, num_frames=1):
+    if isinstance(predictions, dict) or predictions is None:
+        predictions = [predictions]
+    frames = [future_prediction_to_frame_np(prediction) for prediction in predictions]
     num_frames = max(1, int(num_frames))
-    return np.stack([frame.copy() for _ in range(num_frames)], axis=0)
+    if len(frames) == 1:
+        return np.stack([frames[0].copy() for _ in range(num_frames)], axis=0)
+    frame_ids = np.linspace(0, len(frames) - 1, num_frames)
+    frame_ids = np.rint(frame_ids).astype(int)
+    return np.stack([frames[idx].copy() for idx in frame_ids], axis=0)
+
+
+def future_prediction_to_video_np(prediction, num_frames=1):
+    return future_predictions_to_video_np([prediction], num_frames=num_frames)
+
+
+def resolve_eval_dataset_sample(dataset, sample_index):
+    sample_index = int(sample_index) % len(dataset)
+    if hasattr(dataset, "_datasets") and hasattr(dataset, "item_id_to_dataset_id"):
+        dataset_id = dataset.item_id_to_dataset_id[sample_index]
+        local_index = sample_index - dataset.acc_dset_num[dataset_id]
+        return dataset._datasets[dataset_id], local_index
+    return dataset, sample_index
+
+
+def select_future_prediction_frame_indices(cur_meta, num_predictions):
+    start = int(cur_meta["start_frame"])
+    end = int(cur_meta["end_frame"])
+    if end <= start:
+        return [start]
+    count = max(1, min(int(num_predictions), end - start))
+    frame_ids = np.rint(np.linspace(start, end - 1, count)).astype(int).tolist()
+    out = []
+    for frame_id in frame_ids:
+        frame_id = int(frame_id)
+        if not out or frame_id != out[-1]:
+            out.append(frame_id)
+    return out
+
+
+def predict_official_future_prediction_sequence(teacher, dataset, sample_index, num_predictions):
+    dataset, local_index = resolve_eval_dataset_sample(dataset, sample_index)
+    if not hasattr(dataset, "new_metas") or not hasattr(dataset, "_get_raw_policy_observation"):
+        raise RuntimeError(
+            "Official Cosmos future video sequence export requires a LatentLeRobotDataset "
+            "with raw observation access."
+        )
+    cur_meta = dataset.new_metas[int(local_index) % len(dataset.new_metas)]
+    predictions = []
+    for frame_id in select_future_prediction_frame_indices(cur_meta, num_predictions):
+        raw_batch = dataset._get_raw_policy_observation(cur_meta, frame_id)
+        predictions.append(predict_official_future_prediction(teacher, raw_batch))
+    return predictions
 
 
 @torch.no_grad()
@@ -196,6 +249,12 @@ def main():
     parser.add_argument("--video-fps", type=int, default=10)
     parser.add_argument("--video-max-pairs", type=int, default=1)
     parser.add_argument("--video-sample-index", type=int, default=0)
+    parser.add_argument(
+        "--cosmos-future-max-predictions",
+        type=int,
+        default=8,
+        help="Maximum official Cosmos future_image_predictions calls per saved offline video.",
+    )
     parser.add_argument(
         "--condition-first-frame",
         action="store_true",
@@ -377,14 +436,12 @@ def main():
                     num_steps=args.teacher_steps,
                 )
             videos_to_save = {}
-            official_future_videos_to_save = {}
+            save_official_future_video = False
             if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
                 sample_idx = min(max(args.video_sample_index, 0), B - 1)
                 videos_to_save["gt_r"] = video_noisy_r[sample_idx:sample_idx + 1].detach().cpu()
                 if is_cosmos_policy_teacher:
-                    official_future_videos_to_save["cosmos_teacher_official_future"] = (
-                        predict_official_future_prediction(trainer.teacher, batch)
-                    )
+                    save_official_future_video = True
                 else:
                     videos_to_save[f"teacher_t{args.teacher_steps}"] = (
                         teacher_x_r[sample_idx:sample_idx + 1].detach().cpu()
@@ -468,16 +525,30 @@ def main():
                     )
                     export_to_video(video_np, str(out_path), fps=args.video_fps)
                     logger.info("Saved rollout video: %s", out_path)
-                for name, prediction in official_future_videos_to_save.items():
+                if save_official_future_video:
                     reference_frame_count = max((len(video) for video in decoded.values()), default=args.video_fps)
-                    video_np = future_prediction_to_video_np(
-                        prediction,
+                    dataset_index = (
+                        int(getattr(cfg, "light_eval_start_index", 0)) + batch_idx
+                    ) % len(trainer.train_loader.dataset)
+                    prediction_count = min(
+                        max(1, int(args.cosmos_future_max_predictions)),
+                        max(1, int(reference_frame_count)),
+                    )
+                    predictions = predict_official_future_prediction_sequence(
+                        trainer.teacher,
+                        trainer.train_loader.dataset,
+                        sample_index=dataset_index,
+                        num_predictions=prediction_count,
+                    )
+                    video_np = future_predictions_to_video_np(
+                        predictions,
                         num_frames=reference_frame_count,
                     )
                     video_np = np.stack(
                         pad_frames_to_min_duration(list(video_np), fps=args.video_fps),
                         axis=0,
                     )
+                    name = "cosmos_teacher_official_future"
                     decoded[name] = video_np
                     out_path = video_dir / f"{pair_name}_{name}.mp4"
                     export_to_video(video_np, str(out_path), fps=args.video_fps)

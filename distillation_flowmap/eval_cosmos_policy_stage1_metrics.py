@@ -41,8 +41,10 @@ from distillation.patches import SafeMultiLatentLeRobotDataset
 from distillation_flowmap.cosmos_policy_adapter import (
     CosmosPolicyActionTeacher,
     compute_masked_action_stats,
+    cosmos_actions_to_flowmap_x0,
     resolve_cosmos_policy_assets,
 )
+from distillation_flowmap.cosmos_future_aux import normalize_future_images
 from distillation_flowmap.flowmap_step import _downsample_action_grid_id
 from distillation_flowmap.model_flowmap import patch_model_forward, setup_flowmap_model
 from modules.model import FlexAttnFunc
@@ -308,9 +310,48 @@ def main():
         batch_size = batch["latents"].shape[0]
         num_video_frames = batch["latents"].shape[2]
 
-        teacher_action_x0 = teacher.action_target_x0(base_input["action_dict"], raw_batch=batch)
-        if teacher_action_x0 is None:
-            raise RuntimeError("Official Cosmos teacher raw x0 was not produced.")
+        teacher_result = teacher.predict_raw_action_result(batch, include_future=True)
+        teacher_action_x0 = cosmos_actions_to_flowmap_x0(
+            teacher_result["actions"],
+            target_shape=tuple(base_input["action_dict"]["latent"].shape),
+            q01=cfg.norm_stat["q01"],
+            q99=cfg.norm_stat["q99"],
+            inverse_used_action_channel_ids=cfg.inverse_used_action_channel_ids,
+            device=base_input["action_dict"]["latent"].device,
+            dtype=base_input["action_dict"]["latent"].dtype,
+        )
+        future_predictions = teacher_result.get("future_image_predictions")
+        if future_predictions is not None:
+            future_items = future_predictions
+            if not isinstance(future_items, list):
+                future_items = [future_items]
+            for future_item in future_items:
+                try:
+                    normalized_future = normalize_future_images(
+                        future_item,
+                        primary_key=getattr(cfg, "raw_primary_image_key", None),
+                        wrist_key=getattr(cfg, "raw_wrist_image_key", None),
+                    )
+                except Exception as exc:
+                    print(f"[eval] warning: could not parse Cosmos future images: {exc}", flush=True)
+                    continue
+                teacher_once.add_scalar(
+                    "cosmos_future/primary_abs_mean",
+                    normalized_future.primary.abs().mean().item(),
+                )
+                teacher_once.add_scalar(
+                    "cosmos_future/primary_num_frames",
+                    float(normalized_future.primary.shape[1]),
+                )
+                if normalized_future.wrist is not None:
+                    teacher_once.add_scalar(
+                        "cosmos_future/wrist_abs_mean",
+                        normalized_future.wrist.abs().mean().item(),
+                    )
+                    teacher_once.add_scalar(
+                        "cosmos_future/wrist_num_frames",
+                        float(normalized_future.wrist.shape[1]),
+                    )
         actions_gt_ds = batch["actions"][:, :, ::action_ds]
         teacher_action_ds = teacher_action_x0[:, :, ::action_ds]
         mask = batch.get("actions_mask")

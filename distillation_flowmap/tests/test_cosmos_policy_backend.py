@@ -503,7 +503,7 @@ def test_cosmos_all_cosmos_stage1_flowmap_config_imports(monkeypatch):
     assert cfg.flowmap_ratio == 0.25
     assert cfg.resume_online_from_target is False
     assert cfg.reset_resume_step is True
-    assert cfg.resume_optimizer_state is True
+    assert cfg.resume_optimizer_state is False
 
 
 def test_cosmos_all_cosmos_stage1_resume_env_overrides(monkeypatch):
@@ -511,7 +511,7 @@ def test_cosmos_all_cosmos_stage1_resume_env_overrides(monkeypatch):
     monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")
     monkeypatch.setenv("RESUME_ONLINE_FROM_TARGET", "1")
     monkeypatch.setenv("RESET_RESUME_STEP", "0")
-    monkeypatch.setenv("RESUME_OPTIMIZER_STATE", "0")
+    monkeypatch.setenv("RESUME_OPTIMIZER_STATE", "1")
     sys.modules.pop(
         "distillation_flowmap.config_libero_cosmos_policy_stage1_all_cosmos_flowmap", None)
 
@@ -521,7 +521,7 @@ def test_cosmos_all_cosmos_stage1_resume_env_overrides(monkeypatch):
 
     assert cfg.resume_online_from_target is True
     assert cfg.reset_resume_step is False
-    assert cfg.resume_optimizer_state is False
+    assert cfg.resume_optimizer_state is True
 
 
 def test_cosmos_stage1_wanva_cdiff_config_imports(monkeypatch):

@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import math
 import torch.distributed as dist
 from torch.distributed.checkpoint.state_dict import (
@@ -130,6 +131,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.video_teacher = None
         self._video_teacher_nofsdp = None
         self.cosmos_video_target = bool(getattr(config, 'cosmos_video_target', False))
+        self.cosmos_latent_target = bool(getattr(config, 'cosmos_latent_target', False))
         self.cosmos_video_cdiff_aux = bool(
             getattr(config, 'cosmos_video_cdiff_aux', False)
         )
@@ -222,6 +224,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info(f"Video teacher backend: {self.teacher_roles.video_backend}")
             logger.info(f"Video teacher path: {self.teacher_roles.video_model_path}")
             logger.info(f"Cosmos video target: {self.cosmos_video_target}")
+            logger.info(f"Cosmos latent target: {self.cosmos_latent_target}")
             logger.info(f"Cosmos video central-diff aux: {self.cosmos_video_cdiff_aux}")
             if self.distill_action:
                 logger.info(f"  k_action = {self.k_action}, "
@@ -308,6 +311,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 "Cosmos Policy action teacher ready; WanVA student base: %s",
                 teacher_path,
             )
+            if self.cosmos_latent_target:
+                if not bool(getattr(config, 'cosmos_policy_use_raw_inference', False)):
+                    raise ValueError(
+                        "cfg.cosmos_latent_target=True requires "
+                        "cfg.cosmos_policy_use_raw_inference=True."
+                    )
+                logger.info(
+                    "Cosmos latent central-diff target enabled; WanVA VAE video "
+                    "encoding is skipped for this path."
+                )
             if self.cosmos_video_target:
                 if not bool(getattr(config, 'cosmos_policy_use_raw_inference', False)):
                     raise ValueError(
@@ -594,6 +607,64 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         if not self._is_lora_resume:
             load_flowmap_delta_weights(self.student, student_path, "online student")
 
+        def adapt_cosmos_latent_video_heads(model, label):
+            if not self.cosmos_latent_target:
+                return model
+            channels = int(getattr(config, "cosmos_latent_channels", 16))
+            patch_dim = channels * math.prod(model.patch_size)
+            old_in = model.patch_embedding_mlp
+            old_out = model.proj_out
+            if old_in.in_features == patch_dim and old_out.out_features == patch_dim:
+                return model
+
+            new_in = nn.Linear(
+                patch_dim,
+                old_in.out_features,
+                bias=old_in.bias is not None,
+                device=old_in.weight.device,
+                dtype=old_in.weight.dtype,
+            )
+            new_out = nn.Linear(
+                old_out.in_features,
+                patch_dim,
+                bias=old_out.bias is not None,
+                device=old_out.weight.device,
+                dtype=old_out.weight.dtype,
+            )
+            with torch.no_grad():
+                new_in.weight.zero_()
+                copy_cols = min(patch_dim, old_in.in_features)
+                new_in.weight[:, :copy_cols].copy_(old_in.weight[:, :copy_cols])
+                if old_in.bias is not None:
+                    new_in.bias.copy_(old_in.bias)
+
+                new_out.weight.zero_()
+                copy_rows = min(patch_dim, old_out.out_features)
+                new_out.weight[:copy_rows].copy_(old_out.weight[:copy_rows])
+                if old_out.bias is not None:
+                    new_out.bias.zero_()
+                    new_out.bias[:copy_rows].copy_(old_out.bias[:copy_rows])
+
+            model.patch_embedding_mlp = new_in
+            model.proj_out = new_out
+            if hasattr(model, "config"):
+                try:
+                    model.config.in_channels = channels
+                    model.config.out_channels = channels
+                except Exception:
+                    pass
+            if config.rank == 0:
+                logger.info(
+                    "Adapted %s video heads for Cosmos latent channels: "
+                    "input %d->%d, output %d->%d",
+                    label,
+                    old_in.in_features,
+                    patch_dim,
+                    old_out.out_features,
+                    patch_dim,
+                )
+            return model
+
         # ==============================================================
         # LoRA 可选：为学生模型添加 LoRA adapter（降低显存开销）
         # ==============================================================
@@ -635,6 +706,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # have the same dtype; LoRA parameters default to float32, which
         # conflicts with the bfloat16 base model.
         self.student = self.student.to(self.dtype)
+        self.student = adapt_cosmos_latent_video_heads(self.student, "online student")
 
         # 创建非 FSDP 学生副本（用于 DMD rollout 和 on-policy transition rollout）
         if (self.use_dmd or self.use_onpolicy_transition or
@@ -694,6 +766,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info("Loading target student (EMA, frozen) ...")
             self.target_student = load_transformer(target_path, torch_dtype=self.dtype, torch_device="cpu")
         self.target_student = self.target_student.to(self.dtype)
+        self.target_student = adapt_cosmos_latent_video_heads(self.target_student, "target student")
 
         # 为目标学生模型添加 Flow Map 能力（与学生模型相同的改造）
         logger.info("Setting up Flow Map for target student ...")

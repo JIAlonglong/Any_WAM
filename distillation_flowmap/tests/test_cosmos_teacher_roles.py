@@ -51,6 +51,23 @@ def test_all_cosmos_video_target_does_not_require_wanva_video_teacher():
     assert roles.uses_separate_video_teacher is False
 
 
+def test_cosmos_latent_target_does_not_require_wanva_video_teacher():
+    cfg = SimpleNamespace(
+        teacher_backend="cosmos_policy",
+        teacher_model_path="/ckpts/cosmos",
+        distill_video=True,
+        cosmos_latent_target=True,
+    )
+
+    roles = resolve_teacher_roles(cfg)
+
+    assert roles.action_backend == "cosmos_policy"
+    assert roles.action_model_path == "/ckpts/cosmos"
+    assert roles.video_backend == "cosmos_latent"
+    assert roles.video_model_path == "/ckpts/cosmos"
+    assert roles.uses_separate_video_teacher is False
+
+
 def test_dual_teacher_defaults_video_backend_to_wanva():
     cfg = SimpleNamespace(
         teacher_backend="cosmos_policy",

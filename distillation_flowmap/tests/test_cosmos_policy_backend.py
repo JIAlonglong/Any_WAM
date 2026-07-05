@@ -56,6 +56,60 @@ def test_cosmos_policy_action_teacher_returns_wanva_action_tokens(tmp_path):
     assert torch.allclose(tokens[:, 0], action_target[:, :, 0, 0, 0])
 
 
+def test_cosmos_policy_teacher_keeps_worker_gpu_override_explicit(tmp_path, monkeypatch):
+    from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+
+    monkeypatch.delenv("COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES", raising=False)
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+
+    default_teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32)
+    override_teacher = CosmosPolicyActionTeacher(
+        str(ckpt),
+        dtype=torch.float32,
+        config=SimpleNamespace(cosmos_policy_worker_cuda_visible_devices="1"),
+    )
+
+    assert default_teacher.cosmos_worker_cuda_visible_devices is None
+    assert override_teacher.cosmos_worker_cuda_visible_devices == "1"
+
+
+def test_cosmos_policy_action_teacher_returns_latent_cdiff_tensors(tmp_path):
+    from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+    teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32)
+
+    def provider(raw_batch, noise, t, r, epsilon):
+        assert raw_batch == {"raw_task": ["pick up the cup"]}
+        assert tuple(noise.shape) == (1, 16, 9, 28, 28)
+        assert tuple(t.shape) == (1, 9)
+        assert tuple(r.shape) == (1, 9)
+        assert epsilon == 0.001
+        return {
+            "actions": np.zeros((1, 16, 7), dtype=np.float32),
+            "cosmos_latent_x0": np.ones((1, 16, 9, 28, 28), dtype=np.float32),
+            "cosmos_latent_cdiff_target": np.full((1, 16, 9, 28, 28), 2.0, dtype=np.float32),
+            "cosmos_latent_velocity": np.full((1, 16, 9, 28, 28), 3.0, dtype=np.float32),
+        }
+
+    teacher._raw_latent_cdiff_provider = provider
+    result = teacher.predict_raw_latent_cdiff(
+        {"raw_task": ["pick up the cup"]},
+        noise=torch.zeros(1, 16, 9, 28, 28),
+        t=torch.full((1, 9), 0.9),
+        r=torch.zeros(1, 9),
+        epsilon=0.001,
+    )
+
+    assert result["actions"].shape == (1, 16, 7)
+    assert result["cosmos_latent_x0"].shape == (1, 16, 9, 28, 28)
+    assert result["cosmos_latent_cdiff_target"].dtype == torch.float32
+    assert torch.all(result["cosmos_latent_cdiff_target"] == 2.0)
+    assert torch.all(result["cosmos_latent_velocity"] == 3.0)
+
+
 def test_libero_state_to_cosmos_proprio_uses_official_order():
     from distillation_flowmap.cosmos_policy_adapter import libero_state_to_cosmos_proprio
 
@@ -504,6 +558,37 @@ def test_cosmos_all_cosmos_stage1_flowmap_config_imports(monkeypatch):
     assert cfg.resume_online_from_target is False
     assert cfg.reset_resume_step is True
     assert cfg.resume_optimizer_state is False
+
+
+def test_cosmos_latent_cdiff_stage1_config_imports(monkeypatch):
+    monkeypatch.setenv("COSMOS_POLICY_PATH", "/tmp/cosmos-policy")
+    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")
+    monkeypatch.setenv("COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES", "1")
+    sys.modules.pop(
+        "distillation_flowmap.config_libero_cosmos_policy_stage1_cosmos_latent_cdiff",
+        None,
+    )
+
+    cfg = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage1_cosmos_latent_cdiff"
+    ).cfg
+
+    assert cfg.teacher_backend == "cosmos_policy"
+    assert cfg.action_teacher_backend == "cosmos_policy"
+    assert cfg.teacher_model_path == "/tmp/cosmos-policy"
+    assert cfg.student_base_model_path == "/tmp/wanva-base"
+    assert cfg.cosmos_latent_target is True
+    assert cfg.cosmos_video_target is False
+    assert cfg.cosmos_policy_use_raw_inference is True
+    assert cfg.return_raw_observation is True
+    assert cfg.distill_video is True
+    assert cfg.distill_action is True
+    assert cfg.use_central_diff is True
+    assert cfg.cosmos_video_cdiff_aux is False
+    assert cfg.cosmos_latent_t_min == 0.8
+    assert abs(cfg.cosmos_latent_t_max - (80.0 / 81.0)) < 1e-9
+    assert cfg.cosmos_latent_cdiff_loss_weight == 1.0
+    assert cfg.cosmos_policy_worker_cuda_visible_devices == "1"
 
 
 def test_cosmos_all_cosmos_stage1_resume_env_overrides(monkeypatch):

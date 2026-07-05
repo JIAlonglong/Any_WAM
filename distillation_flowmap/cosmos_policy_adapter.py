@@ -274,12 +274,21 @@ class CosmosPolicyActionTeacher:
             getattr(config, "cosmos_policy_num_denoising_steps_action", 5)
         ) if config is not None else 5
         self.raw_seed = int(getattr(config, "cosmos_policy_seed", 1)) if config is not None else 1
+        worker_visible_devices = getattr(
+            config,
+            "cosmos_policy_worker_cuda_visible_devices",
+            os.environ.get("COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES"),
+        ) if config is not None else os.environ.get("COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES")
+        if worker_visible_devices is not None:
+            worker_visible_devices = str(worker_visible_devices).strip()
+        self.cosmos_worker_cuda_visible_devices = worker_visible_devices or None
 
         self._official_model = None
         self._official_dataset_stats = None
         self._official_get_action = None
         self._official_cfg = None
         self._raw_action_provider = None
+        self._raw_latent_cdiff_provider = None
         self._raw_worker = None
         self._raw_worker_tmpdir = None
 
@@ -519,7 +528,9 @@ class CosmosPolicyActionTeacher:
         env = os.environ.copy()
         if self.cosmos_repo_path:
             env["PYTHONPATH"] = self.cosmos_repo_path + os.pathsep + env.get("PYTHONPATH", "")
-        if self.device.type == "cuda" and self.device.index is not None:
+        if self.cosmos_worker_cuda_visible_devices is not None:
+            env["CUDA_VISIBLE_DEVICES"] = self.cosmos_worker_cuda_visible_devices
+        elif self.device.type == "cuda" and self.device.index is not None:
             env["CUDA_VISIBLE_DEVICES"] = str(self.device.index)
         if self.cosmos_local_model_dir:
             env["COSMOS_PREDICT25_LOCAL_MODEL_DIR"] = self.cosmos_local_model_dir
@@ -604,6 +615,85 @@ class CosmosPolicyActionTeacher:
                 pass
         return result
 
+    def _coerce_raw_latent_cdiff_result(self, result):
+        if not isinstance(result, dict):
+            raise TypeError(f"Cosmos latent cdiff result must be a dict, got {type(result)!r}")
+        required = (
+            "actions",
+            "cosmos_latent_x0",
+            "cosmos_latent_cdiff_target",
+            "cosmos_latent_velocity",
+        )
+        missing = [key for key in required if key not in result]
+        if missing:
+            raise KeyError(f"Cosmos latent cdiff result missing fields: {missing}")
+        coerced = dict(result)
+        coerced["actions"] = torch.as_tensor(coerced["actions"], dtype=torch.float32)
+        for key in (
+            "cosmos_latent_x0",
+            "cosmos_latent_cdiff_target",
+            "cosmos_latent_velocity",
+        ):
+            coerced[key] = torch.as_tensor(coerced[key], dtype=torch.float32)
+        return coerced
+
+    def _predict_raw_latent_cdiff_subprocess(self, raw_batch, noise, t, r, epsilon):
+        primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
+        self._ensure_raw_worker()
+        req_dir = self._raw_worker_tmpdir or tempfile.mkdtemp(prefix="cosmos_policy_raw_")
+        fd, npz_path = tempfile.mkstemp(prefix="request_", suffix=".npz", dir=req_dir)
+        os.close(fd)
+        actions_path = npz_path.replace("request_", "actions_")
+        noise_np = _as_numpy(noise).astype(np.float32)
+        t_np = _as_numpy(t).astype(np.float32)
+        r_np = _as_numpy(r).astype(np.float32)
+        np.savez_compressed(
+            npz_path,
+            primary_image=primary,
+            wrist_image=wrist,
+            proprio=proprio,
+            cosmos_latent_noise=noise_np,
+            cosmos_latent_t=t_np,
+            cosmos_latent_r=r_np,
+        )
+        payload = {
+            "npz_path": npz_path,
+            "actions_path": actions_path,
+            "tasks": tasks,
+            "seed": self.raw_seed,
+            "include_future_predictions": False,
+            "include_latent_cdiff": True,
+            "cosmos_latent_epsilon": float(epsilon),
+        }
+        try:
+            self._raw_worker.stdin.write(json.dumps(payload) + "\n")
+            self._raw_worker.stdin.flush()
+            line = self._raw_worker.stdout.readline()
+        except BrokenPipeError as exc:
+            raise RuntimeError("Cosmos Policy raw worker exited before responding.") from exc
+        if not line:
+            try:
+                code = self._raw_worker.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                code = self._raw_worker.poll()
+            raise RuntimeError(f"Cosmos Policy raw worker produced no response; exit code={code}")
+        response = json.loads(line)
+        if not response.get("ok", False):
+            raise RuntimeError("Cosmos Policy raw worker failed:\n" + response.get("error", "unknown error"))
+        with np.load(response["actions_path"]) as data:
+            result = {
+                "actions": data["actions"].astype(np.float32),
+                "cosmos_latent_x0": data["cosmos_latent_x0"].astype(np.float32),
+                "cosmos_latent_cdiff_target": data["cosmos_latent_cdiff_target"].astype(np.float32),
+                "cosmos_latent_velocity": data["cosmos_latent_velocity"].astype(np.float32),
+            }
+        for path in (npz_path, response["actions_path"]):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return self._coerce_raw_latent_cdiff_result(result)
+
     def predict_raw_actions(self, raw_batch):
         return self.predict_raw_action_result(raw_batch, include_future=False)["actions"]
 
@@ -618,6 +708,27 @@ class CosmosPolicyActionTeacher:
             f"Unsupported cosmos_policy_inference_mode={self.raw_inference_mode!r}; "
             "expected 'subprocess' or 'inprocess'."
         )
+
+    def predict_raw_latent_cdiff(self, raw_batch, noise, t, r, epsilon):
+        """Return official Cosmos latent x0 and central-diff target tensors.
+
+        ``t`` and ``r`` are normalized FlowUniPC t-space values in [0, 1], not
+        Any_WAM's 0..num_train_timesteps integer timestep scale.
+        """
+        if self._raw_latent_cdiff_provider is not None:
+            return self._coerce_raw_latent_cdiff_result(
+                self._raw_latent_cdiff_provider(raw_batch, noise, t, r, epsilon)
+            )
+        if not self.raw_inference_enabled:
+            raise RuntimeError(
+                "Cosmos latent central-diff requires cfg.cosmos_policy_use_raw_inference=True."
+            )
+        if self.raw_inference_mode != "subprocess":
+            raise NotImplementedError(
+                "Cosmos latent central-diff currently requires "
+                "cosmos_policy_inference_mode='subprocess'."
+            )
+        return self._predict_raw_latent_cdiff_subprocess(raw_batch, noise, t, r, epsilon)
 
     def action_target_x0(self, action_dict, raw_batch=None):
         """Return FlowMap-normalized action x0 from official raw Cosmos inference."""

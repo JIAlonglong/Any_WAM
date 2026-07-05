@@ -403,6 +403,57 @@ class FlowMapStepMixin:
         r = scheduler.apply_shift(r) * self.config.num_train_timesteps
         return t, r, is_diffusion
 
+    def sample_cosmos_latent_timestep_mixed(
+        self, batch_size, num_frames, dtype, device,
+    ):
+        """Sample FlowMap t/r for Cosmos latent teacher queries.
+
+        Cosmos Policy's EDM teacher is reliable in sigma=[4,80], which maps to
+        FlowUniPC t=sigma/(1+sigma). We keep student timestep embeddings on the
+        existing 0..num_train_timesteps scale, but central-diff math uses the
+        normalized t/r values returned here.
+        """
+        t_min = float(getattr(self.config, "cosmos_latent_t_min", 4.0 / 5.0))
+        t_max = float(getattr(self.config, "cosmos_latent_t_max", 80.0 / 81.0))
+        if not (0.0 <= t_min < t_max < 1.0):
+            raise ValueError(
+                "Cosmos latent t range must satisfy 0 <= t_min < t_max < 1, "
+                f"got t_min={t_min}, t_max={t_max}"
+            )
+
+        t_1 = torch.rand(batch_size, dtype=dtype, device=device)
+        t_2 = torch.rand(batch_size, dtype=dtype, device=device)
+        hi = torch.maximum(t_1, t_2)
+        lo = torch.minimum(t_1, t_2)
+        t_norm = t_min + (t_max - t_min) * hi
+        ratio = torch.where(hi > 1e-6, lo / hi.clamp(min=1e-6), torch.zeros_like(lo))
+        r_norm = t_norm * ratio
+
+        total_ratio = self.diffusion_ratio + self.consistency_ratio + self.flowmap_ratio
+        if total_ratio <= 0:
+            raise ValueError("diffusion_ratio + consistency_ratio + flowmap_ratio must be positive.")
+        diffusion_ratio = self.diffusion_ratio / total_ratio
+        consistency_ratio = self.consistency_ratio / total_ratio
+        mode_rand = torch.rand(batch_size, dtype=dtype, device=device)
+
+        is_diffusion = mode_rand < diffusion_ratio
+        is_consistency = (
+            (mode_rand >= diffusion_ratio) &
+            (mode_rand < diffusion_ratio + consistency_ratio)
+        )
+        r_norm = torch.where(is_diffusion, t_norm, r_norm)
+        r_norm = torch.where(is_consistency, torch.zeros_like(r_norm), r_norm)
+
+        t_norm = t_norm.unsqueeze(1).expand(-1, num_frames)
+        r_norm = r_norm.unsqueeze(1).expand(-1, num_frames)
+        return (
+            t_norm * self.config.num_train_timesteps,
+            r_norm * self.config.num_train_timesteps,
+            t_norm,
+            r_norm,
+            is_diffusion,
+        )
+
     def _apply_opd_low_noise_query_bias(self, query_t, query_r):
         """Bias OPD query states toward low-noise timesteps, following DanceOPD."""
         bias = str(getattr(self.config, "opd_query_bias", "none")).lower()
@@ -1491,7 +1542,56 @@ class FlowMapStepMixin:
 
         teacher = self._action_teacher_model
         teacher_action_x0_full = None
-        if getattr(self, "cosmos_video_target", False):
+        cosmos_latent_teacher_result = None
+        video_t = video_r = video_t_norm = video_r_norm = None
+        video_noise = None
+        if getattr(self.config, "cosmos_latent_target", False):
+            if not hasattr(teacher, "predict_raw_latent_cdiff"):
+                raise RuntimeError(
+                    "cfg.cosmos_latent_target=True requires Cosmos Policy raw "
+                    "inference with predict_raw_latent_cdiff()."
+                )
+            if not getattr(teacher, "raw_inference_enabled", False):
+                raise RuntimeError(
+                    "cfg.cosmos_latent_target=True requires "
+                    "cfg.cosmos_policy_use_raw_inference=True."
+                )
+            B_raw = int(batch["actions"].shape[0])
+            latent_shape = (
+                B_raw,
+                int(getattr(self.config, "cosmos_latent_channels", 16)),
+                int(getattr(self.config, "cosmos_latent_frames", 9)),
+                int(getattr(self.config, "cosmos_latent_height", 28)),
+                int(getattr(self.config, "cosmos_latent_width", 28)),
+            )
+            video_t, video_r, video_t_norm, video_r_norm, _ = (
+                self.sample_cosmos_latent_timestep_mixed(
+                    B_raw, latent_shape[2], dtype=torch.float32, device=self.device,
+                )
+            )
+            video_noise = torch.randn(
+                latent_shape, device=self.device, dtype=batch["actions"].dtype)
+            with torch.no_grad():
+                cosmos_latent_teacher_result = teacher.predict_raw_latent_cdiff(
+                    batch,
+                    noise=video_noise,
+                    t=video_t_norm,
+                    r=video_r_norm,
+                    epsilon=float(getattr(self.config, "cosmos_latent_epsilon", 0.001)),
+                )
+                teacher_action_x0_full = cosmos_actions_to_flowmap_x0(
+                    cosmos_latent_teacher_result["actions"],
+                    target_shape=tuple(batch["actions"].shape),
+                    q01=self.config.norm_stat["q01"],
+                    q99=self.config.norm_stat["q99"],
+                    inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
+                    device=batch["actions"].device,
+                    dtype=batch["actions"].dtype,
+                )
+                batch["latents"] = cosmos_latent_teacher_result[
+                    "cosmos_latent_x0"
+                ].to(device=batch["actions"].device, dtype=batch["actions"].dtype)
+        elif getattr(self, "cosmos_video_target", False):
             if not hasattr(teacher, "predict_raw_action_result"):
                 raise RuntimeError(
                     "cfg.cosmos_video_target=True requires Cosmos Policy raw "
@@ -1522,24 +1622,32 @@ class FlowMapStepMixin:
         B = batch['latents'].shape[0]
         ref_shape = batch['latents'].shape
         num_frames = ref_shape[2]
+        action_frames = batch['actions'].shape[2]
         actions_mask = batch.get('actions_mask')
         input_dict = self._prepare_base_dict(batch)
 
-        video_t, video_r, _ = self.sample_timestep_mixed(
-            B, num_frames, dtype=torch.float32, device=self.device,
-        )
+        if video_t is None or video_r is None:
+            video_t, video_r, _ = self.sample_timestep_mixed(
+                B, num_frames, dtype=torch.float32, device=self.device,
+            )
         action_t, action_r, _ = self.sample_timestep_mixed(
-            B, num_frames, dtype=torch.float32, device=self.device,
+            B, action_frames, dtype=torch.float32, device=self.device,
             scheduler=self.train_scheduler_action,
         )
         action_r_sigma = action_r / self.config.num_train_timesteps
         cfg_scale = self.config.cfg_min + torch.rand(1).item() * (
             self.config.cfg_max - self.config.cfg_min)
 
-        video_noise = torch.randn_like(batch['latents'])
-        video_noisy_latents = self.train_scheduler_latent.add_noise(
-            batch['latents'], video_noise, video_t, t_dim=2
-        )
+        if video_noise is None:
+            video_noise = torch.randn_like(batch['latents'])
+            video_noisy_latents = self.train_scheduler_latent.add_noise(
+                batch['latents'], video_noise, video_t, t_dim=2
+            )
+        else:
+            sigma_t = video_t_norm[:, None, :, None, None].to(batch['latents'])
+            video_noisy_latents = (
+                (1.0 - sigma_t) * batch['latents'] + sigma_t * video_noise
+            )
         video_v_target = self.train_scheduler_latent.training_target(
             batch['latents'], video_noise, video_t
         )
@@ -1660,7 +1768,7 @@ class FlowMapStepMixin:
                 teacher_action_pred = teacher_action_x0[:, :, ::action_ds]
             else:
                 teacher_action_v_seq = teacher.action_target_tokens(input_dict['action_dict'])
-                teacher_action_v = self._extract_action_v(teacher_action_v_seq, num_frames)
+                teacher_action_v = self._extract_action_v(teacher_action_v_seq, action_frames)
                 teacher_action_pred = action_noisy_ds - sigma_r * teacher_action_v[:, :, ::action_ds]
         if teacher_action_x0 is not None:
             raw_stats = compute_masked_action_stats(teacher_action_pred, actions_gt_ds, mask)
@@ -1801,47 +1909,12 @@ class FlowMapStepMixin:
 
         video_loss = torch.tensor(0.0, device=self.device)
         if self.distill_video:
-            cdiff_mode = str(
-                getattr(self.config, "cosmos_video_cdiff_mode", "aux")
-            ).lower()
-            if cdiff_mode not in ("primary", "aux"):
-                raise ValueError(
-                    "cfg.cosmos_video_cdiff_mode must be either 'primary' or 'aux'."
-                )
-            if cdiff_mode == "primary" and not bool(
-                getattr(self.config, "cosmos_video_cdiff_aux", False)
-            ):
-                raise RuntimeError(
-                    "cfg.cosmos_video_cdiff_mode='primary' requires "
-                    "cfg.cosmos_video_cdiff_aux=True."
-                )
-            endpoint_loss_weight = float(
-                getattr(self.config, "cosmos_video_endpoint_loss_weight", 1.0))
-            cdiff_loss_weight = float(
-                getattr(self.config, "cosmos_video_cdiff_loss_weight", 0.0))
-            video_sigma_r = (
-                video_r / self.config.num_train_timesteps
-            )[:, None, :, None, None].to(student_video_v)
-            student_video_pred = video_noisy_latents - video_sigma_r * student_video_v
-            video_diff = student_video_pred.float() - batch['latents'].detach().float()
-            cosmos_video_endpoint_loss = (video_diff ** 2).mean()
-            video_loss = endpoint_loss_weight * cosmos_video_endpoint_loss
-
-            if bool(getattr(self.config, "cosmos_video_cdiff_aux", False)):
-                if lingbotva_stage1_targets is not None:
-                    cdiff_target = lingbotva_stage1_targets["video_target"]
-                else:
-                    cdiff_target = self._cosmos_video_cdiff_target(
-                        input_dict=input_dict,
-                        batch=batch,
-                        video_noisy_latents=video_noisy_latents,
-                        video_noise=video_noise,
-                        video_t=video_t,
-                        video_r=video_r,
-                        ref_shape=ref_shape,
-                        batch_size=B,
-                        cfg_scale=cfg_scale,
-                    )
+            if getattr(self.config, "cosmos_latent_target", False):
+                if cosmos_latent_teacher_result is None:
+                    raise RuntimeError("Missing Cosmos latent teacher result.")
+                cdiff_target = cosmos_latent_teacher_result[
+                    "cosmos_latent_cdiff_target"
+                ].to(device=student_video_v.device, dtype=student_video_v.dtype)
                 cdiff_diff = student_video_v.float() - cdiff_target.float()
                 loss_type = getattr(self.config, "loss_type", "l2")
                 if loss_type == "huber":
@@ -1859,7 +1932,81 @@ class FlowMapStepMixin:
                 weight = self._get_timestep_weight(
                     video_t.mean(dim=-1), weight_type).to(self.device)
                 cosmos_video_cdiff_loss = (per_sample_loss * weight).mean()
-                video_loss = video_loss + cdiff_loss_weight * cosmos_video_cdiff_loss
+                cdiff_loss_weight = float(
+                    getattr(self.config, "cosmos_latent_cdiff_loss_weight", 1.0)
+                )
+                endpoint_loss_weight = float(
+                    getattr(self.config, "cosmos_latent_endpoint_loss_weight", 0.0)
+                )
+                video_loss = cdiff_loss_weight * cosmos_video_cdiff_loss
+                if endpoint_loss_weight > 0:
+                    video_sigma_r = (
+                        video_r / self.config.num_train_timesteps
+                    )[:, None, :, None, None].to(student_video_v)
+                    student_video_pred = video_noisy_latents - video_sigma_r * student_video_v
+                    video_diff = student_video_pred.float() - batch['latents'].detach().float()
+                    cosmos_video_endpoint_loss = (video_diff ** 2).mean()
+                    video_loss = video_loss + endpoint_loss_weight * cosmos_video_endpoint_loss
+            else:
+                cdiff_mode = str(
+                    getattr(self.config, "cosmos_video_cdiff_mode", "aux")
+                ).lower()
+                if cdiff_mode not in ("primary", "aux"):
+                    raise ValueError(
+                        "cfg.cosmos_video_cdiff_mode must be either 'primary' or 'aux'."
+                    )
+                if cdiff_mode == "primary" and not bool(
+                    getattr(self.config, "cosmos_video_cdiff_aux", False)
+                ):
+                    raise RuntimeError(
+                        "cfg.cosmos_video_cdiff_mode='primary' requires "
+                        "cfg.cosmos_video_cdiff_aux=True."
+                    )
+                endpoint_loss_weight = float(
+                    getattr(self.config, "cosmos_video_endpoint_loss_weight", 1.0))
+                cdiff_loss_weight = float(
+                    getattr(self.config, "cosmos_video_cdiff_loss_weight", 0.0))
+                video_sigma_r = (
+                    video_r / self.config.num_train_timesteps
+                )[:, None, :, None, None].to(student_video_v)
+                student_video_pred = video_noisy_latents - video_sigma_r * student_video_v
+                video_diff = student_video_pred.float() - batch['latents'].detach().float()
+                cosmos_video_endpoint_loss = (video_diff ** 2).mean()
+                video_loss = endpoint_loss_weight * cosmos_video_endpoint_loss
+
+                if bool(getattr(self.config, "cosmos_video_cdiff_aux", False)):
+                    if lingbotva_stage1_targets is not None:
+                        cdiff_target = lingbotva_stage1_targets["video_target"]
+                    else:
+                        cdiff_target = self._cosmos_video_cdiff_target(
+                            input_dict=input_dict,
+                            batch=batch,
+                            video_noisy_latents=video_noisy_latents,
+                            video_noise=video_noise,
+                            video_t=video_t,
+                            video_r=video_r,
+                            ref_shape=ref_shape,
+                            batch_size=B,
+                            cfg_scale=cfg_scale,
+                        )
+                    cdiff_diff = student_video_v.float() - cdiff_target.float()
+                    loss_type = getattr(self.config, "loss_type", "l2")
+                    if loss_type == "huber":
+                        huber_c = float(getattr(self.config, "huber_c", 0.001))
+                        abs_diff = cdiff_diff.abs()
+                        token_loss = torch.where(
+                            abs_diff < huber_c,
+                            0.5 * cdiff_diff ** 2,
+                            huber_c * (abs_diff - 0.5 * huber_c),
+                        ).mean(dim=1)
+                    else:
+                        token_loss = (cdiff_diff ** 2).mean(dim=1)
+                    per_sample_loss = token_loss.flatten(1).mean(dim=1)
+                    weight_type = getattr(self.config, "weight_type", "uniform")
+                    weight = self._get_timestep_weight(
+                        video_t.mean(dim=-1), weight_type).to(self.device)
+                    cosmos_video_cdiff_loss = (per_sample_loss * weight).mean()
+                    video_loss = video_loss + cdiff_loss_weight * cosmos_video_cdiff_loss
 
         loss = getattr(self.config, 'video_loss_weight', 1.0) * video_loss \
                + getattr(self.config, 'action_block_weight', 1.0) * (
@@ -1948,7 +2095,9 @@ class FlowMapStepMixin:
             包含损失值和是否需要梯度同步的字典
         """
         if getattr(self, 'is_cosmos_policy_teacher', False) and (
-            not self.distill_video or getattr(self.config, 'cosmos_video_target', False)
+            not self.distill_video
+            or getattr(self.config, 'cosmos_video_target', False)
+            or getattr(self.config, 'cosmos_latent_target', False)
         ):
             return self._cosmos_policy_train_step(batch, batch_idx)
 

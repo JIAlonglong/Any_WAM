@@ -64,6 +64,14 @@ def resolve_teacher_roles(config: Any) -> TeacherRoles:
                 video_model_path=action_model_path,
                 uses_separate_video_teacher=False,
             )
+        if bool(_get(config, "cosmos_latent_target", False)):
+            return TeacherRoles(
+                action_backend=action_backend,
+                action_model_path=action_model_path,
+                video_backend="cosmos_latent",
+                video_model_path=action_model_path,
+                uses_separate_video_teacher=False,
+            )
         if video_backend is None:
             video_backend = "wanva"
         if _is_cosmos_backend(video_backend):

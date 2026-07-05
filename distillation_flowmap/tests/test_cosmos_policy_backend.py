@@ -474,6 +474,35 @@ def test_cosmos_dual_teacher_stage1_config_imports(monkeypatch):
     assert cfg.flowmap_ratio == 0.25
 
 
+def test_cosmos_all_cosmos_stage1_flowmap_config_imports(monkeypatch):
+    monkeypatch.setenv("COSMOS_POLICY_PATH", "/tmp/cosmos-policy")
+    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")
+    sys.modules.pop(
+        "distillation_flowmap.config_libero_cosmos_policy_stage1_all_cosmos_flowmap", None)
+
+    cfg = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage1_all_cosmos_flowmap"
+    ).cfg
+
+    assert cfg.teacher_backend == "cosmos_policy"
+    assert cfg.action_teacher_backend == "cosmos_policy"
+    assert cfg.teacher_model_path == "/tmp/cosmos-policy"
+    assert cfg.student_base_model_path == "/tmp/wanva-base"
+    assert cfg.cosmos_video_target is True
+    assert cfg.cosmos_video_vae_model_path == "/tmp/wanva-base"
+    assert cfg.cosmos_policy_use_raw_inference is True
+    assert cfg.return_raw_observation is True
+    assert cfg.distill_video is True
+    assert cfg.distill_action is True
+    assert cfg.action_aware is False
+    assert cfg.use_gt_regression is False
+    assert cfg.use_central_diff is False
+    assert cfg.action_use_flowmap is False
+    assert cfg.diffusion_ratio == 0.5
+    assert cfg.consistency_ratio == 0.25
+    assert cfg.flowmap_ratio == 0.25
+
+
 def test_cosmos_dual_teacher_stage2_config_imports(monkeypatch):
     monkeypatch.setenv("COSMOS_POLICY_PATH", "/tmp/cosmos-policy")
     monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")

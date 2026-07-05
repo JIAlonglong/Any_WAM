@@ -38,7 +38,7 @@ from distillation_flowmap.samplers import build_stage2_sampler
 from distributed.fsdp import shard_model, apply_ac
 from wan_va.distributed.fsdp import shard_model_fsdp1
 from distributed.util import _configure_model, dist_mean
-from modules.utils import load_transformer
+from modules.utils import WanVAEStreamingWrapper, load_transformer, load_vae
 from utils import logger, warmup_constant_lambda, FlowMatchScheduler
 from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
 from distillation_flowmap.cosmos_teacher_roles import resolve_teacher_roles
@@ -129,6 +129,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.teacher_roles = resolve_teacher_roles(config)
         self.video_teacher = None
         self._video_teacher_nofsdp = None
+        self.cosmos_video_target = bool(getattr(config, 'cosmos_video_target', False))
+        self.cosmos_video_vae = None
+        self.cosmos_video_streaming_vae = None
         # 动作的跳步数（可能与视频不同）
         self.k_action = config.num_train_timesteps // getattr(
             config, 'num_ddim_timesteps_action', config.num_ddim_timesteps)
@@ -215,6 +218,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info(f"Action teacher backend: {self.teacher_roles.action_backend}")
             logger.info(f"Video teacher backend: {self.teacher_roles.video_backend}")
             logger.info(f"Video teacher path: {self.teacher_roles.video_model_path}")
+            logger.info(f"Cosmos video target: {self.cosmos_video_target}")
             if self.distill_action:
                 logger.info(f"  k_action = {self.k_action}, "
                             f"action_loss_weight = {config.action_loss_weight}, "
@@ -300,6 +304,35 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 "Cosmos Policy action teacher ready; WanVA student base: %s",
                 teacher_path,
             )
+            if self.cosmos_video_target:
+                if not bool(getattr(config, 'cosmos_policy_use_raw_inference', False)):
+                    raise ValueError(
+                        "cfg.cosmos_video_target=True requires "
+                        "cfg.cosmos_policy_use_raw_inference=True."
+                    )
+                vae_root = getattr(config, 'cosmos_video_vae_model_path', None)
+                if vae_root is None:
+                    vae_root = getattr(config, 'student_base_model_path', None)
+                vae_root = os.path.abspath(os.path.expanduser(vae_root))
+                vae_path = (
+                    vae_root if os.path.basename(vae_root) == "vae"
+                    else os.path.join(vae_root, "vae")
+                )
+                if not os.path.isdir(vae_path):
+                    raise FileNotFoundError(
+                        "Invalid cosmos_video_vae_model_path: "
+                        f"expected VAE directory at {vae_path}"
+                    )
+                logger.info("Loading WanVA VAE encoder for Cosmos future video targets ...")
+                self.cosmos_video_vae = load_vae(
+                    vae_path,
+                    torch_dtype=self.dtype,
+                    torch_device=f"cuda:{local_rank}",
+                )
+                self.cosmos_video_vae.requires_grad_(False)
+                self.cosmos_video_vae.eval()
+                self.cosmos_video_streaming_vae = WanVAEStreamingWrapper(self.cosmos_video_vae)
+                logger.info("WanVA VAE encoder ready for Cosmos future video targets.")
             if self.teacher_roles.uses_separate_video_teacher:
                 video_root = os.path.abspath(os.path.expanduser(self.teacher_roles.video_model_path))
                 if os.path.basename(video_root) == "transformer":

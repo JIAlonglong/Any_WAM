@@ -61,7 +61,11 @@ from einops import rearrange
 
 from utils import data_seq_to_patch, logger
 from distillation.consistency import scalings_for_boundary_conditions
-from distillation_flowmap.cosmos_policy_adapter import compute_masked_action_stats
+from distillation_flowmap.cosmos_future_aux import select_official_future_camera_images
+from distillation_flowmap.cosmos_policy_adapter import (
+    compute_masked_action_stats,
+    cosmos_actions_to_flowmap_x0,
+)
 from distillation_flowmap.kto_reweighting import (
     compute_normalized_focal_weights,
     piecewise_linear_scale,
@@ -122,6 +126,209 @@ class FlowMapStepMixin:
         if downsample_factor != 1:
             target = target[:, :, ::downsample_factor]
         return target.contiguous()
+
+    def _cosmos_future_prediction_items(self, future_predictions, batch_size):
+        """Return one official Cosmos future-prediction mapping per batch item."""
+        if future_predictions is None:
+            raise RuntimeError(
+                "cfg.cosmos_video_target=True requires Cosmos raw inference to "
+                "return future_image_predictions."
+            )
+        if isinstance(future_predictions, (list, tuple)):
+            if len(future_predictions) != batch_size:
+                raise ValueError(
+                    "Cosmos future prediction batch size mismatch: "
+                    f"got {len(future_predictions)}, expected {batch_size}"
+                )
+            return list(future_predictions)
+        if not isinstance(future_predictions, dict):
+            raise TypeError(
+                "future_image_predictions must be a mapping or batch list of mappings, "
+                f"got {type(future_predictions)!r}"
+            )
+        if batch_size == 1:
+            return [future_predictions]
+
+        items = []
+        for batch_idx in range(batch_size):
+            item = {}
+            for key, value in future_predictions.items():
+                if torch.is_tensor(value):
+                    if value.ndim >= 4 and value.shape[0] == batch_size:
+                        item[key] = value[batch_idx]
+                    else:
+                        item[key] = value
+                elif hasattr(value, "shape"):
+                    if len(value.shape) >= 4 and value.shape[0] == batch_size:
+                        item[key] = value[batch_idx]
+                    else:
+                        item[key] = value
+                elif isinstance(value, (list, tuple)) and len(value) == batch_size:
+                    item[key] = value[batch_idx]
+                else:
+                    item[key] = value
+            items.append(item)
+        return items
+
+    def _future_image_to_video_tensor(self, image):
+        """Convert one official Cosmos future image/video to [1,3,T,H,W]."""
+        tensor = image if torch.is_tensor(image) else torch.as_tensor(image)
+        tensor = tensor.detach().to(torch.float32)
+
+        if tensor.ndim == 5:
+            if tensor.shape[0] != 1:
+                raise ValueError(
+                    "Per-sample future image tensor must have batch size 1 when 5D, "
+                    f"got shape={tuple(tensor.shape)}"
+                )
+            tensor = tensor[0]
+
+        if tensor.ndim == 3:
+            if tensor.shape[-1] in (1, 3, 4):
+                tensor = tensor.permute(2, 0, 1).unsqueeze(1)
+            elif tensor.shape[0] in (1, 3, 4):
+                tensor = tensor.unsqueeze(1)
+            else:
+                raise ValueError(f"Cannot infer future image layout from shape={tuple(tensor.shape)}")
+        elif tensor.ndim == 4:
+            if tensor.shape[-1] in (1, 3, 4):        # [T,H,W,C]
+                tensor = tensor.permute(3, 0, 1, 2)
+            elif tensor.shape[1] in (1, 3, 4):       # [T,C,H,W]
+                tensor = tensor.permute(1, 0, 2, 3)
+            elif tensor.shape[0] in (1, 3, 4):       # [C,T,H,W]
+                tensor = tensor
+            else:
+                raise ValueError(f"Cannot infer future video layout from shape={tuple(tensor.shape)}")
+        else:
+            raise ValueError(
+                f"Expected future image/video tensor with 3-5 dims, got shape={tuple(tensor.shape)}"
+            )
+
+        if tensor.shape[0] == 1:
+            tensor = tensor.expand(3, -1, -1, -1)
+        elif tensor.shape[0] == 4:
+            tensor = tensor[:3]
+        elif tensor.shape[0] != 3:
+            raise ValueError(f"Expected 1/3/4 image channels, got shape={tuple(tensor.shape)}")
+
+        if tensor.numel() > 0:
+            if tensor.min() < -0.1:
+                tensor = (tensor + 1.0) * 127.5
+            elif tensor.max() <= 2.0:
+                tensor = tensor * 255.0
+        tensor = tensor.clamp(0.0, 255.0).unsqueeze(0)  # [1,C,T,H,W]
+
+        target_hw = (
+            int(getattr(self.config, "height", tensor.shape[-2])),
+            int(getattr(self.config, "width", tensor.shape[-1])),
+        )
+        if tensor.shape[-2:] != target_hw:
+            bsz, channels, frames, height, width = tensor.shape
+            frame_tensor = tensor.permute(0, 2, 1, 3, 4).reshape(
+                bsz * frames, channels, height, width)
+            frame_tensor = F.interpolate(
+                frame_tensor, size=target_hw, mode="bilinear", align_corners=False)
+            tensor = frame_tensor.reshape(
+                bsz, frames, channels, target_hw[0], target_hw[1]
+            ).permute(0, 2, 1, 3, 4).contiguous()
+        return tensor
+
+    def _pad_future_videos_to_common_time(self, videos):
+        max_frames = max(video.shape[2] for video in videos)
+        out = []
+        for video in videos:
+            if video.shape[2] < max_frames:
+                pad = video[:, :, -1:].expand(
+                    -1, -1, max_frames - video.shape[2], -1, -1)
+                video = torch.cat([video, pad], dim=2)
+            elif video.shape[2] > max_frames:
+                video = video[:, :, :max_frames]
+            out.append(video)
+        return out
+
+    @torch.no_grad()
+    def _encode_cosmos_future_video_latents(self, future_predictions, ref_shape):
+        """Encode official Cosmos future images into WanVA latent x0 layout."""
+        if getattr(self, "cosmos_video_streaming_vae", None) is None:
+            raise RuntimeError(
+                "cfg.cosmos_video_target=True requires FlowMapDistiller to load "
+                "self.cosmos_video_streaming_vae."
+            )
+        if str(getattr(self.config, "env_type", "")).lower() == "robotwin_tshape":
+            raise NotImplementedError(
+                "Cosmos future video targets for robotwin_tshape need the "
+                "RobotWin half-resolution VAE layout; LIBERO is supported."
+            )
+
+        batch_size = int(ref_shape[0])
+        cam_keys = list(getattr(self.config, "obs_cam_keys", []))
+        if not cam_keys:
+            raise ValueError("cfg.obs_cam_keys is required for Cosmos future video targets.")
+
+        prediction_items = self._cosmos_future_prediction_items(
+            future_predictions, batch_size)
+        videos = []
+        for prediction in prediction_items:
+            if not isinstance(prediction, dict):
+                raise TypeError(
+                    "Each Cosmos future prediction must be a mapping, "
+                    f"got {type(prediction)!r}"
+                )
+            for image in select_official_future_camera_images(prediction, cam_keys):
+                videos.append(self._future_image_to_video_tensor(image))
+
+        videos = self._pad_future_videos_to_common_time(videos)
+        videos = torch.cat(videos, dim=0) / 255.0 * 2.0 - 1.0
+
+        vae_device = next(self.cosmos_video_vae.parameters()).device
+        self.cosmos_video_streaming_vae.clear_cache()
+        enc_out = self.cosmos_video_streaming_vae.encode_chunk(
+            videos.to(device=vae_device, dtype=self.dtype)
+        )
+        mu, _ = torch.chunk(enc_out, 2, dim=1)
+        latents_mean = torch.tensor(
+            self.cosmos_video_vae.config.latents_mean,
+            device=mu.device,
+            dtype=torch.float32,
+        ).view(1, -1, 1, 1, 1)
+        latents_std = torch.tensor(
+            self.cosmos_video_vae.config.latents_std,
+            device=mu.device,
+            dtype=torch.float32,
+        ).view(1, -1, 1, 1, 1)
+        mu_norm = ((mu.float() - latents_mean) / latents_std).to(mu.dtype)
+
+        num_cams = len(cam_keys)
+        if mu_norm.shape[0] != batch_size * num_cams:
+            raise ValueError(
+                "Encoded Cosmos future latent batch mismatch: "
+                f"got {mu_norm.shape[0]}, expected {batch_size * num_cams}"
+            )
+        mu_norm = mu_norm.reshape(batch_size, num_cams, *mu_norm.shape[1:])
+        per_sample = [
+            torch.cat([mu_norm[b, cam_idx] for cam_idx in range(num_cams)], dim=-1)
+            for b in range(batch_size)
+        ]
+        latents = torch.stack(per_sample, dim=0)
+
+        target_channels, target_frames, target_height, target_width = map(int, ref_shape[1:])
+        if latents.shape[1] != target_channels:
+            raise ValueError(
+                f"Cosmos future latent channel mismatch: got {latents.shape[1]}, "
+                f"expected {target_channels}"
+            )
+        if latents.shape[3] != target_height or latents.shape[4] != target_width:
+            raise ValueError(
+                "Cosmos future latent spatial mismatch: "
+                f"got {tuple(latents.shape[3:])}, expected {(target_height, target_width)}"
+            )
+        if latents.shape[2] < target_frames:
+            pad = latents[:, :, -1:].expand(
+                -1, -1, target_frames - latents.shape[2], -1, -1)
+            latents = torch.cat([latents, pad], dim=2)
+        elif latents.shape[2] > target_frames:
+            latents = latents[:, :, :target_frames]
+        return latents.contiguous()
 
     # ==================================================================
     # 混合时间步采样：扩散目标 + 一致性目标 + 流映射目标
@@ -1061,13 +1268,44 @@ class FlowMapStepMixin:
     # 核心训练步：Flow Map 蒸馏
     # ==================================================================
     def _cosmos_policy_train_step(self, batch, batch_idx):
-        """Action-only stage step for Cosmos Policy checkpoints.
+        """Stage step for Cosmos Policy checkpoints.
 
-        Cosmos Policy is an action policy checkpoint, not a WanVA video latent
-        teacher. This step keeps the FlowMap student plumbing/checkpoint format
-        intact while avoiding WanVA teacher video CFG and VAE paths.
+        The default path remains action-only. When cfg.cosmos_video_target=True,
+        official Cosmos future_image_predictions are encoded through the WanVA
+        VAE and used as the video x0 target, while official Cosmos actions are
+        used as the action x0 target.
         """
         batch = self.convert_input_format(batch)
+
+        teacher = self._action_teacher_model
+        teacher_action_x0_full = None
+        if getattr(self, "cosmos_video_target", False):
+            if not hasattr(teacher, "predict_raw_action_result"):
+                raise RuntimeError(
+                    "cfg.cosmos_video_target=True requires Cosmos Policy raw "
+                    "inference with predict_raw_action_result()."
+                )
+            if not getattr(teacher, "raw_inference_enabled", False):
+                raise RuntimeError(
+                    "cfg.cosmos_video_target=True requires "
+                    "cfg.cosmos_policy_use_raw_inference=True."
+                )
+            with torch.no_grad():
+                raw_teacher_result = teacher.predict_raw_action_result(
+                    batch, include_future=True)
+                teacher_action_x0_full = cosmos_actions_to_flowmap_x0(
+                    raw_teacher_result["actions"],
+                    target_shape=tuple(batch["actions"].shape),
+                    q01=self.config.norm_stat["q01"],
+                    q99=self.config.norm_stat["q99"],
+                    inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
+                    device=batch["actions"].device,
+                    dtype=batch["actions"].dtype,
+                )
+                batch["latents"] = self._encode_cosmos_future_video_latents(
+                    raw_teacher_result.get("future_image_predictions"),
+                    ref_shape=tuple(batch["latents"].shape),
+                ).to(device=batch["latents"].device, dtype=batch["latents"].dtype)
 
         B = batch['latents'].shape[0]
         ref_shape = batch['latents'].shape
@@ -1154,11 +1392,13 @@ class FlowMapStepMixin:
             device=self.device,
         )
 
-        _, student_action_v_seq = self.student(
+        student_video_v_seq, student_action_v_seq = self.student(
             student_input, train_mode=True,
             r_timestep=video_r,
             action_r_timestep=action_r_ds,
         )
+        if self.distill_video:
+            student_video_v = self._extract_video_v(student_video_v_seq, ref_shape, B)
         student_action_v = self._extract_action_v(
             student_action_v_seq, student_input['action_dict']['noisy_latents'].shape[2])
 
@@ -1177,12 +1417,11 @@ class FlowMapStepMixin:
         sigma_r = action_r_sigma[:, None, ::action_ds, None, None].to(student_action_v)
         student_action_pred = action_noisy_ds - sigma_r * student_action_v
 
-        teacher = self._action_teacher_model
         if not hasattr(teacher, 'action_target_tokens'):
             raise RuntimeError("Cosmos Policy backend requires a teacher with action_target_tokens().")
         with torch.no_grad():
-            teacher_action_x0 = None
-            if hasattr(teacher, 'action_target_x0') and getattr(teacher, 'raw_inference_enabled', False):
+            teacher_action_x0 = teacher_action_x0_full
+            if teacher_action_x0 is None and hasattr(teacher, 'action_target_x0') and getattr(teacher, 'raw_inference_enabled', False):
                 teacher_action_x0 = teacher.action_target_x0(input_dict['action_dict'], raw_batch=batch)
             if teacher_action_x0 is not None:
                 teacher_action_pred = teacher_action_x0[:, :, ::action_ds]
@@ -1215,7 +1454,16 @@ class FlowMapStepMixin:
             action_aware_loss = action_local_fm_loss
 
         video_loss = torch.tensor(0.0, device=self.device)
-        loss = getattr(self.config, 'action_block_weight', 1.0) * (
+        if self.distill_video:
+            video_sigma_r = (
+                video_r / self.config.num_train_timesteps
+            )[:, None, :, None, None].to(student_video_v)
+            student_video_pred = video_noisy_latents - video_sigma_r * student_video_v
+            video_diff = student_video_pred.float() - batch['latents'].detach().float()
+            video_loss = (video_diff ** 2).mean()
+
+        loss = getattr(self.config, 'video_loss_weight', 1.0) * video_loss \
+               + getattr(self.config, 'action_block_weight', 1.0) * (
             self.config.action_loss_weight * action_loss
             + self.gt_regression_weight * gt_regression_loss
             + getattr(self.config, 'action_aware_weight', 0.0) * action_aware_loss
@@ -1296,7 +1544,9 @@ class FlowMapStepMixin:
         返回:
             包含损失值和是否需要梯度同步的字典
         """
-        if getattr(self, 'is_cosmos_policy_teacher', False) and not self.distill_video:
+        if getattr(self, 'is_cosmos_policy_teacher', False) and (
+            not self.distill_video or getattr(self.config, 'cosmos_video_target', False)
+        ):
             return self._cosmos_policy_train_step(batch, batch_idx)
 
         batch = self.convert_input_format(batch)

@@ -54,14 +54,26 @@ cfg.use_central_diff = _env_bool("USE_CENTRAL_DIFF", True)
 cfg.selective_cdiff = _env_bool("SELECTIVE_CDIFF", True)
 cfg.epsilon = float(os.environ.get("EPSILON", getattr(cfg, "epsilon", 5.0)))
 
-# Cosmos action remains endpoint x0 supervision. There is no Cosmos velocity
-# teacher to central-difference on the action side.
-cfg.action_use_flowmap = False
-cfg.use_action_distill = False
-cfg.action_aware = False
-cfg.use_gt_regression = False
-cfg.gt_regression_weight = 0.0
-cfg.action_aware_weight = 0.0
+# Match the LingBotVA Stage 1 action objective by default: target-student
+# action distillation, action-side FlowMap where available, local action FM,
+# and the same light GT regularizer. Set COSMOS_ACTION_LINGBOTVA_STAGE1=0 to
+# recover the older Cosmos raw-action endpoint objective.
+cfg.cosmos_action_lingbotva_stage1 = _env_bool(
+    "COSMOS_ACTION_LINGBOTVA_STAGE1", True)
+if cfg.cosmos_action_lingbotva_stage1:
+    cfg.action_use_flowmap = _env_bool("ACTION_USE_FLOWMAP", True)
+    cfg.use_action_distill = _env_bool("USE_ACTION_DISTILL", True)
+    cfg.action_aware = _env_bool("ACTION_AWARE", True)
+    cfg.use_gt_regression = _env_bool("USE_GT_REGRESSION", True)
+    cfg.gt_regression_weight = float(os.environ.get("GT_REGRESSION_WEIGHT", 0.15))
+    cfg.action_aware_weight = float(os.environ.get("ACTION_AWARE_WEIGHT", 0.1))
+else:
+    cfg.action_use_flowmap = False
+    cfg.use_action_distill = False
+    cfg.action_aware = False
+    cfg.use_gt_regression = False
+    cfg.gt_regression_weight = 0.0
+    cfg.action_aware_weight = 0.0
 
 cfg.use_opd_aux = False
 cfg.use_dmd = False

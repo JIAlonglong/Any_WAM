@@ -527,7 +527,14 @@ def test_cosmos_stage1_wanva_cdiff_config_imports(monkeypatch):
     assert cfg.cosmos_video_cdiff_loss_weight == 1.0
     assert cfg.cosmos_video_endpoint_loss_weight == 1e-3
     assert cfg.use_central_diff is True
-    assert cfg.action_use_flowmap is False
+    assert cfg.cosmos_action_lingbotva_stage1 is True
+    assert cfg.action_use_flowmap is True
+    assert cfg.use_action_distill is True
+    assert cfg.action_aware is True
+    assert cfg.use_gt_regression is True
+    assert cfg.gt_regression_weight == 0.15
+    assert cfg.action_aware_weight == 0.1
+    assert cfg.num_ddim_timesteps_action == 1
     assert cfg.use_opd_aux is False
 
 

@@ -1331,6 +1331,151 @@ class FlowMapStepMixin:
         r_5d = video_r[:, None, :, None, None].to(video_v_cfg_5d)
         return (video_v_cfg_5d - (t_5d - r_5d) * dF_dt).detach()
 
+    @torch.no_grad()
+    def _cosmos_wanva_stage1_targets(
+        self,
+        input_dict,
+        batch,
+        video_noisy_latents,
+        video_noise,
+        video_t,
+        video_r,
+        action_noisy_latents,
+        action_noise,
+        action_t,
+        action_r,
+        ref_shape,
+        batch_size,
+        cfg_scale,
+    ):
+        """Return LingBotVA-style WanVA video/action FlowMap targets.
+
+        Cosmos still supplies future-image endpoint anchors and raw action
+        metrics. The primary vector-field targets come from the frozen
+        WanVA/LingBotVA teacher so this path matches the regular Stage 1
+        FlowMap objective.
+        """
+        if getattr(self, "_video_teacher_nofsdp", None) is None:
+            raise RuntimeError(
+                "Cosmos LingBotVA-aligned Stage 1 requires a WanVA video/action "
+                "teacher. Set cfg.cosmos_video_cdiff_teacher_model_path."
+            )
+
+        use_central_diff = bool(getattr(self.config, "use_central_diff", True))
+        action_ds = getattr(self.config, "action_downsample_factor", 4)
+        num_frames = ref_shape[2]
+
+        v_pred = video_noise - batch["latents"]
+        t_plus = (video_t + self.epsilon).clamp(max=self.config.num_train_timesteps)
+        noisy_latents_plus = (
+            video_noisy_latents
+            + v_pred * (self.epsilon / self.config.num_train_timesteps)
+        )
+        t_minus = (video_t - self.epsilon).clamp(min=0)
+        noisy_latents_minus = (
+            video_noisy_latents
+            - v_pred * (self.epsilon / self.config.num_train_timesteps)
+        )
+
+        action_noisy_plus = action_noisy_minus = None
+        action_t_plus = action_t_minus = None
+        action_has_flowmap = False
+        action_eps = float(getattr(self.config, "action_epsilon", self.epsilon))
+        if (
+            use_central_diff
+            and bool(getattr(self.config, "action_use_flowmap", False))
+        ):
+            flowmap_token_mask = (
+                ((action_t[:, ::action_ds] - action_r[:, ::action_ds]).abs() > 1e-3)
+                & (action_r[:, ::action_ds] > 1e-3)
+            )
+            action_has_flowmap = bool(flowmap_token_mask.any().item())
+            if action_has_flowmap:
+                action_t_center = action_t.clamp(
+                    min=action_eps,
+                    max=self.config.num_train_timesteps - action_eps,
+                )
+                action_t_plus = action_t_center + action_eps
+                action_t_minus = action_t_center - action_eps
+                action_noisy_plus = self.train_scheduler_action.add_noise(
+                    batch["actions"], action_noise, action_t_plus, t_dim=2
+                )
+                action_noisy_minus = self.train_scheduler_action.add_noise(
+                    batch["actions"], action_noise, action_t_minus, t_dim=2
+                )
+
+        if use_central_diff:
+            (
+                video_v_cfg_seq,
+                action_v_cond_seq,
+                video_v_plus_seq,
+                video_v_minus_seq,
+                action_plus_seq,
+                action_minus_seq,
+            ) = self._merged_cfg_central_diff_unified(
+                input_dict,
+                self.empty_emb,
+                cfg_scale,
+                noisy_latents_plus,
+                noisy_latents_minus,
+                t_plus,
+                t_minus,
+                batch["latents"],
+                action_noisy_plus=action_noisy_plus,
+                action_noisy_minus=action_noisy_minus,
+                action_t_plus=action_t_plus,
+                action_t_minus=action_t_minus,
+            )
+            video_v_cfg_5d = self._extract_video_v(
+                video_v_cfg_seq, ref_shape, batch_size)
+            video_v_plus_5d = self._extract_video_v(
+                video_v_plus_seq, ref_shape, batch_size)
+            video_v_minus_5d = self._extract_video_v(
+                video_v_minus_seq, ref_shape, batch_size)
+            video_dF_dt = (video_v_plus_5d - video_v_minus_5d) / (2 * self.epsilon)
+
+            action_dF_dt_5d = None
+            if action_has_flowmap and action_plus_seq is not None and action_minus_seq is not None:
+                action_plus_5d = self._extract_action_v(action_plus_seq, num_frames)
+                action_minus_5d = self._extract_action_v(action_minus_seq, num_frames)
+                action_dF_dt_5d = (action_plus_5d - action_minus_5d) / (2 * action_eps)
+        else:
+            video_v_cond, video_v_uncond, action_v_cond_seq = self._batched_cfg_forward(
+                input_dict, self.empty_emb)
+            video_v_cfg = video_v_uncond + cfg_scale * (
+                video_v_cond - video_v_uncond)
+            video_v_cfg_5d = self._extract_video_v(
+                video_v_cfg, ref_shape, batch_size)
+            video_dF_dt = torch.zeros_like(video_v_cfg_5d)
+            action_dF_dt_5d = None
+
+        if action_v_cond_seq is None:
+            raise RuntimeError(
+                "WanVA teacher did not return action output for LingBotVA-aligned "
+                "Cosmos Stage 1."
+            )
+        action_v_5d = self._extract_action_v(action_v_cond_seq, num_frames)
+
+        t_5d = video_t[:, None, :, None, None].to(video_v_cfg_5d)
+        r_5d = video_r[:, None, :, None, None].to(video_v_cfg_5d)
+        video_target = video_v_cfg_5d - (t_5d - r_5d) * video_dF_dt
+
+        action_t_sigma = action_t / self.config.num_train_timesteps
+        action_r_sigma = action_r / self.config.num_train_timesteps
+        sigma_s_a = action_t_sigma[:, None, :, None, None].to(action_v_5d)
+        sigma_r_a = action_r_sigma[:, None, :, None, None].to(action_v_5d)
+        x_prev_action = action_noisy_latents + action_v_5d * (sigma_r_a - sigma_s_a)
+
+        return {
+            "video_target": video_target.detach(),
+            "video_v_cfg": video_v_cfg_5d.detach(),
+            "action_v": action_v_5d.detach(),
+            "action_dF_dt": (
+                action_dF_dt_5d.detach() if action_dF_dt_5d is not None else None
+            ),
+            "x_prev_action": x_prev_action.detach(),
+        }
+
     # ==================================================================
     # 核心训练步：Flow Map 蒸馏
     # ==================================================================
@@ -1484,6 +1629,23 @@ class FlowMapStepMixin:
         raw_gt_abs_mean = zero_metric
         cosmos_video_endpoint_loss = zero_metric
         cosmos_video_cdiff_loss = zero_metric
+        lingbotva_stage1_targets = None
+        if bool(getattr(self.config, "cosmos_action_lingbotva_stage1", False)):
+            lingbotva_stage1_targets = self._cosmos_wanva_stage1_targets(
+                input_dict=input_dict,
+                batch=batch,
+                video_noisy_latents=video_noisy_latents,
+                video_noise=video_noise,
+                video_t=video_t,
+                video_r=video_r,
+                action_noisy_latents=action_noisy_latents,
+                action_noise=action_noise,
+                action_t=action_t,
+                action_r=action_r,
+                ref_shape=ref_shape,
+                batch_size=B,
+                cfg_scale=cfg_scale,
+            )
 
         sigma_r = action_r_sigma[:, None, ::action_ds, None, None].to(student_action_v)
         student_action_pred = action_noisy_ds - sigma_r * student_action_v
@@ -1508,7 +1670,120 @@ class FlowMapStepMixin:
             raw_teacher_abs_mean = raw_stats["teacher_abs_mean"]
             raw_gt_abs_mean = raw_stats["target_abs_mean"]
 
-        action_diff = (student_action_pred.float() - teacher_action_pred.detach().float()) * mask
+        if lingbotva_stage1_targets is not None:
+            action_v_5d = lingbotva_stage1_targets["action_v"]
+            action_dF_dt_5d = lingbotva_stage1_targets["action_dF_dt"]
+            use_action_distill = getattr(self.config, "use_action_distill", True)
+            target_action_pred = None
+
+            if self.distill_action and use_action_distill:
+                video_sigma_s = self._timestep_to_sigma_5d(video_t)
+                video_sigma_r = self._timestep_to_sigma_5d(video_r)
+                x_prev_video = (
+                    video_noisy_latents
+                    + lingbotva_stage1_targets["video_v_cfg"] * (
+                        video_sigma_r - video_sigma_s)
+                )
+                target_input = {
+                    "latent_dict": {
+                        **input_dict["latent_dict"],
+                        "noisy_latents": x_prev_video.detach(),
+                        "timesteps": video_r,
+                    },
+                    "action_dict": {
+                        "noisy_latents": lingbotva_stage1_targets[
+                            "x_prev_action"
+                        ][:, :, ::action_ds],
+                        "latent": actions_gt_ds,
+                        "timesteps": action_r[:, ::action_ds],
+                        "cond_timesteps": input_dict["action_dict"][
+                            "cond_timesteps"
+                        ][:, ::action_ds],
+                        "text_emb": input_dict["action_dict"]["text_emb"],
+                    },
+                    "chunk_size": input_dict["chunk_size"],
+                    "window_size": input_dict["window_size"],
+                }
+                if (
+                    "grid_id" in input_dict["action_dict"]
+                    and input_dict["action_dict"]["grid_id"] is not None
+                ):
+                    target_input["action_dict"]["grid_id"] = _downsample_action_grid_id(
+                        input_dict["action_dict"]["grid_id"],
+                        batch["actions"],
+                        action_ds,
+                    )
+                if (
+                    "actions_mask" in input_dict["action_dict"]
+                    and input_dict["action_dict"]["actions_mask"] is not None
+                ):
+                    target_input["action_dict"]["actions_mask"] = input_dict[
+                        "action_dict"
+                    ]["actions_mask"][:, :, ::action_ds]
+
+                with torch.no_grad():
+                    _, target_action_v_seq = self.target_student(
+                        target_input,
+                        train_mode=True,
+                        r_timestep=video_r,
+                        action_r_timestep=action_r[:, ::action_ds],
+                    )
+                    target_action_v = self._extract_action_v(
+                        target_action_v_seq,
+                        target_input["action_dict"]["noisy_latents"].shape[2],
+                    )
+                    target_action_pred = (
+                        lingbotva_stage1_targets["x_prev_action"][:, :, ::action_ds]
+                        - sigma_r.to(target_action_v) * target_action_v
+                    )
+
+            if use_action_distill and target_action_pred is not None:
+                action_target_pred = target_action_pred
+            elif self.action_distill_mode == "x0":
+                action_target_pred = actions_gt_ds
+            else:
+                student_action_pred = self._consistency_function(
+                    student_action_v, action_noisy_ds, action_r_sigma[:, ::action_ds]
+                )
+                action_target_pred = action_v_5d[:, :, ::action_ds]
+
+            action_use_flowmap = getattr(self.config, "action_use_flowmap", False)
+            flowmap_token_mask = torch.zeros_like(
+                action_r[:, ::action_ds], dtype=torch.bool)
+            if action_use_flowmap:
+                flowmap_token_mask = (
+                    ((action_t[:, ::action_ds] - action_r[:, ::action_ds]).abs() > 1e-3)
+                    & (action_r[:, ::action_ds] > 1e-3)
+                )
+
+            if (
+                action_use_flowmap
+                and flowmap_token_mask.any()
+                and action_dF_dt_5d is not None
+            ):
+                action_t_5d = action_t[:, None, ::action_ds, None, None].to(action_v_5d)
+                action_r_5d = action_r[:, None, ::action_ds, None, None].to(action_v_5d)
+                action_flowmap_v_target = action_v_5d[:, :, ::action_ds] - (
+                    action_t_5d - action_r_5d
+                ) * action_dF_dt_5d[:, :, ::action_ds]
+
+                if self.action_distill_mode == "x0":
+                    flowmap_action_target_pred = (
+                        action_noisy_ds - sigma_r.to(action_flowmap_v_target)
+                        * action_flowmap_v_target
+                    )
+                else:
+                    flowmap_action_target_pred = action_flowmap_v_target
+
+                action_target_pred = torch.where(
+                    flowmap_token_mask[:, None, :, None, None],
+                    flowmap_action_target_pred,
+                    action_target_pred,
+                )
+        else:
+            action_target_pred = teacher_action_pred
+
+        action_diff = (student_action_pred.float() - action_target_pred.detach().float()) * mask
         action_loss = (action_diff ** 2).sum() / action_denom
 
         gt_regression_loss = torch.tensor(0.0, device=self.device)
@@ -1553,17 +1828,20 @@ class FlowMapStepMixin:
             video_loss = endpoint_loss_weight * cosmos_video_endpoint_loss
 
             if bool(getattr(self.config, "cosmos_video_cdiff_aux", False)):
-                cdiff_target = self._cosmos_video_cdiff_target(
-                    input_dict=input_dict,
-                    batch=batch,
-                    video_noisy_latents=video_noisy_latents,
-                    video_noise=video_noise,
-                    video_t=video_t,
-                    video_r=video_r,
-                    ref_shape=ref_shape,
-                    batch_size=B,
-                    cfg_scale=cfg_scale,
-                )
+                if lingbotva_stage1_targets is not None:
+                    cdiff_target = lingbotva_stage1_targets["video_target"]
+                else:
+                    cdiff_target = self._cosmos_video_cdiff_target(
+                        input_dict=input_dict,
+                        batch=batch,
+                        video_noisy_latents=video_noisy_latents,
+                        video_noise=video_noise,
+                        video_t=video_t,
+                        video_r=video_r,
+                        ref_shape=ref_shape,
+                        batch_size=B,
+                        cfg_scale=cfg_scale,
+                    )
                 cdiff_diff = student_video_v.float() - cdiff_target.float()
                 loss_type = getattr(self.config, "loss_type", "l2")
                 if loss_type == "huber":

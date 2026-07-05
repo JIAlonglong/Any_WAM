@@ -96,6 +96,16 @@ def apply_first_frame_condition(noisy_latents, timesteps, target_timesteps, clea
     return noisy_latents, timesteps, target_timesteps
 
 
+def should_save_student_latent_video(
+    is_cosmos_policy_teacher,
+    distill_video,
+    allow_cosmos_latent_diagnostic=False,
+):
+    if is_cosmos_policy_teacher and not distill_video and not allow_cosmos_latent_diagnostic:
+        return False
+    return True
+
+
 def decode_latents_to_np(vae, video_processor, latents):
     latents = latents.detach().to(next(vae.parameters()).device, dtype=vae.dtype)
     latents_mean = (
@@ -260,6 +270,14 @@ def main():
         action="store_true",
         help="Keep frame 0 clean with t=r=0, matching WanVA/Cosmos streaming inference.",
     )
+    parser.add_argument(
+        "--save-cosmos-latent-diagnostic-videos",
+        action="store_true",
+        help=(
+            "Also save student_s* WanVA latent diagnostic videos for Cosmos action-only "
+            "configs. These are not true Cosmos policy environment rollouts."
+        ),
+    )
     args = parser.parse_args()
 
     init_logger()
@@ -313,8 +331,19 @@ def main():
     video_processor = None
     saved_video_pairs = 0
     is_cosmos_policy_teacher = bool(getattr(trainer, "is_cosmos_policy_teacher", False))
+    save_student_latent_video = should_save_student_latent_video(
+        is_cosmos_policy_teacher=is_cosmos_policy_teacher,
+        distill_video=bool(getattr(cfg, "distill_video", True)),
+        allow_cosmos_latent_diagnostic=args.save_cosmos_latent_diagnostic_videos,
+    )
     if rank == 0 and video_dir is not None:
         video_dir.mkdir(parents=True, exist_ok=True)
+        if not save_student_latent_video:
+            logger.warning(
+                "Skipping student_s* WanVA latent videos for Cosmos action-only config. "
+                "Use evaluation/libero/run_eval_new.sh for true student policy env videos, "
+                "or pass --save-cosmos-latent-diagnostic-videos for the latent diagnostic."
+            )
         vae_model_root = (
             getattr(cfg, "student_base_model_path", args.teacher_model_path)
             if is_cosmos_policy_teacher
@@ -463,7 +492,8 @@ def main():
                 )
                 if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
                     sample_idx = min(max(args.video_sample_index, 0), B - 1)
-                    videos_to_save[f"student_s{k_steps}"] = student_x_r[sample_idx:sample_idx + 1].detach().cpu()
+                    if save_student_latent_video:
+                        videos_to_save[f"student_s{k_steps}"] = student_x_r[sample_idx:sample_idx + 1].detach().cpu()
                 prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{args.teacher_steps}"
                 if teacher_x_r is not None and teacher_v_r is not None:
                     add(prefix + "/video_teacher_x_mse", (student_x_r.float() - teacher_x_r.float()).pow(2).mean())

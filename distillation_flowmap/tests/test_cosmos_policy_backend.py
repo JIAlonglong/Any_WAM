@@ -473,6 +473,31 @@ def test_rollout_video_conditioning_keeps_first_frame_clean():
     assert torch.equal(conditioned_r[:, 1:], target_timesteps[:, 1:])
 
 
+def test_cosmos_action_only_rollout_video_skips_student_latent_diagnostic_by_default():
+    from distillation_flowmap.rollout_eval_video_stage2 import should_save_student_latent_video
+
+    assert should_save_student_latent_video(
+        is_cosmos_policy_teacher=True,
+        distill_video=False,
+        allow_cosmos_latent_diagnostic=False,
+    ) is False
+    assert should_save_student_latent_video(
+        is_cosmos_policy_teacher=True,
+        distill_video=False,
+        allow_cosmos_latent_diagnostic=True,
+    ) is True
+    assert should_save_student_latent_video(
+        is_cosmos_policy_teacher=True,
+        distill_video=True,
+        allow_cosmos_latent_diagnostic=False,
+    ) is True
+    assert should_save_student_latent_video(
+        is_cosmos_policy_teacher=False,
+        distill_video=False,
+        allow_cosmos_latent_diagnostic=False,
+    ) is True
+
+
 def test_cosmos_teacher_official_eval_defaults_match_nvidia_libero_settings():
     from evaluation.libero.rollout_cosmos_policy import apply_eval_defaults
 

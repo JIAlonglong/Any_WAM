@@ -27,6 +27,7 @@ from distillation_flowmap.flowmap_trainer import FlowMapDistiller
 from distillation_flowmap.flowmap_step import _downsample_action_grid_id
 from distillation_flowmap.cosmos_future_video import (
     OFFICIAL_COSMOS_FUTURE_VIDEO_SOURCE,
+    pad_frames_to_min_duration,
     predict_official_future_prediction,
 )
 from modules.utils import load_vae
@@ -155,7 +156,7 @@ def save_contact_sheet(named_videos, path):
     sheet.save(path)
 
 
-def future_prediction_to_video_np(prediction):
+def future_prediction_to_video_np(prediction, num_frames=1):
     prediction = prediction or {}
     images = []
     for key in ("future_wrist_image", "future_image"):
@@ -172,7 +173,8 @@ def future_prediction_to_video_np(prediction):
             image = np.asarray(Image.fromarray(image).resize((base_w, base_h)))
         resized.append(image.astype(np.uint8))
     frame = np.hstack(resized).astype(np.uint8)
-    return np.stack([frame], axis=0)
+    num_frames = max(1, int(num_frames))
+    return np.stack([frame.copy() for _ in range(num_frames)], axis=0)
 
 
 @torch.no_grad()
@@ -460,10 +462,22 @@ def main():
                     video_np = decode_latents_to_np(vae, video_processor, latent_cpu.to(trainer.device))
                     decoded[name] = video_np
                     out_path = video_dir / f"{pair_name}_{name}.mp4"
+                    video_np = np.stack(
+                        pad_frames_to_min_duration(list(video_np), fps=args.video_fps),
+                        axis=0,
+                    )
                     export_to_video(video_np, str(out_path), fps=args.video_fps)
                     logger.info("Saved rollout video: %s", out_path)
                 for name, prediction in official_future_videos_to_save.items():
-                    video_np = future_prediction_to_video_np(prediction)
+                    reference_frame_count = max((len(video) for video in decoded.values()), default=args.video_fps)
+                    video_np = future_prediction_to_video_np(
+                        prediction,
+                        num_frames=reference_frame_count,
+                    )
+                    video_np = np.stack(
+                        pad_frames_to_min_duration(list(video_np), fps=args.video_fps),
+                        axis=0,
+                    )
                     decoded[name] = video_np
                     out_path = video_dir / f"{pair_name}_{name}.mp4"
                     export_to_video(video_np, str(out_path), fps=args.video_fps)

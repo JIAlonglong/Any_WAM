@@ -1,5 +1,9 @@
 """Helpers for exporting official Cosmos Policy future image predictions."""
 
+import math
+
+import numpy as np
+
 OFFICIAL_COSMOS_FUTURE_VIDEO_SOURCE = "official_cosmos_future_image_predictions"
 
 RAW_COSMOS_POLICY_BATCH_KEYS = (
@@ -39,3 +43,15 @@ def predict_official_future_prediction(teacher, batch):
     raw_batch = build_raw_cosmos_batch(batch)
     action_result = teacher.predict_raw_action_result(raw_batch, include_future=True)
     return select_first_future_prediction(action_result)
+
+
+def pad_frames_to_min_duration(frames, fps, min_seconds=1.0):
+    if not frames:
+        return frames
+    fps = max(float(fps), 1.0)
+    min_seconds = max(float(min_seconds), 0.0)
+    min_frames = max(1, int(math.ceil(fps * min_seconds)))
+    out = list(frames)
+    while len(out) < min_frames:
+        out.append(np.array(out[-1], copy=True))
+    return out

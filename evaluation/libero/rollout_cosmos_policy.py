@@ -28,6 +28,7 @@ from distillation_flowmap.cosmos_policy_adapter import (  # noqa: E402
 )
 from distillation_flowmap.cosmos_future_video import (  # noqa: E402
     OFFICIAL_COSMOS_FUTURE_VIDEO_SOURCE,
+    pad_frames_to_min_duration,
     select_first_future_prediction,
 )
 
@@ -52,6 +53,7 @@ def save_video(real_obs_list, save_path, fps=15):
         np.hstack([cv2.resize(obs[name], target_size) for name in names]).astype(np.uint8)
         for obs in real_obs_list
     ]
+    frames = pad_frames_to_min_duration(frames, fps=fps)
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     imageio.mimsave(str(save_path), frames, fps=fps)
@@ -122,6 +124,7 @@ def save_cosmos_future_video(real_obs_list, future_prediction_list, save_path, f
             )
         frames.append(_labeled_frame(columns))
 
+    frames = pad_frames_to_min_duration(frames, fps=fps)
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     imageio.mimsave(str(save_path), frames, fps=fps)
@@ -177,6 +180,7 @@ def save_cosmos_future_chunk_video(future_prediction_list, save_path, fps=2):
             )
         frames.append(_labeled_frame(columns))
 
+    frames = pad_frames_to_min_duration(frames, fps=fps)
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     imageio.mimsave(str(save_path), frames, fps=fps)

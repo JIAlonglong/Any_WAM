@@ -254,6 +254,29 @@ def test_future_prediction_to_video_np_stacks_official_wrist_and_primary():
     assert np.all(video[0, :, 6:] == 20)
 
 
+def test_future_prediction_to_video_np_repeats_to_reference_frame_count():
+    from distillation_flowmap.rollout_eval_video_stage2 import future_prediction_to_video_np
+
+    prediction = {"future_image": np.full((4, 6, 3), 20, dtype=np.uint8)}
+
+    video = future_prediction_to_video_np(prediction, num_frames=5)
+
+    assert video.shape == (5, 4, 6, 3)
+    assert np.all(video == 20)
+
+
+def test_pad_frames_to_min_duration_repeats_last_frame():
+    from distillation_flowmap.cosmos_future_video import pad_frames_to_min_duration
+
+    first = np.zeros((2, 2, 3), dtype=np.uint8)
+    padded = pad_frames_to_min_duration([first], fps=10, min_seconds=1.0)
+
+    assert len(padded) == 10
+    assert np.all(padded[0] == 0)
+    assert np.all(padded[-1] == 0)
+    assert padded[-1] is not first
+
+
 def test_save_cosmos_future_video_writes_prediction_comparison(tmp_path):
     from evaluation.libero.rollout_cosmos_policy import save_cosmos_future_video
 

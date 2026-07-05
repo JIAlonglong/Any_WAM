@@ -134,3 +134,71 @@ def test_flowmap_step_video_accessor_falls_back_to_default_teacher():
     distiller._teacher_nofsdp = "default_teacher"
 
     assert distiller._video_teacher_model == "default_teacher"
+
+
+def test_flowmap_step_cosmos_action_x0_target_downsamples_raw_teacher_output():
+    repo_root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repo_root))
+    sys.path.insert(0, str(repo_root / "wan_va"))
+
+    import torch
+    from distillation_flowmap.flowmap_step import FlowMapStepMixin
+
+    class Teacher:
+        raw_inference_enabled = True
+
+        def __init__(self):
+            self.calls = []
+
+        def action_target_x0(self, action_dict, raw_batch=None):
+            self.calls.append((action_dict, raw_batch))
+            return torch.arange(1 * 2 * 6 * 1 * 1).reshape(1, 2, 6, 1, 1).float()
+
+    class DummyDistiller(FlowMapStepMixin):
+        pass
+
+    teacher = Teacher()
+    distiller = DummyDistiller()
+    distiller.is_cosmos_policy_teacher = True
+    distiller.teacher = teacher
+    distiller._teacher_nofsdp = teacher
+    action_dict = {"latent": torch.zeros(1, 2, 6, 1, 1)}
+    raw_batch = {"raw_task": ["open drawer"]}
+
+    target = distiller._cosmos_action_x0_target(
+        action_dict,
+        raw_batch=raw_batch,
+        downsample_factor=2,
+    )
+
+    assert torch.equal(target, torch.arange(12).reshape(1, 2, 6, 1, 1).float()[:, :, ::2])
+    assert teacher.calls == [(action_dict, raw_batch)]
+
+
+def test_flowmap_step_cosmos_action_x0_target_returns_none_when_raw_disabled():
+    repo_root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repo_root))
+    sys.path.insert(0, str(repo_root / "wan_va"))
+
+    import torch
+    from distillation_flowmap.flowmap_step import FlowMapStepMixin
+
+    class Teacher:
+        raw_inference_enabled = False
+
+        def action_target_x0(self, action_dict, raw_batch=None):
+            raise AssertionError("raw-disabled teacher should not be called")
+
+    class DummyDistiller(FlowMapStepMixin):
+        pass
+
+    distiller = DummyDistiller()
+    distiller.is_cosmos_policy_teacher = True
+    distiller.teacher = Teacher()
+    distiller._teacher_nofsdp = distiller.teacher
+
+    assert distiller._cosmos_action_x0_target(
+        {"latent": torch.zeros(1, 2, 6, 1, 1)},
+        raw_batch={},
+        downsample_factor=2,
+    ) is None

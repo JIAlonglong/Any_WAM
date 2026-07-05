@@ -103,6 +103,26 @@ class FlowMapStepMixin:
             return video_teacher
         return self._teacher_model
 
+    def _cosmos_action_x0_target(self, action_dict, raw_batch, downsample_factor):
+        """Return downsampled raw Cosmos action x0 when available."""
+        if not getattr(self, 'is_cosmos_policy_teacher', False):
+            return None
+        teacher = self._action_teacher_model
+        if not hasattr(teacher, 'action_target_x0'):
+            return None
+        if not getattr(teacher, 'raw_inference_enabled', False):
+            return None
+        target = teacher.action_target_x0(action_dict, raw_batch=raw_batch)
+        if target is None:
+            return None
+        if target.ndim != 5:
+            raise ValueError(
+                f"Cosmos action x0 target must be 5D [B,C,F,N,1], got {tuple(target.shape)}"
+            )
+        if downsample_factor != 1:
+            target = target[:, :, ::downsample_factor]
+        return target.contiguous()
+
     # ==================================================================
     # 混合时间步采样：扩散目标 + 一致性目标 + 流映射目标
     # ==================================================================
@@ -1725,6 +1745,12 @@ class FlowMapStepMixin:
             action_denom = (mask.sum() * student_action_pred.shape[1]).clamp(min=1)
 
             if self.distill_action:
+                with torch.no_grad():
+                    cosmos_action_target_pred = self._cosmos_action_x0_target(
+                        input_dict['action_dict'],
+                        raw_batch=batch,
+                        downsample_factor=_ad,
+                    )
                 action_use_flowmap = getattr(self.config, 'action_use_flowmap', False)
                 if action_use_flowmap:
                     flowmap_token_mask = (
@@ -1734,7 +1760,10 @@ class FlowMapStepMixin:
                 else:
                     flowmap_token_mask = torch.zeros_like(action_r[:, ::_ad], dtype=torch.bool)
 
-                if use_action_distill and target_action_pred is not None:
+                if cosmos_action_target_pred is not None:
+                    base_action_target_pred = cosmos_action_target_pred
+                    flowmap_token_mask = torch.zeros_like(flowmap_token_mask)
+                elif use_action_distill and target_action_pred is not None:
                     base_action_target_pred = target_action_pred
                 elif self.action_distill_mode == "x0":
                     base_action_target_pred = actions_gt_ds

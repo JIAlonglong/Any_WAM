@@ -575,6 +575,34 @@ def test_cosmos_dual_teacher_stage2_config_imports(monkeypatch):
     assert cfg.use_opd_aux is True
 
 
+def test_cosmos_wanva_cdiff_stage2_lingbotva_config_imports(monkeypatch):
+    monkeypatch.setenv("TEACHER_PATH", "/tmp/wanva-teacher")
+    sys.modules.pop(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_wanva_cdiff", None)
+
+    cfg = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_wanva_cdiff"
+    ).cfg
+
+    assert getattr(cfg, "teacher_backend", "wanva") == "wanva"
+    assert cfg.teacher_model_path == "/tmp/wanva-teacher"
+    assert cfg.distill_mode == "flashwam"
+    assert cfg.distill_video is True
+    assert cfg.distill_action is True
+    assert cfg.use_central_diff is True
+    assert cfg.action_use_flowmap is True
+    assert cfg.use_action_distill is True
+    assert cfg.action_aware is True
+    assert cfg.use_gt_regression is True
+    assert cfg.use_opd_aux is True
+    assert cfg.opd_aux_action is False
+    assert cfg.resume_online_from_target is True
+    assert cfg.reset_resume_step is True
+    assert cfg.resume_from_path.endswith(
+        "output_libero_cosmos_policy_stage1_wanva_cdiff/checkpoints/step_5000"
+    )
+
+
 def test_rollout_video_conditioning_keeps_first_frame_clean():
     from distillation_flowmap.rollout_eval_video_stage2 import apply_first_frame_condition
 

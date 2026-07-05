@@ -41,6 +41,7 @@ from distributed.util import _configure_model, dist_mean
 from modules.utils import load_transformer
 from utils import logger, warmup_constant_lambda, FlowMatchScheduler
 from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+from distillation_flowmap.cosmos_teacher_roles import resolve_teacher_roles
 
 try:
     import wandb
@@ -125,6 +126,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.teacher_backend = str(getattr(config, 'teacher_backend', 'wanva')).lower()
         self.is_cosmos_policy_teacher = self.teacher_backend in (
             'cosmos', 'cosmos_policy', 'cosmos-policy')
+        self.teacher_roles = resolve_teacher_roles(config)
+        self.video_teacher = None
+        self._video_teacher_nofsdp = None
         # 动作的跳步数（可能与视频不同）
         self.k_action = config.num_train_timesteps // getattr(
             config, 'num_ddim_timesteps_action', config.num_ddim_timesteps)
@@ -208,6 +212,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info(f"Distill video: {self.distill_video}")
             logger.info(f"Distill action: {self.distill_action}")
             logger.info(f"Action aware: {self.action_aware}")
+            logger.info(f"Action teacher backend: {self.teacher_roles.action_backend}")
+            logger.info(f"Video teacher backend: {self.teacher_roles.video_backend}")
+            logger.info(f"Video teacher path: {self.teacher_roles.video_model_path}")
             if self.distill_action:
                 logger.info(f"  k_action = {self.k_action}, "
                             f"action_loss_weight = {config.action_loss_weight}, "
@@ -293,6 +300,29 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 "Cosmos Policy action teacher ready; WanVA student base: %s",
                 teacher_path,
             )
+            if self.teacher_roles.uses_separate_video_teacher:
+                video_root = os.path.abspath(os.path.expanduser(self.teacher_roles.video_model_path))
+                if os.path.basename(video_root) == "transformer":
+                    video_teacher_path = video_root
+                else:
+                    video_teacher_path = os.path.join(video_root, "transformer")
+                if not os.path.isfile(os.path.join(video_teacher_path, "config.json")):
+                    raise FileNotFoundError(
+                        "Invalid video_teacher_model_path for Cosmos dual-teacher mode: "
+                        f"expected {os.path.join(video_teacher_path, 'config.json')}"
+                    )
+                logger.info("Loading WanVA video teacher for Cosmos dual-teacher mode ...")
+                self.video_teacher = load_transformer(
+                    video_teacher_path,
+                    torch_dtype=self.dtype,
+                    torch_device="cpu",
+                )
+                self.video_teacher.requires_grad_(False)
+                self.video_teacher.eval()
+                self.video_teacher = self.video_teacher.to(self.dtype)
+                self._video_teacher_nofsdp = self.video_teacher.to(f"cuda:{local_rank}")
+                self.video_teacher = None
+                logger.info("WanVA video teacher ready for Cosmos dual-teacher mode.")
         else:
             logger.info("Loading teacher (frozen) ...")
             self.teacher = load_transformer(teacher_path, torch_dtype=self.dtype, torch_device="cpu")

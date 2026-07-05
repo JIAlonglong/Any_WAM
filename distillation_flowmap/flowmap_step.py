@@ -87,8 +87,21 @@ class FlowMapStepMixin:
 
     @property
     def _teacher_model(self):
-        """Return _teacher_nofsdp if available, else fall back to teacher."""
+        """Return the default frozen teacher for backward compatibility."""
         return getattr(self, '_teacher_nofsdp', self.teacher)
+
+    @property
+    def _action_teacher_model(self):
+        """Return the teacher that supplies action targets."""
+        return getattr(self, '_teacher_nofsdp', self.teacher)
+
+    @property
+    def _video_teacher_model(self):
+        """Return the teacher that supplies WanVA latent video targets."""
+        video_teacher = getattr(self, '_video_teacher_nofsdp', None)
+        if video_teacher is not None:
+            return video_teacher
+        return self._teacher_model
 
     # ==================================================================
     # 混合时间步采样：扩散目标 + 一致性目标 + 流映射目标
@@ -358,7 +371,7 @@ class FlowMapStepMixin:
 
             # 前向 1: t+eps, cond+uncond (2B)
             input_plus = _build_2b_input(noisy_latents_plus, latents, t_plus)
-            v_plus_all, _ = self._teacher_model(input_plus, train_mode=True)
+            v_plus_all, _ = self._video_teacher_model(input_plus, train_mode=True)
 
             # 恢复 mask（teacher forward 会更新 mask，需要在下次前向前重置）
             FlexAttnFunc.attention_mask = None
@@ -366,7 +379,7 @@ class FlowMapStepMixin:
 
             # 前向 2: t-eps, cond+uncond (2B)
             input_minus = _build_2b_input(noisy_latents_minus, latents, t_minus)
-            v_minus_all, _ = self._teacher_model(input_minus, train_mode=True)
+            v_minus_all, _ = self._video_teacher_model(input_minus, train_mode=True)
         finally:
             FlexAttnFunc.attention_mask = saved_attn_mask
             FlexAttnFunc.cross_attention_mask = saved_cross_mask
@@ -500,7 +513,7 @@ class FlowMapStepMixin:
 
             # 前向 1 (3B): cond at (t, t+ε, t-ε)
             cond_input = _build_3b_input(torch.cat([ld['text_emb']] * 3, dim=0))
-            v_cond_all, action_cond_all = self._teacher_model(cond_input, train_mode=True)
+            v_cond_all, action_cond_all = self._video_teacher_model(cond_input, train_mode=True)
 
             # 重置 mask（第二次前向需要重新创建）
             FlexAttnFunc.attention_mask = None
@@ -508,7 +521,7 @@ class FlowMapStepMixin:
 
             # 前向 2 (3B): uncond at (t, t+ε, t-ε)
             uncond_input = _build_3b_input(torch.cat([empty_expanded] * 3, dim=0))
-            v_uncond_all, _ = self._teacher_model(uncond_input, train_mode=True)
+            v_uncond_all, _ = self._video_teacher_model(uncond_input, train_mode=True)
         finally:
             FlexAttnFunc.attention_mask = saved_attn_mask
             FlexAttnFunc.cross_attention_mask = saved_cross_mask
@@ -599,14 +612,14 @@ class FlowMapStepMixin:
 
             # 前向 1 (3B): cond at (t, t+ε, t-ε)
             cond_input = _build_3b_input(torch.cat([ld['text_emb']] * 3, dim=0))
-            v_cond_all, action_cond_all = self._teacher_model(cond_input, train_mode=True)
+            v_cond_all, action_cond_all = self._video_teacher_model(cond_input, train_mode=True)
 
             FlexAttnFunc.attention_mask = None
             FlexAttnFunc.cross_attention_mask = None
 
             # 前向 2 (3B): uncond at (t, t+ε, t-ε)
             uncond_input = _build_3b_input(torch.cat([empty_expanded] * 3, dim=0))
-            v_uncond_all, _ = self._teacher_model(uncond_input, train_mode=True)
+            v_uncond_all, _ = self._video_teacher_model(uncond_input, train_mode=True)
         finally:
             FlexAttnFunc.attention_mask = saved_attn_mask
             FlexAttnFunc.cross_attention_mask = saved_cross_mask
@@ -715,7 +728,7 @@ class FlowMapStepMixin:
         try:
             FlexAttnFunc.attention_mask = None
             FlexAttnFunc.cross_attention_mask = None
-            return self._teacher_model(input_dict, train_mode=True)
+            return self._video_teacher_model(input_dict, train_mode=True)
         finally:
             FlexAttnFunc.attention_mask = saved_attn_mask
             FlexAttnFunc.cross_attention_mask = saved_cross_mask
@@ -817,7 +830,7 @@ class FlowMapStepMixin:
         try:
             FlexAttnFunc.attention_mask = None
             FlexAttnFunc.cross_attention_mask = None
-            v_all, action_all = self._teacher_model(doubled_input, train_mode=True)
+            v_all, action_all = self._video_teacher_model(doubled_input, train_mode=True)
         finally:
             FlexAttnFunc.attention_mask = saved_attn_mask
             FlexAttnFunc.cross_attention_mask = saved_cross_mask
@@ -883,7 +896,7 @@ class FlowMapStepMixin:
         try:
             FlexAttnFunc.attention_mask = None
             FlexAttnFunc.cross_attention_mask = None
-            _, action_all = self._teacher_model(doubled_input, train_mode=True)
+            _, action_all = self._action_teacher_model(doubled_input, train_mode=True)
         finally:
             FlexAttnFunc.attention_mask = saved_attn_mask
             FlexAttnFunc.cross_attention_mask = saved_cross_mask
@@ -1144,7 +1157,7 @@ class FlowMapStepMixin:
         sigma_r = action_r_sigma[:, None, ::action_ds, None, None].to(student_action_v)
         student_action_pred = action_noisy_ds - sigma_r * student_action_v
 
-        teacher = self._teacher_model
+        teacher = self._action_teacher_model
         if not hasattr(teacher, 'action_target_tokens'):
             raise RuntimeError("Cosmos Policy backend requires a teacher with action_target_tokens().")
         with torch.no_grad():
@@ -1263,7 +1276,7 @@ class FlowMapStepMixin:
         返回:
             包含损失值和是否需要梯度同步的字典
         """
-        if getattr(self, 'is_cosmos_policy_teacher', False):
+        if getattr(self, 'is_cosmos_policy_teacher', False) and not self.distill_video:
             return self._cosmos_policy_train_step(batch, batch_idx)
 
         batch = self.convert_input_format(batch)

@@ -1,4 +1,6 @@
 from types import SimpleNamespace
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -95,3 +97,40 @@ def test_dual_teacher_uses_student_base_as_default_video_teacher_when_requested(
     assert roles.video_backend == "wanva"
     assert roles.video_model_path == "/ckpts/wanva"
     assert roles.uses_separate_video_teacher is True
+
+
+def test_flowmap_step_accessors_split_action_and_video_teachers():
+    repo_root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repo_root))
+    sys.path.insert(0, str(repo_root / "wan_va"))
+
+    from distillation_flowmap.flowmap_step import FlowMapStepMixin
+
+    class DummyDistiller(FlowMapStepMixin):
+        pass
+
+    distiller = DummyDistiller()
+    distiller.teacher = "fsdp_action_teacher"
+    distiller._teacher_nofsdp = "action_teacher"
+    distiller._video_teacher_nofsdp = "video_teacher"
+
+    assert distiller._teacher_model == "action_teacher"
+    assert distiller._action_teacher_model == "action_teacher"
+    assert distiller._video_teacher_model == "video_teacher"
+
+
+def test_flowmap_step_video_accessor_falls_back_to_default_teacher():
+    repo_root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repo_root))
+    sys.path.insert(0, str(repo_root / "wan_va"))
+
+    from distillation_flowmap.flowmap_step import FlowMapStepMixin
+
+    class DummyDistiller(FlowMapStepMixin):
+        pass
+
+    distiller = DummyDistiller()
+    distiller.teacher = "fsdp_teacher"
+    distiller._teacher_nofsdp = "default_teacher"
+
+    assert distiller._video_teacher_model == "default_teacher"

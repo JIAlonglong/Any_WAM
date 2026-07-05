@@ -3,6 +3,7 @@ import torch
 from distillation_flowmap.cosmos_future_aux import (
     image_l1_mse,
     normalize_future_images,
+    select_official_future_camera_images,
     select_future_frames,
 )
 
@@ -58,6 +59,25 @@ def test_normalize_future_images_accepts_single_hwc_image():
     result = normalize_future_images({"future_image": image})
 
     assert result.primary.shape == (1, 1, 3, 16, 16)
+
+
+def test_select_official_future_camera_images_maps_libero_keys():
+    primary = torch.zeros(16, 16, 3, dtype=torch.uint8)
+    wrist = torch.ones(16, 16, 3, dtype=torch.uint8)
+
+    images = select_official_future_camera_images(
+        {
+            "future_image": primary,
+            "future_wrist_image": wrist,
+        },
+        [
+            "observation.images.agentview_rgb",
+            "observation.images.eye_in_hand_rgb",
+        ],
+    )
+
+    assert torch.equal(torch.as_tensor(images[0]), primary)
+    assert torch.equal(torch.as_tensor(images[1]), wrist)
 
 
 def test_select_future_frames_clamps_to_available_frames():

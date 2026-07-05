@@ -34,6 +34,23 @@ def test_dual_teacher_requires_wanva_video_model_path():
         resolve_teacher_roles(cfg)
 
 
+def test_all_cosmos_video_target_does_not_require_wanva_video_teacher():
+    cfg = SimpleNamespace(
+        teacher_backend="cosmos_policy",
+        teacher_model_path="/ckpts/cosmos",
+        distill_video=True,
+        cosmos_video_target=True,
+    )
+
+    roles = resolve_teacher_roles(cfg)
+
+    assert roles.action_backend == "cosmos_policy"
+    assert roles.action_model_path == "/ckpts/cosmos"
+    assert roles.video_backend == "cosmos_future"
+    assert roles.video_model_path == "/ckpts/cosmos"
+    assert roles.uses_separate_video_teacher is False
+
+
 def test_dual_teacher_defaults_video_backend_to_wanva():
     cfg = SimpleNamespace(
         teacher_backend="cosmos_policy",

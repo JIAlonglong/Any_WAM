@@ -50,6 +50,31 @@ def _select(mapping: Mapping[str, object], key: str | None):
     return None
 
 
+def select_official_future_camera_images(
+    prediction: Mapping[str, object],
+    obs_cam_keys: list[str] | tuple[str, ...],
+) -> list[object]:
+    """Select official Cosmos future images in the WanVA observation-camera order."""
+    out = []
+    for key in obs_cam_keys:
+        key_l = str(key).lower()
+        if "eye_in_hand" in key_l or "wrist" in key_l:
+            image = prediction.get("future_wrist_image")
+            if image is None:
+                image = prediction.get("future_wrist_image2")
+        else:
+            image = prediction.get("future_image")
+            if image is None:
+                image = prediction.get("future_image2")
+        if image is None:
+            raise KeyError(
+                f"Cosmos future prediction does not contain an image for camera {key!r}; "
+                f"available keys={sorted(prediction.keys())}"
+            )
+        out.append(image)
+    return out
+
+
 def normalize_future_images(
     future_image_predictions,
     *,

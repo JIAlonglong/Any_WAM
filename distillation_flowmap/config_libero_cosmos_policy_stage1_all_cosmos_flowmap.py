@@ -79,6 +79,9 @@ cfg.output_dir = os.environ.get(
 )
 cfg.wandb_name_prefix = "stage1_cosmos_all_cosmos_flowmap"
 cfg.enable_wandb = _env_bool("ENABLE_WANDB", False)
+cfg.resume_online_from_target = _env_bool("RESUME_ONLINE_FROM_TARGET", False)
+cfg.reset_resume_step = _env_bool("RESET_RESUME_STEP", True)
+cfg.resume_optimizer_state = _env_bool("RESUME_OPTIMIZER_STATE", True)
 
 cfg.distill_mode = "flashwam"
 cfg.distill_video = True

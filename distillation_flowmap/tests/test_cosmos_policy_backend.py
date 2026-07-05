@@ -74,6 +74,25 @@ def test_cosmos_policy_teacher_keeps_worker_gpu_override_explicit(tmp_path, monk
     assert override_teacher.cosmos_worker_cuda_visible_devices == "1"
 
 
+def test_cosmos_policy_teacher_maps_worker_gpu_list_by_rank(tmp_path, monkeypatch):
+    from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+
+    monkeypatch.delenv("COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES", raising=False)
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+    teacher = CosmosPolicyActionTeacher(
+        str(ckpt),
+        dtype=torch.float32,
+        config=SimpleNamespace(
+            cosmos_policy_worker_cuda_visible_devices="4,5,6,7",
+            rank=6,
+            local_rank=2,
+        ),
+    )
+
+    assert teacher.cosmos_worker_cuda_visible_devices == "6"
+
+
 def test_cosmos_policy_action_teacher_returns_latent_cdiff_tensors(tmp_path):
     from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
 
@@ -589,6 +608,46 @@ def test_cosmos_latent_cdiff_stage1_config_imports(monkeypatch):
     assert abs(cfg.cosmos_latent_t_max - (80.0 / 81.0)) < 1e-9
     assert cfg.cosmos_latent_cdiff_loss_weight == 1.0
     assert cfg.cosmos_policy_worker_cuda_visible_devices == "1"
+    assert cfg.gradient_checkpointing is True
+
+
+def test_cosmos_latent_cdiff_stage2_config_imports(monkeypatch):
+    monkeypatch.setenv("COSMOS_POLICY_PATH", "/tmp/cosmos-policy")
+    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")
+    monkeypatch.setenv("COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES", "4,5,6,7")
+    sys.modules.pop(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_cosmos_latent_cdiff",
+        None,
+    )
+
+    cfg = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_cosmos_latent_cdiff"
+    ).cfg
+
+    assert cfg.teacher_backend == "cosmos_policy"
+    assert cfg.action_teacher_backend == "cosmos_policy"
+    assert cfg.teacher_model_path == "/tmp/cosmos-policy"
+    assert cfg.student_base_model_path == "/tmp/wanva-base"
+    assert cfg.cosmos_latent_target is True
+    assert cfg.cosmos_video_target is False
+    assert cfg.cosmos_policy_use_raw_inference is True
+    assert cfg.return_raw_observation is True
+    assert cfg.distill_video is True
+    assert cfg.distill_action is True
+    assert cfg.use_central_diff is True
+    assert cfg.cosmos_video_cdiff_aux is False
+    assert cfg.action_aware is False
+    assert cfg.use_action_distill is False
+    assert cfg.use_gt_regression is False
+    assert cfg.action_use_flowmap is False
+    assert cfg.resume_online_from_target is True
+    assert cfg.reset_resume_step is True
+    assert cfg.resume_optimizer_state is False
+    assert "output_libero_cosmos_policy_stage1_cosmos_latent_cdiff" in cfg.resume_from_path
+    assert cfg.resume_from_path.endswith("/checkpoints/step_5000")
+    assert cfg.output_dir.endswith("output_libero_cosmos_policy_stage2_cosmos_latent_cdiff")
+    assert cfg.cosmos_policy_worker_cuda_visible_devices == "4,5,6,7"
+    assert cfg.gradient_checkpointing is True
 
 
 def test_cosmos_all_cosmos_stage1_resume_env_overrides(monkeypatch):

@@ -279,9 +279,9 @@ class CosmosPolicyActionTeacher:
             "cosmos_policy_worker_cuda_visible_devices",
             os.environ.get("COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES"),
         ) if config is not None else os.environ.get("COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES")
-        if worker_visible_devices is not None:
-            worker_visible_devices = str(worker_visible_devices).strip()
-        self.cosmos_worker_cuda_visible_devices = worker_visible_devices or None
+        self.cosmos_worker_cuda_visible_devices = (
+            self._select_worker_cuda_visible_devices(worker_visible_devices, config)
+        )
 
         self._official_model = None
         self._official_dataset_stats = None
@@ -291,6 +291,29 @@ class CosmosPolicyActionTeacher:
         self._raw_latent_cdiff_provider = None
         self._raw_worker = None
         self._raw_worker_tmpdir = None
+
+    @staticmethod
+    def _select_worker_cuda_visible_devices(worker_visible_devices, config=None):
+        if worker_visible_devices is None:
+            return None
+        value = str(worker_visible_devices).strip()
+        if not value:
+            return None
+        devices = [part.strip() for part in value.split(",") if part.strip()]
+        if len(devices) <= 1:
+            return devices[0] if devices else None
+        rank_value = None
+        if config is not None:
+            rank_value = getattr(config, "local_rank", None)
+            if rank_value is None:
+                rank_value = getattr(config, "rank", None)
+        if rank_value is None:
+            rank_value = os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0))
+        try:
+            rank_index = int(rank_value)
+        except (TypeError, ValueError):
+            rank_index = 0
+        return devices[rank_index % len(devices)]
 
     @property
     def weight_path(self):

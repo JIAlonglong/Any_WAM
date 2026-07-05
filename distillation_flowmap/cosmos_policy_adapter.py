@@ -274,6 +274,15 @@ class CosmosPolicyActionTeacher:
             getattr(config, "cosmos_policy_num_denoising_steps_action", 5)
         ) if config is not None else 5
         self.raw_seed = int(getattr(config, "cosmos_policy_seed", 1)) if config is not None else 1
+        center_velocity_mode = getattr(
+            config,
+            "cosmos_latent_center_velocity_mode",
+            os.environ.get("COSMOS_LATENT_CENTER_VELOCITY_MODE", "exact"),
+        ) if config is not None else os.environ.get(
+            "COSMOS_LATENT_CENTER_VELOCITY_MODE", "exact"
+        )
+        self.cosmos_latent_center_velocity_mode = str(
+            center_velocity_mode or "exact").lower()
         worker_visible_devices = getattr(
             config,
             "cosmos_policy_worker_cuda_visible_devices",
@@ -687,6 +696,7 @@ class CosmosPolicyActionTeacher:
             "include_future_predictions": False,
             "include_latent_cdiff": True,
             "cosmos_latent_epsilon": float(epsilon),
+            "cosmos_latent_center_velocity_mode": self.cosmos_latent_center_velocity_mode,
         }
         try:
             self._raw_worker.stdin.write(json.dumps(payload) + "\n")

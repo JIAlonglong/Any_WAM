@@ -129,6 +129,76 @@ def test_cosmos_policy_action_teacher_returns_latent_cdiff_tensors(tmp_path):
     assert torch.all(result["cosmos_latent_velocity"] == 3.0)
 
 
+def test_cosmos_latent_cdiff_symmetric_average_skips_center_teacher_query():
+    from distillation_flowmap.cosmos_policy_raw_worker import _compute_latent_cdiff
+
+    class CountingModel:
+        def __init__(self):
+            self.calls = []
+
+        def get_x0_fn_from_batch(self, data_batch, guidance, is_negative_prompt):
+            def x0_fn(x_sigma, sigma):
+                self.calls.append(tuple(float(v) for v in sigma.flatten()))
+                return torch.zeros_like(x_sigma)
+
+            return x0_fn
+
+    model = CountingModel()
+    x0 = torch.zeros(1, 1, 2, 1, 1)
+    noise = torch.ones_like(x0)
+    t = torch.full((1, 2), 0.9)
+    r = torch.full((1, 2), 0.1)
+
+    result = _compute_latent_cdiff(
+        model,
+        data_batch={},
+        x0_anchor=x0,
+        noise=noise,
+        t=t,
+        r=r,
+        epsilon=0.001,
+        center_velocity_mode="symmetric_average",
+    )
+
+    assert len(model.calls) == 2
+    assert result["target"].shape == (1, 1, 2, 1, 1)
+    assert result["velocity"].shape == (1, 1, 2, 1, 1)
+
+
+def test_cosmos_latent_cdiff_exact_mode_keeps_center_teacher_query():
+    from distillation_flowmap.cosmos_policy_raw_worker import _compute_latent_cdiff
+
+    class CountingModel:
+        def __init__(self):
+            self.calls = []
+
+        def get_x0_fn_from_batch(self, data_batch, guidance, is_negative_prompt):
+            def x0_fn(x_sigma, sigma):
+                self.calls.append(tuple(float(v) for v in sigma.flatten()))
+                return torch.zeros_like(x_sigma)
+
+            return x0_fn
+
+    model = CountingModel()
+    x0 = torch.zeros(1, 1, 2, 1, 1)
+    noise = torch.ones_like(x0)
+    t = torch.full((1, 2), 0.9)
+    r = torch.full((1, 2), 0.1)
+
+    _compute_latent_cdiff(
+        model,
+        data_batch={},
+        x0_anchor=x0,
+        noise=noise,
+        t=t,
+        r=r,
+        epsilon=0.001,
+        center_velocity_mode="exact",
+    )
+
+    assert len(model.calls) == 3
+
+
 def test_libero_state_to_cosmos_proprio_uses_official_order():
     from distillation_flowmap.cosmos_policy_adapter import libero_state_to_cosmos_proprio
 
@@ -609,6 +679,7 @@ def test_cosmos_latent_cdiff_stage1_config_imports(monkeypatch):
     assert cfg.cosmos_latent_cdiff_loss_weight == 1.0
     assert cfg.cosmos_policy_worker_cuda_visible_devices == "1"
     assert cfg.gradient_checkpointing is True
+    assert cfg.cosmos_latent_center_velocity_mode == "symmetric_average"
 
 
 def test_cosmos_latent_cdiff_stage2_config_imports(monkeypatch):
@@ -648,6 +719,7 @@ def test_cosmos_latent_cdiff_stage2_config_imports(monkeypatch):
     assert cfg.output_dir.endswith("output_libero_cosmos_policy_stage2_cosmos_latent_cdiff")
     assert cfg.cosmos_policy_worker_cuda_visible_devices == "4,5,6,7"
     assert cfg.gradient_checkpointing is True
+    assert cfg.cosmos_latent_center_velocity_mode == "symmetric_average"
 
 
 def test_cosmos_all_cosmos_stage1_resume_env_overrides(monkeypatch):

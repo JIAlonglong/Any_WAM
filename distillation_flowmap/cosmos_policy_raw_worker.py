@@ -82,7 +82,16 @@ def _velocity_from_x0_fn(model, x0_fn, x_t, t):
     return eps_pred - x0_pred
 
 
-def _compute_latent_cdiff(model, data_batch, x0_anchor, noise, t, r, epsilon):
+def _compute_latent_cdiff(
+    model,
+    data_batch,
+    x0_anchor,
+    noise,
+    t,
+    r,
+    epsilon,
+    center_velocity_mode="exact",
+):
     eps = float(epsilon)
     if eps <= 0:
         raise ValueError(f"cosmos latent central-diff epsilon must be positive, got {eps}")
@@ -112,9 +121,18 @@ def _compute_latent_cdiff(model, data_batch, x0_anchor, noise, t, r, epsilon):
         guidance=0,
         is_negative_prompt=False,
     )
-    v_center = _velocity_from_x0_fn(model, x0_fn, x_t, t_center)
     v_plus = _velocity_from_x0_fn(model, x0_fn, x_plus, t_plus)
     v_minus = _velocity_from_x0_fn(model, x0_fn, x_minus, t_minus)
+    mode = str(center_velocity_mode).lower()
+    if mode in ("symmetric_average", "symmetric-avg", "avg", "fast"):
+        v_center = 0.5 * (v_plus + v_minus)
+    elif mode == "exact":
+        v_center = _velocity_from_x0_fn(model, x0_fn, x_t, t_center)
+    else:
+        raise ValueError(
+            "cosmos latent center velocity mode must be 'exact' or "
+            f"'symmetric_average', got {center_velocity_mode!r}"
+        )
     dF_dt = (v_plus - v_minus) / (2.0 * eps)
     target = v_center - _time_view(t_center - r).to(v_center) * dF_dt
     return {
@@ -167,6 +185,8 @@ def main():
             latent_t = data["cosmos_latent_t"] if include_latent_cdiff else None
             latent_r = data["cosmos_latent_r"] if include_latent_cdiff else None
             latent_epsilon = float(request.get("cosmos_latent_epsilon", 0.001))
+            latent_center_velocity_mode = request.get(
+                "cosmos_latent_center_velocity_mode", "exact")
             future_predictions = []
             value_predictions = []
             latent_x0 = []
@@ -202,6 +222,7 @@ def main():
                             latent_t[idx: idx + 1],
                             latent_r[idx: idx + 1],
                             latent_epsilon,
+                            latent_center_velocity_mode,
                         )
                         latent_x0.append(cdiff["x0"])
                         latent_cdiff_targets.append(cdiff["target"])

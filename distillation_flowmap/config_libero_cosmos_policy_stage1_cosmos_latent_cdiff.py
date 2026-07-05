@@ -43,6 +43,9 @@ cfg.cosmos_latent_channels = int(os.environ.get("COSMOS_LATENT_CHANNELS", 16))
 cfg.cosmos_latent_frames = int(os.environ.get("COSMOS_LATENT_FRAMES", 9))
 cfg.cosmos_latent_height = int(os.environ.get("COSMOS_LATENT_HEIGHT", 28))
 cfg.cosmos_latent_width = int(os.environ.get("COSMOS_LATENT_WIDTH", 28))
+cfg.cosmos_latent_center_velocity_mode = os.environ.get(
+    "COSMOS_LATENT_CENTER_VELOCITY_MODE", "symmetric_average"
+).lower()
 cfg.cosmos_policy_worker_cuda_visible_devices = (
     os.environ.get("COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES") or None
 )

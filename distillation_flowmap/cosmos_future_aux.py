@@ -20,6 +20,8 @@ def _as_tensor(value) -> torch.Tensor:
 
 def _to_btchw(value) -> torch.Tensor:
     tensor = _as_tensor(value)
+    if tensor.ndim == 3:
+        tensor = tensor.unsqueeze(0).unsqueeze(0)
     if tensor.ndim == 4:
         tensor = tensor.unsqueeze(0)
     if tensor.ndim != 5:
@@ -65,9 +67,12 @@ def normalize_future_images(
     primary = _select(future_image_predictions, primary_key)
     if primary is None:
         for value in future_image_predictions.values():
-            if isinstance(value, torch.Tensor):
+            try:
+                _to_btchw(value)
                 primary = value
                 break
+            except (TypeError, ValueError):
+                continue
     if primary is None:
         raise ValueError("No tensor found in future_image_predictions")
 

@@ -44,6 +44,22 @@ def test_normalize_future_images_adds_batch_dim_for_single_sample_future():
     assert result.primary.shape == (1, 4, 3, 16, 16)
 
 
+def test_normalize_future_images_falls_back_to_numpy_array_values():
+    array = torch.zeros(4, 16, 16, 3, dtype=torch.uint8).numpy()
+
+    result = normalize_future_images({"primary_image": array})
+
+    assert result.primary.shape == (1, 4, 3, 16, 16)
+
+
+def test_normalize_future_images_accepts_single_hwc_image():
+    image = torch.zeros(16, 16, 3, dtype=torch.uint8)
+
+    result = normalize_future_images({"future_image": image})
+
+    assert result.primary.shape == (1, 1, 3, 16, 16)
+
+
 def test_select_future_frames_clamps_to_available_frames():
     tensor = torch.arange(1 * 3 * 1 * 1 * 1).reshape(1, 3, 1, 1, 1).float()
 

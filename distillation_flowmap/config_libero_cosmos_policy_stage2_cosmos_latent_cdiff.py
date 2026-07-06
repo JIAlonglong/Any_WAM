@@ -23,6 +23,24 @@ def _env_bool(name, default):
     return val.lower() in ("1", "true", "yes", "on")
 
 
+def _parse_step_pairs(text):
+    pairs = []
+    for pair in text.split(";"):
+        pair = pair.strip()
+        if not pair:
+            continue
+        values = [int(v) for v in pair.split(",")]
+        if len(values) != 2:
+            raise ValueError(
+                "Step pairs must use 'teacher_steps,student_steps' entries; "
+                f"got {pair!r}"
+            )
+        pairs.append(values)
+    if not pairs:
+        raise ValueError("Step pair override did not contain any valid pairs.")
+    return pairs
+
+
 _stage1_ckpt = os.path.join(
     _this_dir,
     "output_libero_cosmos_policy_stage1_cosmos_latent_cdiff",
@@ -83,7 +101,34 @@ cfg.action_use_flowmap = False
 cfg.action_aware_weight = 0.0
 cfg.gt_regression_weight = 0.0
 
-cfg.use_opd_aux = False
+cfg.use_opd_aux = _env_bool("USE_OPD_AUX", True)
+cfg.opd_aux_variant = os.environ.get("OPD_AUX_VARIANT", "default").lower()
+cfg.opd_aux_weight = float(os.environ.get("OPD_AUX_WEIGHT", 1.0))
+cfg.opd_aux_warmup_steps = int(os.environ.get("OPD_AUX_WARMUP_STEPS", 0))
+cfg.opd_aux_interval = int(os.environ.get("OPD_AUX_INTERVAL", 16))
+cfg.opd_aux_prob = float(os.environ.get("OPD_AUX_PROB", 1.0))
+cfg.opd_teacher_target_mode = os.environ.get(
+    "OPD_TEACHER_TARGET_MODE", "cosmos_latent_student_state"
+).lower()
+cfg.opd_rollout_grad_mode = os.environ.get("OPD_ROLLOUT_GRAD_MODE", "endpoint").lower()
+cfg.opd_action_rollout_grad_mode = os.environ.get(
+    "OPD_ACTION_ROLLOUT_GRAD_MODE", cfg.opd_rollout_grad_mode
+).lower()
+cfg.opd_aux_use_nofsdp_rollout = _env_bool("OPD_AUX_USE_NOFSDP_ROLLOUT", False)
+cfg.opd_profile = _env_bool("OPD_PROFILE", False)
+cfg.rollout_step_pairs = _parse_step_pairs(
+    os.environ.get("ROLLOUT_STEP_PAIRS", "1,1")
+)
+cfg.opd_rollout_step_pairs = _parse_step_pairs(
+    os.environ.get("OPD_ROLLOUT_STEP_PAIRS", "1,1;2,1;4,1;4,2")
+)
+cfg.video_transition_param = os.environ.get("VIDEO_TRANSITION_PARAM", "velocity").lower()
+cfg.video_transition_weight = float(os.environ.get("VIDEO_TRANSITION_WEIGHT", 1.0))
+cfg.opd_endpoint_aux_weight = float(os.environ.get("OPD_ENDPOINT_AUX_WEIGHT", 0.1))
+cfg.local_fm_weight = float(os.environ.get("LOCAL_FM_WEIGHT", 1e-4))
+cfg.opd_transition_group_weight = float(os.environ.get("OPD_TRANSITION_GROUP_WEIGHT", 25.0))
+cfg.opd_anchor_cap_ratio = float(os.environ.get("OPD_ANCHOR_CAP_RATIO", 0.25))
+cfg.opd_aux_action = _env_bool("OPD_AUX_ACTION", False)
 cfg.use_onpolicy_transition = False
 cfg.use_dmd = False
 cfg.gradient_checkpointing = _env_bool("GRADIENT_CHECKPOINTING", False)

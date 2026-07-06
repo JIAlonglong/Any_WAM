@@ -110,7 +110,10 @@ def resolve_cosmos_policy_assets(path):
 
 def _as_numpy(value):
     if torch.is_tensor(value):
-        return value.detach().cpu().numpy()
+        value = value.detach().cpu()
+        if value.dtype == torch.bfloat16:
+            value = value.float()
+        return value.numpy()
     return np.asarray(value)
 
 
@@ -332,6 +335,7 @@ class CosmosPolicyActionTeacher:
         self._official_cfg = None
         self._raw_action_provider = None
         self._raw_latent_cdiff_provider = None
+        self._raw_latent_velocity_provider = None
         self._raw_worker = None
         self._raw_worker_tmpdir = None
 
@@ -704,6 +708,19 @@ class CosmosPolicyActionTeacher:
     def _coerce_raw_latent_cdiff_result(self, result):
         return self._coerce_raw_latent_result(result, require_cdiff=True)
 
+    def _coerce_raw_latent_velocity_result(self, result):
+        if not isinstance(result, dict):
+            raise TypeError(f"Cosmos latent velocity result must be a dict, got {type(result)!r}")
+        required = ("actions", "cosmos_latent_velocity")
+        missing = [key for key in required if key not in result]
+        if missing:
+            raise KeyError(f"Cosmos latent velocity result missing fields: {missing}")
+        coerced = dict(result)
+        coerced["actions"] = torch.as_tensor(coerced["actions"], dtype=torch.float32)
+        coerced["cosmos_latent_velocity"] = torch.as_tensor(
+            coerced["cosmos_latent_velocity"], dtype=torch.float32)
+        return coerced
+
     def _predict_raw_latent_cdiff_subprocess(
         self,
         raw_batch,
@@ -798,6 +815,78 @@ class CosmosPolicyActionTeacher:
             )
         return self._coerce_raw_latent_result(result, require_cdiff=include_cdiff)
 
+    def _predict_raw_latent_velocity_subprocess(self, raw_batch, query_latent, t):
+        primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
+        self._ensure_raw_worker()
+        profile = os.environ.get("COSMOS_POLICY_WORKER_PROFILE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        request_t0 = time.perf_counter() if profile else None
+        req_dir = self._raw_worker_tmpdir or tempfile.mkdtemp(prefix="cosmos_policy_raw_")
+        fd, npz_path = tempfile.mkstemp(prefix="request_", suffix=".npz", dir=req_dir)
+        os.close(fd)
+        actions_path = npz_path.replace("request_", "actions_")
+        np.savez_compressed(
+            npz_path,
+            primary_image=primary,
+            wrist_image=wrist,
+            proprio=proprio,
+            cosmos_latent_query_x=_as_numpy(query_latent).astype(np.float32),
+            cosmos_latent_query_t=_as_numpy(t).astype(np.float32),
+        )
+        payload = {
+            "npz_path": npz_path,
+            "actions_path": actions_path,
+            "tasks": tasks,
+            "seed": self.raw_seed,
+            "include_future_predictions": False,
+            "include_latent_velocity_query": True,
+        }
+        try:
+            wait_t0 = time.perf_counter() if profile else None
+            self._raw_worker.stdin.write(json.dumps(payload) + "\n")
+            self._raw_worker.stdin.flush()
+            line = self._raw_worker.stdout.readline()
+            if profile:
+                print(
+                    "[cosmos_adapter_profile] "
+                    f"worker_wait_s={time.perf_counter() - wait_t0:.3f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except BrokenPipeError as exc:
+            raise RuntimeError("Cosmos Policy raw worker exited before responding.") from exc
+        if not line:
+            try:
+                code = self._raw_worker.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                code = self._raw_worker.poll()
+            raise RuntimeError(f"Cosmos Policy raw worker produced no response; exit code={code}")
+        response = json.loads(line)
+        if not response.get("ok", False):
+            raise RuntimeError("Cosmos Policy raw worker failed:\n" + response.get("error", "unknown error"))
+        with np.load(response["actions_path"]) as data:
+            result = {
+                "actions": data["actions"].astype(np.float32),
+                "cosmos_latent_velocity": data["cosmos_latent_velocity"].astype(np.float32),
+            }
+        for path in (npz_path, response["actions_path"]):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        if profile:
+            print(
+                "[cosmos_adapter_profile] "
+                f"request_total_s={time.perf_counter() - request_t0:.3f} batch={len(tasks)}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return self._coerce_raw_latent_velocity_result(result)
+
     def predict_raw_actions(self, raw_batch):
         return self.predict_raw_action_result(raw_batch, include_future=False)["actions"]
 
@@ -867,6 +956,23 @@ class CosmosPolicyActionTeacher:
             epsilon,
             include_cdiff=True,
         )
+
+    def predict_raw_latent_velocity(self, raw_batch, query_latent, t):
+        """Return official Cosmos latent velocity at an arbitrary student state."""
+        if self._raw_latent_velocity_provider is not None:
+            return self._coerce_raw_latent_velocity_result(
+                self._raw_latent_velocity_provider(raw_batch, query_latent, t)
+            )
+        if not self.raw_inference_enabled:
+            raise RuntimeError(
+                "Cosmos latent velocity requires cfg.cosmos_policy_use_raw_inference=True."
+            )
+        if self.raw_inference_mode != "subprocess":
+            raise NotImplementedError(
+                "Cosmos latent velocity currently requires "
+                "cosmos_policy_inference_mode='subprocess'."
+            )
+        return self._predict_raw_latent_velocity_subprocess(raw_batch, query_latent, t)
 
     def action_target_x0(self, action_dict, raw_batch=None):
         """Return FlowMap-normalized action x0 from official raw Cosmos inference."""

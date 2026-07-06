@@ -192,9 +192,12 @@ def main():
             include_future = bool(request.get("include_future_predictions", False))
             include_latent_x0 = bool(request.get("include_latent_x0", False))
             include_latent_cdiff = bool(request.get("include_latent_cdiff", False))
+            include_latent_velocity_query = bool(request.get("include_latent_velocity_query", False))
             latent_noise = data["cosmos_latent_noise"] if include_latent_cdiff else None
             latent_t = data["cosmos_latent_t"] if include_latent_cdiff else None
             latent_r = data["cosmos_latent_r"] if include_latent_cdiff else None
+            latent_query_x = data["cosmos_latent_query_x"] if include_latent_velocity_query else None
+            latent_query_t = data["cosmos_latent_query_t"] if include_latent_velocity_query else None
             latent_epsilon = float(request.get("cosmos_latent_epsilon", 0.001))
             latent_center_velocity_mode = request.get(
                 "cosmos_latent_center_velocity_mode", "exact")
@@ -205,6 +208,7 @@ def main():
             latent_x0 = []
             latent_cdiff_targets = []
             latent_velocities = []
+            latent_query_velocities = []
             with torch.no_grad():
                 for idx, task in enumerate(tasks):
                     sample_t0 = time.perf_counter() if profile else None
@@ -266,6 +270,34 @@ def main():
                         latent_x0.append(cdiff["x0"])
                         latent_cdiff_targets.append(cdiff["target"])
                         latent_velocities.append(cdiff["velocity"])
+                    if include_latent_velocity_query:
+                        query_t0 = time.perf_counter() if profile else None
+                        x0_fn = model.get_x0_fn_from_batch(
+                            result["data_batch"],
+                            guidance=0,
+                            is_negative_prompt=False,
+                        )
+                        query_x = torch.as_tensor(
+                            latent_query_x[idx: idx + 1],
+                            device=result["generated_latent"].device,
+                            dtype=torch.float32,
+                        )
+                        query_t = torch.as_tensor(
+                            latent_query_t[idx: idx + 1],
+                            device=result["generated_latent"].device,
+                            dtype=torch.float32,
+                        )
+                        query_v = _velocity_from_x0_fn(model, x0_fn, query_x, query_t)
+                        if profile:
+                            print(
+                                "[cosmos_worker_profile] "
+                                f"sample={idx} latent_velocity_query_s={time.perf_counter() - query_t0:.3f}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        latent_query_velocities.append(
+                            query_v.detach().cpu().numpy().astype(np.float32)
+                        )
                     if include_future:
                         future_predictions.append(
                             {
@@ -308,12 +340,15 @@ def main():
                 fields["cosmos_latent_velocity"] = np.concatenate(latent_velocities, axis=0)
             elif include_latent_x0:
                 fields["cosmos_latent_x0"] = np.concatenate(latent_x0, axis=0)
+            if include_latent_velocity_query:
+                fields["cosmos_latent_velocity"] = np.concatenate(latent_query_velocities, axis=0)
             np.savez_compressed(actions_path, **fields)
             if profile:
                 print(
                     "[cosmos_worker_profile] "
                     f"request_total_s={time.perf_counter() - request_t0:.3f} "
-                    f"batch={len(tasks)} latent_cdiff={include_latent_cdiff}",
+                    f"batch={len(tasks)} latent_cdiff={include_latent_cdiff} "
+                    f"latent_velocity_query={include_latent_velocity_query}",
                     file=sys.stderr,
                     flush=True,
                 )

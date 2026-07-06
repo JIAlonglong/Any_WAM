@@ -56,6 +56,15 @@ def test_cosmos_policy_action_teacher_returns_wanva_action_tokens(tmp_path):
     assert torch.allclose(tokens[:, 0], action_target[:, :, 0, 0, 0])
 
 
+def test_cosmos_policy_numpy_conversion_accepts_bfloat16_tensors():
+    from distillation_flowmap.cosmos_policy_adapter import _as_numpy
+
+    array = _as_numpy(torch.ones(2, dtype=torch.bfloat16))
+
+    assert array.dtype == np.float32
+    assert np.allclose(array, np.ones(2, dtype=np.float32))
+
+
 def test_cosmos_policy_teacher_keeps_worker_gpu_override_explicit(tmp_path, monkeypatch):
     from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
 
@@ -157,6 +166,34 @@ def test_cosmos_policy_action_teacher_returns_latent_endpoint_without_cdiff(tmp_
     assert result["cosmos_latent_x0"].shape == (1, 16, 9, 28, 28)
     assert "cosmos_latent_cdiff_target" not in result
     assert "cosmos_latent_velocity" not in result
+
+
+def test_cosmos_policy_action_teacher_returns_latent_velocity_query(tmp_path):
+    from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+    teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32)
+
+    def provider(raw_batch, query_latent, t):
+        assert raw_batch["raw_task"] == ["pick up the cup"]
+        assert query_latent.shape == (1, 16, 9, 28, 28)
+        assert t.shape == (1, 9)
+        return {
+            "actions": np.zeros((1, 16, 7), dtype=np.float32),
+            "cosmos_latent_velocity": np.full((1, 16, 9, 28, 28), 2.0, dtype=np.float32),
+        }
+
+    teacher._raw_latent_velocity_provider = provider
+    result = teacher.predict_raw_latent_velocity(
+        {"raw_task": ["pick up the cup"]},
+        query_latent=torch.zeros(1, 16, 9, 28, 28),
+        t=torch.full((1, 9), 0.5),
+    )
+
+    assert result["actions"].shape == (1, 16, 7)
+    assert result["cosmos_latent_velocity"].shape == (1, 16, 9, 28, 28)
+    assert torch.all(result["cosmos_latent_velocity"] == 2.0)
 
 
 def test_cosmos_latent_target_mode_controls_cdiff_requests():
@@ -804,6 +841,16 @@ def test_cosmos_latent_cdiff_stage2_config_imports(monkeypatch):
     assert cfg.cosmos_latent_target_mode == "hybrid_cdiff"
     assert cfg.cosmos_latent_cdiff_interval == 4
     assert cfg.skip_target_student_for_cosmos_latent is True
+    assert cfg.use_opd_aux is True
+    assert cfg.use_onpolicy_transition is False
+    assert cfg.use_dmd is False
+    assert cfg.opd_teacher_target_mode == "cosmos_latent_student_state"
+    assert cfg.video_transition_param == "velocity"
+    assert cfg.opd_endpoint_aux_weight == 0.1
+    assert cfg.local_fm_weight == 1e-4
+    assert cfg.opd_rollout_step_pairs == [[1, 1], [2, 1], [4, 1], [4, 2]]
+    assert cfg.opd_aux_interval == 16
+    assert cfg.opd_aux_action is False
 
 
 def test_cosmos_all_cosmos_stage1_resume_env_overrides(monkeypatch):

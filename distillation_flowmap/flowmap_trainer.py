@@ -173,6 +173,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.skip_target_student = bool(
             getattr(config, 'skip_target_student_for_cosmos_latent', False)
         )
+        cosmos_latent_opd_without_target_student = (
+            self.cosmos_latent_target
+            and self.use_opd_aux
+            and str(getattr(
+                config,
+                'opd_teacher_target_mode',
+                'student_state',
+            )).lower() in ('cosmos_latent_student_state', 'cosmos_latent_velocity')
+            and not bool(getattr(config, 'opd_aux_action', False))
+        )
         if self.skip_target_student:
             blockers = []
             if not self.cosmos_latent_target:
@@ -185,7 +195,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 blockers.append("use_dmd=True")
             if self.use_onpolicy_transition:
                 blockers.append("use_onpolicy_transition=True")
-            if self.use_opd_aux:
+            if self.use_opd_aux and not cosmos_latent_opd_without_target_student:
                 blockers.append("use_opd_aux=True")
             if getattr(config, 'opd_aux_use_nofsdp_rollout', False):
                 blockers.append("opd_aux_use_nofsdp_rollout=True")

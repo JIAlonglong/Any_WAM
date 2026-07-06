@@ -137,11 +137,12 @@ def main():
     parser.add_argument("--cfg-scale", type=float, default=5.0)
     parser.add_argument("--pairs", nargs="+", default=["1000,0", "1000,500", "750,250"])
     parser.add_argument("--student-steps", nargs="+", type=int, default=[1, 2, 4])
-    parser.add_argument("--teacher-steps", type=int, default=4)
+    parser.add_argument("--teacher-steps", nargs="+", type=int, default=[4])
     parser.add_argument("--video-dir", default=None)
     parser.add_argument("--video-fps", type=int, default=10)
     parser.add_argument("--video-max-pairs", type=int, default=1)
     parser.add_argument("--video-sample-index", type=int, default=0)
+    parser.add_argument("--start-index", type=int, default=0)
     args = parser.parse_args()
 
     init_logger()
@@ -167,9 +168,11 @@ def main():
     cfg.skip_teacher_compile = True
     cfg.light_eval_num_batches = args.num_batches
     cfg.light_eval_seed = args.seed
-    cfg.light_eval_start_index = 0
+    cfg.light_eval_start_index = args.start_index
     # Keep memory closer to training but avoid the full no-FSDP student copy for this offline pass.
     cfg.opd_aux_use_nofsdp_rollout = False
+    # Offline video eval samples only a few items; avoid preloading every RobotWin subdataset.
+    cfg.cache_dataset_in_memory = False
 
     trainer = FlowMapDistiller(cfg)
     trainer.student.eval()
@@ -272,23 +275,29 @@ def main():
             }
 
             pair_name = f"t{int(t_value)}_r{int(r_value)}"
-            teacher_x_r, teacher_v_r = trainer._teacher_integrate_to_r(
-                noisy_latents=video_noisy_t,
-                timesteps=video_t,
-                target_r=video_r,
-                input_dict=input_dict,
-                empty_emb=empty_emb,
-                cfg_scale=args.cfg_scale,
-                ref_shape=ref_shape,
-                B=B,
-                num_frames=num_frames,
-                num_steps=args.teacher_steps,
-            )
             videos_to_save = {}
             if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
                 sample_idx = min(max(args.video_sample_index, 0), B - 1)
                 videos_to_save["gt_r"] = video_noisy_r[sample_idx:sample_idx + 1].detach().cpu()
-                videos_to_save[f"teacher_t{args.teacher_steps}"] = teacher_x_r[sample_idx:sample_idx + 1].detach().cpu()
+
+            # 生成多个 teacher steps 的视频
+            teacher_results = {}
+            for t_steps in args.teacher_steps:
+                teacher_x_r, teacher_v_r = trainer._teacher_integrate_to_r(
+                    noisy_latents=video_noisy_t,
+                    timesteps=video_t,
+                    target_r=video_r,
+                    input_dict=input_dict,
+                    empty_emb=empty_emb,
+                    cfg_scale=args.cfg_scale,
+                    ref_shape=ref_shape,
+                    B=B,
+                    num_frames=num_frames,
+                    num_steps=t_steps,
+                )
+                teacher_results[t_steps] = (teacher_x_r, teacher_v_r)
+                if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
+                    videos_to_save[f"teacher_t{t_steps}"] = teacher_x_r[sample_idx:sample_idx + 1].detach().cpu()
 
             for k_steps in args.student_steps:
                 student_x_r, student_v_r = trainer._student_euler_integrate(
@@ -307,15 +316,18 @@ def main():
                 if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
                     sample_idx = min(max(args.video_sample_index, 0), B - 1)
                     videos_to_save[f"student_s{k_steps}"] = student_x_r[sample_idx:sample_idx + 1].detach().cpu()
-                prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{args.teacher_steps}"
-                add(prefix + "/video_teacher_x_mse", (student_x_r.float() - teacher_x_r.float()).pow(2).mean())
-                add(prefix + "/video_teacher_x_l1", (student_x_r.float() - teacher_x_r.float()).abs().mean())
-                add(prefix + "/video_teacher_v_mse", (student_v_r.float() - teacher_v_r.float()).pow(2).mean())
-                add(prefix + "/video_teacher_v_l1", (student_v_r.float() - teacher_v_r.float()).abs().mean())
-                add(prefix + "/video_gt_x_mse", (student_x_r.float() - video_noisy_r.float()).pow(2).mean())
-                add(prefix + "/video_gt_x_l1", (student_x_r.float() - video_noisy_r.float()).abs().mean())
-                add(prefix + "/video_gt_v_mse", (student_v_r.float() - video_v_target_r.float()).pow(2).mean())
-                add(prefix + "/video_latent_norm", student_x_r.float().pow(2).mean().sqrt())
+                # 对每个 teacher step 计算 metrics
+                for t_steps in args.teacher_steps:
+                    teacher_x_r, teacher_v_r = teacher_results[t_steps]
+                    prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{t_steps}"
+                    add(prefix + "/video_teacher_x_mse", (student_x_r.float() - teacher_x_r.float()).pow(2).mean())
+                    add(prefix + "/video_teacher_x_l1", (student_x_r.float() - teacher_x_r.float()).abs().mean())
+                    add(prefix + "/video_teacher_v_mse", (student_v_r.float() - teacher_v_r.float()).pow(2).mean())
+                    add(prefix + "/video_teacher_v_l1", (student_v_r.float() - teacher_v_r.float()).abs().mean())
+                    add(prefix + "/video_gt_x_mse", (student_x_r.float() - video_noisy_r.float()).pow(2).mean())
+                    add(prefix + "/video_gt_x_l1", (student_x_r.float() - video_noisy_r.float()).abs().mean())
+                    add(prefix + "/video_gt_v_mse", (student_v_r.float() - video_v_target_r.float()).pow(2).mean())
+                    add(prefix + "/video_latent_norm", student_x_r.float().pow(2).mean().sqrt())
 
                 action_input = {
                     "latent_dict": {

@@ -22,21 +22,27 @@ cfg.output_dir = os.environ.get(
 )
 cfg.wandb_name_prefix = "robotwin_stage2_fullft_anyflow"
 
-# Stage 2 keeps the AnyFlow objective and adds OPD only as an auxiliary
-# teacher correction on the student-visited state.
+# Stage 2 keeps the AnyFlow objective and adds endpoint OPD as an auxiliary
+# teacher correction for the rollout lengths used by RobotWin eval.
 cfg.use_onpolicy_transition = _env_bool("USE_ONPOLICY_TRANSITION", False)
 cfg.use_opd_aux = _env_bool("USE_OPD_AUX", True)
 cfg.opd_aux_weight = float(os.environ.get("OPD_AUX_WEIGHT", 1.0))
 cfg.opd_aux_warmup_steps = int(os.environ.get("OPD_AUX_WARMUP_STEPS", 0))
-cfg.opd_aux_interval = int(os.environ.get("OPD_AUX_INTERVAL", 32))
+cfg.opd_aux_interval = int(os.environ.get("OPD_AUX_INTERVAL", 4))
 cfg.opd_aux_prob = float(os.environ.get("OPD_AUX_PROB", 1.0))
 cfg.opd_aux_use_nofsdp_rollout = _env_bool("OPD_AUX_USE_NOFSDP_ROLLOUT", False)
 cfg.opd_profile = _env_bool("OPD_PROFILE", False)
-cfg.opd_teacher_target_mode = os.environ.get("OPD_TEACHER_TARGET_MODE", "student_state").lower()
-cfg.opd_rollout_grad_mode = os.environ.get("OPD_ROLLOUT_GRAD_MODE", "endpoint").lower()
+cfg.opd_teacher_target_mode = os.environ.get("OPD_TEACHER_TARGET_MODE", "endpoint").lower()
+_default_rollout_grad_mode = (
+    "last_step" if cfg.opd_teacher_target_mode == "endpoint" else "endpoint"
+)
+cfg.opd_rollout_grad_mode = os.environ.get(
+    "OPD_ROLLOUT_GRAD_MODE", _default_rollout_grad_mode).lower()
 cfg.opd_action_rollout_grad_mode = os.environ.get(
     "OPD_ACTION_ROLLOUT_GRAD_MODE", cfg.opd_rollout_grad_mode).lower()
 cfg.opd_fuse_action_teacher = _env_bool("OPD_FUSE_ACTION_TEACHER", True)
+cfg.opd_same_state_velocity_weight = float(os.environ.get(
+    "OPD_SAME_STATE_VELOCITY_WEIGHT", 0.0))
 
 _opd_aux_loss_clip = os.environ.get("OPD_AUX_LOSS_CLIP_VALUE")
 cfg.opd_aux_loss_clip_value = (
@@ -49,29 +55,28 @@ cfg.gradient_accumulation_reference = int(os.environ.get(
     cfg.gradient_accumulation_steps,
 ))
 
-# In student_state mode, N only labels the curriculum bucket; K is the student
-# rollout multiplier. Keep RobotWin lighter than LIBERO because its sequences
-# are 128 frames at 256x320.
-cfg.rollout_step_pairs = [
-    [1, 1],
-    [2, 1],
-    [4, 1],
-    [4, 2],
-]
+def _parse_step_pairs(text):
+    return [
+        [int(v) for v in pair.split(",")]
+        for pair in text.split(";")
+        if pair.strip()
+    ]
+
+
+# Endpoint mode makes the first pair item meaningful: N-step teacher endpoint
+# vs K-step student endpoint. Defaults focus OPD on the harder compressed rows.
+cfg.rollout_step_pairs = (
+    [[4, 1], [4, 2]]
+    if cfg.opd_teacher_target_mode == "endpoint"
+    else [[1, 1], [2, 1], [4, 1], [4, 2]]
+)
 _rollout_step_pairs = os.environ.get("ROLLOUT_STEP_PAIRS")
 if _rollout_step_pairs:
-    cfg.rollout_step_pairs = [
-        [int(v) for v in pair.split(",")]
-        for pair in _rollout_step_pairs.split(";")
-        if pair.strip()
-    ]
+    cfg.rollout_step_pairs = _parse_step_pairs(_rollout_step_pairs)
+cfg.opd_rollout_step_pairs = list(cfg.rollout_step_pairs)
 _opd_rollout_step_pairs = os.environ.get("OPD_ROLLOUT_STEP_PAIRS")
 if _opd_rollout_step_pairs:
-    cfg.opd_rollout_step_pairs = [
-        [int(v) for v in pair.split(",")]
-        for pair in _opd_rollout_step_pairs.split(";")
-        if pair.strip()
-    ]
+    cfg.opd_rollout_step_pairs = _parse_step_pairs(_opd_rollout_step_pairs)
 
 # DanceOPD-style low-noise query bias.
 cfg.opd_query_bias = os.environ.get("OPD_QUERY_BIAS", "low_t").lower()
@@ -98,11 +103,19 @@ cfg.resume_optimizer_state = _env_bool("RESUME_OPTIMIZER_STATE", False)
 cfg.reset_resume_step = _env_bool("RESET_RESUME_STEP", True)
 cfg.skip_teacher_compile = _env_bool("SKIP_TEACHER_COMPILE", True)
 cfg.gradient_checkpointing = _env_bool("GRADIENT_CHECKPOINTING", True)
+# OPD aux does an additional student backward path; with PyTorch FSDP2,
+# activation-checkpoint recompute can mix regular Tensor activations from the
+# rollout path with DTensor-sharded weights. Keep checkpointing on for the main
+# train step to fit memory, but disable it around OPD aux unless overridden.
+cfg.opd_aux_gradient_checkpointing = _env_bool("OPD_AUX_GRADIENT_CHECKPOINTING", False)
 
 # OPD loss balance. Action OPD is off by default; enable it after checking
 # stage2 speed with video OPD.
-cfg.video_transition_param = os.environ.get("VIDEO_TRANSITION_PARAM", "velocity")
-cfg.action_transition_param = os.environ.get("ACTION_TRANSITION_PARAM", "velocity")
+_default_transition_param = (
+    "x0" if cfg.opd_teacher_target_mode == "endpoint" else "velocity"
+)
+cfg.video_transition_param = os.environ.get("VIDEO_TRANSITION_PARAM", _default_transition_param)
+cfg.action_transition_param = os.environ.get("ACTION_TRANSITION_PARAM", _default_transition_param)
 cfg.video_transition_weight = float(os.environ.get("VIDEO_TRANSITION_WEIGHT", 1.0))
 cfg.opd_endpoint_aux_weight = float(os.environ.get("OPD_ENDPOINT_AUX_WEIGHT", 0.1))
 cfg.local_fm_weight = float(os.environ.get("LOCAL_FM_WEIGHT", 1e-4))

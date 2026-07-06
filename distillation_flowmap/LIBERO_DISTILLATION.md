@@ -239,20 +239,24 @@ source /kpfs-intern/jialongliu/miniforge3/bin/activate && conda activate flashwa
 - `SAVE_INTERVAL`: checkpoint 保存间隔，默认 `1000`。
 - `GRADIENT_CHECKPOINTING=0`: 已在 config 中默认关闭。OPD 有额外 student backward 路径，PyTorch FSDP2 在 activation checkpoint recompute 中可能触发 `aten.addmm.default: got mixed torch.Tensor and DTensor`。
 - `SKIP_TEACHER_COMPILE=1`: 已在 config 中默认开启，Stage 2 不再额外编译 teacher。
-- `OPD_AUX_INTERVAL=8`: 已在 config 中默认设置。每 8 个 optimizer step 跑一次 OPD，并且只在 gradient accumulation 的最后一个 microbatch 跑，避免被 `ACCUM` 放大。
-- `OPD_ROLLOUT_STEP_PAIRS=1,1;1,2;1,4`: 已在 config 中默认设置。在 `student_state` 模式下保留 1-step/2-step/4-step student-induced state。此模式里 teacher 不做 N-step endpoint rollout，pair 的第一项不会增加 teacher 步数；若要做 endpoint teacher rollout，需要切 `OPD_TEACHER_TARGET_MODE=endpoint`，同时 transition 语义会回到 x0/endpoint。
+- `OPD_AUX_INTERVAL=4`: 已在 config 中默认设置。每 4 个 optimizer step 跑一次 OPD，并且只在 gradient accumulation 的最后一个 microbatch 跑，避免被 `ACCUM` 放大。
+- `OPD_TEACHER_TARGET_MODE=endpoint`: 已在 config 中默认设置，使 Stage 2 直接优化 `rollout_eval_video_stage2.py` 里的 `student K-step -> teacher 4-step endpoint` 指标。
+- `OPD_ROLLOUT_GRAD_MODE=last_step`: 已在 config 中默认设置。endpoint/x0 loss 在 `r=0` 时必须让至少最后一个 student Euler step 保留梯度，否则 `student_x_r` detached 后无法推动 1-step endpoint。
+- `OPD_ROLLOUT_STEP_PAIRS=4,1;4,2`: 已在 config 中默认设置。默认聚焦当前失败的 `s1_t4/s2_t4`，而不是继续训练已经接近 teacher 的 `s4_t4`。
 - OPD 性能约束：不要改回每个 microbatch 都跑，否则耗时会乘以 `gradient_accumulation_steps`。由于 OPD 只跑最后一个 microbatch，OPD loss 本身不再除以 `gradient_accumulation_steps`。
 - action teacher transition 使用 conditional-only teacher forward；action transition 不使用 CFG uncond 分支，避免一整次无用 teacher forward。
 - `OPD_PROFILE=1`: 临时打开 OPD 分段计时，会同步 CUDA 并打印 `prepare_batch/video_student_rollout/video_teacher/action_opd/backward` 等耗时。只用于诊断，不建议常开。
 
 ### 当前 Stage 2 OPD 默认语义
 
-当前 Stage 2 配置让 OPD 的 transition/field matching 主导，endpoint/local-FM 只做 anchor：
+当前 Stage 2 配置让 OPD endpoint transition 直接对齐 rollout eval，local-FM 只做 anchor：
 
 ```text
-OPD_TEACHER_TARGET_MODE=student_state
-VIDEO_TRANSITION_PARAM=velocity
-ACTION_TRANSITION_PARAM=velocity
+OPD_TEACHER_TARGET_MODE=endpoint
+OPD_ROLLOUT_GRAD_MODE=last_step
+OPD_ROLLOUT_STEP_PAIRS=4,1;4,2
+VIDEO_TRANSITION_PARAM=x0
+ACTION_TRANSITION_PARAM=x0
 LOCAL_FM_WEIGHT=1e-4
 ACTION_LOCAL_FM_WEIGHT=0.003
 ACTION_TRANSITION_BLOCK_WEIGHT=4.0
@@ -260,11 +264,10 @@ ACTION_LOCAL_FM_BLOCK_WEIGHT=1.0
 OPD_TRANSITION_GROUP_WEIGHT=25.0
 OPD_ANCHOR_CAP_RATIO=0.25
 OPD_QUERY_BIAS=low_t
-OPD_AUX_INTERVAL=8
-OPD_ROLLOUT_STEP_PAIRS=1,1;1,2;1,4
+OPD_AUX_INTERVAL=4
 ```
 
-`student_state` 模式下，video/action 的 teacher 和 student 应该在同一个 student-induced state 上比较 velocity。不要把 action transition 改回 teacher endpoint rollout 后仍保留 velocity loss；如果切 endpoint 语义，transition 参数也要对应回 x0/endpoint。
+如果临时切回 `OPD_TEACHER_TARGET_MODE=student_state`，video/action 的 teacher 和 student 应该在同一个 student-induced state 上比较 velocity。不要把 teacher endpoint rollout 和 velocity loss 混用；endpoint 语义必须对应 x0/endpoint loss，并且需要 `last_step` 或 `full` rollout 梯度来训练 endpoint。
 
 ### LIBERO i2va 直接生成长视频
 

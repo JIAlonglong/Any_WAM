@@ -97,16 +97,20 @@ Stage 1 仍然是主基础训练阶段，当前设计是：
 
 这点现在已经在 `_train_step()` 和 `_onpolicy_transition_step()` 里统一。
 
-### 3.3 Stage 2: AnyFlow + Student-State OPD Aux
+### 3.3 Stage 2: AnyFlow + Endpoint OPD Aux
 
 Stage 2 当前不是旧的 replacement-style OPD，也不是单独的 Stage3/KTO 分支。
 当前设计是：
 
 1. 保留 AnyFlow / FlowMap 主目标。
-2. 低频加入 OPD aux，默认 `OPD_AUX_INTERVAL=8`。
+2. 低频加入 OPD aux，默认 `OPD_AUX_INTERVAL=4`。
 3. student 从 `x_t` 做 K 步 Euler rollout 到自己的 `student_x_r`。
-4. teacher 直接在同一个 `student_x_r` 上 forward，提供 transition target。
-5. velocity transition loss 只比较同一个 latent state 上的 teacher/student velocity。
+4. teacher 从同一个 `x_t` 做 N 步 Euler rollout 到 `teacher_x_r`。
+5. 默认用 endpoint/x0 transition loss 对齐 `student_x_r` 和 `teacher_x_r`，直接优化
+   `rollout_eval_video_stage2.py` 中的 `s1_t4/s2_t4` 指标。
+6. 默认 `OPD_ROLLOUT_GRAD_MODE=last_step`，确保 endpoint loss 能通过最后一步 student
+   Euler 更新反传；如果保持旧的 `endpoint` detach 模式，`r=0` 时 endpoint/x0 loss 对
+   1-step student 的推动会很弱。
 
 当前入口是：
 
@@ -114,8 +118,21 @@ Stage 2 当前不是旧的 replacement-style OPD，也不是单独的 Stage3/KTO
 - `flowmap_trainer.py` 中的 OPD aux 调度
 - `flowmap_step.py` 中的 `_opd_aux_transition_step()`
 
-默认 rollout pair 收窄为 `[[1, 1], [2, 1]]`，action OPD 默认关闭，先验证 video
-侧少步 rollout 是否改善。
+默认 rollout pair 收窄为 `[[4, 1], [4, 2]]`，action OPD 默认关闭，先验证 video
+侧少步 endpoint 是否改善。
+
+如果需要回到 DanceOPD-style student-state velocity 语义，必须同时切：
+
+```bash
+OPD_TEACHER_TARGET_MODE=student_state
+VIDEO_TRANSITION_PARAM=velocity
+ACTION_TRANSITION_PARAM=velocity
+OPD_ROLLOUT_GRAD_MODE=endpoint
+OPD_ROLLOUT_STEP_PAIRS='1,1;1,2;1,4'
+```
+
+不要混用 teacher endpoint rollout 和 velocity loss。velocity loss 只适合 teacher/student
+在同一个 student-induced state 上比较。
 
 ### 3.4 已移除的历史分支
 
@@ -338,12 +355,178 @@ Stage 1 应该基于修复后的代码重新训练。
 Stage 2 当前建议：
 
 1. 只在修复后的 Stage 1 checkpoint 上启动
-2. 先开较小的 `rollout_step_pairs` 做稳定性验证
+2. 先开 `OPD_ROLLOUT_STEP_PAIRS='4,1;4,2'` 做少步 endpoint 稳定性验证
 3. 先验证：
    - loss 是否稳定
-   - `video_transition_loss` 是否正常下降
+   - `opd_video_transition_loss` 是否正常下降
+   - `s1_t4/s2_t4` 的 endpoint MSE/L1 是否下降
    - `action_aware_loss` 是否量级合理
 4. 再扩大 rollout 步数范围
+
+推荐 Stage 2 endpoint 版启动命令：
+
+```bash
+source /kpfs-intern/jialongliu/miniforge3/bin/activate && conda activate flashwam && cd /kpfs-intern/jialongliu/projects/Flash-WAM && \
+CONFIG_FILE=distillation_flowmap.config_libero_fullfinetune_stage2_anyflow \
+RESUME_FROM_PATH=/kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_fullft_stage1_warmup/checkpoints/step_2000 \
+RESUME_ONLINE_FROM_TARGET=1 \
+OUTPUT_DIR=/kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_fullft_stage2_endpoint_from_stage1_step2000 \
+MAX_TRAIN_STEPS=10000 \
+OPD_TEACHER_TARGET_MODE=endpoint \
+OPD_ROLLOUT_GRAD_MODE=last_step \
+OPD_ACTION_ROLLOUT_GRAD_MODE=last_step \
+VIDEO_TRANSITION_PARAM=x0 \
+ACTION_TRANSITION_PARAM=x0 \
+OPD_ROLLOUT_STEP_PAIRS='4,1;4,2' \
+OPD_AUX_INTERVAL=4 \
+WANDB_MODE=offline \
+torchrun --nproc_per_node=8 --master_port=29620 distillation_flowmap/train.py \
+  --teacher-model-path /kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero \
+  --dataset-path /kpfs-intern/jialongliu/projects/Flash-WAM/training_data/libero-long-lerobot \
+  --gradient-accumulation-steps 2
+```
+
+### 6.2.1 Endpoint-only vs Endpoint+Velocity Ablation
+
+当前要比较的是：
+
+注意：当前代码已经支持 Endpoint only 和 Student-state velocity only；Endpoint+Velocity hybrid
+还需要先在 `distillation_flowmap/flowmap_step.py` 和
+`distillation_flowmap/config_libero_fullfinetune_stage2_anyflow.py` 增加一个小权重 regularizer。
+建议新增配置名：
+
+```python
+cfg.opd_same_state_velocity_weight = float(os.environ.get("OPD_SAME_STATE_VELOCITY_WEIGHT", 0.0))
+```
+
+实现位置建议放在 `_opd_aux_transition_step()`：
+
+1. 保持 endpoint 分支里的 `teacher_x_r, teacher_v_at_r = _teacher_integrate_to_r(...)` 不变。
+2. 额外调用 `_teacher_forward_at_student_state(student_x_r, video_r, ...)` 得到
+   `teacher_v_at_student_state`。
+3. 使用已有的 `student_v_at_r` 计算：
+   ```python
+   same_state_velocity_loss = (
+       student_v_at_r.float() - teacher_v_at_student_state.detach().float()
+   ).pow(2).mean()
+   ```
+4. 将其以 `OPD_SAME_STATE_VELOCITY_WEIGHT` 加到 OPD aux：
+   ```python
+   raw_opd_same_state_velocity_contrib = (
+       opd_same_state_velocity_weight * same_state_velocity_loss
+   )
+   raw_aux_loss = scaled_transition_group + scaled_anchor_group + raw_opd_same_state_velocity_contrib
+   ```
+5. 记录 TensorBoard/WandB：
+   ```text
+   loss/opd_same_state_velocity
+   loss_weighted/opd_same_state_velocity
+   ```
+
+实现完成后再跑 hybrid 组，否则 B/C 两组不会真的包含 velocity regularizer。
+
+1. **Endpoint only**
+   - 目标：直接优化当前失败的 `student K-step endpoint -> teacher 4-step endpoint`。
+   - 训练环境变量：
+     ```bash
+     OPD_TEACHER_TARGET_MODE=endpoint
+     OPD_ROLLOUT_GRAD_MODE=last_step
+     OPD_ACTION_ROLLOUT_GRAD_MODE=last_step
+     VIDEO_TRANSITION_PARAM=x0
+     ACTION_TRANSITION_PARAM=x0
+     OPD_ROLLOUT_STEP_PAIRS='4,1;4,2'
+     ```
+   - 输出目录建议：
+     ```text
+     output_libero_ablation_endpoint_only_from_stage1_step2000
+     ```
+
+2. **Endpoint + same-state velocity, lambda=0.1**
+   - 目标：保留 endpoint 主目标，同时用小权重 DanceOPD-style same-state velocity 稳定 student
+     自己 rollout 分布上的 vector field。
+   - 期望 loss 形式：
+     ```text
+     loss = endpoint_x0_loss
+          + 0.1 * same_state_velocity_loss(student_v(student_x_r, r), teacher_v(student_x_r, r))
+          + small_local_fm_anchor
+     ```
+   - 输出目录建议：
+     ```text
+     output_libero_ablation_endpoint_velocity01_from_stage1_step2000
+     ```
+
+3. **Endpoint + same-state velocity, lambda=0.3**
+   - 目标：测试 velocity regularizer 权重更大时是否更稳，或者是否压慢 endpoint 改善。
+   - 期望 loss 形式：
+     ```text
+     loss = endpoint_x0_loss
+          + 0.3 * same_state_velocity_loss(student_v(student_x_r, r), teacher_v(student_x_r, r))
+          + small_local_fm_anchor
+     ```
+   - 输出目录建议：
+     ```text
+     output_libero_ablation_endpoint_velocity03_from_stage1_step2000
+     ```
+
+4. **Student-state velocity only baseline**
+   - 目标：复现旧 DanceOPD-style 目标，作为对照而不是主推方案。
+   - 训练环境变量：
+     ```bash
+     OPD_TEACHER_TARGET_MODE=student_state
+     VIDEO_TRANSITION_PARAM=velocity
+     ACTION_TRANSITION_PARAM=velocity
+     OPD_ROLLOUT_GRAD_MODE=endpoint
+     OPD_ROLLOUT_STEP_PAIRS='1,1;1,2;1,4'
+     ```
+   - 输出目录建议：
+     ```text
+     output_libero_ablation_student_state_velocity_from_stage1_step2000
+     ```
+
+比较时必须固定：
+
+- 相同 Stage 1 起点：`output_libero_fullft_stage1_warmup/checkpoints/step_2000`
+- 相同 seed
+- 相同 `MAX_TRAIN_STEPS`
+- 相同 `--gradient-accumulation-steps 2`
+- 相同 eval batch 和 `rollout_eval_video_stage2.py` 参数
+
+建议每组至少在 `step_2000` 和 `step_4000` 各 eval 一次，不要只看最终 step。
+
+Primary metrics：
+
+```text
+rollout_eval/t1000_r0/s1_t4/video_teacher_x_mse
+rollout_eval/t1000_r0/s1_t4/video_teacher_x_l1
+rollout_eval/t1000_r0/s2_t4/video_teacher_x_mse
+rollout_eval/t1000_r0/s2_t4/video_teacher_x_l1
+```
+
+Secondary metrics：
+
+```text
+same_state_velocity_mse(student_x_r):
+  student rollout 到 student_x_r
+  teacher 在 student_x_r 上 query velocity
+  比较 student_v(student_x_r, r) 和 teacher_v(student_x_r, r)
+```
+
+泛化检查：
+
+```text
+t1000->r0
+t1000->r250
+t750->r250
+student steps: 1,2,4
+teacher steps: 4
+```
+
+判定标准：
+
+1. 如果 Endpoint only 的 `s1_t4/s2_t4` 明显下降，但 same-state velocity 变差，说明需要 velocity regularizer。
+2. 如果 Endpoint+Velocity 的 endpoint 指标接近 Endpoint only，同时 same-state velocity 更好，优先选 hybrid。
+3. 如果 `lambda=0.3` 明显压慢 endpoint 指标，降回 `0.1` 或 `0.05`。
+4. 如果 Student-state velocity only 的 velocity 指标很好但 endpoint 不改善，说明旧 DanceOPD 目标和当前少步 endpoint 指标不够对齐。
 
 ### 6.3 Stage 3
 

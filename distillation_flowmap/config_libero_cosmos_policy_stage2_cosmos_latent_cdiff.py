@@ -64,6 +64,11 @@ cfg.cosmos_latent_width = int(os.environ.get("COSMOS_LATENT_WIDTH", 28))
 cfg.cosmos_latent_center_velocity_mode = os.environ.get(
     "COSMOS_LATENT_CENTER_VELOCITY_MODE", "symmetric_average"
 ).lower()
+cfg.cosmos_latent_target_mode = os.environ.get(
+    "COSMOS_LATENT_TARGET_MODE", "hybrid_cdiff"
+).lower()
+cfg.cosmos_latent_cdiff_interval = int(os.environ.get("COSMOS_LATENT_CDIFF_INTERVAL", 4))
+cfg.cosmos_train_step_profile = _env_bool("COSMOS_TRAIN_STEP_PROFILE", False)
 cfg.cosmos_policy_worker_cuda_visible_devices = (
     os.environ.get("COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES") or None
 )

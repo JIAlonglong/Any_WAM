@@ -129,6 +129,84 @@ def test_cosmos_policy_action_teacher_returns_latent_cdiff_tensors(tmp_path):
     assert torch.all(result["cosmos_latent_velocity"] == 3.0)
 
 
+def test_cosmos_policy_action_teacher_returns_latent_endpoint_without_cdiff(tmp_path):
+    from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+    teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32)
+
+    def provider(raw_batch, noise, t, r, epsilon, include_cdiff=True):
+        assert include_cdiff is False
+        return {
+            "actions": np.zeros((1, 16, 7), dtype=np.float32),
+            "cosmos_latent_x0": np.ones((1, 16, 9, 28, 28), dtype=np.float32),
+        }
+
+    teacher._raw_latent_cdiff_provider = provider
+    result = teacher.predict_raw_latent_target(
+        {"raw_task": ["pick up the cup"]},
+        noise=torch.zeros(1, 16, 9, 28, 28),
+        t=torch.full((1, 9), 0.9),
+        r=torch.zeros(1, 9),
+        epsilon=0.001,
+        include_cdiff=False,
+    )
+
+    assert result["actions"].shape == (1, 16, 7)
+    assert result["cosmos_latent_x0"].shape == (1, 16, 9, 28, 28)
+    assert "cosmos_latent_cdiff_target" not in result
+    assert "cosmos_latent_velocity" not in result
+
+
+def test_cosmos_latent_target_mode_controls_cdiff_requests():
+    from distillation_flowmap.cosmos_policy_adapter import (
+        cosmos_latent_should_request_cdiff,
+    )
+
+    assert cosmos_latent_should_request_cdiff("cdiff", step=0, interval=4) is True
+    assert cosmos_latent_should_request_cdiff("endpoint_fm", step=0, interval=4) is False
+    assert cosmos_latent_should_request_cdiff("hybrid_cdiff", step=0, interval=4) is True
+    assert cosmos_latent_should_request_cdiff("hybrid_cdiff", step=1, interval=4) is False
+    assert cosmos_latent_should_request_cdiff("hybrid_cdiff", step=4, interval=4) is True
+
+
+def test_cosmos_latent_hybrid_uses_microstep_cadence():
+    from distillation_flowmap.cosmos_policy_adapter import (
+        cosmos_latent_micro_step_index,
+        cosmos_latent_should_request_cdiff,
+    )
+
+    micro_steps = [
+        cosmos_latent_micro_step_index(
+            global_step=0,
+            batch_idx=batch_idx,
+            gradient_accumulation_steps=8,
+        )
+        for batch_idx in range(8)
+    ]
+    decisions = [
+        cosmos_latent_should_request_cdiff("hybrid_cdiff", step=step, interval=4)
+        for step in micro_steps
+    ]
+
+    assert micro_steps == list(range(8))
+    assert decisions == [True, False, False, False, True, False, False, False]
+
+
+def test_cosmos_latent_target_mode_rejects_invalid_values():
+    from distillation_flowmap.cosmos_policy_adapter import (
+        cosmos_latent_should_request_cdiff,
+    )
+
+    try:
+        cosmos_latent_should_request_cdiff("bad-mode", step=0, interval=4)
+    except ValueError as exc:
+        assert "cosmos_latent_target_mode" in str(exc)
+    else:
+        raise AssertionError("expected invalid target mode to raise")
+
+
 def test_cosmos_latent_cdiff_symmetric_average_skips_center_teacher_query():
     from distillation_flowmap.cosmos_policy_raw_worker import _compute_latent_cdiff
 
@@ -680,6 +758,8 @@ def test_cosmos_latent_cdiff_stage1_config_imports(monkeypatch):
     assert cfg.cosmos_policy_worker_cuda_visible_devices == "1"
     assert cfg.gradient_checkpointing is False
     assert cfg.cosmos_latent_center_velocity_mode == "symmetric_average"
+    assert cfg.cosmos_latent_target_mode == "hybrid_cdiff"
+    assert cfg.cosmos_latent_cdiff_interval == 4
     assert cfg.skip_target_student_for_cosmos_latent is True
 
 
@@ -721,6 +801,8 @@ def test_cosmos_latent_cdiff_stage2_config_imports(monkeypatch):
     assert cfg.cosmos_policy_worker_cuda_visible_devices == "4,5,6,7"
     assert cfg.gradient_checkpointing is False
     assert cfg.cosmos_latent_center_velocity_mode == "symmetric_average"
+    assert cfg.cosmos_latent_target_mode == "hybrid_cdiff"
+    assert cfg.cosmos_latent_cdiff_interval == 4
     assert cfg.skip_target_student_for_cosmos_latent is True
 
 

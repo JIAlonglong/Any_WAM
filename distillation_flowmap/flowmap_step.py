@@ -65,6 +65,8 @@ from distillation_flowmap.cosmos_future_aux import select_official_future_camera
 from distillation_flowmap.cosmos_policy_adapter import (
     compute_masked_action_stats,
     cosmos_actions_to_flowmap_x0,
+    cosmos_latent_micro_step_index,
+    cosmos_latent_should_request_cdiff,
 )
 from distillation_flowmap.kto_reweighting import (
     compute_normalized_focal_weights,
@@ -1539,17 +1541,36 @@ class FlowMapStepMixin:
         used as the action x0 target.
         """
         batch = self.convert_input_format(batch)
+        profile_step = bool(getattr(self.config, "cosmos_train_step_profile", False))
+        profile_times = {}
+        profile_last = None
+
+        def _profile_mark(name):
+            nonlocal profile_last
+            if not profile_step:
+                return
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)
+            now = time.perf_counter()
+            if profile_last is not None:
+                profile_times[name] = now - profile_last
+            profile_last = now
+
+        _profile_mark("start")
 
         teacher = self._action_teacher_model
         teacher_action_x0_full = None
         cosmos_latent_teacher_result = None
+        cosmos_latent_cdiff_active = False
+        cosmos_latent_target_step = None
+        latent_target_mode = None
         video_t = video_r = video_t_norm = video_r_norm = None
         video_noise = None
         if getattr(self.config, "cosmos_latent_target", False):
-            if not hasattr(teacher, "predict_raw_latent_cdiff"):
+            if not hasattr(teacher, "predict_raw_latent_target"):
                 raise RuntimeError(
                     "cfg.cosmos_latent_target=True requires Cosmos Policy raw "
-                    "inference with predict_raw_latent_cdiff()."
+                    "inference with predict_raw_latent_target()."
                 )
             if not getattr(teacher, "raw_inference_enabled", False):
                 raise RuntimeError(
@@ -1571,13 +1592,29 @@ class FlowMapStepMixin:
             )
             video_noise = torch.randn(
                 latent_shape, device=self.device, dtype=batch["actions"].dtype)
+            latent_target_mode = getattr(
+                self.config, "cosmos_latent_target_mode", "cdiff")
+            latent_cdiff_interval = int(getattr(
+                self.config, "cosmos_latent_cdiff_interval", 1))
+            cosmos_latent_target_step = cosmos_latent_micro_step_index(
+                global_step=getattr(self, "step", 0),
+                batch_idx=batch_idx,
+                gradient_accumulation_steps=getattr(
+                    self, "gradient_accumulation_steps", 1),
+            )
+            cosmos_latent_cdiff_active = cosmos_latent_should_request_cdiff(
+                latent_target_mode,
+                step=cosmos_latent_target_step,
+                interval=latent_cdiff_interval,
+            )
             with torch.no_grad():
-                cosmos_latent_teacher_result = teacher.predict_raw_latent_cdiff(
+                cosmos_latent_teacher_result = teacher.predict_raw_latent_target(
                     batch,
                     noise=video_noise,
                     t=video_t_norm,
                     r=video_r_norm,
                     epsilon=float(getattr(self.config, "cosmos_latent_epsilon", 0.001)),
+                    include_cdiff=cosmos_latent_cdiff_active,
                 )
                 teacher_action_x0_full = cosmos_actions_to_flowmap_x0(
                     cosmos_latent_teacher_result["actions"],
@@ -1618,6 +1655,7 @@ class FlowMapStepMixin:
                     raw_teacher_result.get("future_image_predictions"),
                     ref_shape=tuple(batch["latents"].shape),
                 ).to(device=batch["latents"].device, dtype=batch["latents"].dtype)
+        _profile_mark("teacher")
 
         B = batch['latents'].shape[0]
         ref_shape = batch['latents'].shape
@@ -1719,6 +1757,7 @@ class FlowMapStepMixin:
             r_timestep=video_r,
             action_r_timestep=action_r_ds,
         )
+        _profile_mark("student_forward")
         if self.distill_video:
             student_video_v = self._extract_video_v(student_video_v_seq, ref_shape, B)
         student_action_v = self._extract_action_v(
@@ -1912,10 +1951,14 @@ class FlowMapStepMixin:
             if getattr(self.config, "cosmos_latent_target", False):
                 if cosmos_latent_teacher_result is None:
                     raise RuntimeError("Missing Cosmos latent teacher result.")
-                cdiff_target = cosmos_latent_teacher_result[
-                    "cosmos_latent_cdiff_target"
-                ].to(device=student_video_v.device, dtype=student_video_v.dtype)
-                cdiff_diff = student_video_v.float() - cdiff_target.float()
+                if "cosmos_latent_cdiff_target" in cosmos_latent_teacher_result:
+                    latent_target = cosmos_latent_teacher_result[
+                        "cosmos_latent_cdiff_target"
+                    ].to(device=student_video_v.device, dtype=student_video_v.dtype)
+                else:
+                    latent_target = video_v_target.to(
+                        device=student_video_v.device, dtype=student_video_v.dtype)
+                cdiff_diff = student_video_v.float() - latent_target.float()
                 loss_type = getattr(self.config, "loss_type", "l2")
                 if loss_type == "huber":
                     huber_c = float(getattr(self.config, "huber_c", 0.001))
@@ -2050,7 +2093,22 @@ class FlowMapStepMixin:
                 "skip_step": True,
             }
 
+        _profile_mark("loss_compute")
         loss.backward()
+        _profile_mark("backward")
+        if profile_step and getattr(self.config, "rank", 0) == 0:
+            logger.info(
+                "[cosmos_step_profile] step=%s micro_step=%s mode=%s cdiff=%s "
+                "teacher=%.3fs student_forward=%.3fs loss_compute=%.3fs backward=%.3fs",
+                getattr(self, "step", 0),
+                cosmos_latent_target_step,
+                latent_target_mode,
+                cosmos_latent_cdiff_active,
+                profile_times.get("teacher", 0.0),
+                profile_times.get("student_forward", 0.0),
+                profile_times.get("loss_compute", 0.0),
+                profile_times.get("backward", 0.0),
+            )
         return {
             "loss": loss.detach(),
             "video_loss": video_loss.detach(),

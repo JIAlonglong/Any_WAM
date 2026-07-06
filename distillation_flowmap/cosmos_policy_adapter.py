@@ -7,6 +7,7 @@ one narrow adapter.
 """
 
 import atexit
+import inspect
 import json
 import os
 import subprocess
@@ -24,6 +25,38 @@ COSMOS_POLICY_WEIGHT_NAMES = (
     "Cosmos-Policy-LIBERO-Predict2-2B.pt",
     "Cosmos-Policy-RoboCasa-Predict2-2B.pt",
 )
+
+
+def cosmos_latent_should_request_cdiff(mode, step, interval):
+    """Return whether this step should request Cosmos latent central-diff."""
+    mode = str(mode).lower()
+    if mode in ("cdiff", "central_diff", "central-diff"):
+        return True
+    if mode in ("endpoint_fm", "endpoint", "velocity", "endpoint_velocity"):
+        return False
+    if mode in ("hybrid_cdiff", "hybrid", "periodic_cdiff"):
+        interval = int(interval)
+        if interval <= 0:
+            raise ValueError("cosmos_latent_cdiff_interval must be positive for hybrid_cdiff mode.")
+        return int(step) % interval == 0
+    raise ValueError(
+        "Unsupported cosmos_latent_target_mode="
+        f"{mode!r}; expected 'cdiff', 'endpoint_fm', or 'hybrid_cdiff'."
+    )
+
+
+def cosmos_latent_micro_step_index(global_step, batch_idx, gradient_accumulation_steps):
+    """Return the monotonic microbatch index used for periodic latent targets."""
+    global_step = int(global_step)
+    batch_idx = int(batch_idx)
+    gradient_accumulation_steps = int(gradient_accumulation_steps)
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive.")
+    if global_step < 0:
+        raise ValueError("global_step must be non-negative.")
+    if batch_idx < 0:
+        raise ValueError("batch_idx must be non-negative.")
+    return global_step * gradient_accumulation_steps + batch_idx
 
 
 def resolve_cosmos_policy_assets(path):
@@ -648,18 +681,15 @@ class CosmosPolicyActionTeacher:
                 pass
         return result
 
-    def _coerce_raw_latent_cdiff_result(self, result):
+    def _coerce_raw_latent_result(self, result, require_cdiff):
         if not isinstance(result, dict):
-            raise TypeError(f"Cosmos latent cdiff result must be a dict, got {type(result)!r}")
-        required = (
-            "actions",
-            "cosmos_latent_x0",
-            "cosmos_latent_cdiff_target",
-            "cosmos_latent_velocity",
-        )
+            raise TypeError(f"Cosmos latent result must be a dict, got {type(result)!r}")
+        required = ["actions", "cosmos_latent_x0"]
+        if require_cdiff:
+            required.extend(["cosmos_latent_cdiff_target", "cosmos_latent_velocity"])
         missing = [key for key in required if key not in result]
         if missing:
-            raise KeyError(f"Cosmos latent cdiff result missing fields: {missing}")
+            raise KeyError(f"Cosmos latent result missing fields: {missing}")
         coerced = dict(result)
         coerced["actions"] = torch.as_tensor(coerced["actions"], dtype=torch.float32)
         for key in (
@@ -667,10 +697,22 @@ class CosmosPolicyActionTeacher:
             "cosmos_latent_cdiff_target",
             "cosmos_latent_velocity",
         ):
-            coerced[key] = torch.as_tensor(coerced[key], dtype=torch.float32)
+            if key in coerced:
+                coerced[key] = torch.as_tensor(coerced[key], dtype=torch.float32)
         return coerced
 
-    def _predict_raw_latent_cdiff_subprocess(self, raw_batch, noise, t, r, epsilon):
+    def _coerce_raw_latent_cdiff_result(self, result):
+        return self._coerce_raw_latent_result(result, require_cdiff=True)
+
+    def _predict_raw_latent_cdiff_subprocess(
+        self,
+        raw_batch,
+        noise,
+        t,
+        r,
+        epsilon,
+        include_cdiff=True,
+    ):
         primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
         self._ensure_raw_worker()
         profile = os.environ.get("COSMOS_POLICY_WORKER_PROFILE", "").lower() in (
@@ -702,7 +744,8 @@ class CosmosPolicyActionTeacher:
             "tasks": tasks,
             "seed": self.raw_seed,
             "include_future_predictions": False,
-            "include_latent_cdiff": True,
+            "include_latent_x0": True,
+            "include_latent_cdiff": bool(include_cdiff),
             "cosmos_latent_epsilon": float(epsilon),
             "cosmos_latent_center_velocity_mode": self.cosmos_latent_center_velocity_mode,
         }
@@ -733,9 +776,14 @@ class CosmosPolicyActionTeacher:
             result = {
                 "actions": data["actions"].astype(np.float32),
                 "cosmos_latent_x0": data["cosmos_latent_x0"].astype(np.float32),
-                "cosmos_latent_cdiff_target": data["cosmos_latent_cdiff_target"].astype(np.float32),
-                "cosmos_latent_velocity": data["cosmos_latent_velocity"].astype(np.float32),
             }
+            if include_cdiff:
+                result["cosmos_latent_cdiff_target"] = data[
+                    "cosmos_latent_cdiff_target"
+                ].astype(np.float32)
+                result["cosmos_latent_velocity"] = data[
+                    "cosmos_latent_velocity"
+                ].astype(np.float32)
         for path in (npz_path, response["actions_path"]):
             try:
                 os.remove(path)
@@ -748,7 +796,7 @@ class CosmosPolicyActionTeacher:
                 file=sys.stderr,
                 flush=True,
             )
-        return self._coerce_raw_latent_cdiff_result(result)
+        return self._coerce_raw_latent_result(result, require_cdiff=include_cdiff)
 
     def predict_raw_actions(self, raw_batch):
         return self.predict_raw_action_result(raw_batch, include_future=False)["actions"]
@@ -765,26 +813,60 @@ class CosmosPolicyActionTeacher:
             "expected 'subprocess' or 'inprocess'."
         )
 
-    def predict_raw_latent_cdiff(self, raw_batch, noise, t, r, epsilon):
-        """Return official Cosmos latent x0 and central-diff target tensors.
+    def predict_raw_latent_target(
+        self,
+        raw_batch,
+        noise,
+        t,
+        r,
+        epsilon,
+        include_cdiff=True,
+    ):
+        """Return official Cosmos latent x0, optionally with central-diff target.
 
         ``t`` and ``r`` are normalized FlowUniPC t-space values in [0, 1], not
         Any_WAM's 0..num_train_timesteps integer timestep scale.
         """
         if self._raw_latent_cdiff_provider is not None:
-            return self._coerce_raw_latent_cdiff_result(
-                self._raw_latent_cdiff_provider(raw_batch, noise, t, r, epsilon)
+            provider = self._raw_latent_cdiff_provider
+            kwargs = {}
+            try:
+                if "include_cdiff" in inspect.signature(provider).parameters:
+                    kwargs["include_cdiff"] = bool(include_cdiff)
+            except (TypeError, ValueError):
+                pass
+            return self._coerce_raw_latent_result(
+                provider(raw_batch, noise, t, r, epsilon, **kwargs),
+                require_cdiff=include_cdiff,
             )
         if not self.raw_inference_enabled:
             raise RuntimeError(
-                "Cosmos latent central-diff requires cfg.cosmos_policy_use_raw_inference=True."
+                "Cosmos latent target requires cfg.cosmos_policy_use_raw_inference=True."
             )
         if self.raw_inference_mode != "subprocess":
             raise NotImplementedError(
-                "Cosmos latent central-diff currently requires "
+                "Cosmos latent target currently requires "
                 "cosmos_policy_inference_mode='subprocess'."
             )
-        return self._predict_raw_latent_cdiff_subprocess(raw_batch, noise, t, r, epsilon)
+        return self._predict_raw_latent_cdiff_subprocess(
+            raw_batch,
+            noise,
+            t,
+            r,
+            epsilon,
+            include_cdiff=include_cdiff,
+        )
+
+    def predict_raw_latent_cdiff(self, raw_batch, noise, t, r, epsilon):
+        """Return official Cosmos latent x0 and central-diff target tensors."""
+        return self.predict_raw_latent_target(
+            raw_batch,
+            noise,
+            t,
+            r,
+            epsilon,
+            include_cdiff=True,
+        )
 
     def action_target_x0(self, action_dict, raw_batch=None):
         """Return FlowMap-normalized action x0 from official raw Cosmos inference."""

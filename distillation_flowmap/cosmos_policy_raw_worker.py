@@ -190,6 +190,7 @@ def main():
             tasks = request["tasks"]
             actions = []
             include_future = bool(request.get("include_future_predictions", False))
+            include_latent_x0 = bool(request.get("include_latent_x0", False))
             include_latent_cdiff = bool(request.get("include_latent_cdiff", False))
             latent_noise = data["cosmos_latent_noise"] if include_latent_cdiff else None
             latent_t = data["cosmos_latent_t"] if include_latent_cdiff else None
@@ -234,6 +235,14 @@ def main():
                             flush=True,
                         )
                     actions.append(np.asarray(result["actions"], dtype=np.float32))
+                    if include_latent_x0 and not include_latent_cdiff:
+                        latent_x0.append(
+                            result["generated_latent"]
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            .astype(np.float32)
+                        )
                     if include_latent_cdiff:
                         cdiff_t0 = time.perf_counter() if profile else None
                         cdiff = _compute_latent_cdiff(
@@ -297,6 +306,8 @@ def main():
                 fields["cosmos_latent_x0"] = np.concatenate(latent_x0, axis=0)
                 fields["cosmos_latent_cdiff_target"] = np.concatenate(latent_cdiff_targets, axis=0)
                 fields["cosmos_latent_velocity"] = np.concatenate(latent_velocities, axis=0)
+            elif include_latent_x0:
+                fields["cosmos_latent_x0"] = np.concatenate(latent_x0, axis=0)
             np.savez_compressed(actions_path, **fields)
             if profile:
                 print(

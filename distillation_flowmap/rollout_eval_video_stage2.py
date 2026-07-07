@@ -302,6 +302,16 @@ def main():
             "configs. These are not true Cosmos policy environment rollouts."
         ),
     )
+    parser.add_argument(
+        "--load-target-student",
+        action="store_true",
+        help="Load EMA target student during offline eval. Disabled by default to reduce memory.",
+    )
+    parser.add_argument(
+        "--use-nofsdp-teacher",
+        action="store_true",
+        help="Use the full non-FSDP teacher copy during offline eval. Disabled by default to reduce memory.",
+    )
     args = parser.parse_args()
 
     init_logger()
@@ -324,6 +334,8 @@ def main():
     cfg.enable_light_eval = False
     cfg.enable_stage1_start_eval = False
     cfg.enable_stage1_start_eval_baseline = False
+    cfg.offline_eval_skip_target_student = not args.load_target_student
+    cfg.offline_eval_use_fsdp_teacher = not args.use_nofsdp_teacher
     cfg.skip_teacher_compile = True
     cfg.light_eval_num_batches = args.num_batches
     cfg.light_eval_seed = args.seed

@@ -116,12 +116,24 @@ class FlowMapStepMixin:
     @property
     def _teacher_model(self):
         """Return the default frozen teacher for backward compatibility."""
-        return getattr(self, '_teacher_nofsdp', self.teacher)
+        teacher = getattr(self, '_teacher_nofsdp', None)
+        if teacher is not None:
+            return teacher
+        teacher = getattr(self, 'teacher', None)
+        if teacher is None:
+            raise RuntimeError("No teacher model is available for this FlowMapDistiller.")
+        return teacher
 
     @property
     def _action_teacher_model(self):
         """Return the teacher that supplies action targets."""
-        return getattr(self, '_teacher_nofsdp', self.teacher)
+        teacher = getattr(self, '_teacher_nofsdp', None)
+        if teacher is not None:
+            return teacher
+        teacher = getattr(self, 'teacher', None)
+        if teacher is None:
+            raise RuntimeError("No action teacher model is available for this FlowMapDistiller.")
+        return teacher
 
     @property
     def _video_teacher_model(self):
@@ -2943,6 +2955,9 @@ class FlowMapStepMixin:
                 f"Invalid opd_rollout_grad_mode={rollout_grad_mode!r}; "
                 "expected endpoint, last_step, or full."
             )
+        force_eval_checkpointing = bool(
+            getattr(self.config, 'offline_eval_force_gradient_checkpointing', False)
+        )
 
         use_nofsdp_rollout = (
             rollout_grad_mode == 'endpoint' or
@@ -3051,13 +3066,20 @@ class FlowMapStepMixin:
                 else (r_timestep_i[:, ::_ACTION_DS] if (self.distill_action or self.action_aware) else r_timestep_i)
             )
 
-            grad_context = torch.enable_grad() if keep_step_grad else torch.no_grad()
+            if force_eval_checkpointing:
+                grad_context = torch.enable_grad()
+            else:
+                grad_context = torch.enable_grad() if keep_step_grad else torch.no_grad()
             with grad_context:
                 v_cfg = _student_cfg_with_optional_uncompile(
                     step_model, step_input, step_empty, r_timestep_i, action_r_timestep_i)
+                if force_eval_checkpointing and not keep_step_grad:
+                    v_cfg = v_cfg.detach()
                 sigma_i = self._timestep_to_sigma_5d(t_i)
                 sigma_next = self._timestep_to_sigma_5d(r_next)
                 current_x = current_x + v_cfg * (sigma_next - sigma_i)
+                if force_eval_checkpointing and not keep_step_grad:
+                    current_x = current_x.detach()
 
         current_x_for_loss = current_x if rollout_grad_mode != 'endpoint' else current_x.detach()
         current_x_for_forward = current_x.detach()
@@ -3086,10 +3108,16 @@ class FlowMapStepMixin:
                 if hasattr(_block, '_orig_mod'):
                     self.student.blocks[_bi] = _block._orig_mod
         try:
-            v_final_cfg = self._student_cfg_forward(
-                self.student, final_input, empty_emb, cfg_scale,
-                B, ref_shape, target_r, _act_r_final, force_cfg=False,
+            final_grad_context = (
+                torch.enable_grad() if force_eval_checkpointing else contextlib.nullcontext()
             )
+            with final_grad_context:
+                v_final_cfg = self._student_cfg_forward(
+                    self.student, final_input, empty_emb, cfg_scale,
+                    B, ref_shape, target_r, _act_r_final, force_cfg=False,
+                )
+                if force_eval_checkpointing:
+                    v_final_cfg = v_final_cfg.detach()
         finally:
             if _saved_blocks is not None:
                 for _bi, _block in enumerate(_saved_blocks):

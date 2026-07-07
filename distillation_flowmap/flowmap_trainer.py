@@ -228,6 +228,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             'cosmos', 'cosmos_policy', 'cosmos-policy')
         self.teacher_roles = resolve_teacher_roles(config)
         self.video_teacher = None
+        self._teacher_nofsdp = None
         self._video_teacher_nofsdp = None
         self.cosmos_video_target = bool(getattr(config, 'cosmos_video_target', False))
         self.cosmos_latent_target = bool(getattr(config, 'cosmos_latent_target', False))
@@ -270,8 +271,15 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 "expected 'default', 'kto_paopd', or 'kto_paopd_norm_focal'."
             )
         self.target_student = None
-        self.skip_target_student = bool(
-            getattr(config, 'skip_target_student_for_cosmos_latent', False)
+        self.offline_eval_skip_target_student = bool(
+            getattr(config, 'offline_eval_skip_target_student', False)
+        )
+        self.offline_eval_use_fsdp_teacher = bool(
+            getattr(config, 'offline_eval_use_fsdp_teacher', False)
+        )
+        self.skip_target_student = (
+            bool(getattr(config, 'skip_target_student_for_cosmos_latent', False))
+            or self.offline_eval_skip_target_student
         )
         cosmos_latent_opd_without_target_student = (
             self.cosmos_latent_target
@@ -283,7 +291,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             )).lower() in ('cosmos_latent_student_state', 'cosmos_latent_velocity')
             and not bool(getattr(config, 'opd_aux_action', False))
         )
-        if self.skip_target_student:
+        if self.skip_target_student and not self.offline_eval_skip_target_student:
             blockers = []
             if not self.cosmos_latent_target:
                 blockers.append("cosmos_latent_target=False")
@@ -432,7 +440,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
         # 1. 教师模型（frozen）：预训练好的 LingBot-VA，不参与训练
         #    注意：教师模型保持原始结构，不添加 delta_embedder
-        if self.is_cosmos_policy_teacher:
+        if bool(getattr(config, 'offline_eval_skip_teacher', False)):
+            self.teacher = None
+            self._teacher_nofsdp = None
+            logger.info("Skipping teacher load for offline eval cache replay.")
+        elif self.is_cosmos_policy_teacher:
             logger.info("Loading Cosmos Policy action teacher metadata ...")
             self.teacher = CosmosPolicyActionTeacher(
                 config.teacher_model_path, dtype=self.dtype, device="cpu", config=config)
@@ -552,18 +564,23 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             self.teacher.eval()                 # 评估模式
             self.teacher = self.teacher.to(self.dtype)
 
-            # 创建非 FSDP 教师副本（用于纯推理 forward，避免 FSDP all-gather 通信开销）
-            # 教师 frozen + eval，不需要梯度同步，非 FSDP forward 结果完全一致
-            import copy
-            logger.info("Creating non-FSDP teacher copy for inference ...")
-            self._teacher_nofsdp = copy.deepcopy(self.teacher)
-            self._teacher_nofsdp = self._teacher_nofsdp.to(self.dtype)
-            self._teacher_nofsdp.eval()
-            for p in self._teacher_nofsdp.parameters():
-                p.requires_grad_(False)
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            self._teacher_nofsdp = self._teacher_nofsdp.to(f"cuda:{local_rank}")
-            logger.info(f"Non-FSDP teacher copy created (on cuda:{local_rank}).")
+            if self.offline_eval_use_fsdp_teacher:
+                logger.info(
+                    "Offline eval uses the FSDP teacher; skipping non-FSDP teacher copy."
+                )
+            else:
+                # 创建非 FSDP 教师副本（用于纯推理 forward，避免 FSDP all-gather 通信开销）
+                # 教师 frozen + eval，不需要梯度同步，非 FSDP forward 结果完全一致
+                import copy
+                logger.info("Creating non-FSDP teacher copy for inference ...")
+                self._teacher_nofsdp = copy.deepcopy(self.teacher)
+                self._teacher_nofsdp = self._teacher_nofsdp.to(self.dtype)
+                self._teacher_nofsdp.eval()
+                for p in self._teacher_nofsdp.parameters():
+                    p.requires_grad_(False)
+                local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                self._teacher_nofsdp = self._teacher_nofsdp.to(f"cuda:{local_rank}")
+                logger.info(f"Non-FSDP teacher copy created (on cuda:{local_rank}).")
             if self.use_fsdp1:
                 # FSDP1 avoids DTensor/checkpoint recompute type mixing.
                 self.teacher = shard_model_fsdp1(self.teacher, param_dtype=self.dtype)
@@ -578,11 +595,13 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     logger.info("Compiling teacher model with torch.compile ...")
                     self.teacher = torch.compile(self.teacher, mode="default")
                     logger.info("Teacher model compiled.")
-                # 释放 FSDP teacher（推理用 _teacher_nofsdp），省 ~10GB/卡
-                if self._teacher_nofsdp is not None:
-                    del self.teacher
-                    self.teacher = None
-                    logger.info("FSDP teacher released (inference uses non-FSDP copy).")
+            # 释放 FSDP teacher（推理用 _teacher_nofsdp），省 ~10GB/卡
+            if self._teacher_nofsdp is not None:
+                del self.teacher
+                self.teacher = None
+                logger.info("FSDP teacher released (inference uses non-FSDP copy).")
+            elif self.offline_eval_use_fsdp_teacher:
+                logger.info("FSDP teacher retained for offline eval.")
 
         # 确定学生模型的初始化路径（从检查点恢复或从教师初始化）
         resume_path = getattr(config, "resume_from_path", None)
@@ -714,11 +733,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.student._flowmap_gradient_checkpointing = bool(
             getattr(config, "gradient_checkpointing", True)
         )
+        self.student._flowmap_force_gradient_checkpointing = bool(
+            getattr(config, "offline_eval_force_gradient_checkpointing", False)
+        )
         if config.rank == 0:
             logger.info(
                 "Student gradient checkpointing: %s",
                 self.student._flowmap_gradient_checkpointing,
             )
+            if self.student._flowmap_force_gradient_checkpointing:
+                logger.info("Student force gradient checkpointing enabled for offline eval.")
 
         def load_flowmap_delta_weights(model, transformer_dir, label):
             """Restore FlowMap-only weights dropped by the base Wan loader."""
@@ -901,7 +925,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # 如果从 LoRA checkpoint 恢复，需要先加载基座模型，再加载 LoRA adapter
         if self.skip_target_student:
             logger.info(
-                "Skipping target student load/EMA for pure Cosmos latent path."
+                "Skipping target student load/EMA."
             )
         else:
             if self._is_lora_resume:

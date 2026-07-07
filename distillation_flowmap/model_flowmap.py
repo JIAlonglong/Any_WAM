@@ -463,9 +463,12 @@ def patch_model_forward(model):
             fdm=fdm,
         )
 
+        force_gradient_checkpointing = bool(
+            getattr(model, "_flowmap_force_gradient_checkpointing", False)
+        )
         use_gradient_checkpointing = (
             bool(getattr(model, "_flowmap_gradient_checkpointing", True))
-            and model.training
+            and (model.training or force_gradient_checkpointing)
             and torch.is_grad_enabled()
             and update_cache == 0
         )

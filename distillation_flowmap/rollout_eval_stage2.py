@@ -51,6 +51,10 @@ def resolve_empty_emb_path(dataset_path, explicit_path=None):
     return str(candidates[0])
 
 
+def teacher_cache_key(batch_idx, t_value, r_value):
+    return f"batch{batch_idx}/t{int(t_value)}_r{int(r_value)}"
+
+
 def init_mask(trainer, input_dict):
     from modules.model import FlexAttnFunc
 
@@ -97,6 +101,31 @@ def main():
     parser.add_argument("--pairs", nargs="+", default=["1000,0", "1000,500", "750,250"])
     parser.add_argument("--student-steps", nargs="+", type=int, default=[1, 2, 4])
     parser.add_argument("--teacher-steps", type=int, default=4)
+    parser.add_argument(
+        "--load-target-student",
+        action="store_true",
+        help="Load EMA target student during offline eval. Disabled by default to reduce memory.",
+    )
+    parser.add_argument(
+        "--use-nofsdp-teacher",
+        action="store_true",
+        help="Use the full non-FSDP teacher copy during offline eval. Disabled by default to reduce memory.",
+    )
+    parser.add_argument(
+        "--teacher-cache-path",
+        default=None,
+        help="Path to a CPU teacher-target cache. If it exists, teacher loading is skipped.",
+    )
+    parser.add_argument(
+        "--teacher-cache-only",
+        action="store_true",
+        help="Only compute and save teacher rollout targets, then exit before student eval.",
+    )
+    parser.add_argument(
+        "--refresh-teacher-cache",
+        action="store_true",
+        help="Recompute teacher targets even when --teacher-cache-path already exists.",
+    )
     args = parser.parse_args()
 
     init_logger()
@@ -104,6 +133,33 @@ def main():
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     init_distributed(world_size, local_rank, rank)
+
+    teacher_cache_path = Path(args.teacher_cache_path) if args.teacher_cache_path else None
+    if args.teacher_cache_only and teacher_cache_path is None:
+        raise ValueError("--teacher-cache-only requires --teacher-cache-path")
+    if (
+        args.teacher_cache_only
+        and teacher_cache_path is not None
+        and teacher_cache_path.exists()
+        and not args.refresh_teacher_cache
+    ):
+        if rank == 0:
+            logger.info("Teacher cache already exists at %s; not refreshing.", teacher_cache_path)
+        if dist.is_initialized():
+            dist.barrier(device_ids=[torch.cuda.current_device()])
+        return
+    use_teacher_cache = (
+        teacher_cache_path is not None
+        and teacher_cache_path.exists()
+        and not args.refresh_teacher_cache
+        and not args.teacher_cache_only
+    )
+    teacher_cache = None
+    if use_teacher_cache:
+        teacher_cache = torch.load(teacher_cache_path, map_location="cpu")
+        if rank == 0:
+            logger.info("Loaded teacher cache from %s", teacher_cache_path)
+    teacher_cache_to_write = {}
 
     cfg = importlib.import_module(args.config).cfg
     cfg.rank = rank
@@ -119,6 +175,10 @@ def main():
     cfg.enable_light_eval = False
     cfg.enable_stage1_start_eval = False
     cfg.enable_stage1_start_eval_baseline = False
+    cfg.offline_eval_skip_target_student = not args.load_target_student
+    cfg.offline_eval_use_fsdp_teacher = not args.use_nofsdp_teacher
+    cfg.offline_eval_skip_teacher = use_teacher_cache
+    cfg.offline_eval_force_gradient_checkpointing = True
     cfg.skip_teacher_compile = True
     cfg.light_eval_num_batches = args.num_batches
     cfg.light_eval_seed = args.seed
@@ -128,7 +188,8 @@ def main():
 
     trainer = FlowMapDistiller(cfg)
     trainer.student.eval()
-    trainer.target_student.eval()
+    if trainer.target_student is not None:
+        trainer.target_student.eval()
     if getattr(trainer, "_student_nofsdp", None) is not None:
         trainer._student_nofsdp.eval()
 
@@ -214,18 +275,43 @@ def main():
             }
 
             pair_name = f"t{int(t_value)}_r{int(r_value)}"
-            teacher_x_r, teacher_v_r = trainer._teacher_integrate_to_r(
-                noisy_latents=video_noisy_t,
-                timesteps=video_t,
-                target_r=video_r,
-                input_dict=input_dict,
-                empty_emb=empty_emb,
-                cfg_scale=args.cfg_scale,
-                ref_shape=ref_shape,
-                B=B,
-                num_frames=num_frames,
-                num_steps=args.teacher_steps,
-            )
+            cache_key = teacher_cache_key(batch_idx, t_value, r_value)
+            if use_teacher_cache:
+                targets = teacher_cache.get("targets", {})
+                if cache_key not in targets:
+                    raise KeyError(f"Teacher cache missing key: {cache_key}")
+                cached = targets[cache_key]
+                teacher_x_r = cached["teacher_x_r"].to(
+                    device=trainer.device,
+                    dtype=video_noisy_t.dtype,
+                    non_blocking=True,
+                )
+                teacher_v_r = cached["teacher_v_r"].to(
+                    device=trainer.device,
+                    dtype=video_noisy_t.dtype,
+                    non_blocking=True,
+                )
+            else:
+                teacher_x_r, teacher_v_r = trainer._teacher_integrate_to_r(
+                    noisy_latents=video_noisy_t,
+                    timesteps=video_t,
+                    target_r=video_r,
+                    input_dict=input_dict,
+                    empty_emb=empty_emb,
+                    cfg_scale=args.cfg_scale,
+                    ref_shape=ref_shape,
+                    B=B,
+                    num_frames=num_frames,
+                    num_steps=args.teacher_steps,
+                )
+                if teacher_cache_path is not None and rank == 0:
+                    teacher_cache_to_write[cache_key] = {
+                        "teacher_x_r": teacher_x_r.detach().cpu(),
+                        "teacher_v_r": teacher_v_r.detach().cpu(),
+                    }
+
+            if args.teacher_cache_only:
+                continue
 
             for k_steps in args.student_steps:
                 student_x_r, student_v_r = trainer._student_euler_integrate(
@@ -262,13 +348,22 @@ def main():
                     "window_size": input_dict["window_size"],
                 }
                 init_mask(trainer, action_input)
-                _, student_action_seq = trainer.student(
-                    action_input, train_mode=True,
-                    r_timestep=video_r,
-                    action_r_timestep=action_r[:, ::action_ds],
+                action_grad_context = (
+                    torch.enable_grad()
+                    if getattr(trainer.config, "offline_eval_force_gradient_checkpointing", False)
+                    else torch.no_grad()
                 )
+                with action_grad_context:
+                    _, student_action_seq = trainer.student(
+                        action_input, train_mode=True,
+                        r_timestep=video_r,
+                        action_r_timestep=action_r[:, ::action_ds],
+                    )
                 action_frames = batch["actions"].shape[2] // action_ds
                 student_action_v = trainer._extract_action_v(student_action_seq, action_frames)
+                if getattr(trainer.config, "offline_eval_force_gradient_checkpointing", False):
+                    student_action_v = student_action_v.detach()
+                del student_action_seq
                 action_noisy_t_ds = action_noisy_t[:, :, ::action_ds]
                 action_noisy_r_ds = action_noisy_r[:, :, ::action_ds]
                 action_v_target_ds = action_v_target_t[:, :, ::action_ds]
@@ -288,6 +383,30 @@ def main():
                     smooth = (student_action_v[:, :, 1:] - student_action_v[:, :, :-1]).float().abs().mean()
                     add(prefix + "/action_v_smoothness_l1", smooth)
                 add(prefix + "/action_v_norm", student_action_v.float().pow(2).mean().sqrt())
+
+    if teacher_cache_path is not None and not use_teacher_cache and rank == 0:
+        teacher_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "metadata": {
+                    "config": args.config,
+                    "teacher_model_path": args.teacher_model_path,
+                    "dataset_path": args.dataset_path,
+                    "num_batches": args.num_batches,
+                    "seed": args.seed,
+                    "cfg_scale": args.cfg_scale,
+                    "pairs": args.pairs,
+                    "teacher_steps": args.teacher_steps,
+                },
+                "targets": teacher_cache_to_write,
+            },
+            teacher_cache_path,
+        )
+        logger.info("Wrote teacher cache to %s", teacher_cache_path)
+    if dist.is_initialized():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+    if args.teacher_cache_only:
+        return
 
     out = {}
     for name, total in metrics.items():

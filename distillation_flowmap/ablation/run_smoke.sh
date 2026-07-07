@@ -14,6 +14,7 @@ SMOKE_STAGE2_STEPS="${SMOKE_STAGE2_STEPS:-20}"
 SMOKE_TASK="${SMOKE_TASK:-place_a2b_right}"
 SMOKE_EPISODES="${SMOKE_EPISODES:-5}"
 SMOKE_MAX_SAMPLES="${SMOKE_MAX_SAMPLES:-${SMOKE_EPISODES}}"
+SMOKE_NGPU="${SMOKE_NGPU:-1}"
 MASTER_PORT="${MASTER_PORT:-29640}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-${SMOKE_STAGE2_STEPS}}"
 
@@ -33,6 +34,7 @@ cd "${PROJECT_ROOT}"
   --max-samples-per-task "${SMOKE_MAX_SAMPLES}" \
   --stage1-steps "${SMOKE_STAGE1_STEPS}" \
   --stage2-steps "${SMOKE_STAGE2_STEPS}" \
+  --ngpu "${SMOKE_NGPU}" \
   --master-port "${MASTER_PORT}"
 
 RUN_DIR="${SMOKE_ROOT}/full_stepwam/seed_0"

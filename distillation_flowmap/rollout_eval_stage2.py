@@ -36,6 +36,21 @@ def parse_pair(text):
     return float(t), float(r)
 
 
+def resolve_empty_emb_path(dataset_path, explicit_path=None):
+    candidates = []
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+    dataset_path = Path(dataset_path)
+    candidates.extend([
+        dataset_path / "empty_emb.pt",
+        dataset_path.parent / "empty_emb.pt",
+    ])
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return str(candidates[0])
+
+
 def init_mask(trainer, input_dict):
     from modules.model import FlexAttnFunc
 
@@ -72,6 +87,7 @@ def main():
     parser.add_argument("--config", default="distillation_flowmap.config_libero_fullfinetune_stage2_anyflow")
     parser.add_argument("--teacher-model-path", required=True)
     parser.add_argument("--dataset-path", required=True)
+    parser.add_argument("--empty-emb-path", default=os.environ.get("EMPTY_EMB_PATH"))
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--resume-from-path", required=True)
     parser.add_argument("--result-json", required=True)
@@ -95,7 +111,7 @@ def main():
     cfg.world_size = world_size
     cfg.teacher_model_path = args.teacher_model_path
     cfg.dataset_path = args.dataset_path
-    cfg.empty_emb_path = os.path.join(args.dataset_path, "empty_emb.pt")
+    cfg.empty_emb_path = resolve_empty_emb_path(args.dataset_path, args.empty_emb_path)
     cfg.output_dir = args.output_dir
     cfg.resume_from_path = args.resume_from_path
     cfg.reset_resume_step = False

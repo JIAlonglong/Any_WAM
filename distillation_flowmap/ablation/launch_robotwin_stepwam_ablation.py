@@ -37,6 +37,10 @@ DEFAULT_EMPTY_EMB = first_existing([
     DEFAULT_DATASET.parent / "empty_emb.pt",
     Path("/root/nas/junjie/data/robotwin-clean-and-aug-lerobot/empty_emb.pt"),
 ])
+DEFAULT_TORCHRUN = first_existing([
+    Path("/root/nas/junjie/conda_envs/any_wam/bin/torchrun"),
+    "torchrun",
+])
 
 
 def read_json(path):
@@ -93,6 +97,7 @@ def build_stage_command(
     gradient_accumulation_steps,
     ngpu,
     master_port,
+    torchrun_path,
     resume_from_path=None,
 ):
     env = {
@@ -107,7 +112,7 @@ def build_stage_command(
         env["RESUME_ONLINE_FROM_TARGET"] = os.environ.get("RESUME_ONLINE_FROM_TARGET", "1")
 
     argv = [
-        "torchrun",
+        str(torchrun_path),
         f"--nproc_per_node={ngpu}",
         f"--master_port={master_port}",
         "distillation_flowmap/train.py",
@@ -154,6 +159,7 @@ def build_run_plan(args):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         ngpu=args.ngpu,
         master_port=args.master_port,
+        torchrun_path=args.torchrun,
     )
     stage2 = build_stage_command(
         stage_name="stage2",
@@ -166,6 +172,7 @@ def build_run_plan(args):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         ngpu=args.ngpu,
         master_port=args.master_port + 1,
+        torchrun_path=args.torchrun,
         resume_from_path=stage1_ckpt,
     )
     manifest = {
@@ -217,6 +224,7 @@ def parse_args():
     parser.add_argument("--teacher-model-path", type=Path, default=DEFAULT_TEACHER)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--empty-emb-path", type=Path, default=DEFAULT_EMPTY_EMB)
+    parser.add_argument("--torchrun", type=Path, default=Path(os.environ.get("TORCHRUN", DEFAULT_TORCHRUN)))
     parser.add_argument("--stage1-steps", type=int, default=None)
     parser.add_argument("--stage2-steps", type=int, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)

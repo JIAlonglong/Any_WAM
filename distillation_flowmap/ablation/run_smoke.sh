@@ -7,6 +7,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-${PROJECT_ROOT}/checkpoints/lingbot-va-posttrain-robotwin}"
 DATASET_PATH="${DATASET_PATH:-/root/nas/junjie/data/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500}"
 EMPTY_EMB_PATH="${EMPTY_EMB_PATH:-/root/nas/junjie/data/robotwin-clean-and-aug-lerobot/empty_emb.pt}"
+TORCHRUN="${TORCHRUN:-/root/nas/junjie/conda_envs/any_wam/bin/torchrun}"
 SMOKE_ROOT="${SMOKE_ROOT:-${PROJECT_ROOT}/distillation_flowmap/output_robotwin_stepwam_ablation/smoke}"
 SMOKE_STAGE1_STEPS="${SMOKE_STAGE1_STEPS:-20}"
 SMOKE_STAGE2_STEPS="${SMOKE_STAGE2_STEPS:-20}"
@@ -25,6 +26,7 @@ cd "${PROJECT_ROOT}"
   --teacher-model-path "${TEACHER_MODEL_PATH}" \
   --dataset-path "${DATASET_PATH}" \
   --empty-emb-path "${EMPTY_EMB_PATH}" \
+  --torchrun "${TORCHRUN}" \
   --stage1-steps "${SMOKE_STAGE1_STEPS}" \
   --stage2-steps "${SMOKE_STAGE2_STEPS}" \
   --master-port "${MASTER_PORT}"
@@ -32,7 +34,7 @@ cd "${PROJECT_ROOT}"
 RUN_DIR="${SMOKE_ROOT}/full_stepwam/seed_0"
 mkdir -p "${RUN_DIR}/metrics" "${RUN_DIR}/videos"
 
-torchrun --nproc_per_node=1 --master_port="$((MASTER_PORT + 2))" \
+"${TORCHRUN}" --nproc_per_node=1 --master_port="$((MASTER_PORT + 2))" \
   distillation_flowmap/rollout_eval_stage2.py \
   --config distillation_flowmap.config_robotwin_fullfinetune_stage2_anyflow \
   --teacher-model-path "${TEACHER_MODEL_PATH}" \
@@ -45,7 +47,7 @@ torchrun --nproc_per_node=1 --master_port="$((MASTER_PORT + 2))" \
   --teacher-steps 4 \
   --pairs 1000,0
 
-torchrun --nproc_per_node=1 --master_port="$((MASTER_PORT + 3))" \
+"${TORCHRUN}" --nproc_per_node=1 --master_port="$((MASTER_PORT + 3))" \
   distillation_flowmap/rollout_eval_video_stage2.py \
   --config distillation_flowmap.config_robotwin_fullfinetune_stage2_anyflow \
   --teacher-model-path "${TEACHER_MODEL_PATH}" \

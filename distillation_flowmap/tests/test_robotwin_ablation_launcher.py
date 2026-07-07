@@ -94,3 +94,4 @@ def test_default_paths_use_robotwin_teacher_dataset_and_empty_emb(tmp_path):
     assert "lingbot-va-posttrain-robotwin" in result.stdout
     assert "lerobot_robotwin_eef_aug_500" in result.stdout
     assert "EMPTY_EMB_PATH=" in result.stdout
+    assert "/root/nas/junjie/conda_envs/any_wam/bin/torchrun" in result.stdout

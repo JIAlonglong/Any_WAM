@@ -7,6 +7,7 @@ ROOT="${ROOT:-${PROJECT_ROOT}/distillation_flowmap/output_robotwin_stepwam_ablat
 TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-${PROJECT_ROOT}/checkpoints/lingbot-va-posttrain-robotwin}"
 DATASET_PATH="${DATASET_PATH:-/root/nas/junjie/data/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500}"
 EMPTY_EMB_PATH="${EMPTY_EMB_PATH:-/root/nas/junjie/data/robotwin-clean-and-aug-lerobot/empty_emb.pt}"
+TORCHRUN="${TORCHRUN:-/root/nas/junjie/conda_envs/any_wam/bin/torchrun}"
 STAGE1_STEPS=5000
 STAGE2_STEPS=5000
 VARIANTS="full_stepwam,w_o_opd,endpoint_only_opd,velocity_only_opd,local_adjacent_only,action_only"
@@ -47,6 +48,7 @@ for seed in "${seed_list[@]}"; do
       --teacher-model-path "${TEACHER_MODEL_PATH}" \
       --dataset-path "${DATASET_PATH}" \
       --empty-emb-path "${EMPTY_EMB_PATH}" \
+      --torchrun "${TORCHRUN}" \
       --stage1-steps "${STAGE1_STEPS}" \
       --stage2-steps "${STAGE2_STEPS}" \
       --master-port "${port}" > "${log_file}" 2>&1 &

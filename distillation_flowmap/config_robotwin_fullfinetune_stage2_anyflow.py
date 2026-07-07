@@ -120,6 +120,7 @@ cfg.resume_optimizer_state = _env_bool("RESUME_OPTIMIZER_STATE", False)
 cfg.reset_resume_step = _env_bool("RESET_RESUME_STEP", True)
 cfg.skip_teacher_compile = _env_bool("SKIP_TEACHER_COMPILE", True)
 cfg.gradient_checkpointing = _env_bool("GRADIENT_CHECKPOINTING", True)
+cfg.use_fsdp1 = _env_bool("USE_FSDP1", True)
 # OPD aux does an additional student backward path; with PyTorch FSDP2,
 # activation-checkpoint recompute can mix regular Tensor activations from the
 # rollout path with DTensor-sharded weights. Keep checkpointing on for the main

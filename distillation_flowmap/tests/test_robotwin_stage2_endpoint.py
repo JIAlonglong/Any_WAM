@@ -11,10 +11,62 @@ import torch
 CONFIG_MODULE = "distillation_flowmap.config_robotwin_fullfinetune_stage2_anyflow"
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 FLOWMAP_DIR = os.path.join(REPO_ROOT, "distillation_flowmap")
-WANVA_UTILS_DIR = os.path.join(REPO_ROOT, "wan_va", "utils")
-for path in (FLOWMAP_DIR, WANVA_UTILS_DIR):
+WANVA_ROOT = os.path.join(REPO_ROOT, "wan_va")
+for path in (FLOWMAP_DIR, WANVA_ROOT):
     if path not in sys.path:
         sys.path.insert(0, path)
+
+
+def import_flowmap_trainer_helper():
+    stubs = {}
+
+    def stub_module(name, **attrs):
+        mod = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(mod, key, value)
+        stubs[name] = sys.modules.get(name)
+        sys.modules[name] = mod
+        return mod
+
+    class _DataMixin:
+        pass
+
+    class _FlowMapStepMixin:
+        pass
+
+    stub_module("distributed", __path__=[])
+    stub_module("distributed.fsdp", shard_model=lambda model, **_: model, apply_ac=lambda model: model)
+    stub_module(
+        "distributed.util",
+        _configure_model=lambda model, **_: model,
+        dist_mean=lambda value: value,
+    )
+    stub_module("wan_va.distributed.fsdp", shard_model_fsdp1=lambda model, **_: model)
+    stub_module(
+        "modules.utils",
+        WanVAEStreamingWrapper=object,
+        load_transformer=lambda *args, **kwargs: None,
+        load_vae=lambda *args, **kwargs: None,
+    )
+    stub_module("distillation.data", DataMixin=_DataMixin)
+    stub_module("distillation.ema", update_ema=lambda *args, **kwargs: None)
+    stub_module("flowmap_step", FlowMapStepMixin=_FlowMapStepMixin)
+    stub_module(
+        "model_flowmap",
+        setup_flowmap_model=lambda model, **kwargs: model,
+        patch_model_forward=lambda model: model,
+    )
+
+    sys.modules.pop("distillation_flowmap.flowmap_trainer", None)
+    try:
+        from distillation_flowmap.flowmap_trainer import _resolve_use_fsdp1
+    finally:
+        for name, old in stubs.items():
+            if old is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
+    return _resolve_use_fsdp1
 
 
 def load_config(**env):
@@ -58,6 +110,18 @@ class RobotWinStage2EndpointConfigTest(unittest.TestCase):
         self.assertEqual(cfg.opd_same_state_velocity_weight, 0.0)
         self.assertTrue(cfg.gradient_checkpointing)
         self.assertFalse(cfg.opd_aux_gradient_checkpointing)
+        self.assertTrue(cfg.use_fsdp1)
+
+    def test_use_fsdp1_env_override_is_available_for_non_checkpointed_debug(self):
+        cfg = load_config(USE_FSDP1="0", GRADIENT_CHECKPOINTING="0")
+        self.assertFalse(cfg.use_fsdp1)
+
+    def test_opd_checkpointing_forces_fsdp1_even_if_env_disables_it(self):
+        cfg = load_config(USE_FSDP1="0", USE_OPD_AUX="1", GRADIENT_CHECKPOINTING="1")
+
+        _resolve_use_fsdp1 = import_flowmap_trainer_helper()
+
+        self.assertTrue(_resolve_use_fsdp1(cfg))
 
     def test_gradient_checkpointing_can_be_reenabled_for_non_opd_ablation(self):
         cfg = load_config(GRADIENT_CHECKPOINTING="1")

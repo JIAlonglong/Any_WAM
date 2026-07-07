@@ -90,6 +90,51 @@ def _call_with_student_checkpointing(student, enabled, fn):
             student._flowmap_gradient_checkpointing = old_enabled
 
 
+def _resolve_use_fsdp1(config):
+    use_fsdp1 = bool(getattr(config, 'use_fsdp1', False))
+    use_onpolicy = bool(getattr(config, 'use_onpolicy_transition', False))
+    risky_opd_checkpoint = (
+        bool(getattr(config, 'use_opd_aux', False))
+        and bool(getattr(config, 'gradient_checkpointing', False))
+    )
+
+    if use_onpolicy:
+        use_fsdp1 = True
+    if risky_opd_checkpoint and not use_fsdp1:
+        logger.warning(
+            "Forcing FSDP1 because use_opd_aux=True with "
+            "gradient_checkpointing=True can mix Tensor/DTensor during "
+            "checkpoint recompute under FSDP2."
+        )
+        use_fsdp1 = True
+
+    config.use_fsdp1 = use_fsdp1
+    return use_fsdp1
+
+
+def _is_dtensor_param(param):
+    try:
+        from torch.distributed.tensor import DTensor
+    except Exception:
+        return False
+    return isinstance(param, DTensor)
+
+
+def _assert_no_dtensor_params(module, name):
+    offenders = [
+        param_name
+        for param_name, param in module.named_parameters()
+        if _is_dtensor_param(param)
+    ]
+    if offenders:
+        preview = ", ".join(offenders[:8])
+        extra = "" if len(offenders) <= 8 else f", ... (+{len(offenders) - 8})"
+        raise RuntimeError(
+            f"{name} is expected to use FSDP1 but still has DTensor "
+            f"parameters: {preview}{extra}. Check use_fsdp1/FSDP wrapping."
+        )
+
+
 def _set_video_channel_config_from_heads(config_dict, model=None, state_dict=None):
     """Persist channel config from the actual video head shapes."""
     patch_size = config_dict.get("patch_size")
@@ -217,6 +262,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.use_dmd = getattr(config, 'use_dmd', False)
         self.use_onpolicy_transition = getattr(config, 'use_onpolicy_transition', False)
         self.use_opd_aux = getattr(config, 'use_opd_aux', False)
+        self.use_fsdp1 = _resolve_use_fsdp1(config)
         self.opd_aux_variant = str(getattr(config, 'opd_aux_variant', 'default')).lower()
         if self.opd_aux_variant not in ('default', 'kto_paopd', 'kto_paopd_norm_focal'):
             raise ValueError(
@@ -337,6 +383,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info(f"  gt_regression_weight = {self.gt_regression_weight} (GT 回归 loss 权重)")
             logger.info(f"  use_lora           = {self.use_lora} (LoRA 微调)")
             logger.info(f"  use_opd_aux        = {self.use_opd_aux} (teacher-transition auxiliary)")
+            logger.info(f"  use_fsdp1          = {self.use_fsdp1} (FSDP backend guard)")
             if self.use_opd_aux:
                 logger.info(f"  opd_aux_variant    = {self.opd_aux_variant}")
                 logger.info(f"  opd_aux_weight     = {getattr(config, 'opd_aux_weight', 0.1)}")
@@ -517,10 +564,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             self._teacher_nofsdp = self._teacher_nofsdp.to(f"cuda:{local_rank}")
             logger.info(f"Non-FSDP teacher copy created (on cuda:{local_rank}).")
-            if self.use_onpolicy_transition:
-                # On-policy mode: use FSDP1 (no DTensor issues)
+            if self.use_fsdp1:
+                # FSDP1 avoids DTensor/checkpoint recompute type mixing.
                 self.teacher = shard_model_fsdp1(self.teacher, param_dtype=self.dtype)
-                logger.info("Teacher wrapped with FSDP1 (on-policy mode)")
+                logger.info("Teacher wrapped with FSDP1")
             else:
                 # FSDP2 mode
                 self.teacher = _configure_model(
@@ -827,12 +874,13 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         else:
             self._student_nofsdp = None
 
-        if self.use_onpolicy_transition:
-            # On-policy mode: use FSDP1 (shards parameters across GPUs)
+        if self.use_fsdp1:
+            # FSDP1 shards parameters without DTensor dispatch in checkpoint recompute.
             # apply_ac disabled - checkpointing + batched CFG = mask mismatch during backward
             # apply_ac(self.student)
             self.student = shard_model_fsdp1(self.student, param_dtype=self.dtype)
-            logger.info("Student wrapped with FSDP1 (on-policy mode)")
+            _assert_no_dtensor_params(self.student, "student")
+            logger.info("Student wrapped with FSDP1")
         else:
             self.student = _configure_model(
                 model=self.student, shard_fn=shard_model,
@@ -911,10 +959,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             # before FSDP wrapping (same reason as online student above).
             self.target_student = self.target_student.to(self.dtype)
 
-            if self.use_onpolicy_transition:
-                # On-policy mode: use FSDP1 (shards parameters across GPUs)
+            if self.use_fsdp1:
+                # FSDP1 avoids DTensor/checkpoint recompute type mixing.
                 self.target_student = shard_model_fsdp1(self.target_student, param_dtype=self.dtype)
-                logger.info("Target student wrapped with FSDP1 (on-policy mode)")
+                _assert_no_dtensor_params(self.target_student, "target_student")
+                logger.info("Target student wrapped with FSDP1")
             else:
                 self.target_student = _configure_model(
                     model=self.target_student, shard_fn=shard_model,

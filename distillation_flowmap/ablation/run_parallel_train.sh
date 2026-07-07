@@ -4,8 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 ROOT="${ROOT:-${PROJECT_ROOT}/distillation_flowmap/output_robotwin_stepwam_ablation}"
-TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-${PROJECT_ROOT}/checkpoints/base}"
-DATASET_PATH="${DATASET_PATH:-${PROJECT_ROOT}/training_data/lerobot_robotwin_eef_aug_500}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-${PROJECT_ROOT}/checkpoints/lingbot-va-posttrain-robotwin}"
+DATASET_PATH="${DATASET_PATH:-/root/nas/junjie/data/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500}"
+EMPTY_EMB_PATH="${EMPTY_EMB_PATH:-/root/nas/junjie/data/robotwin-clean-and-aug-lerobot/empty_emb.pt}"
 STAGE1_STEPS=5000
 STAGE2_STEPS=5000
 VARIANTS="full_stepwam,w_o_opd,endpoint_only_opd,velocity_only_opd,local_adjacent_only,action_only"
@@ -45,6 +46,7 @@ for seed in "${seed_list[@]}"; do
       --root "${ROOT}" \
       --teacher-model-path "${TEACHER_MODEL_PATH}" \
       --dataset-path "${DATASET_PATH}" \
+      --empty-emb-path "${EMPTY_EMB_PATH}" \
       --stage1-steps "${STAGE1_STEPS}" \
       --stage2-steps "${STAGE2_STEPS}" \
       --master-port "${port}" > "${log_file}" 2>&1 &

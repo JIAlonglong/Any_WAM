@@ -13,9 +13,30 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ABLATION_DIR = Path(__file__).resolve().parent
 DEFAULT_ROOT = REPO_ROOT / "distillation_flowmap" / "output_robotwin_stepwam_ablation"
-DEFAULT_TEACHER = REPO_ROOT / "checkpoints" / "base"
-DEFAULT_DATASET = REPO_ROOT / "training_data" / "lerobot_robotwin_eef_aug_500"
 SAFE_SHELL_VALUE = re.compile(r"^[A-Za-z0-9_./,:=+-]+$")
+
+
+def first_existing(candidates):
+    for path in candidates:
+        path = Path(path)
+        if path.exists():
+            return path
+    return Path(candidates[0])
+
+
+DEFAULT_TEACHER = first_existing([
+    REPO_ROOT / "checkpoints" / "lingbot-va-posttrain-robotwin",
+    REPO_ROOT / "checkpoints" / "base",
+])
+DEFAULT_DATASET = first_existing([
+    REPO_ROOT / "training_data" / "lerobot_robotwin_eef_aug_500",
+    Path("/root/nas/junjie/data/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500"),
+])
+DEFAULT_EMPTY_EMB = first_existing([
+    DEFAULT_DATASET / "empty_emb.pt",
+    DEFAULT_DATASET.parent / "empty_emb.pt",
+    Path("/root/nas/junjie/data/robotwin-clean-and-aug-lerobot/empty_emb.pt"),
+])
 
 
 def read_json(path):
@@ -118,10 +139,14 @@ def build_run_plan(args):
     stage1_ckpt = stage1_dir / "checkpoints" / f"step_{stage1_steps}"
     stage2_ckpt = stage2_dir / "checkpoints" / f"step_{stage2_steps}"
 
+    common_env = {}
+    if args.empty_emb_path is not None:
+        common_env["EMPTY_EMB_PATH"] = str(args.empty_emb_path)
+
     stage1 = build_stage_command(
         stage_name="stage1",
         config_module=defaults["stage1_config"],
-        stage_env=variant.get("stage1_env", {}),
+        stage_env={**common_env, **variant.get("stage1_env", {})},
         output_dir=stage1_dir,
         max_steps=stage1_steps,
         teacher_model_path=args.teacher_model_path,
@@ -133,7 +158,7 @@ def build_run_plan(args):
     stage2 = build_stage_command(
         stage_name="stage2",
         config_module=defaults["stage2_config"],
-        stage_env=variant.get("stage2_env", {}),
+        stage_env={**common_env, **variant.get("stage2_env", {})},
         output_dir=stage2_dir,
         max_steps=stage2_steps,
         teacher_model_path=args.teacher_model_path,
@@ -150,6 +175,7 @@ def build_run_plan(args):
         "seed": args.seed,
         "teacher_model_path": str(args.teacher_model_path),
         "dataset_path": str(args.dataset_path),
+        "empty_emb_path": str(args.empty_emb_path) if args.empty_emb_path else None,
         "run_dir": str(run_dir),
         "stage1_ckpt": str(stage1_ckpt),
         "stage2_ckpt": str(stage2_ckpt),
@@ -190,6 +216,7 @@ def parse_args():
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--teacher-model-path", type=Path, default=DEFAULT_TEACHER)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET)
+    parser.add_argument("--empty-emb-path", type=Path, default=DEFAULT_EMPTY_EMB)
     parser.add_argument("--stage1-steps", type=int, default=None)
     parser.add_argument("--stage2-steps", type=int, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)

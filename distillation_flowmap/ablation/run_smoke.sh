@@ -4,8 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-${PROJECT_ROOT}/checkpoints/base}"
-DATASET_PATH="${DATASET_PATH:-${PROJECT_ROOT}/training_data/lerobot_robotwin_eef_aug_500}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-${PROJECT_ROOT}/checkpoints/lingbot-va-posttrain-robotwin}"
+DATASET_PATH="${DATASET_PATH:-/root/nas/junjie/data/robotwin-clean-and-aug-lerobot/lerobot_robotwin_eef_aug_500}"
+EMPTY_EMB_PATH="${EMPTY_EMB_PATH:-/root/nas/junjie/data/robotwin-clean-and-aug-lerobot/empty_emb.pt}"
 SMOKE_ROOT="${SMOKE_ROOT:-${PROJECT_ROOT}/distillation_flowmap/output_robotwin_stepwam_ablation/smoke}"
 SMOKE_STAGE1_STEPS="${SMOKE_STAGE1_STEPS:-20}"
 SMOKE_STAGE2_STEPS="${SMOKE_STAGE2_STEPS:-20}"
@@ -23,6 +24,7 @@ cd "${PROJECT_ROOT}"
   --root "${SMOKE_ROOT}" \
   --teacher-model-path "${TEACHER_MODEL_PATH}" \
   --dataset-path "${DATASET_PATH}" \
+  --empty-emb-path "${EMPTY_EMB_PATH}" \
   --stage1-steps "${SMOKE_STAGE1_STEPS}" \
   --stage2-steps "${SMOKE_STAGE2_STEPS}" \
   --master-port "${MASTER_PORT}"

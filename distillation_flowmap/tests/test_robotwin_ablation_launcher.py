@@ -8,28 +8,29 @@ LAUNCHER = REPO_ROOT / "distillation_flowmap" / "ablation" / "launch_robotwin_st
 
 
 def run_dry_run(tmp_path, variant):
+    args = [
+        sys.executable,
+        str(LAUNCHER),
+        "--variant",
+        variant,
+        "--seed",
+        "0",
+        "--root",
+        str(tmp_path / "ablation_root"),
+        "--teacher-model-path",
+        "/tmp/teacher",
+        "--dataset-path",
+        "/tmp/dataset",
+        "--stage1-steps",
+        "5",
+        "--stage2-steps",
+        "7",
+        "--master-port",
+        "29990",
+        "--dry-run",
+    ]
     return subprocess.run(
-        [
-            sys.executable,
-            str(LAUNCHER),
-            "--variant",
-            variant,
-            "--seed",
-            "0",
-            "--root",
-            str(tmp_path / "ablation_root"),
-            "--teacher-model-path",
-            "/tmp/teacher",
-            "--dataset-path",
-            "/tmp/dataset",
-            "--stage1-steps",
-            "5",
-            "--stage2-steps",
-            "7",
-            "--master-port",
-            "29990",
-            "--dry-run",
-        ],
+        args,
         cwd=REPO_ROOT,
         check=True,
         text=True,
@@ -62,3 +63,34 @@ def test_local_variant_dry_run_contains_adjacent_grid_env(tmp_path):
     assert "FLOWMAP_PAIR_MODE=adjacent_grid" in result.stdout
     assert "OPD_PAIR_MODE=adjacent_grid" in result.stdout
     assert "FLOWMAP_ADJACENT_GRID=1000,750,500,250,0" in result.stdout
+
+
+def test_default_paths_use_robotwin_teacher_dataset_and_empty_emb(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LAUNCHER),
+            "--variant",
+            "full_stepwam",
+            "--seed",
+            "0",
+            "--root",
+            str(tmp_path / "ablation_root"),
+            "--stage1-steps",
+            "5",
+            "--stage2-steps",
+            "7",
+            "--master-port",
+            "29990",
+            "--dry-run",
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert "lingbot-va-posttrain-robotwin" in result.stdout
+    assert "lerobot_robotwin_eef_aug_500" in result.stdout
+    assert "EMPTY_EMB_PATH=" in result.stdout

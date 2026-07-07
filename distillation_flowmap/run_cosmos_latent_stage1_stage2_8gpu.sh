@@ -92,9 +92,13 @@ echo "[Stage 2] start $(date)"
   OUTPUT_DIR="${STAGE2_OUTPUT}" \
   MAX_TRAIN_STEPS="${STAGE2_STEPS}" \
   SAVE_INTERVAL="${SAVE_INTERVAL}" \
+  GRADIENT_CHECKPOINTING=1 \
   USE_OPD_AUX=1 \
+  OPD_AUX_WARMUP_STEPS="${OPD_AUX_WARMUP_STEPS:-8}" \
+  OPD_ROLLOUT_STEP_PAIRS="${OPD_ROLLOUT_STEP_PAIRS:-1,1}" \
   OPD_TEACHER_TARGET_MODE=cosmos_latent_student_state \
   OPD_AUX_ACTION=0 \
+  OPD_TRANSITION_GROUP_WEIGHT="${OPD_TRANSITION_GROUP_WEIGHT:-0.001}" \
   /root/nas/junjie/conda_envs/any_wam/bin/torchrun \
     --nproc_per_node="${NGPU}" \
     --master_port="${MASTER_PORT_STAGE2}" \

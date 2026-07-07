@@ -53,6 +53,11 @@ cfg.resume_online_from_target = _env_bool("RESUME_ONLINE_FROM_TARGET", False)
 cfg.reset_resume_step = _env_bool("RESET_RESUME_STEP", True)
 cfg.resume_optimizer_state = _env_bool("RESUME_OPTIMIZER_STATE", False)
 
+cfg.teacher_model_path = os.environ.get("COSMOS_POLICY_PATH", cfg.teacher_model_path)
+cfg.student_base_model_path = os.environ.get(
+    "STUDENT_BASE_MODEL_PATH", cfg.student_base_model_path
+)
+
 cfg.output_dir = os.environ.get(
     "OUTPUT_DIR",
     os.path.join(_this_dir, "output_libero_cosmos_policy_stage2_cosmos_latent_cdiff"),
@@ -104,7 +109,7 @@ cfg.gt_regression_weight = 0.0
 cfg.use_opd_aux = _env_bool("USE_OPD_AUX", True)
 cfg.opd_aux_variant = os.environ.get("OPD_AUX_VARIANT", "default").lower()
 cfg.opd_aux_weight = float(os.environ.get("OPD_AUX_WEIGHT", 1.0))
-cfg.opd_aux_warmup_steps = int(os.environ.get("OPD_AUX_WARMUP_STEPS", 0))
+cfg.opd_aux_warmup_steps = int(os.environ.get("OPD_AUX_WARMUP_STEPS", 8))
 cfg.opd_aux_interval = int(os.environ.get("OPD_AUX_INTERVAL", 16))
 cfg.opd_aux_prob = float(os.environ.get("OPD_AUX_PROB", 1.0))
 cfg.opd_teacher_target_mode = os.environ.get(
@@ -120,15 +125,15 @@ cfg.rollout_step_pairs = _parse_step_pairs(
     os.environ.get("ROLLOUT_STEP_PAIRS", "1,1")
 )
 cfg.opd_rollout_step_pairs = _parse_step_pairs(
-    os.environ.get("OPD_ROLLOUT_STEP_PAIRS", "1,1;2,1;4,1;4,2")
+    os.environ.get("OPD_ROLLOUT_STEP_PAIRS", "1,1")
 )
 cfg.video_transition_param = os.environ.get("VIDEO_TRANSITION_PARAM", "velocity").lower()
 cfg.video_transition_weight = float(os.environ.get("VIDEO_TRANSITION_WEIGHT", 1.0))
 cfg.opd_endpoint_aux_weight = float(os.environ.get("OPD_ENDPOINT_AUX_WEIGHT", 0.1))
 cfg.local_fm_weight = float(os.environ.get("LOCAL_FM_WEIGHT", 1e-4))
-cfg.opd_transition_group_weight = float(os.environ.get("OPD_TRANSITION_GROUP_WEIGHT", 25.0))
+cfg.opd_transition_group_weight = float(os.environ.get("OPD_TRANSITION_GROUP_WEIGHT", 1e-3))
 cfg.opd_anchor_cap_ratio = float(os.environ.get("OPD_ANCHOR_CAP_RATIO", 0.25))
 cfg.opd_aux_action = _env_bool("OPD_AUX_ACTION", False)
 cfg.use_onpolicy_transition = False
 cfg.use_dmd = False
-cfg.gradient_checkpointing = _env_bool("GRADIENT_CHECKPOINTING", False)
+cfg.gradient_checkpointing = _env_bool("GRADIENT_CHECKPOINTING", True)

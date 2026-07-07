@@ -1,4 +1,5 @@
 import torch
+import importlib
 
 from distillation_flowmap.flowmap_trainer import _set_video_channel_config_from_heads
 
@@ -21,3 +22,23 @@ def test_set_video_channel_config_from_heads_uses_adapted_cosmos_latent_heads():
 
     assert config_dict["in_channels"] == 16
     assert config_dict["out_channels"] == 16
+
+
+def test_cosmos_latent_stage2_defaults_are_memory_safe(monkeypatch):
+    for name in (
+        "GRADIENT_CHECKPOINTING",
+        "OPD_AUX_WARMUP_STEPS",
+        "OPD_ROLLOUT_STEP_PAIRS",
+        "OPD_TRANSITION_GROUP_WEIGHT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    module = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_cosmos_latent_cdiff"
+    )
+    module = importlib.reload(module)
+
+    assert module.cfg.gradient_checkpointing is True
+    assert module.cfg.opd_aux_warmup_steps >= 8
+    assert module.cfg.opd_rollout_step_pairs == [[1, 1]]
+    assert module.cfg.opd_transition_group_weight <= 1e-2

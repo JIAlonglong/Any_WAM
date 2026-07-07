@@ -836,7 +836,7 @@ def test_cosmos_latent_cdiff_stage2_config_imports(monkeypatch):
     assert cfg.resume_from_path.endswith("/checkpoints/step_5000")
     assert cfg.output_dir.endswith("output_libero_cosmos_policy_stage2_cosmos_latent_cdiff")
     assert cfg.cosmos_policy_worker_cuda_visible_devices == "4,5,6,7"
-    assert cfg.gradient_checkpointing is False
+    assert cfg.gradient_checkpointing is True
     assert cfg.cosmos_latent_center_velocity_mode == "symmetric_average"
     assert cfg.cosmos_latent_target_mode == "hybrid_cdiff"
     assert cfg.cosmos_latent_cdiff_interval == 4
@@ -848,8 +848,10 @@ def test_cosmos_latent_cdiff_stage2_config_imports(monkeypatch):
     assert cfg.video_transition_param == "velocity"
     assert cfg.opd_endpoint_aux_weight == 0.1
     assert cfg.local_fm_weight == 1e-4
-    assert cfg.opd_rollout_step_pairs == [[1, 1], [2, 1], [4, 1], [4, 2]]
+    assert cfg.opd_rollout_step_pairs == [[1, 1]]
     assert cfg.opd_aux_interval == 16
+    assert cfg.opd_aux_warmup_steps == 8
+    assert cfg.opd_transition_group_weight == 1e-3
     assert cfg.opd_aux_action is False
 
 

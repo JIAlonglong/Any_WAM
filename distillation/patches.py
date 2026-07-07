@@ -14,8 +14,76 @@ LCM 蒸馏的兼容性补丁。
 """
 
 import importlib.machinery
+import os
 import sys
 import types
+
+
+def _split_config_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [v.strip() for v in value.replace(";", ",").split(",") if v.strip()]
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
+def _positive_int_or_none(value):
+    if value in (None, "", 0, "0"):
+        return None
+    value = int(value)
+    return value if value > 0 else None
+
+
+def _repo_task_name(repo_id):
+    name = os.path.basename(str(repo_id).rstrip("/"))
+    return name.split("-", 1)[0]
+
+
+def _repo_matches_task(repo_id, task_names):
+    basename = os.path.basename(str(repo_id).rstrip("/")).lower()
+    canonical = basename.split("-", 1)[0]
+    for task in task_names:
+        task = str(task).strip().lower()
+        if not task:
+            continue
+        if task == basename or task == canonical or basename.startswith(f"{task}-"):
+            return True
+    return False
+
+
+def _filter_repo_list_by_tasks(repo_list, task_filter):
+    task_names = _split_config_list(task_filter)
+    if not task_names:
+        return list(repo_list)
+    return [repo_id for repo_id in repo_list if _repo_matches_task(repo_id, task_names)]
+
+
+def _limit_dataset_metas(dataset, max_episodes=None, max_samples=None):
+    metas = getattr(dataset, "new_metas", None)
+    if metas is None:
+        return 0, 0
+
+    max_episodes = _positive_int_or_none(max_episodes)
+    max_samples = _positive_int_or_none(max_samples)
+    if max_episodes is None and max_samples is None:
+        return len(metas), len(metas)
+
+    selected = []
+    seen_episodes = []
+    seen_set = set()
+    for meta in metas:
+        episode_index = meta.get("episode_index")
+        if max_episodes is not None and episode_index not in seen_set:
+            if len(seen_episodes) >= max_episodes:
+                continue
+            seen_episodes.append(episode_index)
+            seen_set.add(episode_index)
+        selected.append(meta)
+        if max_samples is not None and len(selected) >= max_samples:
+            break
+
+    dataset.new_metas = selected
+    return len(metas), len(selected)
 
 
 def install_flash_attn_stub():
@@ -83,7 +151,6 @@ class SafeMultiLatentLeRobotDataset:
           3. 尝试加载每个子数据集，失败则跳过
           4. 构建全局索引映射
         """
-        import os
         from pathlib import Path
         from dataset.lerobot_latent_dataset import (
             recursive_find_file,
@@ -93,15 +160,61 @@ class SafeMultiLatentLeRobotDataset:
         # 递归查找所有 info.json 文件，确定子数据集路径
         repo_list = recursive_find_file(config.dataset_path, "info.json")
         repo_list = [v.split("/meta/info.json")[0] for v in repo_list]
+        total_discovered = len(repo_list)
+
+        task_filter = _split_config_list(getattr(config, "dataset_task_filter", None))
+        repo_list = _filter_repo_list_by_tasks(repo_list, task_filter)
+        if task_filter:
+            matched_names = ", ".join(_repo_task_name(v) for v in repo_list)
+            print(
+                "Dataset task filter matched "
+                f"{len(repo_list)}/{total_discovered} sub-datasets: {matched_names}"
+            )
+        if not repo_list:
+            raise RuntimeError(
+                "No sub-datasets matched dataset_task_filter="
+                f"{','.join(task_filter)} under {config.dataset_path}"
+            )
+
+        max_episodes = _positive_int_or_none(
+            getattr(config, "dataset_max_episodes_per_task", None)
+        )
+        max_samples = _positive_int_or_none(
+            getattr(config, "dataset_max_samples_per_task", None)
+        )
+        defer_cache = bool(getattr(config, "cache_dataset_in_memory", False)) and (
+            max_episodes is not None or max_samples is not None
+        )
 
         self._datasets = []
         skipped = []
         for repo_id in repo_list:
+            old_cache = getattr(config, "cache_dataset_in_memory", False)
             try:
+                if defer_cache:
+                    config.cache_dataset_in_memory = False
                 ds = LatentLeRobotDataset(repo_id=repo_id, config=config)
+                before, after = _limit_dataset_metas(ds, max_episodes, max_samples)
+                if after == 0:
+                    raise RuntimeError(
+                        "Dataset filter left no samples in "
+                        f"{os.path.basename(repo_id)}"
+                    )
+                if after != before:
+                    print(
+                        "Limited "
+                        f"{os.path.basename(repo_id)} samples: {before} -> {after}"
+                    )
+                if defer_cache:
+                    ds.cache_in_memory = True
+                    ds._memory_cache = {}
+                    ds._preload_dataset()
                 self._datasets.append(ds)
             except Exception as e:
                 skipped.append((repo_id, e))
+            finally:
+                if defer_cache:
+                    config.cache_dataset_in_memory = old_cache
 
         total = len(repo_list)
         loaded = len(self._datasets)

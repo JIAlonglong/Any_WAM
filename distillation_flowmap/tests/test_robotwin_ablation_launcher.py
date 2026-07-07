@@ -95,3 +95,54 @@ def test_default_paths_use_robotwin_teacher_dataset_and_empty_emb(tmp_path):
     assert "lerobot_robotwin_eef_aug_500" in result.stdout
     assert "EMPTY_EMB_PATH=" in result.stdout
     assert "/root/nas/junjie/conda_envs/any_wam/bin/torchrun" in result.stdout
+
+
+def test_default_dry_run_filters_to_representative_robotwin_subset(tmp_path):
+    result = run_dry_run(tmp_path, "full_stepwam")
+
+    assert "DATASET_TASK_FILTER=" in result.stdout
+    assert "place_a2b_right" in result.stdout
+    assert "rotate_qrcode" in result.stdout
+    assert "place_burger_fries" in result.stdout
+
+
+def test_dry_run_accepts_single_task_smoke_limits(tmp_path):
+    args = [
+        sys.executable,
+        str(LAUNCHER),
+        "--variant",
+        "full_stepwam",
+        "--seed",
+        "0",
+        "--root",
+        str(tmp_path / "ablation_root"),
+        "--teacher-model-path",
+        "/tmp/teacher",
+        "--dataset-path",
+        "/tmp/dataset",
+        "--task-filter",
+        "place_a2b_right",
+        "--max-episodes-per-task",
+        "5",
+        "--max-samples-per-task",
+        "5",
+        "--stage1-steps",
+        "5",
+        "--stage2-steps",
+        "7",
+        "--master-port",
+        "29990",
+        "--dry-run",
+    ]
+    result = subprocess.run(
+        args,
+        cwd=REPO_ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert "DATASET_TASK_FILTER=place_a2b_right" in result.stdout
+    assert "DATASET_MAX_EPISODES_PER_TASK=5" in result.stdout
+    assert "DATASET_MAX_SAMPLES_PER_TASK=5" in result.stdout

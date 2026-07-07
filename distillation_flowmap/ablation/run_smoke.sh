@@ -13,6 +13,7 @@ SMOKE_STAGE1_STEPS="${SMOKE_STAGE1_STEPS:-20}"
 SMOKE_STAGE2_STEPS="${SMOKE_STAGE2_STEPS:-20}"
 SMOKE_TASK="${SMOKE_TASK:-place_a2b_right}"
 SMOKE_EPISODES="${SMOKE_EPISODES:-5}"
+SMOKE_MAX_SAMPLES="${SMOKE_MAX_SAMPLES:-${SMOKE_EPISODES}}"
 MASTER_PORT="${MASTER_PORT:-29640}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-${SMOKE_STAGE2_STEPS}}"
 
@@ -27,12 +28,18 @@ cd "${PROJECT_ROOT}"
   --dataset-path "${DATASET_PATH}" \
   --empty-emb-path "${EMPTY_EMB_PATH}" \
   --torchrun "${TORCHRUN}" \
+  --task-filter "${SMOKE_TASK}" \
+  --max-episodes-per-task "${SMOKE_EPISODES}" \
+  --max-samples-per-task "${SMOKE_MAX_SAMPLES}" \
   --stage1-steps "${SMOKE_STAGE1_STEPS}" \
   --stage2-steps "${SMOKE_STAGE2_STEPS}" \
   --master-port "${MASTER_PORT}"
 
 RUN_DIR="${SMOKE_ROOT}/full_stepwam/seed_0"
 mkdir -p "${RUN_DIR}/metrics" "${RUN_DIR}/videos"
+export DATASET_TASK_FILTER="${SMOKE_TASK}"
+export DATASET_MAX_EPISODES_PER_TASK="${SMOKE_EPISODES}"
+export DATASET_MAX_SAMPLES_PER_TASK="${SMOKE_MAX_SAMPLES}"
 
 "${TORCHRUN}" --nproc_per_node=1 --master_port="$((MASTER_PORT + 2))" \
   distillation_flowmap/rollout_eval_stage2.py \

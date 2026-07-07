@@ -62,6 +62,29 @@ def find_variant(variants, name_or_id):
     raise ValueError(f"Unknown variant {name_or_id!r}; known variants: {known}")
 
 
+def split_csv(value):
+    if not value:
+        return []
+    return [v.strip() for v in str(value).replace(";", ",").split(",") if v.strip()]
+
+
+def representative_task_filter(tasks):
+    splits = tasks.get("splits", {})
+    ordered = []
+    for split_name in ("easy", "hard"):
+        ordered.extend(splits.get(split_name, []))
+    for split_tasks in splits.values():
+        ordered.extend(split_tasks)
+
+    deduped = []
+    seen = set()
+    for task in ordered:
+        if task not in seen:
+            deduped.append(task)
+            seen.add(task)
+    return deduped
+
+
 def shell_value(value):
     text = str(value)
     if SAFE_SHELL_VALUE.match(text):
@@ -144,9 +167,19 @@ def build_run_plan(args):
     stage1_ckpt = stage1_dir / "checkpoints" / f"step_{stage1_steps}"
     stage2_ckpt = stage2_dir / "checkpoints" / f"step_{stage2_steps}"
 
+    task_filter = [] if args.all_dataset_tasks else (
+        split_csv(args.task_filter) or representative_task_filter(tasks)
+    )
+
     common_env = {}
     if args.empty_emb_path is not None:
         common_env["EMPTY_EMB_PATH"] = str(args.empty_emb_path)
+    if task_filter:
+        common_env["DATASET_TASK_FILTER"] = ",".join(task_filter)
+    if args.max_episodes_per_task is not None:
+        common_env["DATASET_MAX_EPISODES_PER_TASK"] = str(args.max_episodes_per_task)
+    if args.max_samples_per_task is not None:
+        common_env["DATASET_MAX_SAMPLES_PER_TASK"] = str(args.max_samples_per_task)
 
     stage1 = build_stage_command(
         stage_name="stage1",
@@ -187,6 +220,9 @@ def build_run_plan(args):
         "stage1_ckpt": str(stage1_ckpt),
         "stage2_ckpt": str(stage2_ckpt),
         "task_list": tasks,
+        "selected_task_filter": task_filter,
+        "dataset_max_episodes_per_task": args.max_episodes_per_task,
+        "dataset_max_samples_per_task": args.max_samples_per_task,
         "stage1_env": stage1["env"],
         "stage2_env": stage2["env"],
         "commands": {
@@ -227,6 +263,18 @@ def parse_args():
     parser.add_argument("--torchrun", type=Path, default=Path(os.environ.get("TORCHRUN", DEFAULT_TORCHRUN)))
     parser.add_argument("--stage1-steps", type=int, default=None)
     parser.add_argument("--stage2-steps", type=int, default=None)
+    parser.add_argument(
+        "--task-filter",
+        default=None,
+        help="Comma-separated RobotWin task names. Defaults to the metadata Easy+Hard subset.",
+    )
+    parser.add_argument(
+        "--all-dataset-tasks",
+        action="store_true",
+        help="Disable the default representative task filter and train on every dataset task.",
+    )
+    parser.add_argument("--max-episodes-per-task", type=int, default=None)
+    parser.add_argument("--max-samples-per-task", type=int, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--ngpu", type=int, default=1)
     parser.add_argument("--master-port", type=int, default=29620)

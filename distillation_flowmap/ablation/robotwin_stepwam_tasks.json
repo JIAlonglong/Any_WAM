@@ -1,0 +1,24 @@
+{
+  "task_config": "demo_clean",
+  "episodes_per_task": 50,
+  "smoke_episodes": 5,
+  "student_steps": 4,
+  "splits": {
+    "easy": [
+      "place_a2b_right",
+      "put_object_cabinet",
+      "stack_bowls_three",
+      "lift_pot",
+      "place_can_basket",
+      "handover_block"
+    ],
+    "hard": [
+      "open_microwave",
+      "open_laptop",
+      "pick_dual_bottles",
+      "blocks_ranking_size",
+      "place_burger_fries",
+      "rotate_qrcode"
+    ]
+  }
+}

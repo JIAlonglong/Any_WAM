@@ -1,0 +1,152 @@
+{
+  "defaults": {
+    "teacher": "lingbot-va",
+    "benchmark": "robotwin",
+    "stage1_steps": 5000,
+    "stage2_steps": 5000,
+    "student_steps": 4,
+    "stage1_config": "distillation_flowmap.config_robotwin_fullfinetune_stage1_warmup",
+    "stage2_config": "distillation_flowmap.config_robotwin_fullfinetune_stage2_anyflow"
+  },
+  "variants": [
+    {
+      "id": "v1",
+      "name": "full_stepwam",
+      "seeds": [0, 1, 2],
+      "priority": "first_pass",
+      "requires_code_flag": false,
+      "description": "Arbitrary t->r shortcut plus hybrid endpoint/same-state OPD with joint video-action distillation.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "1",
+        "OPD_AUX_ACTION": "1",
+        "VIDEO_TRANSITION_WEIGHT": "1.0",
+        "OPD_ENDPOINT_AUX_WEIGHT": "0.1",
+        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.1"
+      }
+    },
+    {
+      "id": "v2",
+      "name": "w_o_opd",
+      "seeds": [0, 1, 2],
+      "priority": "first_pass",
+      "requires_code_flag": false,
+      "description": "Stage 1 arbitrary shortcut distillation only; Stage 2 OPD disabled.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "0"
+      }
+    },
+    {
+      "id": "v3",
+      "name": "endpoint_only_opd",
+      "seeds": [0],
+      "backfill_seeds": [1, 2],
+      "priority": "first_pass",
+      "requires_code_flag": false,
+      "description": "Endpoint/x0 OPD without same-state velocity regularization.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "1",
+        "OPD_AUX_ACTION": "1",
+        "VIDEO_TRANSITION_WEIGHT": "1.0",
+        "OPD_ENDPOINT_AUX_WEIGHT": "0.1",
+        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.0"
+      }
+    },
+    {
+      "id": "v4",
+      "name": "velocity_only_opd",
+      "seeds": [0],
+      "backfill_seeds": [1, 2],
+      "priority": "first_pass",
+      "requires_code_flag": false,
+      "description": "Same-state velocity regularizer only; action OPD is off to avoid endpoint leakage.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "1",
+        "OPD_AUX_ACTION": "0",
+        "VIDEO_TRANSITION_WEIGHT": "0.0",
+        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
+        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.1"
+      }
+    },
+    {
+      "id": "v5",
+      "name": "local_adjacent_only",
+      "seeds": [0, 1, 2],
+      "priority": "first_pass",
+      "requires_code_flag": true,
+      "description": "No arbitrary shortcut. Stage 1 and OPD sample only adjacent 4-step grid edges.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam",
+        "FLOWMAP_PAIR_MODE": "adjacent_grid",
+        "FLOWMAP_ADJACENT_GRID": "1000,750,500,250,0"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "1",
+        "OPD_AUX_ACTION": "1",
+        "FLOWMAP_PAIR_MODE": "adjacent_grid",
+        "OPD_PAIR_MODE": "adjacent_grid",
+        "FLOWMAP_ADJACENT_GRID": "1000,750,500,250,0",
+        "VIDEO_TRANSITION_WEIGHT": "1.0",
+        "OPD_ENDPOINT_AUX_WEIGHT": "0.1",
+        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.1"
+      }
+    },
+    {
+      "id": "v6",
+      "name": "action_only",
+      "seeds": [0],
+      "backfill_seeds": [1, 2],
+      "priority": "first_pass",
+      "requires_code_flag": false,
+      "description": "Action-only distillation control. Stage 2 action OPD is enabled only after smoke passes.",
+      "stage1_env": {
+        "DISTILL_MODE": "action"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "action",
+        "USE_OPD_AUX": "1",
+        "OPD_AUX_ACTION": "1",
+        "VIDEO_TRANSITION_WEIGHT": "0.0",
+        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
+        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.0"
+      }
+    },
+    {
+      "id": "v7",
+      "name": "no_video_loss_optional",
+      "seeds": [],
+      "priority": "optional",
+      "requires_code_flag": true,
+      "description": "Optional no-video-loss/video-detached control. Run only if implementation remains small and smoke passes.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam",
+        "VIDEO_LOSS_WEIGHT": "0.0"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "1",
+        "OPD_AUX_ACTION": "1",
+        "VIDEO_LOSS_WEIGHT": "0.0",
+        "VIDEO_TRANSITION_WEIGHT": "1.0",
+        "OPD_ENDPOINT_AUX_WEIGHT": "0.1",
+        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.1"
+      }
+    }
+  ]
+}

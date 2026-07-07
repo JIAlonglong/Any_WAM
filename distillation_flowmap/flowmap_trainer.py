@@ -75,6 +75,45 @@ except ImportError:
     HAS_DISCRIMINATOR = False
 
 
+def _set_video_channel_config_from_heads(config_dict, model=None, state_dict=None):
+    """Persist channel config from the actual video head shapes."""
+    patch_size = config_dict.get("patch_size")
+    if patch_size is None and model is not None:
+        patch_size = getattr(model, "patch_size", None)
+    if patch_size is None:
+        return config_dict
+
+    patch_size = list(patch_size)
+    patch_volume = math.prod(patch_size)
+    if patch_volume <= 0:
+        return config_dict
+
+    in_features = None
+    out_features = None
+    if state_dict is not None:
+        in_weight = state_dict.get("patch_embedding_mlp.weight")
+        out_weight = state_dict.get("proj_out.weight")
+        if in_weight is not None and len(in_weight.shape) >= 2:
+            in_features = int(in_weight.shape[1])
+        if out_weight is not None and len(out_weight.shape) >= 1:
+            out_features = int(out_weight.shape[0])
+
+    if model is not None:
+        patch_embedding_mlp = getattr(model, "patch_embedding_mlp", None)
+        proj_out = getattr(model, "proj_out", None)
+        if in_features is None and patch_embedding_mlp is not None:
+            in_features = int(getattr(patch_embedding_mlp, "in_features", 0) or 0)
+        if out_features is None and proj_out is not None:
+            out_features = int(getattr(proj_out, "out_features", 0) or 0)
+
+    config_dict["patch_size"] = patch_size
+    if in_features and in_features % patch_volume == 0:
+        config_dict["in_channels"] = in_features // patch_volume
+    if out_features and out_features % patch_volume == 0:
+        config_dict["out_channels"] = out_features // patch_volume
+    return config_dict
+
+
 class FlowMapDistiller(DataMixin, FlowMapStepMixin):
     """
     Flow Map 蒸馏训练器。
@@ -1106,6 +1145,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 config_dict['patch_size'] = list(getattr(self.config, 'patch_size', (1, 2, 2)))
                 config_dict['distill_mode'] = getattr(self.config, 'distill_mode', 'flashwam')
                 config_dict['checkpoint_step'] = self.step
+                _set_video_channel_config_from_heads(config_dict, model, state_dict_bf16)
                 # 保存 LoRA 元信息，方便恢复时重建 LoRA 结构
                 if self.use_lora:
                     config_dict['use_lora'] = True

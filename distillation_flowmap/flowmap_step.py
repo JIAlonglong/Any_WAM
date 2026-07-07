@@ -357,8 +357,29 @@ class FlowMapStepMixin:
     # ==================================================================
     # 混合时间步采样：扩散目标 + 一致性目标 + 流映射目标
     # ==================================================================
+    def _sample_adjacent_grid_timesteps(self, batch_size, num_frames, dtype, device):
+        """Sample only neighboring edges on a fixed denoising grid."""
+        grid = torch.as_tensor(
+            getattr(self.config, "flowmap_adjacent_grid", [1000, 750, 500, 250, 0]),
+            dtype=dtype,
+            device=device,
+        )
+        if grid.ndim != 1 or grid.numel() < 2:
+            raise ValueError("flowmap_adjacent_grid must contain at least two timesteps.")
+        if not torch.all(grid[:-1] > grid[1:]):
+            raise ValueError(
+                "flowmap_adjacent_grid must be strictly descending, "
+                f"got {grid.detach().cpu().tolist()}"
+            )
+
+        edge_idx = torch.randint(0, grid.numel() - 1, (batch_size,), device=device)
+        t = grid[edge_idx].unsqueeze(1).expand(-1, num_frames)
+        r = grid[edge_idx + 1].unsqueeze(1).expand(-1, num_frames)
+        is_diffusion = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        return t, r, is_diffusion
+
     def sample_timestep_mixed(
-        self, batch_size, num_frames, dtype, device, scheduler=None,
+        self, batch_size, num_frames, dtype, device, scheduler=None, pair_mode=None,
     ):
         """
         混合时间步采样，实现三种目标的随机切换。
@@ -390,6 +411,16 @@ class FlowMapStepMixin:
           - 返回前会应用 SNR shift（与 FlowMatchScheduler 一致）并乘以 num_train_timesteps
           - 返回值已是原始时间步，无需再乘以 num_train_timesteps
         """
+        pair_mode = str(pair_mode or getattr(
+            self.config, "flowmap_pair_mode", "arbitrary")).lower()
+        if pair_mode in ("adjacent_grid", "adjacent", "local"):
+            return self._sample_adjacent_grid_timesteps(
+                batch_size, num_frames, dtype, device)
+        if pair_mode not in ("arbitrary", "mixed", "anyflow", "flowmap"):
+            raise ValueError(
+                f"Unsupported pair_mode={pair_mode!r}; expected arbitrary or adjacent_grid."
+            )
+
         # 步骤 1：采样两个均匀随机数（per-sample）
         t_1 = torch.rand(batch_size, dtype=dtype, device=device)
         t_2 = torch.rand(batch_size, dtype=dtype, device=device)
@@ -4039,6 +4070,7 @@ class FlowMapStepMixin:
 
         video_t, video_r, _ = self.sample_timestep_mixed(
             B, num_frames, dtype=torch.float32, device=self.device,
+            pair_mode=getattr(self.config, 'opd_pair_mode', None),
         )
         video_r = self._apply_opd_low_noise_query_bias(video_t, video_r)
         video_r_sigma = video_r / self.config.num_train_timesteps
@@ -4049,6 +4081,7 @@ class FlowMapStepMixin:
             action_t, action_r, _ = self.sample_timestep_mixed(
                 B, num_frames, dtype=torch.float32, device=self.device,
                 scheduler=self.train_scheduler_action,
+                pair_mode=getattr(self.config, 'opd_pair_mode', None),
             )
             action_r = self._apply_opd_low_noise_query_bias(action_t, action_r)
             action_t_sigma = action_t / self.config.num_train_timesteps

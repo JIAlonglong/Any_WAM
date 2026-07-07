@@ -25,6 +25,17 @@ cfg.use_onpolicy_transition = False
 cfg.use_opd_aux = False
 cfg.use_dmd = False
 
+
+def _parse_adjacent_grid(text):
+    return [int(v.strip()) for v in text.split(",") if v.strip()]
+
+
+cfg.flowmap_pair_mode = os.environ.get("FLOWMAP_PAIR_MODE", "arbitrary").lower()
+cfg.opd_pair_mode = os.environ.get("OPD_PAIR_MODE", cfg.flowmap_pair_mode).lower()
+cfg.flowmap_adjacent_grid = _parse_adjacent_grid(
+    os.environ.get("FLOWMAP_ADJACENT_GRID", "1000,750,500,250,0")
+)
+
 # Keep the single-node RobotWin effective batch when launched with torchrun.
 cfg.auto_scale_gradient_accumulation = _env_bool("AUTO_SCALE_GRADIENT_ACCUMULATION", True)
 cfg.gradient_accumulation_reference = int(os.environ.get(

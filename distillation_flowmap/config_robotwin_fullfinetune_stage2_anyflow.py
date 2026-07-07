@@ -2,7 +2,11 @@
 import copy
 import os
 
-from distillation_flowmap.config_robotwin_fullfinetune_stage1_warmup import cfg as _stage1_cfg, _env_bool
+from distillation_flowmap.config_robotwin_fullfinetune_stage1_warmup import (
+    cfg as _stage1_cfg,
+    _env_bool,
+    _parse_adjacent_grid,
+)
 
 cfg = copy.deepcopy(_stage1_cfg)
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +47,14 @@ cfg.opd_action_rollout_grad_mode = os.environ.get(
 cfg.opd_fuse_action_teacher = _env_bool("OPD_FUSE_ACTION_TEACHER", True)
 cfg.opd_same_state_velocity_weight = float(os.environ.get(
     "OPD_SAME_STATE_VELOCITY_WEIGHT", 0.0))
+cfg.flowmap_pair_mode = os.environ.get("FLOWMAP_PAIR_MODE", cfg.flowmap_pair_mode).lower()
+cfg.opd_pair_mode = os.environ.get("OPD_PAIR_MODE", cfg.flowmap_pair_mode).lower()
+cfg.flowmap_adjacent_grid = _parse_adjacent_grid(
+    os.environ.get(
+        "FLOWMAP_ADJACENT_GRID",
+        ",".join(str(v) for v in cfg.flowmap_adjacent_grid),
+    )
+)
 
 _opd_aux_loss_clip = os.environ.get("OPD_AUX_LOSS_CLIP_VALUE")
 cfg.opd_aux_loss_clip_value = (
@@ -78,8 +90,13 @@ _opd_rollout_step_pairs = os.environ.get("OPD_ROLLOUT_STEP_PAIRS")
 if _opd_rollout_step_pairs:
     cfg.opd_rollout_step_pairs = _parse_step_pairs(_opd_rollout_step_pairs)
 
-# DanceOPD-style low-noise query bias.
-cfg.opd_query_bias = os.environ.get("OPD_QUERY_BIAS", "low_t").lower()
+# DanceOPD-style low-noise query bias. Adjacent-grid OPD is the local
+# transition ablation, so keep those endpoints exact unless explicitly
+# overridden.
+_default_opd_query_bias = (
+    "none" if cfg.opd_pair_mode in ("adjacent_grid", "adjacent", "local") else "low_t"
+)
+cfg.opd_query_bias = os.environ.get("OPD_QUERY_BIAS", _default_opd_query_bias).lower()
 cfg.opd_query_bias_ratio = float(os.environ.get("OPD_QUERY_BIAS_RATIO", 1.0))
 cfg.opd_low_noise_alpha = float(os.environ.get("OPD_LOW_NOISE_ALPHA", 5.0))
 cfg.opd_low_noise_beta = float(os.environ.get("OPD_LOW_NOISE_BETA", 2.0))

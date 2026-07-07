@@ -1030,6 +1030,33 @@ def test_rollout_video_conditioning_keeps_first_frame_clean():
     assert torch.equal(conditioned_r[:, 1:], target_timesteps[:, 1:])
 
 
+def test_rollout_eval_video_allows_missing_target_student():
+    from types import SimpleNamespace
+
+    from distillation_flowmap.rollout_eval_video_stage2 import (
+        set_eval_mode_for_optional_students,
+    )
+
+    calls = []
+
+    class _Module:
+        def __init__(self, name):
+            self.name = name
+
+        def eval(self):
+            calls.append(self.name)
+
+    trainer = SimpleNamespace(
+        student=_Module("student"),
+        target_student=None,
+        _student_nofsdp=_Module("nofsdp"),
+    )
+
+    set_eval_mode_for_optional_students(trainer)
+
+    assert calls == ["student", "nofsdp"]
+
+
 def test_cosmos_action_only_rollout_video_skips_student_latent_diagnostic_by_default():
     from distillation_flowmap.rollout_eval_video_stage2 import should_save_student_latent_video
 

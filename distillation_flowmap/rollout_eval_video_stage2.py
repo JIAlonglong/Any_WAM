@@ -106,6 +106,14 @@ def should_save_student_latent_video(
     return True
 
 
+def set_eval_mode_for_optional_students(trainer):
+    trainer.student.eval()
+    if getattr(trainer, "target_student", None) is not None:
+        trainer.target_student.eval()
+    if getattr(trainer, "_student_nofsdp", None) is not None:
+        trainer._student_nofsdp.eval()
+
+
 def decode_latents_to_np(vae, video_processor, latents):
     latents = latents.detach().to(next(vae.parameters()).device, dtype=vae.dtype)
     latents_mean = (
@@ -317,10 +325,7 @@ def main():
         cfg.cache_dataset_in_memory = False
 
     trainer = FlowMapDistiller(cfg)
-    trainer.student.eval()
-    trainer.target_student.eval()
-    if getattr(trainer, "_student_nofsdp", None) is not None:
-        trainer._student_nofsdp.eval()
+    set_eval_mode_for_optional_students(trainer)
 
     action_ds = getattr(trainer.config, "action_downsample_factor", 4)
     pairs = [parse_pair(p) for p in args.pairs]

@@ -75,6 +75,21 @@ except ImportError:
     HAS_DISCRIMINATOR = False
 
 
+def _call_with_student_checkpointing(student, enabled, fn):
+    old_enabled = getattr(student, "_flowmap_gradient_checkpointing", None)
+    student._flowmap_gradient_checkpointing = bool(enabled)
+    try:
+        return fn()
+    finally:
+        if old_enabled is None:
+            try:
+                delattr(student, "_flowmap_gradient_checkpointing")
+            except AttributeError:
+                pass
+        else:
+            student._flowmap_gradient_checkpointing = old_enabled
+
+
 def _set_video_channel_config_from_heads(config_dict, model=None, state_dict=None):
     """Persist channel config from the actual video head shapes."""
     patch_size = config_dict.get("patch_size")
@@ -328,8 +343,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 logger.info(f"  opd_aux_interval   = {getattr(config, 'opd_aux_interval', 1)}")
                 logger.info(f"  flowmap_aux_weight = {getattr(config, 'flowmap_aux_weight', 1.0)}")
                 logger.info(f"  endpoint_aux_weight= {getattr(config, 'opd_endpoint_aux_weight', 0.0)}")
+                logger.info(f"  same_state_velocity_weight= {getattr(config, 'opd_same_state_velocity_weight', 0.0)}")
                 logger.info(f"  opd_target_mode    = {getattr(config, 'opd_teacher_target_mode', 'student_state')}")
                 logger.info(f"  opd_grad_mode      = {getattr(config, 'opd_rollout_grad_mode', 'endpoint')}")
+                logger.info(f"  opd_aux_gradient_checkpointing = {getattr(config, 'opd_aux_gradient_checkpointing', False)}")
                 logger.info(f"  action_transition_block = {getattr(config, 'action_transition_block_weight', getattr(config, 'action_block_weight', 1.0))}")
                 logger.info(f"  action_local_fm_block   = {getattr(config, 'action_local_fm_block_weight', 1.0)}")
                 logger.info(f"  action_local_fm_weight  = {getattr(config, 'action_aware_weight', 0.0)}")
@@ -2246,6 +2263,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         f"grad={getattr(config, 'opd_rollout_grad_mode', 'endpoint')}, "
                         f"flowmap_aux={getattr(config, 'flowmap_aux_weight', 1.0)}, "
                         f"endpoint_aux={getattr(config, 'opd_endpoint_aux_weight', 0.0)}, "
+                        f"same_state_vel={getattr(config, 'opd_same_state_velocity_weight', 0.0)}, "
+                        f"aux_gc={getattr(config, 'opd_aux_gradient_checkpointing', False)}, "
                         f"action_transition_block={getattr(config, 'action_transition_block_weight', getattr(config, 'action_block_weight', 1.0))}, "
                         f"action_local_fm_block={getattr(config, 'action_local_fm_block_weight', 1.0)}, "
                         f"action_local_fm_weight={getattr(config, 'action_aware_weight', 0.0)}, "
@@ -2332,16 +2351,19 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         acc_opd_aux_losses = []
         acc_opd_video_transition_losses = []
         acc_opd_endpoint_aux_losses = []
+        acc_opd_same_state_velocity_losses = []
         acc_opd_local_fm_losses = []
         acc_opd_action_transition_losses = []
         acc_opd_action_local_fm_losses = []
         acc_opd_video_transition_contribs = []
         acc_opd_endpoint_aux_contribs = []
+        acc_opd_same_state_velocity_contribs = []
         acc_opd_local_fm_contribs = []
         acc_opd_action_transition_contribs = []
         acc_opd_action_local_fm_contribs = []
         acc_opd_video_transition_ratios = []
         acc_opd_endpoint_aux_ratios = []
+        acc_opd_same_state_velocity_ratios = []
         acc_opd_local_fm_ratios = []
         acc_opd_action_transition_ratios = []
         acc_opd_action_local_fm_ratios = []
@@ -2408,10 +2430,15 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         use_opd_aux_now = torch.rand(1).item() < opd_aux_prob
 
             if use_opd_aux_now:
-                if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
-                    opd_aux_result = self._opd_aux_transition_step_kto_paopd(batch, step_in_acc)
-                else:
-                    opd_aux_result = self._opd_aux_transition_step(batch, step_in_acc)
+                def _run_opd_aux():
+                    if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
+                        return self._opd_aux_transition_step_kto_paopd(batch, step_in_acc)
+                    return self._opd_aux_transition_step(batch, step_in_acc)
+
+                opd_aux_checkpointing = bool(getattr(
+                    self.config, 'opd_aux_gradient_checkpointing', False))
+                opd_aux_result = _call_with_student_checkpointing(
+                    self.student, opd_aux_checkpointing, _run_opd_aux)
                 result["loss"] = result["loss"] + opd_aux_result.get("loss", zero_tensor)
                 result["skip_step"] = (
                     result.get("skip_step", False) or
@@ -2455,6 +2482,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             acc_opd_endpoint_aux_losses.append(
                 opd_aux_result.get("opd_endpoint_aux_loss", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
+            acc_opd_same_state_velocity_losses.append(
+                opd_aux_result.get("opd_same_state_velocity_loss", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
             acc_opd_local_fm_losses.append(
                 opd_aux_result.get("opd_local_fm_loss", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
@@ -2470,6 +2500,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             acc_opd_endpoint_aux_contribs.append(
                 opd_aux_result.get("opd_endpoint_aux_contrib", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
+            acc_opd_same_state_velocity_contribs.append(
+                opd_aux_result.get("opd_same_state_velocity_contrib", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
             acc_opd_local_fm_contribs.append(
                 opd_aux_result.get("opd_local_fm_contrib", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
@@ -2484,6 +2517,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 if opd_aux_result is not None else zero_tensor)
             acc_opd_endpoint_aux_ratios.append(
                 opd_aux_result.get("opd_endpoint_aux_ratio", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_opd_same_state_velocity_ratios.append(
+                opd_aux_result.get("opd_same_state_velocity_ratio", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
             acc_opd_local_fm_ratios.append(
                 opd_aux_result.get("opd_local_fm_ratio", zero_tensor)
@@ -2631,16 +2667,19 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     torch.stack(acc_opd_aux_losses).sum(),
                     torch.stack(acc_opd_video_transition_losses).sum(),
                     torch.stack(acc_opd_endpoint_aux_losses).sum(),
+                    torch.stack(acc_opd_same_state_velocity_losses).sum(),
                     torch.stack(acc_opd_local_fm_losses).sum(),
                     torch.stack(acc_opd_action_transition_losses).sum(),
                     torch.stack(acc_opd_action_local_fm_losses).sum(),
                     torch.stack(acc_opd_video_transition_contribs).sum(),
                     torch.stack(acc_opd_endpoint_aux_contribs).sum(),
+                    torch.stack(acc_opd_same_state_velocity_contribs).sum(),
                     torch.stack(acc_opd_local_fm_contribs).sum(),
                     torch.stack(acc_opd_action_transition_contribs).sum(),
                     torch.stack(acc_opd_action_local_fm_contribs).sum(),
                     torch.stack(acc_opd_video_transition_ratios).sum(),
                     torch.stack(acc_opd_endpoint_aux_ratios).sum(),
+                    torch.stack(acc_opd_same_state_velocity_ratios).sum(),
                     torch.stack(acc_opd_local_fm_ratios).sum(),
                     torch.stack(acc_opd_action_transition_ratios).sum(),
                     torch.stack(acc_opd_action_local_fm_ratios).sum(),
@@ -2671,7 +2710,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     ])
                 metric_values = torch.stack(metric_tensors).float()
                 metric_results = dist_mean(metric_values).tolist()
-                base_metric_count = 38
+                base_metric_count = 41
                 (
                     avg_loss,
                     avg_video_loss,
@@ -2692,16 +2731,19 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     avg_opd_aux_loss,
                     avg_opd_video_transition_loss,
                     avg_opd_endpoint_aux_loss,
+                    avg_opd_same_state_velocity_loss,
                     avg_opd_local_fm_loss,
                     avg_opd_action_transition_loss,
                     avg_opd_action_local_fm_loss,
                     avg_opd_video_transition_contrib,
                     avg_opd_endpoint_aux_contrib,
+                    avg_opd_same_state_velocity_contrib,
                     avg_opd_local_fm_contrib,
                     avg_opd_action_transition_contrib,
                     avg_opd_action_local_fm_contrib,
                     avg_opd_video_transition_ratio,
                     avg_opd_endpoint_aux_ratio,
+                    avg_opd_same_state_velocity_ratio,
                     avg_opd_local_fm_ratio,
                     avg_opd_action_transition_ratio,
                     avg_opd_action_local_fm_ratio,
@@ -2775,16 +2817,19 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_opd_aux_losses = []
                 acc_opd_video_transition_losses = []
                 acc_opd_endpoint_aux_losses = []
+                acc_opd_same_state_velocity_losses = []
                 acc_opd_local_fm_losses = []
                 acc_opd_action_transition_losses = []
                 acc_opd_action_local_fm_losses = []
                 acc_opd_video_transition_contribs = []
                 acc_opd_endpoint_aux_contribs = []
+                acc_opd_same_state_velocity_contribs = []
                 acc_opd_local_fm_contribs = []
                 acc_opd_action_transition_contribs = []
                 acc_opd_action_local_fm_contribs = []
                 acc_opd_video_transition_ratios = []
                 acc_opd_endpoint_aux_ratios = []
+                acc_opd_same_state_velocity_ratios = []
                 acc_opd_local_fm_ratios = []
                 acc_opd_action_transition_ratios = []
                 acc_opd_action_local_fm_ratios = []
@@ -2873,6 +2918,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         postfix["opd"] = f"{avg_opd_aux_loss:.4f}"
                         postfix["ovt"] = f"{avg_opd_video_transition_loss:.2e}"
                         postfix["oep"] = f"{avg_opd_endpoint_aux_loss:.2e}"
+                        postfix["ossv"] = f"{avg_opd_same_state_velocity_loss:.2e}"
                         postfix["ovlfm"] = f"{avg_opd_local_fm_loss:.2e}"
                         postfix["wovt"] = f"{avg_opd_video_transition_contrib:.2e}"
                         postfix["rat"] = f"{avg_opd_video_transition_ratio:.2f}/{avg_opd_action_transition_ratio:.2f}/{avg_opd_action_local_fm_ratio:.2f}"
@@ -2881,9 +2927,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         log_dict["loss/opd_aux"] = avg_opd_aux_loss
                         log_dict["loss/opd_video_transition"] = avg_opd_video_transition_loss
                         log_dict["loss/opd_endpoint_aux"] = avg_opd_endpoint_aux_loss
+                        log_dict["loss/opd_same_state_velocity"] = avg_opd_same_state_velocity_loss
                         log_dict["loss/opd_local_fm"] = avg_opd_local_fm_loss
                         log_dict["loss_weighted/opd_video_transition"] = avg_opd_video_transition_contrib
                         log_dict["loss_weighted/opd_endpoint_aux"] = avg_opd_endpoint_aux_contrib
+                        log_dict["loss_weighted/opd_same_state_velocity"] = avg_opd_same_state_velocity_contrib
                         log_dict["loss_weighted/opd_local_fm"] = avg_opd_local_fm_contrib
                         log_dict["loss_weighted/opd_transition_group_scaled"] = avg_opd_transition_group_scaled
                         log_dict["loss_weighted/opd_anchor_group_scaled"] = avg_opd_anchor_group_scaled
@@ -2893,6 +2941,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         log_dict["loss_ratio/opd_anchor_total"] = avg_opd_anchor_group_ratio
                         log_dict["loss_ratio/opd_video_transition"] = avg_opd_video_transition_ratio
                         log_dict["loss_ratio/opd_endpoint_aux"] = avg_opd_endpoint_aux_ratio
+                        log_dict["loss_ratio/opd_same_state_velocity"] = avg_opd_same_state_velocity_ratio
                         log_dict["loss_ratio/opd_local_fm"] = avg_opd_local_fm_ratio
                         if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
                             postfix["kto"] = f"{avg_kto_good_ratio:.2f}/{avg_kto_weight_mean:.2f}"

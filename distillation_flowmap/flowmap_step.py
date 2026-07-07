@@ -57,6 +57,28 @@ def _downsample_action_grid_id(grid_id, action_latents, factor):
     if W_action != 1:
         raise ValueError(f"Expected action width 1, got {W_action}")
     return grid_id.reshape(B, 4, F_action, N_action, W_action)[:, :, ::factor].reshape(B, 4, -1)
+
+
+def _same_state_velocity_loss(
+    student_v,
+    teacher_v,
+    sample_weight,
+    transition_loss_type="huber",
+    transition_huber_c=1e-3,
+):
+    """Weighted per-sample velocity loss at the student-induced endpoint."""
+    diff = student_v.float() - teacher_v.detach().float()
+    if transition_loss_type == "huber":
+        abs_diff = diff.abs()
+        per_token = torch.where(
+            abs_diff < transition_huber_c,
+            0.5 * diff ** 2,
+            transition_huber_c * (abs_diff - 0.5 * transition_huber_c),
+        )
+    else:
+        per_token = diff ** 2
+    per_sample = per_token.mean(dim=[1, 2, 3, 4])
+    return (per_sample * sample_weight.to(per_sample.device)).mean()
 from einops import rearrange
 
 from utils import data_seq_to_patch, logger
@@ -4570,6 +4592,28 @@ class FlowMapStepMixin:
                 endpoint_per_sample = (endpoint_diff ** 2).mean(dim=[1, 2, 3, 4])
             opd_endpoint_aux_loss = (endpoint_per_sample * weight).mean()
 
+        opd_same_state_velocity_loss = torch.tensor(0.0, device=self.device)
+        opd_same_state_velocity_weight = float(getattr(
+            self.config, 'opd_same_state_velocity_weight', 0.0))
+        if opd_same_state_velocity_weight > 0 and teacher_target_mode == 'endpoint':
+            _, teacher_v_same_state = self._teacher_forward_at_student_state(
+                student_x_r=student_x_r,
+                target_r=video_r,
+                input_dict=input_dict,
+                empty_emb=empty_emb,
+                cfg_scale=cfg_scale,
+                ref_shape=ref_shape,
+                B=B,
+            )
+            opd_same_state_velocity_loss = _same_state_velocity_loss(
+                student_v_at_r,
+                teacher_v_same_state,
+                weight,
+                transition_loss_type=transition_loss_type,
+                transition_huber_c=transition_huber_c,
+            )
+            _profile_mark('video_teacher_same_state_query')
+
         local_fm_loss = torch.tensor(0.0, device=self.device)
         local_fm_weight = getattr(self.config, 'local_fm_weight', 0.05)
         if local_fm_weight > 0:
@@ -4633,6 +4677,9 @@ class FlowMapStepMixin:
 
         raw_opd_video_transition_contrib = video_transition_weight * video_transition_loss
         raw_opd_endpoint_aux_contrib = opd_endpoint_aux_weight * opd_endpoint_aux_loss
+        raw_opd_same_state_velocity_contrib = (
+            opd_same_state_velocity_weight * opd_same_state_velocity_loss
+        )
         raw_opd_local_fm_contrib = local_fm_weight * local_fm_loss
         raw_opd_action_transition_contrib = (
             action_transition_block_weight * action_transition_weight * opd_action_transition_loss
@@ -4646,6 +4693,7 @@ class FlowMapStepMixin:
         )
         raw_anchor_group = (
             raw_opd_endpoint_aux_contrib
+            + raw_opd_same_state_velocity_contrib
             + raw_opd_local_fm_contrib
             + raw_opd_action_local_fm_contrib
         )
@@ -4666,6 +4714,7 @@ class FlowMapStepMixin:
         opd_video_transition_contrib = raw_opd_video_transition_contrib * transition_scale
         opd_action_transition_contrib = raw_opd_action_transition_contrib * transition_scale
         opd_endpoint_aux_contrib = raw_opd_endpoint_aux_contrib * anchor_scale
+        opd_same_state_velocity_contrib = raw_opd_same_state_velocity_contrib * anchor_scale
         opd_local_fm_contrib = raw_opd_local_fm_contrib * anchor_scale
         opd_action_local_fm_contrib = raw_opd_action_local_fm_contrib * anchor_scale
         raw_aux_loss = scaled_transition_group + scaled_anchor_group
@@ -4699,11 +4748,13 @@ class FlowMapStepMixin:
                 'opd_aux_loss': weighted_aux_loss.detach(),
                 'opd_video_transition_loss': video_transition_loss.detach(),
                 'opd_endpoint_aux_loss': opd_endpoint_aux_loss.detach(),
+                'opd_same_state_velocity_loss': opd_same_state_velocity_loss.detach(),
                 'opd_local_fm_loss': local_fm_loss.detach(),
                 'opd_action_transition_loss': opd_action_transition_loss.detach(),
                 'opd_action_local_fm_loss': opd_action_local_fm_loss.detach(),
                 'opd_video_transition_contrib': opd_video_transition_contrib.detach(),
                 'opd_endpoint_aux_contrib': opd_endpoint_aux_contrib.detach(),
+                'opd_same_state_velocity_contrib': opd_same_state_velocity_contrib.detach(),
                 'opd_local_fm_contrib': opd_local_fm_contrib.detach(),
                 'opd_action_transition_contrib': opd_action_transition_contrib.detach(),
                 'opd_action_local_fm_contrib': opd_action_local_fm_contrib.detach(),
@@ -4715,6 +4766,7 @@ class FlowMapStepMixin:
                 'opd_anchor_group_ratio': opd_anchor_group_ratio.detach(),
                 'opd_video_transition_ratio': (opd_video_transition_contrib.detach().abs() / contrib_denom),
                 'opd_endpoint_aux_ratio': (opd_endpoint_aux_contrib.detach().abs() / contrib_denom),
+                'opd_same_state_velocity_ratio': (opd_same_state_velocity_contrib.detach().abs() / contrib_denom),
                 'opd_local_fm_ratio': (opd_local_fm_contrib.detach().abs() / contrib_denom),
                 'opd_action_transition_ratio': (opd_action_transition_contrib.detach().abs() / contrib_denom),
                 'opd_action_local_fm_ratio': (opd_action_local_fm_contrib.detach().abs() / contrib_denom),
@@ -4746,11 +4798,13 @@ class FlowMapStepMixin:
             'opd_aux_loss': weighted_aux_loss.detach(),
             'opd_video_transition_loss': video_transition_loss.detach(),
             'opd_endpoint_aux_loss': opd_endpoint_aux_loss.detach(),
+            'opd_same_state_velocity_loss': opd_same_state_velocity_loss.detach(),
             'opd_local_fm_loss': local_fm_loss.detach(),
             'opd_action_transition_loss': opd_action_transition_loss.detach(),
             'opd_action_local_fm_loss': opd_action_local_fm_loss.detach(),
             'opd_video_transition_contrib': opd_video_transition_contrib.detach(),
             'opd_endpoint_aux_contrib': opd_endpoint_aux_contrib.detach(),
+            'opd_same_state_velocity_contrib': opd_same_state_velocity_contrib.detach(),
             'opd_local_fm_contrib': opd_local_fm_contrib.detach(),
             'opd_action_transition_contrib': opd_action_transition_contrib.detach(),
             'opd_action_local_fm_contrib': opd_action_local_fm_contrib.detach(),
@@ -4762,6 +4816,7 @@ class FlowMapStepMixin:
             'opd_anchor_group_ratio': opd_anchor_group_ratio.detach(),
             'opd_video_transition_ratio': (opd_video_transition_contrib.detach().abs() / contrib_denom),
             'opd_endpoint_aux_ratio': (opd_endpoint_aux_contrib.detach().abs() / contrib_denom),
+            'opd_same_state_velocity_ratio': (opd_same_state_velocity_contrib.detach().abs() / contrib_denom),
             'opd_local_fm_ratio': (opd_local_fm_contrib.detach().abs() / contrib_denom),
             'opd_action_transition_ratio': (opd_action_transition_contrib.detach().abs() / contrib_denom),
             'opd_action_local_fm_ratio': (opd_action_local_fm_contrib.detach().abs() / contrib_denom),

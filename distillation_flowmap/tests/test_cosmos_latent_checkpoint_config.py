@@ -1,5 +1,16 @@
-import torch
 import importlib
+import os
+import sys
+
+import torch
+
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+FLOWMAP_DIR = os.path.join(REPO_ROOT, "distillation_flowmap")
+WANVA_DIR = os.path.join(REPO_ROOT, "wan_va")
+for path in (FLOWMAP_DIR, WANVA_DIR):
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
 from distillation_flowmap.flowmap_trainer import _set_video_channel_config_from_heads
 

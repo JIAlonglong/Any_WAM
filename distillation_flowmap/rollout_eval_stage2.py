@@ -29,6 +29,11 @@ from distributed.util import init_distributed, dist_mean
 from utils import init_logger, logger
 from distillation_flowmap.flowmap_trainer import FlowMapDistiller
 from distillation_flowmap.flowmap_step import _downsample_action_grid_id
+from distillation_flowmap.ablation.robotwin_mini_protocol import (
+    dataset_indices_for_manifest,
+    eval_seed_for_pair,
+    load_eval_pairs,
+)
 
 
 def parse_pair(text):
@@ -51,8 +56,62 @@ def resolve_empty_emb_path(dataset_path, explicit_path=None):
     return str(candidates[0])
 
 
-def teacher_cache_key(batch_idx, t_value, r_value):
-    return f"batch{batch_idx}/t{int(t_value)}_r{int(r_value)}"
+def teacher_cache_key(batch_idx, t_value, r_value, pair_id=None, sample_key=None):
+    pair_key = pair_id or f"t{int(t_value)}_r{int(r_value)}"
+    sample_key = sample_key or f"batch{batch_idx}"
+    return f"{sample_key}/{pair_key}"
+
+
+def load_json(path):
+    with Path(path).open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_cli_pair_specs(pairs):
+    specs = []
+    for pair in pairs:
+        t_value, r_value = parse_pair(pair)
+        specs.append({
+            "pair_id": f"t{int(t_value)}_r{int(r_value)}",
+            "t": t_value,
+            "r": r_value,
+            "pair_seed": None,
+        })
+    return specs
+
+
+def build_eval_records(trainer, eval_manifest_path=None, num_batches=1, split_name=None):
+    if eval_manifest_path is None:
+        batches = trainer._get_light_eval_batches()
+        limit = max(1, int(num_batches))
+        return [
+            {
+                "batch": batch,
+                "sample_key": f"batch{batch_idx}",
+                "global_index": None,
+            }
+            for batch_idx, batch in enumerate(batches[:limit])
+        ]
+
+    from torch.utils.data._utils.collate import default_collate
+
+    manifest = load_json(eval_manifest_path)
+    if split_name is not None and manifest.get("split") != split_name:
+        raise ValueError(
+            f"Eval manifest split is {manifest.get('split')!r}, expected {split_name!r}"
+        )
+    dataset = trainer.train_loader.dataset
+    indices = dataset_indices_for_manifest(dataset, manifest)
+    if int(num_batches) > 0:
+        indices = indices[:int(num_batches)]
+    records = []
+    for global_index in indices:
+        records.append({
+            "batch": default_collate([dataset[global_index]]),
+            "sample_key": f"idx{int(global_index)}",
+            "global_index": int(global_index),
+        })
+    return records
 
 
 def init_mask(trainer, input_dict):
@@ -99,6 +158,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cfg-scale", type=float, default=5.0)
     parser.add_argument("--pairs", nargs="+", default=["1000,0", "1000,500", "750,250"])
+    parser.add_argument("--eval-manifest", type=Path, default=None)
+    parser.add_argument("--eval-pairs-json", type=Path, default=None)
+    parser.add_argument("--split-name", default=None)
     parser.add_argument("--student-steps", nargs="+", type=int, default=[1, 2, 4])
     parser.add_argument("--teacher-steps", type=int, default=4)
     parser.add_argument(
@@ -170,6 +232,8 @@ def main():
     cfg.empty_emb_path = resolve_empty_emb_path(args.dataset_path, args.empty_emb_path)
     cfg.output_dir = args.output_dir
     cfg.resume_from_path = args.resume_from_path
+    if args.eval_manifest is not None:
+        cfg.dataset_sample_manifest = None
     cfg.reset_resume_step = False
     cfg.enable_wandb = False
     cfg.enable_light_eval = False
@@ -180,7 +244,7 @@ def main():
     cfg.offline_eval_skip_teacher = use_teacher_cache
     cfg.offline_eval_force_gradient_checkpointing = True
     cfg.skip_teacher_compile = True
-    cfg.light_eval_num_batches = args.num_batches
+    cfg.light_eval_num_batches = max(1, args.num_batches)
     cfg.light_eval_seed = args.seed
     cfg.light_eval_start_index = 0
     # Keep memory closer to training but avoid the full no-FSDP student copy for this offline pass.
@@ -194,7 +258,11 @@ def main():
         trainer._student_nofsdp.eval()
 
     action_ds = getattr(trainer.config, "action_downsample_factor", 4)
-    pairs = [parse_pair(p) for p in args.pairs]
+    pair_specs = (
+        load_eval_pairs(args.eval_pairs_json)
+        if args.eval_pairs_json is not None
+        else build_cli_pair_specs(args.pairs)
+    )
     metrics = {}
     counts = {}
 
@@ -203,8 +271,14 @@ def main():
         metrics[name] = metrics.get(name, torch.zeros((), device=trainer.device)) + value
         counts[name] = counts.get(name, 0) + 1
 
-    batches = trainer._get_light_eval_batches()
-    for batch_idx, batch in enumerate(batches[:args.num_batches]):
+    eval_records = build_eval_records(
+        trainer,
+        eval_manifest_path=args.eval_manifest,
+        num_batches=args.num_batches,
+        split_name=args.split_name,
+    )
+    for batch_idx, record in enumerate(eval_records):
+        batch = record["batch"]
         batch = trainer._move_eval_batch_to_device(batch)
         base_input = trainer._prepare_base_dict(batch)
         B = batch["latents"].shape[0]
@@ -212,9 +286,14 @@ def main():
         num_frames = ref_shape[2]
         empty_emb = trainer.empty_emb.expand(base_input["latent_dict"]["text_emb"].shape[0], -1, -1)
 
-        for pair_idx, (t_value, r_value) in enumerate(pairs):
+        for pair_idx, pair_spec in enumerate(pair_specs):
+            t_value = float(pair_spec["t"])
+            r_value = float(pair_spec["r"])
             gen = torch.Generator(device=trainer.device)
-            gen.manual_seed(args.seed + batch_idx * 1009 + pair_idx)
+            if pair_spec.get("pair_seed") is None:
+                gen.manual_seed(args.seed + batch_idx * 1009 + pair_idx)
+            else:
+                gen.manual_seed(eval_seed_for_pair(pair_spec, batch_idx))
             video_t = torch.full((B, num_frames), t_value, device=trainer.device, dtype=torch.float32)
             video_r = torch.full((B, num_frames), r_value, device=trainer.device, dtype=torch.float32)
             action_t = video_t
@@ -274,8 +353,14 @@ def main():
                 "window_size": input_dict["window_size"],
             }
 
-            pair_name = f"t{int(t_value)}_r{int(r_value)}"
-            cache_key = teacher_cache_key(batch_idx, t_value, r_value)
+            pair_name = str(pair_spec.get("pair_id") or f"t{int(t_value)}_r{int(r_value)}")
+            cache_key = teacher_cache_key(
+                batch_idx,
+                t_value,
+                r_value,
+                pair_id=pair_name,
+                sample_key=record.get("sample_key"),
+            )
             if use_teacher_cache:
                 targets = teacher_cache.get("targets", {})
                 if cache_key not in targets:
@@ -395,7 +480,10 @@ def main():
                     "num_batches": args.num_batches,
                     "seed": args.seed,
                     "cfg_scale": args.cfg_scale,
-                    "pairs": args.pairs,
+                    "pairs": pair_specs,
+                    "eval_manifest": str(args.eval_manifest) if args.eval_manifest else None,
+                    "eval_pairs_json": str(args.eval_pairs_json) if args.eval_pairs_json else None,
+                    "split_name": args.split_name,
                     "teacher_steps": args.teacher_steps,
                 },
                 "targets": teacher_cache_to_write,

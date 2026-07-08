@@ -14,6 +14,7 @@ LCM 蒸馏的兼容性补丁。
 """
 
 import importlib.machinery
+import json
 import os
 import sys
 import types
@@ -56,6 +57,50 @@ def _filter_repo_list_by_tasks(repo_list, task_filter):
     if not task_names:
         return list(repo_list)
     return [repo_id for repo_id in repo_list if _repo_matches_task(repo_id, task_names)]
+
+
+def _load_dataset_manifest(path):
+    if path in (None, ""):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _manifest_task_entry_for_repo(repo_id, manifest):
+    if not manifest:
+        return None
+    matches = [
+        entry
+        for entry in manifest.get("tasks", [])
+        if _repo_matches_task(repo_id, [entry.get("task")])
+    ]
+    if len(matches) > 1:
+        tasks = ", ".join(str(entry.get("task")) for entry in matches)
+        raise ValueError(f"Dataset manifest has ambiguous entries for {repo_id}: {tasks}")
+    return matches[0] if matches else None
+
+
+def _filter_dataset_metas_by_manifest(dataset, manifest):
+    metas = getattr(dataset, "new_metas", None)
+    if metas is None:
+        return 0, 0
+    repo_id = getattr(dataset, "repo_id", "")
+    task_entry = _manifest_task_entry_for_repo(repo_id, manifest)
+    if task_entry is None:
+        return len(metas), 0
+
+    selected = []
+    for raw_idx in task_entry.get("indices", []):
+        idx = int(raw_idx)
+        if idx < 0 or idx >= len(metas):
+            task_name = task_entry.get("task")
+            raise IndexError(
+                f"Dataset manifest task {task_name!r} index {idx} is out of range "
+                f"for {repo_id} length {len(metas)}"
+            )
+        selected.append(metas[idx])
+    dataset.new_metas = selected
+    return len(metas), len(selected)
 
 
 def _limit_dataset_metas(dataset, max_episodes=None, max_samples=None):
@@ -182,8 +227,10 @@ class SafeMultiLatentLeRobotDataset:
         max_samples = _positive_int_or_none(
             getattr(config, "dataset_max_samples_per_task", None)
         )
+        sample_manifest_path = getattr(config, "dataset_sample_manifest", None)
+        sample_manifest = _load_dataset_manifest(sample_manifest_path)
         defer_cache = bool(getattr(config, "cache_dataset_in_memory", False)) and (
-            max_episodes is not None or max_samples is not None
+            max_episodes is not None or max_samples is not None or sample_manifest is not None
         )
 
         self._datasets = []
@@ -194,6 +241,18 @@ class SafeMultiLatentLeRobotDataset:
                 if defer_cache:
                     config.cache_dataset_in_memory = False
                 ds = LatentLeRobotDataset(repo_id=repo_id, config=config)
+                if sample_manifest is not None:
+                    before, after = _filter_dataset_metas_by_manifest(ds, sample_manifest)
+                    if after == 0:
+                        raise RuntimeError(
+                            "Dataset manifest left no samples in "
+                            f"{os.path.basename(repo_id)}"
+                        )
+                    if after != before:
+                        print(
+                            "Manifest-limited "
+                            f"{os.path.basename(repo_id)} samples: {before} -> {after}"
+                        )
                 before, after = _limit_dataset_metas(ds, max_episodes, max_samples)
                 if after == 0:
                     raise RuntimeError(

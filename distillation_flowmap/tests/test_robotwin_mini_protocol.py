@@ -4,6 +4,9 @@ from pathlib import Path
 from distillation_flowmap.ablation.robotwin_mini_protocol import (
     build_eval_pairs,
     build_index_split,
+    dataset_indices_for_manifest,
+    eval_seed_for_pair,
+    load_eval_pairs,
     write_protocol_manifests,
 )
 
@@ -67,3 +70,49 @@ def test_write_protocol_manifests_records_paths_and_splits(tmp_path):
     assert eval_pairs["pairs"][0]["pair_id"] == "t1000_r0_i0"
     assert train["tasks"][0]["indices"] == [0, 1, 2]
     assert heldout["tasks"][0]["indices"] == [3, 4]
+
+
+class _TinyTaskDataset:
+    def __init__(self, repo_id, length):
+        self.repo_id = repo_id
+        self.new_metas = [{"local": i} for i in range(length)]
+
+    def __len__(self):
+        return len(self.new_metas)
+
+
+class _TinyMultiDataset:
+    def __init__(self):
+        self._datasets = [
+            _TinyTaskDataset("/data/place_a2b_right-aloha-agilex_randomized_500-1000", 6),
+            _TinyTaskDataset("/data/open_microwave", 5),
+        ]
+        self.acc_dset_num = {0: 0, 1: 6}
+
+
+def test_dataset_indices_for_manifest_maps_task_local_indices_to_global_indices():
+    dataset = _TinyMultiDataset()
+    manifest = {
+        "split": "heldout",
+        "tasks": [
+            {"task": "place_a2b_right", "indices": [3, 4]},
+            {"task": "open_microwave", "indices": [1]},
+        ],
+    }
+
+    assert dataset_indices_for_manifest(dataset, manifest) == [3, 4, 7]
+
+
+def test_load_eval_pairs_preserves_pair_ids_and_uses_sample_stable_seeds(tmp_path):
+    path = tmp_path / "eval_pairs.json"
+    path.write_text(json.dumps({
+        "pairs": [
+            {"pair_id": "shortcut", "t": 1000, "r": 0, "pair_seed": 11},
+        ],
+    }))
+
+    pair = load_eval_pairs(path)[0]
+
+    assert pair == {"pair_id": "shortcut", "t": 1000.0, "r": 0.0, "pair_seed": 11}
+    assert eval_seed_for_pair(pair, batch_idx=0) == 11
+    assert eval_seed_for_pair(pair, batch_idx=1) != 11

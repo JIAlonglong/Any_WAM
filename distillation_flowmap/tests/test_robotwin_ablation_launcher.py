@@ -284,3 +284,5 @@ def test_protocol_manifest_paths_are_recorded_in_dry_run(tmp_path):
     assert "eval_pairs_path" in result.stdout
     assert "protocol_seed" in result.stdout
     assert "protocol/manifests/core4_protocol_seed_9" in result.stdout
+    assert "DATASET_SAMPLE_MANIFEST=" in result.stdout
+    assert "train_manifest.json" in result.stdout

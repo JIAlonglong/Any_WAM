@@ -212,11 +212,13 @@ def build_run_plan(args):
     else:
         task_filter = task_preset_filter(tasks, selected_task_preset)
 
+    protocol_paths = protocol_manifest_paths(root, selected_task_preset, args.protocol_seed)
     common_env = {}
     if args.empty_emb_path is not None:
         common_env["EMPTY_EMB_PATH"] = str(args.empty_emb_path)
     if task_filter:
         common_env["DATASET_TASK_FILTER"] = ",".join(task_filter)
+        common_env["DATASET_SAMPLE_MANIFEST"] = protocol_paths["train_manifest_path"]
     if args.max_episodes_per_task is not None:
         common_env["DATASET_MAX_EPISODES_PER_TASK"] = str(args.max_episodes_per_task)
     if args.max_samples_per_task is not None:
@@ -270,7 +272,7 @@ def build_run_plan(args):
         "train_samples_per_task": args.train_samples_per_task,
         "heldout_samples_per_task": args.heldout_samples_per_task,
         "eval_pairs": args.eval_pairs,
-        **protocol_manifest_paths(root, selected_task_preset, args.protocol_seed),
+        **protocol_paths,
         "stage1_env": stage1["env"],
         "stage2_env": stage2["env"],
         "commands": {

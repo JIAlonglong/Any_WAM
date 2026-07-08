@@ -19,3 +19,13 @@ def test_robotwin_stage2_exposes_light_eval_env(monkeypatch):
     assert cfg.light_eval_seed == 123
     assert cfg.light_eval_start_index == 4
     assert cfg.light_eval_pairs == [(1000, 1000), (1000, 0), (750, 250)]
+
+
+def test_robotwin_stage2_exposes_dataset_sample_manifest_env(monkeypatch):
+    monkeypatch.setenv("DATASET_SAMPLE_MANIFEST", "/tmp/train_manifest.json")
+    sys.modules.pop("distillation_flowmap.config_robotwin_fullfinetune_stage1_warmup", None)
+    sys.modules.pop("distillation_flowmap.config_robotwin_fullfinetune_stage2_anyflow", None)
+
+    module = importlib.import_module("distillation_flowmap.config_robotwin_fullfinetune_stage2_anyflow")
+
+    assert module.cfg.dataset_sample_manifest == "/tmp/train_manifest.json"

@@ -42,6 +42,7 @@ def _env_positive_int(name):
 
 
 cfg.dataset_task_filter = _env_list("DATASET_TASK_FILTER")
+cfg.dataset_sample_manifest = os.environ.get("DATASET_SAMPLE_MANIFEST")
 cfg.dataset_max_episodes_per_task = _env_positive_int("DATASET_MAX_EPISODES_PER_TASK")
 cfg.dataset_max_samples_per_task = _env_positive_int("DATASET_MAX_SAMPLES_PER_TASK")
 

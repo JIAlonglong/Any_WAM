@@ -6,6 +6,7 @@ from pathlib import Path
 
 DEFAULT_EVAL_PAIRS = ("1000,0", "1000,500", "750,250")
 PAIR_SEED_STRIDE = 1009
+SAMPLE_SEED_STRIDE = 1000003
 
 
 def _as_task_list(task_names):
@@ -22,6 +23,21 @@ def parse_pair(pair):
     if len(pair) != 2:
         raise ValueError(f"Invalid eval pair {pair!r}; expected t,r")
     return float(pair[0]), float(pair[1])
+
+
+def _repo_task_name(repo_id):
+    name = Path(str(repo_id).rstrip("/")).name
+    return name.split("-", 1)[0]
+
+
+def _repo_matches_task(repo_id, task_name):
+    basename = Path(str(repo_id).rstrip("/")).name.lower()
+    canonical = basename.split("-", 1)[0]
+    task_name = str(task_name).strip().lower()
+    return bool(
+        task_name
+        and (task_name == basename or task_name == canonical or basename.startswith(f"{task_name}-"))
+    )
 
 
 def _format_time(value):
@@ -44,6 +60,35 @@ def build_eval_pairs(pairs=DEFAULT_EVAL_PAIRS, protocol_seed=0):
     if not out:
         raise ValueError("pairs must contain at least one t,r pair")
     return out
+
+
+def load_eval_pairs(path):
+    with Path(path).open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    raw_pairs = payload.get("pairs", payload) if isinstance(payload, dict) else payload
+    out = []
+    for idx, pair in enumerate(raw_pairs):
+        if isinstance(pair, dict):
+            t_value, r_value = parse_pair([pair["t"], pair["r"]])
+            pair_id = str(pair.get("pair_id") or f"t{_format_time(t_value)}_r{_format_time(r_value)}_i{idx}")
+            pair_seed = int(pair.get("pair_seed", idx * PAIR_SEED_STRIDE))
+        else:
+            t_value, r_value = parse_pair(pair)
+            pair_id = f"t{_format_time(t_value)}_r{_format_time(r_value)}_i{idx}"
+            pair_seed = idx * PAIR_SEED_STRIDE
+        out.append({
+            "pair_id": pair_id,
+            "t": t_value,
+            "r": r_value,
+            "pair_seed": pair_seed,
+        })
+    if not out:
+        raise ValueError(f"{path} does not contain any eval pairs")
+    return out
+
+
+def eval_seed_for_pair(pair, batch_idx):
+    return int(pair["pair_seed"]) + int(batch_idx) * SAMPLE_SEED_STRIDE
 
 
 def build_index_split(
@@ -75,6 +120,46 @@ def build_index_split(
         "heldout_samples_per_task": heldout_samples_per_task,
         "tasks": tasks,
     }
+
+
+def dataset_indices_for_manifest(dataset, manifest):
+    if isinstance(manifest, (str, Path)):
+        with Path(manifest).open("r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    task_entries = manifest.get("tasks", [])
+    if not task_entries:
+        raise ValueError("manifest must contain at least one task entry")
+    datasets = list(getattr(dataset, "_datasets", []))
+    acc_dset_num = getattr(dataset, "acc_dset_num", {})
+    if not datasets:
+        raise ValueError("dataset must expose _datasets for task-local manifest lookup")
+
+    global_indices = []
+    for task_entry in task_entries:
+        task_name = task_entry["task"]
+        matches = [
+            (dset_id, sub_dataset)
+            for dset_id, sub_dataset in enumerate(datasets)
+            if _repo_matches_task(getattr(sub_dataset, "repo_id", dset_id), task_name)
+        ]
+        if not matches:
+            raise KeyError(f"No dataset shard matched manifest task {task_name!r}")
+        if len(matches) > 1:
+            matched = ", ".join(str(getattr(ds, "repo_id", dset_id)) for dset_id, ds in matches)
+            raise ValueError(f"Manifest task {task_name!r} matched multiple dataset shards: {matched}")
+        dset_id, sub_dataset = matches[0]
+        offset = int(acc_dset_num.get(dset_id, 0))
+        for local_idx in task_entry.get("indices", []):
+            local_idx = int(local_idx)
+            if local_idx < 0 or local_idx >= len(sub_dataset):
+                raise IndexError(
+                    f"Manifest task {task_name!r} local index {local_idx} is out of range "
+                    f"for dataset length {len(sub_dataset)}"
+                )
+            global_indices.append(offset + local_idx)
+    if not global_indices:
+        raise ValueError("manifest did not select any dataset indices")
+    return global_indices
 
 
 def protocol_manifest_paths(root, task_preset, protocol_seed):

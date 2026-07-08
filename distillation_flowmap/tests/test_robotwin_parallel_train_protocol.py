@@ -12,6 +12,7 @@ def test_parallel_train_uses_protocol_controlled_shared_stage1():
     assert 'VARIANTS="full_stepwam,w_o_opd,endpoint_only_opd,velocity_only_opd"' in source
     assert 'SEEDS="0,1,2"' in source
     assert 'TASK_PRESET="${TASK_PRESET:-core4}"' in source
+    assert 'MAX_EPISODES_PER_TASK="${MAX_EPISODES_PER_TASK:-100}"' in source
     assert 'TRAIN_SAMPLES_PER_TASK="${TRAIN_SAMPLES_PER_TASK:-80}"' in source
     assert 'HELDOUT_SAMPLES_PER_TASK="${HELDOUT_SAMPLES_PER_TASK:-20}"' in source
     assert "--use-shared-stage1" in source

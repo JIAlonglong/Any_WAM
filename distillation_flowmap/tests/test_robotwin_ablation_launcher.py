@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -5,6 +6,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO_ROOT / "distillation_flowmap" / "ablation" / "launch_robotwin_stepwam_ablation.py"
+
+
+def parse_dry_run_manifest(stdout):
+    return json.loads(stdout[stdout.index("{"):])
 
 
 def run_dry_run(tmp_path, variant):
@@ -146,3 +151,133 @@ def test_dry_run_accepts_single_task_smoke_limits(tmp_path):
     assert "DATASET_TASK_FILTER=place_a2b_right" in result.stdout
     assert "DATASET_MAX_EPISODES_PER_TASK=5" in result.stdout
     assert "DATASET_MAX_SAMPLES_PER_TASK=5" in result.stdout
+
+
+def test_core4_task_preset_limits_dry_run_to_protocol_tasks(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LAUNCHER),
+            "--variant",
+            "full_stepwam",
+            "--seed",
+            "0",
+            "--root",
+            str(tmp_path / "ablation_root"),
+            "--teacher-model-path",
+            "/tmp/teacher",
+            "--dataset-path",
+            "/tmp/dataset",
+            "--task-preset",
+            "core4",
+            "--stage1-steps",
+            "5",
+            "--stage2-steps",
+            "7",
+            "--master-port",
+            "29990",
+            "--dry-run",
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    manifest = parse_dry_run_manifest(result.stdout)
+    assert manifest["task_preset"] == "core4"
+    assert manifest["selected_task_filter"] == [
+        "place_a2b_right",
+        "stack_bowls_three",
+        "open_microwave",
+        "pick_dual_bottles",
+    ]
+    assert (
+        "DATASET_TASK_FILTER=place_a2b_right,stack_bowls_three,open_microwave,pick_dual_bottles"
+        in result.stdout
+    )
+    assert "rotate_qrcode" not in manifest["selected_task_filter"]
+
+
+def test_stage2_can_resume_from_shared_stage1_checkpoint(tmp_path):
+    args = [
+        sys.executable,
+        str(LAUNCHER),
+        "--variant",
+        "endpoint_only_opd",
+        "--seed",
+        "1",
+        "--root",
+        str(tmp_path / "ablation_root"),
+        "--teacher-model-path",
+        "/tmp/teacher",
+        "--dataset-path",
+        "/tmp/dataset",
+        "--task-preset",
+        "core4",
+        "--stage1-steps",
+        "5",
+        "--stage2-steps",
+        "7",
+        "--master-port",
+        "29990",
+        "--stage",
+        "stage2",
+        "--use-shared-stage1",
+        "--dry-run",
+    ]
+    result = subprocess.run(
+        args,
+        cwd=REPO_ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    expected = (
+        f"RESUME_FROM_PATH={tmp_path}/ablation_root/shared_stage1/core4/seed_1/"
+        "stage1/checkpoints/step_5"
+    )
+    assert expected in result.stdout
+    assert "shared_stage1_ckpt" in result.stdout
+    assert "endpoint_only_opd/seed_1/stage2" in result.stdout
+
+
+def test_protocol_manifest_paths_are_recorded_in_dry_run(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LAUNCHER),
+            "--variant",
+            "velocity_only_opd",
+            "--seed",
+            "2",
+            "--root",
+            str(tmp_path / "ablation_root"),
+            "--teacher-model-path",
+            "/tmp/teacher",
+            "--dataset-path",
+            "/tmp/dataset",
+            "--task-preset",
+            "core4",
+            "--stage1-steps",
+            "5",
+            "--stage2-steps",
+            "7",
+            "--master-port",
+            "29990",
+            "--dry-run",
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert "train_manifest_path" in result.stdout
+    assert "heldout_eval_manifest_path" in result.stdout
+    assert "eval_pairs_path" in result.stdout
+    assert "protocol/manifests/core4_seed_2" in result.stdout

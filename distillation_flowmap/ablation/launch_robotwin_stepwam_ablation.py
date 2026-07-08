@@ -85,6 +85,27 @@ def representative_task_filter(tasks):
     return deduped
 
 
+def task_preset_filter(tasks, preset):
+    preset = str(preset)
+    if preset in ("representative", "default"):
+        return representative_task_filter(tasks)
+    presets = tasks.get("presets", {})
+    if preset not in presets:
+        known = ", ".join(sorted(["representative", *presets.keys()]))
+        raise ValueError(f"Unknown task preset {preset!r}; known presets: {known}")
+    return list(presets[preset])
+
+
+def protocol_manifest_paths(root, task_preset, seed):
+    manifest_dir = Path(root) / "protocol" / "manifests" / f"{task_preset}_seed_{seed}"
+    return {
+        "protocol_manifest_dir": str(manifest_dir),
+        "train_manifest_path": str(manifest_dir / "train_manifest.json"),
+        "heldout_eval_manifest_path": str(manifest_dir / "heldout_eval_manifest.json"),
+        "eval_pairs_path": str(manifest_dir / "eval_pairs.json"),
+    }
+
+
 def shell_value(value):
     text = str(value)
     if SAFE_SHELL_VALUE.match(text):
@@ -160,16 +181,36 @@ def build_run_plan(args):
     variant = find_variant(metadata, args.variant)
     root = Path(args.root)
     run_dir = root / variant["name"] / f"seed_{args.seed}"
-    stage1_dir = run_dir / "stage1"
+    if args.task_filter and args.task_preset:
+        raise ValueError("--task-filter and --task-preset are mutually exclusive")
+    if args.all_dataset_tasks and args.task_preset:
+        raise ValueError("--all-dataset-tasks and --task-preset are mutually exclusive")
+
+    if args.all_dataset_tasks:
+        selected_task_preset = "all"
+    elif args.task_filter:
+        selected_task_preset = "custom"
+    else:
+        selected_task_preset = args.task_preset or "representative"
+
+    stage1_run_dir = (
+        root / "shared_stage1" / selected_task_preset / f"seed_{args.seed}"
+        if args.use_shared_stage1
+        else run_dir
+    )
+    stage1_dir = stage1_run_dir / "stage1"
     stage2_dir = run_dir / "stage2"
     stage1_steps = args.stage1_steps or int(defaults["stage1_steps"])
     stage2_steps = args.stage2_steps or int(defaults["stage2_steps"])
     stage1_ckpt = stage1_dir / "checkpoints" / f"step_{stage1_steps}"
     stage2_ckpt = stage2_dir / "checkpoints" / f"step_{stage2_steps}"
 
-    task_filter = [] if args.all_dataset_tasks else (
-        split_csv(args.task_filter) or representative_task_filter(tasks)
-    )
+    if args.all_dataset_tasks:
+        task_filter = []
+    elif args.task_filter:
+        task_filter = split_csv(args.task_filter)
+    else:
+        task_filter = task_preset_filter(tasks, selected_task_preset)
 
     common_env = {}
     if args.empty_emb_path is not None:
@@ -213,16 +254,19 @@ def build_run_plan(args):
         "variant": variant["name"],
         "variant_id": variant["id"],
         "seed": args.seed,
+        "task_preset": selected_task_preset,
         "teacher_model_path": str(args.teacher_model_path),
         "dataset_path": str(args.dataset_path),
         "empty_emb_path": str(args.empty_emb_path) if args.empty_emb_path else None,
         "run_dir": str(run_dir),
         "stage1_ckpt": str(stage1_ckpt),
+        "shared_stage1_ckpt": str(stage1_ckpt) if args.use_shared_stage1 else None,
         "stage2_ckpt": str(stage2_ckpt),
         "task_list": tasks,
         "selected_task_filter": task_filter,
         "dataset_max_episodes_per_task": args.max_episodes_per_task,
         "dataset_max_samples_per_task": args.max_samples_per_task,
+        **protocol_manifest_paths(root, selected_task_preset, args.seed),
         "stage1_env": stage1["env"],
         "stage2_env": stage2["env"],
         "commands": {
@@ -269,6 +313,11 @@ def parse_args():
         help="Comma-separated RobotWin task names. Defaults to the metadata Easy+Hard subset.",
     )
     parser.add_argument(
+        "--task-preset",
+        default=None,
+        help="Named task preset from robotwin_stepwam_tasks.json, e.g. core4 or core6.",
+    )
+    parser.add_argument(
         "--all-dataset-tasks",
         action="store_true",
         help="Disable the default representative task filter and train on every dataset task.",
@@ -279,6 +328,11 @@ def parse_args():
     parser.add_argument("--ngpu", type=int, default=1)
     parser.add_argument("--master-port", type=int, default=29620)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--use-shared-stage1",
+        action="store_true",
+        help="Store/read Stage 1 under <root>/shared_stage1/<task_preset>/seed_<seed>/.",
+    )
     parser.add_argument(
         "--stage",
         choices=("both", "stage1", "stage2"),
@@ -298,6 +352,16 @@ def main():
     if args.dry_run:
         print(json.dumps(plan["manifest"], indent=2, sort_keys=True))
         return
+
+    if (
+        args.use_shared_stage1
+        and args.stage == "stage2"
+        and not Path(plan["manifest"]["stage1_ckpt"]).exists()
+    ):
+        raise FileNotFoundError(
+            "Shared Stage 1 checkpoint is required for --stage stage2: "
+            f"{plan['manifest']['stage1_ckpt']}"
+        )
 
     manifest_path = write_manifest(plan["run_dir"], plan["manifest"])
     print(f"MANIFEST={manifest_path}")

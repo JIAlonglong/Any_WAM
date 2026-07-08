@@ -3,6 +3,22 @@
   "episodes_per_task": 50,
   "smoke_episodes": 5,
   "student_steps": 4,
+  "presets": {
+    "core4": [
+      "place_a2b_right",
+      "stack_bowls_three",
+      "open_microwave",
+      "pick_dual_bottles"
+    ],
+    "core6": [
+      "place_a2b_right",
+      "stack_bowls_three",
+      "open_microwave",
+      "pick_dual_bottles",
+      "blocks_ranking_size",
+      "place_burger_fries"
+    ]
+  },
   "splits": {
     "easy": [
       "place_a2b_right",

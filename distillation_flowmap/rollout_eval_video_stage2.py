@@ -371,6 +371,23 @@ def main():
         help="Load EMA target student during offline eval. Disabled by default to reduce memory.",
     )
     parser.add_argument(
+        "--disable-eval-gradient-checkpointing",
+        action="store_true",
+        help=(
+            "Run offline student rollout under no_grad without forcing checkpoint "
+            "recompute. This avoids retaining inference graphs on memory-constrained "
+            "single-GPU eval jobs."
+        ),
+    )
+    parser.add_argument(
+        "--disable-eval-force-cfg",
+        action="store_true",
+        help=(
+            "Do not force cond/uncond CFG when --cfg-scale <= 1 during offline "
+            "student rollout. Training defaults are unchanged."
+        ),
+    )
+    parser.add_argument(
         "--use-nofsdp-teacher",
         action="store_true",
         help="Use the full non-FSDP teacher copy during offline eval. Disabled by default to reduce memory.",
@@ -401,7 +418,8 @@ def main():
     cfg.enable_stage1_start_eval_baseline = False
     cfg.offline_eval_skip_target_student = not args.load_target_student
     cfg.offline_eval_use_fsdp_teacher = not args.use_nofsdp_teacher
-    cfg.offline_eval_force_gradient_checkpointing = True
+    cfg.offline_eval_force_gradient_checkpointing = not args.disable_eval_gradient_checkpointing
+    cfg.offline_eval_force_cfg = not args.disable_eval_force_cfg
     cfg.skip_teacher_compile = True
     cfg.light_eval_num_batches = max(1, args.num_batches)
     cfg.light_eval_seed = args.seed

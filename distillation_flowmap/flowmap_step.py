@@ -2992,6 +2992,7 @@ class FlowMapStepMixin:
         force_eval_checkpointing = bool(
             getattr(self.config, 'offline_eval_force_gradient_checkpointing', False)
         )
+        force_cfg = bool(getattr(self.config, 'offline_eval_force_cfg', True))
 
         use_nofsdp_rollout = (
             rollout_grad_mode == 'endpoint' or
@@ -3050,7 +3051,7 @@ class FlowMapStepMixin:
                     ref_shape,
                     r_timestep_i,
                     action_r_timestep_i,
-                    force_cfg=True,
+                    force_cfg=force_cfg,
                 )
             finally:
                 if saved_blocks is not None:

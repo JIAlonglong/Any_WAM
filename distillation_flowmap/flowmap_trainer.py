@@ -79,19 +79,42 @@ except ImportError:
     HAS_DISCRIMINATOR = False
 
 
+def _iter_flowmap_checkpointing_targets(student):
+    stack = [student]
+    seen = set()
+    while stack:
+        module = stack.pop()
+        if module is None or id(module) in seen:
+            continue
+        seen.add(id(module))
+        yield module
+        for attr in ("module", "_fsdp_wrapped_module"):
+            child = getattr(module, attr, None)
+            if child is not None and child is not module:
+                stack.append(child)
+
+
 def _call_with_student_checkpointing(student, enabled, fn):
-    old_enabled = getattr(student, "_flowmap_gradient_checkpointing", None)
-    student._flowmap_gradient_checkpointing = bool(enabled)
+    old_states = []
+    for module in _iter_flowmap_checkpointing_targets(student):
+        has_attr = hasattr(module, "_flowmap_gradient_checkpointing")
+        old_states.append((
+            module,
+            has_attr,
+            getattr(module, "_flowmap_gradient_checkpointing", None),
+        ))
+        module._flowmap_gradient_checkpointing = bool(enabled)
     try:
         return fn()
     finally:
-        if old_enabled is None:
-            try:
-                delattr(student, "_flowmap_gradient_checkpointing")
-            except AttributeError:
-                pass
-        else:
-            student._flowmap_gradient_checkpointing = old_enabled
+        for module, has_attr, old_enabled in reversed(old_states):
+            if not has_attr:
+                try:
+                    delattr(module, "_flowmap_gradient_checkpointing")
+                except AttributeError:
+                    pass
+            else:
+                module._flowmap_gradient_checkpointing = old_enabled
 
 
 def _resolve_use_fsdp1(config):
@@ -406,6 +429,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 logger.info(f"  opd_target_mode    = {getattr(config, 'opd_teacher_target_mode', 'student_state')}")
                 logger.info(f"  opd_grad_mode      = {getattr(config, 'opd_rollout_grad_mode', 'endpoint')}")
                 logger.info(f"  opd_aux_gradient_checkpointing = {getattr(config, 'opd_aux_gradient_checkpointing', False)}")
+                logger.info(f"  opd_aux_empty_cache = {getattr(config, 'opd_aux_empty_cache', False)}")
                 logger.info(f"  action_transition_block = {getattr(config, 'action_transition_block_weight', getattr(config, 'action_block_weight', 1.0))}")
                 logger.info(f"  action_local_fm_block   = {getattr(config, 'action_local_fm_block_weight', 1.0)}")
                 logger.info(f"  action_local_fm_weight  = {getattr(config, 'action_aware_weight', 0.0)}")
@@ -2536,6 +2560,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
                         return self._opd_aux_transition_step_kto_paopd(batch, step_in_acc)
                     return self._opd_aux_transition_step(batch, step_in_acc)
+
+                if (bool(getattr(self.config, 'opd_aux_empty_cache', False))
+                        and torch.cuda.is_available()):
+                    torch.cuda.empty_cache()
 
                 opd_aux_checkpointing = bool(getattr(
                     self.config, 'opd_aux_gradient_checkpointing', False))

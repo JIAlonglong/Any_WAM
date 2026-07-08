@@ -149,6 +149,8 @@ def build_stage_command(
         "CONFIG_FILE": config_module,
         "OUTPUT_DIR": str(output_dir),
         "MAX_TRAIN_STEPS": str(max_steps),
+        "PYTORCH_CUDA_ALLOC_CONF": os.environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
         "WANDB_MODE": os.environ.get("WANDB_MODE", "offline"),
     }
     if resume_from_path is not None:

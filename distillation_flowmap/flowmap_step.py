@@ -1300,6 +1300,41 @@ class FlowMapStepMixin:
         empty_expanded = empty_emb.expand(B, -1, -1)
 
         ld = input_dict['latent_dict']
+        ad = input_dict['action_dict']
+        serial_student_cfg = bool(getattr(
+            self.config, 'opd_serial_student_cfg', False))
+
+        if serial_student_cfg:
+            def _run_single_cfg(single_input, single_r, single_ar):
+                saved_attn = FlexAttnFunc.attention_mask
+                saved_cross = FlexAttnFunc.cross_attention_mask
+                try:
+                    FlexAttnFunc.attention_mask = None
+                    FlexAttnFunc.cross_attention_mask = None
+                    v, _ = model(single_input, train_mode=True,
+                                 r_timestep=single_r,
+                                 action_r_timestep=single_ar)
+                finally:
+                    FlexAttnFunc.attention_mask = saved_attn
+                    FlexAttnFunc.cross_attention_mask = saved_cross
+                return self._extract_video_v(v, ref_shape, B)
+
+            cond_input = {
+                'latent_dict': ld,
+                'action_dict': ad,
+                'chunk_size': input_dict['chunk_size'],
+                'window_size': input_dict['window_size'],
+            }
+            uncond_input = {
+                'latent_dict': {**ld, 'text_emb': empty_expanded},
+                'action_dict': {**ad, 'text_emb': empty_expanded},
+                'chunk_size': input_dict['chunk_size'],
+                'window_size': input_dict['window_size'],
+            }
+            v_cond_5d = _run_single_cfg(cond_input, r_timestep, action_r_timestep)
+            v_uncond_5d = _run_single_cfg(uncond_input, r_timestep, action_r_timestep)
+            return v_uncond_5d + cfg_scale * (v_cond_5d - v_uncond_5d)
+
         doubled_latent_dict = {
             'noisy_latents':  _cat(ld['noisy_latents'], ld['noisy_latents']),
             'latent':         _cat(ld['latent'], ld['latent']),
@@ -1312,7 +1347,6 @@ class FlowMapStepMixin:
         if 'targets' in ld:
             doubled_latent_dict['targets'] = _cat(ld['targets'], ld['targets'])
 
-        ad = input_dict['action_dict']
         doubled_action_dict = {
             'noisy_latents':  _cat(ad['noisy_latents'], ad['noisy_latents']),
             'latent':         _cat(ad['latent'], ad['latent']),

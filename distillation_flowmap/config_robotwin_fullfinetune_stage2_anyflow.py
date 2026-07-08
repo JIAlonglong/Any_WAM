@@ -45,6 +45,8 @@ cfg.opd_rollout_grad_mode = os.environ.get(
 cfg.opd_action_rollout_grad_mode = os.environ.get(
     "OPD_ACTION_ROLLOUT_GRAD_MODE", cfg.opd_rollout_grad_mode).lower()
 cfg.opd_fuse_action_teacher = _env_bool("OPD_FUSE_ACTION_TEACHER", True)
+cfg.opd_serial_student_cfg = _env_bool("OPD_SERIAL_STUDENT_CFG", cfg.use_opd_aux)
+cfg.opd_aux_empty_cache = _env_bool("OPD_AUX_EMPTY_CACHE", cfg.use_opd_aux)
 cfg.opd_same_state_velocity_weight = float(os.environ.get(
     "OPD_SAME_STATE_VELOCITY_WEIGHT", 0.0))
 cfg.flowmap_pair_mode = os.environ.get("FLOWMAP_PAIR_MODE", cfg.flowmap_pair_mode).lower()
@@ -116,16 +118,16 @@ cfg.warmup_steps = int(os.environ.get("WARMUP_STEPS", 100))
 cfg.max_train_steps = int(os.environ.get("MAX_TRAIN_STEPS", 5000))
 cfg.save_interval = int(os.environ.get("SAVE_INTERVAL", 1000))
 cfg.max_grad_norm = float(os.environ.get("MAX_GRAD_NORM", 0.3))
+cfg.use_8bit_optimizer = _env_bool("USE_8BIT_OPTIMIZER", True)
 cfg.resume_optimizer_state = _env_bool("RESUME_OPTIMIZER_STATE", False)
 cfg.reset_resume_step = _env_bool("RESET_RESUME_STEP", True)
 cfg.skip_teacher_compile = _env_bool("SKIP_TEACHER_COMPILE", True)
 cfg.gradient_checkpointing = _env_bool("GRADIENT_CHECKPOINTING", True)
 cfg.use_fsdp1 = _env_bool("USE_FSDP1", True)
-# OPD aux does an additional student backward path; with PyTorch FSDP2,
-# activation-checkpoint recompute can mix regular Tensor activations from the
-# rollout path with DTensor-sharded weights. Keep checkpointing on for the main
-# train step to fit memory, but disable it around OPD aux unless overridden.
-cfg.opd_aux_gradient_checkpointing = _env_bool("OPD_AUX_GRADIENT_CHECKPOINTING", False)
+# OPD aux does an additional student backward path and needs activation
+# checkpointing on a single H100. FSDP1 is forced above for this path, avoiding
+# the FSDP2 DTensor/checkpoint recompute issue while keeping the memory peak low.
+cfg.opd_aux_gradient_checkpointing = _env_bool("OPD_AUX_GRADIENT_CHECKPOINTING", True)
 
 # OPD loss balance. Action OPD is off by default; enable it after checking
 # stage2 speed with video OPD.

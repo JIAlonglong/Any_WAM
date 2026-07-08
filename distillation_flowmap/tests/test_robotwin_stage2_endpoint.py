@@ -17,7 +17,7 @@ for path in (FLOWMAP_DIR, WANVA_ROOT):
         sys.path.insert(0, path)
 
 
-def import_flowmap_trainer_helper():
+def import_flowmap_trainer_helper(name="_resolve_use_fsdp1"):
     stubs = {}
 
     def stub_module(name, **attrs):
@@ -59,14 +59,15 @@ def import_flowmap_trainer_helper():
 
     sys.modules.pop("distillation_flowmap.flowmap_trainer", None)
     try:
-        from distillation_flowmap.flowmap_trainer import _resolve_use_fsdp1
+        from distillation_flowmap import flowmap_trainer
+        helper = getattr(flowmap_trainer, name)
     finally:
         for name, old in stubs.items():
             if old is None:
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = old
-    return _resolve_use_fsdp1
+    return helper
 
 
 def load_config(**env):
@@ -97,6 +98,9 @@ class RobotWinStage2EndpointConfigTest(unittest.TestCase):
             VIDEO_TRANSITION_PARAM=None,
             ACTION_TRANSITION_PARAM=None,
             OPD_SAME_STATE_VELOCITY_WEIGHT=None,
+            OPD_SERIAL_STUDENT_CFG=None,
+            OPD_AUX_EMPTY_CACHE=None,
+            USE_8BIT_OPTIMIZER=None,
             GRADIENT_CHECKPOINTING=None,
             OPD_AUX_GRADIENT_CHECKPOINTING=None,
         )
@@ -109,7 +113,10 @@ class RobotWinStage2EndpointConfigTest(unittest.TestCase):
         self.assertEqual(cfg.opd_rollout_step_pairs, [[4, 1], [4, 2]])
         self.assertEqual(cfg.opd_same_state_velocity_weight, 0.0)
         self.assertTrue(cfg.gradient_checkpointing)
-        self.assertFalse(cfg.opd_aux_gradient_checkpointing)
+        self.assertTrue(cfg.opd_aux_gradient_checkpointing)
+        self.assertTrue(cfg.opd_serial_student_cfg)
+        self.assertTrue(cfg.opd_aux_empty_cache)
+        self.assertTrue(cfg.use_8bit_optimizer)
         self.assertTrue(cfg.use_fsdp1)
 
     def test_use_fsdp1_env_override_is_available_for_non_checkpointed_debug(self):
@@ -123,13 +130,46 @@ class RobotWinStage2EndpointConfigTest(unittest.TestCase):
 
         self.assertTrue(_resolve_use_fsdp1(cfg))
 
+    def test_opd_aux_checkpointing_switch_reaches_wrapped_module(self):
+        _call_with_student_checkpointing = import_flowmap_trainer_helper(
+            "_call_with_student_checkpointing")
+        inner = types.SimpleNamespace(_flowmap_gradient_checkpointing=True)
+        wrapper = types.SimpleNamespace(module=inner)
+        observed = []
+
+        def run_aux():
+            observed.append((
+                wrapper._flowmap_gradient_checkpointing,
+                inner._flowmap_gradient_checkpointing,
+            ))
+            return "ok"
+
+        result = _call_with_student_checkpointing(wrapper, False, run_aux)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(observed, [(False, False)])
+        self.assertFalse(hasattr(wrapper, "_flowmap_gradient_checkpointing"))
+        self.assertTrue(inner._flowmap_gradient_checkpointing)
+
     def test_gradient_checkpointing_can_be_reenabled_for_non_opd_ablation(self):
         cfg = load_config(GRADIENT_CHECKPOINTING="1")
         self.assertTrue(cfg.gradient_checkpointing)
 
-    def test_opd_aux_gradient_checkpointing_can_be_reenabled_explicitly(self):
-        cfg = load_config(OPD_AUX_GRADIENT_CHECKPOINTING="1")
-        self.assertTrue(cfg.opd_aux_gradient_checkpointing)
+    def test_opd_aux_gradient_checkpointing_can_be_disabled_explicitly(self):
+        cfg = load_config(OPD_AUX_GRADIENT_CHECKPOINTING="0")
+        self.assertFalse(cfg.opd_aux_gradient_checkpointing)
+
+    def test_opd_serial_student_cfg_can_be_disabled_explicitly(self):
+        cfg = load_config(OPD_SERIAL_STUDENT_CFG="0")
+        self.assertFalse(cfg.opd_serial_student_cfg)
+
+    def test_opd_empty_cache_can_be_disabled_explicitly(self):
+        cfg = load_config(OPD_AUX_EMPTY_CACHE="0")
+        self.assertFalse(cfg.opd_aux_empty_cache)
+
+    def test_8bit_optimizer_can_be_disabled_explicitly(self):
+        cfg = load_config(USE_8BIT_OPTIMIZER="0")
+        self.assertFalse(cfg.use_8bit_optimizer)
 
     def test_same_state_velocity_weight_env_override(self):
         cfg = load_config(OPD_SAME_STATE_VELOCITY_WEIGHT="0.25")

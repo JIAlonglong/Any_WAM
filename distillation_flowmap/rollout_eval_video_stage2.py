@@ -1,4 +1,5 @@
 import argparse
+import gc
 import importlib
 import json
 import os
@@ -388,6 +389,20 @@ def main():
         ),
     )
     parser.add_argument(
+        "--eval-rollout-grad-mode",
+        choices=("endpoint", "last_step", "full"),
+        default=None,
+        help=(
+            "Override opd_rollout_grad_mode for offline eval. Use endpoint for "
+            "memory-only metric passes that do not need student rollout gradients."
+        ),
+    )
+    parser.add_argument(
+        "--eval-empty-cache",
+        action="store_true",
+        help="Release large temporary tensors and empty CUDA cache after each eval pair.",
+    )
+    parser.add_argument(
         "--use-nofsdp-teacher",
         action="store_true",
         help="Use the full non-FSDP teacher copy during offline eval. Disabled by default to reduce memory.",
@@ -420,6 +435,9 @@ def main():
     cfg.offline_eval_use_fsdp_teacher = not args.use_nofsdp_teacher
     cfg.offline_eval_force_gradient_checkpointing = not args.disable_eval_gradient_checkpointing
     cfg.offline_eval_force_cfg = not args.disable_eval_force_cfg
+    cfg.offline_eval_return_final_action = True
+    if args.eval_rollout_grad_mode is not None:
+        cfg.opd_rollout_grad_mode = args.eval_rollout_grad_mode
     cfg.skip_teacher_compile = True
     cfg.light_eval_num_batches = max(1, args.num_batches)
     cfg.light_eval_seed = args.seed
@@ -603,7 +621,7 @@ def main():
                     )
 
             for k_steps in args.student_steps:
-                student_x_r, student_v_r = trainer._student_euler_integrate(
+                rollout_out = trainer._student_euler_integrate(
                     noisy_latents=video_noisy_t,
                     timesteps=video_t,
                     target_r=video_r,
@@ -615,7 +633,13 @@ def main():
                     num_frames=num_frames,
                     K_steps=k_steps,
                     action_target_r=action_r,
+                    return_final_action=True,
                 )
+                if isinstance(rollout_out, tuple) and len(rollout_out) == 3:
+                    student_x_r, student_v_r, student_action_seq = rollout_out
+                else:
+                    student_x_r, student_v_r = rollout_out
+                    student_action_seq = None
                 if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
                     sample_idx = min(max(args.video_sample_index, 0), B - 1)
                     if save_student_latent_video:
@@ -631,28 +655,38 @@ def main():
                 add(prefix + "/video_gt_v_mse", (student_v_r.float() - video_v_target_r.float()).pow(2).mean())
                 add(prefix + "/video_latent_norm", student_x_r.float().pow(2).mean().sqrt())
 
-                action_input = {
-                    "latent_dict": {
-                        **input_dict["latent_dict"],
-                        "noisy_latents": student_x_r.detach(),
-                        "timesteps": video_r,
-                    },
-                    "action_dict": student_input["action_dict"],
-                    "chunk_size": input_dict["chunk_size"],
-                    "window_size": input_dict["window_size"],
-                }
-                init_mask(trainer, action_input)
-                action_grad_context = (
-                    torch.enable_grad()
-                    if getattr(trainer.config, "offline_eval_force_gradient_checkpointing", False)
-                    else torch.no_grad()
-                )
-                with action_grad_context:
-                    _, student_action_seq = trainer.student(
-                        action_input, train_mode=True,
-                        r_timestep=video_r,
-                        action_r_timestep=action_r[:, ::action_ds],
+                if args.eval_empty_cache and k_steps == args.student_steps[-1]:
+                    teacher_x_r = teacher_v_r = None
+                    student_v_r = None
+                    video_noisy_r = video_v_target_r = None
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                action_input = None
+                if student_action_seq is None:
+                    action_input = {
+                        "latent_dict": {
+                            **input_dict["latent_dict"],
+                            "noisy_latents": student_x_r.detach(),
+                            "timesteps": video_r,
+                        },
+                        "action_dict": student_input["action_dict"],
+                        "chunk_size": input_dict["chunk_size"],
+                        "window_size": input_dict["window_size"],
+                    }
+                    init_mask(trainer, action_input)
+                    action_grad_context = (
+                        torch.enable_grad()
+                        if getattr(trainer.config, "offline_eval_force_gradient_checkpointing", False)
+                        else torch.no_grad()
                     )
+                    with action_grad_context:
+                        _, student_action_seq = trainer.student(
+                            action_input, train_mode=True,
+                            r_timestep=video_r,
+                            action_r_timestep=action_r[:, ::action_ds],
+                        )
                 action_frames = batch["actions"].shape[2] // action_ds
                 student_action_v = trainer._extract_action_v(student_action_seq, action_frames)
                 if getattr(trainer.config, "offline_eval_force_gradient_checkpointing", False):
@@ -677,6 +711,23 @@ def main():
                     smooth = (student_action_v[:, :, 1:] - student_action_v[:, :, :-1]).float().abs().mean()
                     add(prefix + "/action_v_smoothness_l1", smooth)
                 add(prefix + "/action_v_norm", student_action_v.float().pow(2).mean().sqrt())
+
+                if args.eval_empty_cache:
+                    del (
+                        student_x_r,
+                        student_v_r,
+                        action_input,
+                        student_action_v,
+                        action_noisy_t_ds,
+                        action_noisy_r_ds,
+                        action_v_target_ds,
+                        action_sigma_t,
+                        action_sigma_r,
+                        action_pred_xr,
+                    )
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
                 decoded = {}
@@ -737,6 +788,17 @@ def main():
                 save_contact_sheet(decoded, sheet_path)
                 logger.info("Saved rollout contact sheet: %s", sheet_path)
                 saved_video_pairs += 1
+
+            if args.eval_empty_cache:
+                teacher_x_r = teacher_v_r = None
+                video_t = video_r = action_t = action_r = None
+                video_noise = action_noise = None
+                video_noisy_t = video_noisy_r = video_v_target_r = None
+                action_noisy_t = action_noisy_r = action_v_target_t = None
+                input_dict = student_input = videos_to_save = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     out = {}
     for name, total in metrics.items():

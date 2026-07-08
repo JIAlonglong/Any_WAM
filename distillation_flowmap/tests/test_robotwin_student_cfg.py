@@ -1,5 +1,6 @@
 import os
 import sys
+import logging
 import types
 import unittest
 
@@ -28,7 +29,7 @@ class _DummyStudentModel:
         self.call_batch_sizes.append(text_emb.shape[0])
         self.call_text_values.append(text_emb.detach().clone())
         value = text_emb[:, :1, :1].reshape(text_emb.shape[0], 1, 1, 1, 1)
-        return value, None
+        return value, value + 10.0
 
 
 class _Harness:
@@ -43,11 +44,16 @@ class StudentCfgForwardTest(unittest.TestCase):
     def setUp(self):
         self.old_modules = sys.modules.get("modules")
         self.old_modules_model = sys.modules.get("modules.model")
+        self.old_utils = sys.modules.get("utils")
         modules_stub = types.ModuleType("modules")
         modules_model_stub = types.ModuleType("modules.model")
         modules_model_stub.FlexAttnFunc = _FlexAttnFunc
         sys.modules["modules"] = modules_stub
         sys.modules["modules.model"] = modules_model_stub
+        utils_stub = types.ModuleType("utils")
+        utils_stub.data_seq_to_patch = lambda *args, **kwargs: None
+        utils_stub.logger = logging.getLogger("test-flowmap-step")
+        sys.modules["utils"] = utils_stub
         sys.modules.pop("distillation_flowmap.flowmap_step", None)
         from distillation_flowmap.flowmap_step import FlowMapStepMixin
 
@@ -62,6 +68,10 @@ class StudentCfgForwardTest(unittest.TestCase):
             sys.modules.pop("modules.model", None)
         else:
             sys.modules["modules.model"] = self.old_modules_model
+        if self.old_utils is None:
+            sys.modules.pop("utils", None)
+        else:
+            sys.modules["utils"] = self.old_utils
 
     def _input(self):
         text = torch.tensor([[[3.0]]])
@@ -126,6 +136,56 @@ class StudentCfgForwardTest(unittest.TestCase):
         self.assertTrue(torch.allclose(serial_out, torch.tensor([[[[[5.0]]]]])))
         self.assertEqual(batched_model.call_batch_sizes, [2])
         self.assertEqual(serial_model.call_batch_sizes, [1, 1])
+
+    def test_no_cfg_can_return_action_from_same_forward(self):
+        input_dict, empty = self._input()
+        r_timestep = torch.zeros(1, 1)
+        action_r_timestep = torch.zeros(1, 1)
+        model = _DummyStudentModel()
+
+        video_out, action_out = self.method(
+            _Harness(serial=False),
+            model,
+            input_dict,
+            empty,
+            1.0,
+            1,
+            None,
+            r_timestep,
+            action_r_timestep,
+            force_cfg=False,
+            return_action=True,
+        )
+
+        self.assertTrue(torch.allclose(video_out, torch.tensor([[[[[3.0]]]]])))
+        self.assertTrue(torch.allclose(action_out, torch.tensor([[[[[13.0]]]]])))
+        self.assertEqual(model.call_batch_sizes, [1])
+
+    def test_forced_cfg_returns_cond_action_from_same_forward(self):
+        input_dict, empty = self._input()
+        r_timestep = torch.zeros(1, 1)
+        action_r_timestep = torch.zeros(1, 1)
+
+        for serial, expected_calls in ((False, [2]), (True, [1, 1])):
+            with self.subTest(serial=serial):
+                model = _DummyStudentModel()
+                video_out, action_out = self.method(
+                    _Harness(serial=serial),
+                    model,
+                    input_dict,
+                    empty,
+                    2.0,
+                    1,
+                    None,
+                    r_timestep,
+                    action_r_timestep,
+                    force_cfg=True,
+                    return_action=True,
+                )
+
+                self.assertTrue(torch.allclose(video_out, torch.tensor([[[[[5.0]]]]])))
+                self.assertTrue(torch.allclose(action_out, torch.tensor([[[[[13.0]]]]])))
+                self.assertEqual(model.call_batch_sizes, expected_calls)
 
 
 if __name__ == "__main__":

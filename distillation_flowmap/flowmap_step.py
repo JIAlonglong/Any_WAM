@@ -1256,7 +1256,7 @@ class FlowMapStepMixin:
     # ==================================================================
     def _student_cfg_forward(self, model, input_dict, empty_emb, cfg_scale,
                               B, ref_shape, r_timestep, action_r_timestep,
-                              force_cfg=False):
+                              force_cfg=False, return_action=False):
         """Batched CFG forward for student — cond+uncond in single 2B pass.
 
         Like _batched_cfg_forward (teacher), but for student model (or nofsdp copy).
@@ -1275,6 +1275,8 @@ class FlowMapStepMixin:
 
         Returns:
             v_cfg:  CFG-combined v-prediction in 5D format [B, C, F, H, W]
+            action: Optional action head output from the conditional student pass
+                    when return_action=True.
         """
         if cfg_scale <= 1.0 and not force_cfg:
             from modules.model import FlexAttnFunc
@@ -1283,13 +1285,14 @@ class FlowMapStepMixin:
             try:
                 FlexAttnFunc.attention_mask = None
                 FlexAttnFunc.cross_attention_mask = None
-                v, _ = model(input_dict, train_mode=True,
-                              r_timestep=r_timestep,
-                              action_r_timestep=action_r_timestep)
+                v, action_seq = model(input_dict, train_mode=True,
+                                      r_timestep=r_timestep,
+                                      action_r_timestep=action_r_timestep)
             finally:
                 FlexAttnFunc.attention_mask = saved_attn
                 FlexAttnFunc.cross_attention_mask = saved_cross
-            return self._extract_video_v(v, ref_shape, B)
+            v_cfg = self._extract_video_v(v, ref_shape, B)
+            return (v_cfg, action_seq) if return_action else v_cfg
 
         from modules.model import FlexAttnFunc
 
@@ -1311,13 +1314,13 @@ class FlowMapStepMixin:
                 try:
                     FlexAttnFunc.attention_mask = None
                     FlexAttnFunc.cross_attention_mask = None
-                    v, _ = model(single_input, train_mode=True,
-                                 r_timestep=single_r,
-                                 action_r_timestep=single_ar)
+                    v, action_seq = model(single_input, train_mode=True,
+                                          r_timestep=single_r,
+                                          action_r_timestep=single_ar)
                 finally:
                     FlexAttnFunc.attention_mask = saved_attn
                     FlexAttnFunc.cross_attention_mask = saved_cross
-                return self._extract_video_v(v, ref_shape, B)
+                return self._extract_video_v(v, ref_shape, B), action_seq
 
             cond_input = {
                 'latent_dict': ld,
@@ -1331,9 +1334,10 @@ class FlowMapStepMixin:
                 'chunk_size': input_dict['chunk_size'],
                 'window_size': input_dict['window_size'],
             }
-            v_cond_5d = _run_single_cfg(cond_input, r_timestep, action_r_timestep)
-            v_uncond_5d = _run_single_cfg(uncond_input, r_timestep, action_r_timestep)
-            return v_uncond_5d + cfg_scale * (v_cond_5d - v_uncond_5d)
+            v_cond_5d, action_cond = _run_single_cfg(cond_input, r_timestep, action_r_timestep)
+            v_uncond_5d, _ = _run_single_cfg(uncond_input, r_timestep, action_r_timestep)
+            v_cfg = v_uncond_5d + cfg_scale * (v_cond_5d - v_uncond_5d)
+            return (v_cfg, action_cond) if return_action else v_cfg
 
         doubled_latent_dict = {
             'noisy_latents':  _cat(ld['noisy_latents'], ld['noisy_latents']),
@@ -1377,9 +1381,9 @@ class FlowMapStepMixin:
         try:
             FlexAttnFunc.attention_mask = None
             FlexAttnFunc.cross_attention_mask = None
-            v_all, _ = model(doubled_input, train_mode=True,
-                              r_timestep=doubled_r,
-                              action_r_timestep=doubled_ar)
+            v_all, action_all = model(doubled_input, train_mode=True,
+                                      r_timestep=doubled_r,
+                                      action_r_timestep=doubled_ar)
         finally:
             FlexAttnFunc.attention_mask = saved_attn
             FlexAttnFunc.cross_attention_mask = saved_cross
@@ -1387,7 +1391,11 @@ class FlowMapStepMixin:
         v_cond, v_uncond = v_all.chunk(2, dim=0)
         v_cond_5d = self._extract_video_v(v_cond, ref_shape, B)
         v_uncond_5d = self._extract_video_v(v_uncond, ref_shape, B)
-        return v_uncond_5d + cfg_scale * (v_cond_5d - v_uncond_5d)
+        v_cfg = v_uncond_5d + cfg_scale * (v_cond_5d - v_uncond_5d)
+        if return_action:
+            action_cond = action_all.chunk(2, dim=0)[0] if action_all is not None else None
+            return v_cfg, action_cond
+        return v_cfg
 
 
     # ==================================================================
@@ -2967,7 +2975,8 @@ class FlowMapStepMixin:
     def _student_euler_integrate(self, noisy_latents, timesteps, target_r, base_input_dict,
                                    empty_emb, cfg_scale, ref_shape, B, num_frames,
                                    K_steps=1, action_target_r=None,
-                                   return_last_step_start=False):
+                                   return_last_step_start=False,
+                                   return_final_action=False):
         """
         Student multi-step Euler integration from t to target_r.
 
@@ -3147,20 +3156,38 @@ class FlowMapStepMixin:
                 torch.enable_grad() if force_eval_checkpointing else contextlib.nullcontext()
             )
             with final_grad_context:
-                v_final_cfg = self._student_cfg_forward(
+                final_forward = self._student_cfg_forward(
                     self.student, final_input, empty_emb, cfg_scale,
                     B, ref_shape, target_r, _act_r_final, force_cfg=False,
+                    return_action=return_final_action,
                 )
+                if return_final_action:
+                    v_final_cfg, final_action_seq = final_forward
+                else:
+                    v_final_cfg = final_forward
+                    final_action_seq = None
                 if force_eval_checkpointing:
                     v_final_cfg = v_final_cfg.detach()
+                    if isinstance(final_action_seq, torch.Tensor):
+                        final_action_seq = final_action_seq.detach()
         finally:
             if _saved_blocks is not None:
                 for _bi, _block in enumerate(_saved_blocks):
                     self.student.blocks[_bi] = _block
 
         if return_last_step_start:
+            if return_final_action:
+                return (
+                    current_x_for_loss,
+                    v_final_cfg,
+                    final_action_seq,
+                    last_step_start_x.detach(),
+                    last_step_start_t.detach(),
+                )
             return current_x_for_loss, v_final_cfg, last_step_start_x.detach(), last_step_start_t.detach()
 
+        if return_final_action:
+            return current_x_for_loss, v_final_cfg, final_action_seq
         return current_x_for_loss, v_final_cfg
 
 

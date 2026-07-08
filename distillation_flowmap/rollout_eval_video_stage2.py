@@ -341,6 +341,11 @@ def main():
     parser.add_argument("--video-fps", type=int, default=10)
     parser.add_argument("--video-max-pairs", type=int, default=1)
     parser.add_argument("--video-sample-index", type=int, default=0)
+    parser.add_argument("--video-decode-device",
+        default="cpu",
+        choices=("cpu", "cuda"),
+        help="Device used for WanVAE video decoding. CPU avoids holding VAE weights during GPU rollout.",
+    )
     parser.add_argument(
         "--cosmos-future-max-predictions",
         type=int,
@@ -396,6 +401,7 @@ def main():
     cfg.enable_stage1_start_eval_baseline = False
     cfg.offline_eval_skip_target_student = not args.load_target_student
     cfg.offline_eval_use_fsdp_teacher = not args.use_nofsdp_teacher
+    cfg.offline_eval_force_gradient_checkpointing = True
     cfg.skip_teacher_compile = True
     cfg.light_eval_num_batches = max(1, args.num_batches)
     cfg.light_eval_seed = args.seed
@@ -426,6 +432,7 @@ def main():
     video_dir = Path(args.video_dir) if args.video_dir else None
     vae = None
     video_processor = None
+    vae_model_root = None
     saved_video_pairs = 0
     is_cosmos_policy_teacher = bool(getattr(trainer, "is_cosmos_policy_teacher", False))
     save_student_latent_video = should_save_student_latent_video(
@@ -446,13 +453,6 @@ def main():
             if is_cosmos_policy_teacher
             else args.teacher_model_path
         )
-        vae = load_vae(
-            os.path.join(vae_model_root, "vae"),
-            torch_dtype=torch.float16,
-            torch_device=trainer.device,
-        )
-        vae.eval()
-        video_processor = VideoProcessor(vae_scale_factor=1)
 
     def add(name, value):
         value = value.detach().float()
@@ -624,13 +624,22 @@ def main():
                     "window_size": input_dict["window_size"],
                 }
                 init_mask(trainer, action_input)
-                _, student_action_seq = trainer.student(
-                    action_input, train_mode=True,
-                    r_timestep=video_r,
-                    action_r_timestep=action_r[:, ::action_ds],
+                action_grad_context = (
+                    torch.enable_grad()
+                    if getattr(trainer.config, "offline_eval_force_gradient_checkpointing", False)
+                    else torch.no_grad()
                 )
+                with action_grad_context:
+                    _, student_action_seq = trainer.student(
+                        action_input, train_mode=True,
+                        r_timestep=video_r,
+                        action_r_timestep=action_r[:, ::action_ds],
+                    )
                 action_frames = batch["actions"].shape[2] // action_ds
                 student_action_v = trainer._extract_action_v(student_action_seq, action_frames)
+                if getattr(trainer.config, "offline_eval_force_gradient_checkpointing", False):
+                    student_action_v = student_action_v.detach()
+                del student_action_seq
                 action_noisy_t_ds = action_noisy_t[:, :, ::action_ds]
                 action_noisy_r_ds = action_noisy_r[:, :, ::action_ds]
                 action_v_target_ds = action_v_target_t[:, :, ::action_ds]
@@ -654,7 +663,20 @@ def main():
             if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
                 decoded = {}
                 for name, latent_cpu in videos_to_save.items():
-                    video_np = decode_latents_to_np(vae, video_processor, latent_cpu.to(trainer.device))
+                    if vae is None:
+                        if vae_model_root is None:
+                            raise RuntimeError("VAE model root is unavailable for video decoding.")
+                        decode_device = torch.device("cuda", local_rank) if args.video_decode_device == "cuda" else torch.device("cpu")
+                        if decode_device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        vae = load_vae(
+                            os.path.join(vae_model_root, "vae"),
+                            torch_dtype=torch.float16 if decode_device.type == "cuda" else torch.float32,
+                            torch_device=decode_device,
+                        )
+                        vae.eval()
+                        video_processor = VideoProcessor(vae_scale_factor=1)
+                    video_np = decode_latents_to_np(vae, video_processor, latent_cpu)
                     decoded[name] = video_np
                     out_path = video_dir / f"{pair_name}_{name}.mp4"
                     video_np = np.stack(

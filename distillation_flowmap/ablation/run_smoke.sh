@@ -75,12 +75,14 @@ export DATASET_MAX_SAMPLES_PER_TASK="${SMOKE_MAX_SAMPLES}"
   --output-dir "${RUN_DIR}/videos" \
   --resume-from-path "${RUN_DIR}/stage2/checkpoints/step_${SMOKE_STAGE2_STEPS}" \
   --result-json "${RUN_DIR}/metrics/video_mse.json" \
+  --video-dir "${RUN_DIR}/videos" \
   --eval-manifest "${PROTOCOL_DIR}/heldout_eval_manifest.json" \
   --eval-pairs-json "${PROTOCOL_DIR}/eval_pairs.json" \
   --split-name heldout \
   --num-batches 0 \
   --student-steps 4 \
-  --teacher-steps 4
+  --teacher-steps 4 \
+  --video-decode-device cpu
 
 if [ "${RUN_ROBOTWIN_ENV_SMOKE:-0}" = "1" ]; then
   PYTHONWARNINGS=ignore::UserWarning \

@@ -58,6 +58,8 @@ IFS=',' read -r -a variant_list <<< "${VARIANTS}"
 IFS=',' read -r -a seed_list <<< "${SEEDS}"
 pids_file="${ROOT}/train_pids.txt"
 : > "${pids_file}"
+active_pids=()
+failures=0
 
 common_args=(
   --root "${ROOT}"
@@ -77,9 +79,26 @@ common_args=(
 )
 
 wait_batch() {
-  local active_count="$1"
+  local label="$1"
+  local active_count="$2"
+  local pid
+  local rc
+  local batch_failures=0
   if [ "${active_count}" -gt 0 ]; then
-    wait
+    set +e
+    for pid in "${active_pids[@]}"; do
+      wait "${pid}"
+      rc="$?"
+      if [ "${rc}" -ne 0 ]; then
+        batch_failures=$(( batch_failures + 1 ))
+        echo "Job ${pid} in ${label} failed with exit code ${rc}; check logs under ${ROOT}" >&2
+      fi
+    done
+    set -e
+    active_pids=()
+    if [ "${batch_failures}" -ne 0 ]; then
+      failures=$(( failures + batch_failures ))
+    fi
   fi
 }
 
@@ -109,7 +128,9 @@ launch_job() {
     cmd+=(--dry-run)
   fi
   CUDA_VISIBLE_DEVICES="${gpu}" "${cmd[@]}" > "${log_file}" 2>&1 &
-  echo "$!" >> "${pids_file}"
+  local pid="$!"
+  echo "${pid}" >> "${pids_file}"
+  active_pids+=("${pid}")
 }
 
 if [ "${STAGE}" = "both" ] || [ "${STAGE}" = "stage1" ]; then
@@ -122,11 +143,16 @@ if [ "${STAGE}" = "both" ] || [ "${STAGE}" = "stage1" ]; then
     active=$(( active + 1 ))
     job_idx=$(( job_idx + 1 ))
     if [ "${active}" -ge "${MAX_PARALLEL}" ]; then
-      wait_batch "${active}"
+      wait_batch stage1 "${active}"
       active=0
     fi
   done
-  wait_batch "${active}"
+  wait_batch stage1 "${active}"
+  stage1_failures="${failures}"
+  if [ "${stage1_failures}" -ne 0 ]; then
+    echo "Stopping before stage2 because ${stage1_failures} stage1 job(s) failed." >&2
+    exit 1
+  fi
 fi
 
 if [ "${STAGE}" = "both" ] || [ "${STAGE}" = "stage2" ]; then
@@ -140,12 +166,17 @@ if [ "${STAGE}" = "both" ] || [ "${STAGE}" = "stage2" ]; then
       active=$(( active + 1 ))
       job_idx=$(( job_idx + 1 ))
       if [ "${active}" -ge "${MAX_PARALLEL}" ]; then
-        wait_batch "${active}"
+        wait_batch stage2 "${active}"
         active=0
       fi
     done
   done
-  wait_batch "${active}"
+  wait_batch stage2 "${active}"
+fi
+
+if [ "${failures}" -ne 0 ]; then
+  echo "Finished with ${failures} failed RobotWin ablation job(s); PIDs were written to ${pids_file}" >&2
+  exit 1
 fi
 
 echo "All requested RobotWin mini-ablation jobs finished. PIDs were written to ${pids_file}"

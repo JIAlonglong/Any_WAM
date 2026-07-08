@@ -48,6 +48,7 @@ def test_full_variant_dry_run_contains_hybrid_opd_env(tmp_path):
     result = run_dry_run(tmp_path, "full_stepwam")
 
     assert "full_stepwam/seed_0" in result.stdout
+    assert "ENABLE_GRAD_BRANCH_DIAGNOSTICS=1" in result.stdout
     assert "OPD_SAME_STATE_VELOCITY_WEIGHT=0.1" in result.stdout
     assert "OPD_ENDPOINT_AUX_WEIGHT=0.1" in result.stdout
     assert "USE_OPD_AUX=1" in result.stdout

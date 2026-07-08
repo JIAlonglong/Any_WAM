@@ -43,6 +43,10 @@ from modules.utils import WanVAEStreamingWrapper, load_transformer, load_vae
 from utils import logger, warmup_constant_lambda, FlowMatchScheduler
 from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
 from distillation_flowmap.cosmos_teacher_roles import resolve_teacher_roles
+from distillation_flowmap.ablation.robotwin_diagnostics import (
+    classify_parameter_branch,
+    opd_diagnostic_aliases,
+)
 
 try:
     import wandb
@@ -1286,6 +1290,31 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
     # ==================================================================
     def _light_eval_is_enabled(self):
         return bool(getattr(self.config, "enable_light_eval", False))
+
+    def _compute_student_grad_branch_norms(self):
+        sq_sums = {
+            "video": torch.zeros((), device=self.device),
+            "action": torch.zeros((), device=self.device),
+            "shared": torch.zeros((), device=self.device),
+        }
+        for name, param in self.student.named_parameters():
+            grad = getattr(param, "grad", None)
+            if grad is None:
+                continue
+            if grad.is_sparse:
+                grad = grad.coalesce().values()
+            branch = classify_parameter_branch(name)
+            sq_sums[branch] = sq_sums[branch] + grad.detach().float().pow(2).sum()
+
+        packed = torch.stack([sq_sums["video"], sq_sums["action"], sq_sums["shared"]])
+        if dist.is_initialized():
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        packed = packed.clamp(min=0).sqrt()
+        return {
+            "video": packed[0].item(),
+            "action": packed[1].item(),
+            "shared": packed[2].item(),
+        }
 
     def _get_light_eval_batches(self):
         if self._light_eval_batches is not None:
@@ -2684,10 +2713,21 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
             # 检查是否需要梯度同步（达到累积步数）
             if result["should_sync"]:
+                log_interval = max(1, int(getattr(config, "log_interval", 1)))
+                will_log_step = (
+                    (self.step % log_interval == 0) or
+                    (self.step + 1 >= config.max_train_steps)
+                )
+                grad_branch_norms = {}
                 if skip_step:
                     total_norm = torch.tensor(float("nan"), device=self.device)
                     self.optimizer.zero_grad()
                 else:
+                    if (
+                        bool(getattr(config, "enable_grad_branch_diagnostics", False))
+                        and will_log_step
+                    ):
+                        grad_branch_norms = self._compute_student_grad_branch_norms()
                     # 梯度裁剪
                     total_norm = torch.nn.utils.clip_grad_norm_(
                         self.student.parameters(), config.max_grad_norm)
@@ -2932,8 +2972,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     gc.collect()
 
                 # 记录日志（仅主进程）
-                log_interval = max(1, int(getattr(config, "log_interval", 1)))
-                should_log = (self.step % log_interval == 0) or (self.step + 1 >= config.max_train_steps)
+                should_log = will_log_step
                 if config.rank == 0 and should_log:
                     progress_bar.n = self.step + 1
                     postfix = {
@@ -2947,6 +2986,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         "train/lr": lr,
                         "train/ema_decay": getattr(self, '_last_ema_decay', config.ema_decay),
                     }
+                    if grad_branch_norms:
+                        log_dict["grad_norm/video_branch"] = grad_branch_norms["video"]
+                        log_dict["grad_norm/action_branch"] = grad_branch_norms["action"]
+                        log_dict["grad_norm/shared_branch"] = grad_branch_norms["shared"]
                     if self.distill_video:
                         if use_onpolicy_now:
                             postfix["vt"] = f"{avg_video_loss:.4f}"
@@ -3016,6 +3059,14 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         log_dict["loss_ratio/opd_endpoint_aux"] = avg_opd_endpoint_aux_ratio
                         log_dict["loss_ratio/opd_same_state_velocity"] = avg_opd_same_state_velocity_ratio
                         log_dict["loss_ratio/opd_local_fm"] = avg_opd_local_fm_ratio
+                        log_dict.update(opd_diagnostic_aliases({
+                            "opd_endpoint_aux_loss": avg_opd_endpoint_aux_loss,
+                            "opd_same_state_velocity_loss": avg_opd_same_state_velocity_loss,
+                            "opd_action_transition_loss": avg_opd_action_transition_loss,
+                            "opd_endpoint_aux_ratio": avg_opd_endpoint_aux_ratio,
+                            "opd_same_state_velocity_ratio": avg_opd_same_state_velocity_ratio,
+                            "opd_action_transition_ratio": avg_opd_action_transition_ratio,
+                        }, self.config))
                         if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
                             postfix["kto"] = f"{avg_kto_good_ratio:.2f}/{avg_kto_weight_mean:.2f}"
                             log_dict["kto/good_ratio"] = avg_kto_good_ratio

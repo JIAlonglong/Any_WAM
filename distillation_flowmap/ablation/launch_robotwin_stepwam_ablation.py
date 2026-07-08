@@ -240,7 +240,11 @@ def build_run_plan(args):
     stage2 = build_stage_command(
         stage_name="stage2",
         config_module=defaults["stage2_config"],
-        stage_env={**common_env, **variant.get("stage2_env", {})},
+        stage_env={
+            **common_env,
+            "ENABLE_GRAD_BRANCH_DIAGNOSTICS": "1",
+            **variant.get("stage2_env", {}),
+        },
         output_dir=stage2_dir,
         max_steps=stage2_steps,
         teacher_model_path=args.teacher_model_path,

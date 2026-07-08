@@ -89,3 +89,4 @@ cfg.gradient_checkpointing = _env_bool("GRADIENT_CHECKPOINTING", True)
 # Disabled by default to avoid extra evaluation memory during warmup.
 cfg.enable_light_eval = _env_bool("ENABLE_LIGHT_EVAL", False)
 cfg.enable_rollout_eval = _env_bool("ENABLE_ROLLOUT_EVAL", False)
+cfg.enable_grad_branch_diagnostics = _env_bool("ENABLE_GRAD_BRANCH_DIAGNOSTICS", False)

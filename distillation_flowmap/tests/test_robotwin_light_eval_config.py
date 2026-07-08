@@ -29,3 +29,13 @@ def test_robotwin_stage2_exposes_dataset_sample_manifest_env(monkeypatch):
     module = importlib.import_module("distillation_flowmap.config_robotwin_fullfinetune_stage2_anyflow")
 
     assert module.cfg.dataset_sample_manifest == "/tmp/train_manifest.json"
+
+
+def test_robotwin_stage2_exposes_grad_branch_diagnostics_env(monkeypatch):
+    monkeypatch.setenv("ENABLE_GRAD_BRANCH_DIAGNOSTICS", "1")
+    sys.modules.pop("distillation_flowmap.config_robotwin_fullfinetune_stage1_warmup", None)
+    sys.modules.pop("distillation_flowmap.config_robotwin_fullfinetune_stage2_anyflow", None)
+
+    module = importlib.import_module("distillation_flowmap.config_robotwin_fullfinetune_stage2_anyflow")
+
+    assert module.cfg.enable_grad_branch_diagnostics is True

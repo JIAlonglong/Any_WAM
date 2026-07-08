@@ -262,6 +262,8 @@ def test_protocol_manifest_paths_are_recorded_in_dry_run(tmp_path):
             "/tmp/dataset",
             "--task-preset",
             "core4",
+            "--protocol-seed",
+            "9",
             "--stage1-steps",
             "5",
             "--stage2-steps",
@@ -280,4 +282,5 @@ def test_protocol_manifest_paths_are_recorded_in_dry_run(tmp_path):
     assert "train_manifest_path" in result.stdout
     assert "heldout_eval_manifest_path" in result.stdout
     assert "eval_pairs_path" in result.stdout
-    assert "protocol/manifests/core4_seed_2" in result.stdout
+    assert "protocol_seed" in result.stdout
+    assert "protocol/manifests/core4_protocol_seed_9" in result.stdout

@@ -7,10 +7,20 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from distillation_flowmap.ablation.robotwin_mini_protocol import (
+    DEFAULT_EVAL_PAIRS,
+    protocol_manifest_paths,
+    write_protocol_manifests,
+)
+
+
 ABLATION_DIR = Path(__file__).resolve().parent
 DEFAULT_ROOT = REPO_ROOT / "distillation_flowmap" / "output_robotwin_stepwam_ablation"
 SAFE_SHELL_VALUE = re.compile(r"^[A-Za-z0-9_./,:=+-]+$")
@@ -94,16 +104,6 @@ def task_preset_filter(tasks, preset):
         known = ", ".join(sorted(["representative", *presets.keys()]))
         raise ValueError(f"Unknown task preset {preset!r}; known presets: {known}")
     return list(presets[preset])
-
-
-def protocol_manifest_paths(root, task_preset, seed):
-    manifest_dir = Path(root) / "protocol" / "manifests" / f"{task_preset}_seed_{seed}"
-    return {
-        "protocol_manifest_dir": str(manifest_dir),
-        "train_manifest_path": str(manifest_dir / "train_manifest.json"),
-        "heldout_eval_manifest_path": str(manifest_dir / "heldout_eval_manifest.json"),
-        "eval_pairs_path": str(manifest_dir / "eval_pairs.json"),
-    }
 
 
 def shell_value(value):
@@ -266,7 +266,11 @@ def build_run_plan(args):
         "selected_task_filter": task_filter,
         "dataset_max_episodes_per_task": args.max_episodes_per_task,
         "dataset_max_samples_per_task": args.max_samples_per_task,
-        **protocol_manifest_paths(root, selected_task_preset, args.seed),
+        "protocol_seed": args.protocol_seed,
+        "train_samples_per_task": args.train_samples_per_task,
+        "heldout_samples_per_task": args.heldout_samples_per_task,
+        "eval_pairs": args.eval_pairs,
+        **protocol_manifest_paths(root, selected_task_preset, args.protocol_seed),
         "stage1_env": stage1["env"],
         "stage2_env": stage2["env"],
         "commands": {
@@ -324,6 +328,10 @@ def parse_args():
     )
     parser.add_argument("--max-episodes-per-task", type=int, default=None)
     parser.add_argument("--max-samples-per-task", type=int, default=None)
+    parser.add_argument("--protocol-seed", type=int, default=0)
+    parser.add_argument("--train-samples-per-task", type=int, default=80)
+    parser.add_argument("--heldout-samples-per-task", type=int, default=20)
+    parser.add_argument("--eval-pairs", nargs="+", default=list(DEFAULT_EVAL_PAIRS))
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--ngpu", type=int, default=1)
     parser.add_argument("--master-port", type=int, default=29620)
@@ -361,6 +369,17 @@ def main():
         raise FileNotFoundError(
             "Shared Stage 1 checkpoint is required for --stage stage2: "
             f"{plan['manifest']['stage1_ckpt']}"
+        )
+
+    if plan["manifest"]["selected_task_filter"]:
+        write_protocol_manifests(
+            root=args.root,
+            task_preset=plan["manifest"]["task_preset"],
+            protocol_seed=args.protocol_seed,
+            task_names=plan["manifest"]["selected_task_filter"],
+            train_samples_per_task=args.train_samples_per_task,
+            heldout_samples_per_task=args.heldout_samples_per_task,
+            pairs=args.eval_pairs,
         )
 
     manifest_path = write_manifest(plan["run_dir"], plan["manifest"])

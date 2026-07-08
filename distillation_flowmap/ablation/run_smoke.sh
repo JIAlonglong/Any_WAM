@@ -14,6 +14,9 @@ SMOKE_STAGE2_STEPS="${SMOKE_STAGE2_STEPS:-20}"
 SMOKE_TASK="${SMOKE_TASK:-place_a2b_right}"
 SMOKE_EPISODES="${SMOKE_EPISODES:-5}"
 SMOKE_MAX_SAMPLES="${SMOKE_MAX_SAMPLES:-${SMOKE_EPISODES}}"
+SMOKE_TRAIN_SAMPLES="${SMOKE_TRAIN_SAMPLES:-3}"
+SMOKE_HELDOUT_SAMPLES="${SMOKE_HELDOUT_SAMPLES:-2}"
+SMOKE_PROTOCOL_SEED="${SMOKE_PROTOCOL_SEED:-0}"
 SMOKE_NGPU="${SMOKE_NGPU:-1}"
 MASTER_PORT="${MASTER_PORT:-29640}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-${SMOKE_STAGE2_STEPS}}"
@@ -32,12 +35,17 @@ cd "${PROJECT_ROOT}"
   --task-filter "${SMOKE_TASK}" \
   --max-episodes-per-task "${SMOKE_EPISODES}" \
   --max-samples-per-task "${SMOKE_MAX_SAMPLES}" \
+  --protocol-seed "${SMOKE_PROTOCOL_SEED}" \
+  --train-samples-per-task "${SMOKE_TRAIN_SAMPLES}" \
+  --heldout-samples-per-task "${SMOKE_HELDOUT_SAMPLES}" \
+  --eval-pairs 1000,0 \
   --stage1-steps "${SMOKE_STAGE1_STEPS}" \
   --stage2-steps "${SMOKE_STAGE2_STEPS}" \
   --ngpu "${SMOKE_NGPU}" \
   --master-port "${MASTER_PORT}"
 
 RUN_DIR="${SMOKE_ROOT}/full_stepwam/seed_0"
+PROTOCOL_DIR="${SMOKE_ROOT}/protocol/manifests/custom_protocol_seed_${SMOKE_PROTOCOL_SEED}"
 mkdir -p "${RUN_DIR}/metrics" "${RUN_DIR}/videos"
 export DATASET_TASK_FILTER="${SMOKE_TASK}"
 export DATASET_MAX_EPISODES_PER_TASK="${SMOKE_EPISODES}"
@@ -51,10 +59,13 @@ export DATASET_MAX_SAMPLES_PER_TASK="${SMOKE_MAX_SAMPLES}"
   --output-dir "${RUN_DIR}/eval" \
   --resume-from-path "${RUN_DIR}/stage2/checkpoints/step_${SMOKE_STAGE2_STEPS}" \
   --result-json "${RUN_DIR}/metrics/offline_rollout.json" \
-  --num-batches 1 \
+  --teacher-cache-path "${RUN_DIR}/metrics/teacher_cache.pt" \
+  --eval-manifest "${PROTOCOL_DIR}/heldout_eval_manifest.json" \
+  --eval-pairs-json "${PROTOCOL_DIR}/eval_pairs.json" \
+  --split-name heldout \
+  --num-batches 0 \
   --student-steps 4 \
-  --teacher-steps 4 \
-  --pairs 1000,0
+  --teacher-steps 4
 
 "${TORCHRUN}" --nproc_per_node=1 --master_port="$((MASTER_PORT + 3))" \
   distillation_flowmap/rollout_eval_video_stage2.py \
@@ -64,10 +75,12 @@ export DATASET_MAX_SAMPLES_PER_TASK="${SMOKE_MAX_SAMPLES}"
   --output-dir "${RUN_DIR}/videos" \
   --resume-from-path "${RUN_DIR}/stage2/checkpoints/step_${SMOKE_STAGE2_STEPS}" \
   --result-json "${RUN_DIR}/metrics/video_mse.json" \
-  --num-batches 1 \
+  --eval-manifest "${PROTOCOL_DIR}/heldout_eval_manifest.json" \
+  --eval-pairs-json "${PROTOCOL_DIR}/eval_pairs.json" \
+  --split-name heldout \
+  --num-batches 0 \
   --student-steps 4 \
-  --teacher-steps 4 \
-  --pairs 1000,0
+  --teacher-steps 4
 
 if [ "${RUN_ROBOTWIN_ENV_SMOKE:-0}" = "1" ]; then
   PYTHONWARNINGS=ignore::UserWarning \

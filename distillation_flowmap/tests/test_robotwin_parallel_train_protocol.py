@@ -11,6 +11,11 @@ def _final_train_source():
     return (repo_root / "ablation" / "run_final_ablation.sh").read_text(encoding="utf-8")
 
 
+def _final_eval_source():
+    repo_root = Path(__file__).resolve().parents[1]
+    return (repo_root / "ablation" / "run_final_eval.sh").read_text(encoding="utf-8")
+
+
 def test_parallel_train_uses_protocol_controlled_shared_stage1():
     source = _parallel_train_source()
 
@@ -59,3 +64,23 @@ def test_final_ablation_launcher_uses_representative_12_task_protocol():
     assert "local_adjacent_only" in source
     assert "action_only" in source
     assert 'run_parallel_train.sh' in source
+
+
+def test_final_eval_launcher_reuses_heldout_cache_and_summarizes():
+    source = _final_eval_source()
+
+    assert 'ROOT="${ROOT:-${PROJECT_ROOT}/distillation_flowmap/output_robotwin_stepwam_ablation/protocol_final12_5000}"' in source
+    assert 'VARIANTS="${VARIANTS:-full_stepwam,w_o_opd,endpoint_only_opd,velocity_only_opd,local_adjacent_only,action_only}"' in source
+    assert 'SEEDS="${SEEDS:-0,1,2}"' in source
+    assert 'TEACHER_CACHE="${TEACHER_CACHE:-${ROOT}/protocol/teacher_cache_heldout_final.pt}"' in source
+    assert "--teacher-cache-only" in source
+    assert "--teacher-cache-path" in source
+    assert "--disable-eval-gradient-checkpointing" in source
+    assert "--eval-rollout-grad-mode" in source
+    assert "--eval-empty-cache" in source
+    assert "heldout_eval_manifest.json" in source
+    assert "train_eval_manifest.json" in source
+    assert "make_balanced_train_eval_manifest" in source
+    assert "rollout_eval_stage2.py" in source
+    assert "rollout_eval_video_stage2.py" in source
+    assert "summarize_robotwin_ablation.py" in source

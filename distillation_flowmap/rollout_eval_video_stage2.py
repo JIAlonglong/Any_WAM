@@ -26,6 +26,12 @@ from distributed.util import init_distributed, dist_mean
 from utils import init_logger, logger
 from distillation_flowmap.flowmap_trainer import FlowMapDistiller
 from distillation_flowmap.flowmap_step import _downsample_action_grid_id
+from distillation_flowmap.rollout_masking import (
+    crop_latent_video_to_valid_frames,
+    masked_video_mse_l1,
+    masked_video_rms,
+    video_frame_mask_from_batch,
+)
 from distillation_flowmap.ablation.robotwin_mini_protocol import (
     dataset_indices_for_manifest,
     eval_seed_for_pair,
@@ -508,6 +514,7 @@ def main():
         B = batch["latents"].shape[0]
         ref_shape = batch["latents"].shape
         num_frames = ref_shape[2]
+        video_frame_mask = video_frame_mask_from_batch(batch, num_frames=num_frames)
         empty_emb = trainer.empty_emb.expand(base_input["latent_dict"]["text_emb"].shape[0], -1, -1)
 
         for pair_idx, pair_spec in enumerate(pair_specs):
@@ -612,12 +619,20 @@ def main():
             save_official_future_video = False
             if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
                 sample_idx = min(max(args.video_sample_index, 0), B - 1)
-                videos_to_save["gt_r"] = video_noisy_r[sample_idx:sample_idx + 1].detach().cpu()
+                videos_to_save["gt_r"] = crop_latent_video_to_valid_frames(
+                    video_noisy_r[sample_idx:sample_idx + 1],
+                    video_frame_mask,
+                    sample_idx=sample_idx,
+                ).detach().cpu()
                 if is_cosmos_policy_teacher:
                     save_official_future_video = True
                 else:
                     videos_to_save[f"teacher_t{args.teacher_steps}"] = (
-                        teacher_x_r[sample_idx:sample_idx + 1].detach().cpu()
+                        crop_latent_video_to_valid_frames(
+                            teacher_x_r[sample_idx:sample_idx + 1],
+                            video_frame_mask,
+                            sample_idx=sample_idx,
+                        ).detach().cpu()
                     )
 
             for k_steps in args.student_steps:
@@ -643,17 +658,25 @@ def main():
                 if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
                     sample_idx = min(max(args.video_sample_index, 0), B - 1)
                     if save_student_latent_video:
-                        videos_to_save[f"student_s{k_steps}"] = student_x_r[sample_idx:sample_idx + 1].detach().cpu()
+                        videos_to_save[f"student_s{k_steps}"] = crop_latent_video_to_valid_frames(
+                            student_x_r[sample_idx:sample_idx + 1],
+                            video_frame_mask,
+                            sample_idx=sample_idx,
+                        ).detach().cpu()
                 prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{args.teacher_steps}"
                 if teacher_x_r is not None and teacher_v_r is not None:
-                    add(prefix + "/video_teacher_x_mse", (student_x_r.float() - teacher_x_r.float()).pow(2).mean())
-                    add(prefix + "/video_teacher_x_l1", (student_x_r.float() - teacher_x_r.float()).abs().mean())
-                    add(prefix + "/video_teacher_v_mse", (student_v_r.float() - teacher_v_r.float()).pow(2).mean())
-                    add(prefix + "/video_teacher_v_l1", (student_v_r.float() - teacher_v_r.float()).abs().mean())
-                add(prefix + "/video_gt_x_mse", (student_x_r.float() - video_noisy_r.float()).pow(2).mean())
-                add(prefix + "/video_gt_x_l1", (student_x_r.float() - video_noisy_r.float()).abs().mean())
-                add(prefix + "/video_gt_v_mse", (student_v_r.float() - video_v_target_r.float()).pow(2).mean())
-                add(prefix + "/video_latent_norm", student_x_r.float().pow(2).mean().sqrt())
+                    mse, l1 = masked_video_mse_l1(student_x_r - teacher_x_r, video_frame_mask)
+                    add(prefix + "/video_teacher_x_mse", mse)
+                    add(prefix + "/video_teacher_x_l1", l1)
+                    mse, l1 = masked_video_mse_l1(student_v_r - teacher_v_r, video_frame_mask)
+                    add(prefix + "/video_teacher_v_mse", mse)
+                    add(prefix + "/video_teacher_v_l1", l1)
+                mse, l1 = masked_video_mse_l1(student_x_r - video_noisy_r, video_frame_mask)
+                add(prefix + "/video_gt_x_mse", mse)
+                add(prefix + "/video_gt_x_l1", l1)
+                mse, _ = masked_video_mse_l1(student_v_r - video_v_target_r, video_frame_mask)
+                add(prefix + "/video_gt_v_mse", mse)
+                add(prefix + "/video_latent_norm", masked_video_rms(student_x_r, video_frame_mask))
 
                 if args.eval_empty_cache and k_steps == args.student_steps[-1]:
                     teacher_x_r = teacher_v_r = None
@@ -793,6 +816,7 @@ def main():
                 teacher_x_r = teacher_v_r = None
                 video_t = video_r = action_t = action_r = None
                 video_noise = action_noise = None
+                video_frame_mask = None
                 video_noisy_t = video_noisy_r = video_v_target_r = None
                 action_noisy_t = action_noisy_r = action_v_target_t = None
                 input_dict = student_input = videos_to_save = None

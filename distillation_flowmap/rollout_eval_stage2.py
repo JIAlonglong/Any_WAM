@@ -30,6 +30,11 @@ from distributed.util import init_distributed, dist_mean
 from utils import init_logger, logger
 from distillation_flowmap.flowmap_trainer import FlowMapDistiller
 from distillation_flowmap.flowmap_step import _downsample_action_grid_id
+from distillation_flowmap.rollout_masking import (
+    masked_video_mse_l1,
+    masked_video_rms,
+    video_frame_mask_from_batch,
+)
 from distillation_flowmap.ablation.robotwin_mini_protocol import (
     dataset_indices_for_manifest,
     eval_seed_for_pair,
@@ -320,6 +325,7 @@ def main():
         B = batch["latents"].shape[0]
         ref_shape = batch["latents"].shape
         num_frames = ref_shape[2]
+        video_frame_mask = video_frame_mask_from_batch(batch, num_frames=num_frames)
         empty_emb = trainer.empty_emb.expand(base_input["latent_dict"]["text_emb"].shape[0], -1, -1)
 
         for pair_idx, pair_spec in enumerate(pair_specs):
@@ -455,14 +461,18 @@ def main():
                     student_x_r, student_v_r = rollout_out
                     student_action_seq = None
                 prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{args.teacher_steps}"
-                add(prefix + "/video_teacher_x_mse", (student_x_r.float() - teacher_x_r.float()).pow(2).mean())
-                add(prefix + "/video_teacher_x_l1", (student_x_r.float() - teacher_x_r.float()).abs().mean())
-                add(prefix + "/video_teacher_v_mse", (student_v_r.float() - teacher_v_r.float()).pow(2).mean())
-                add(prefix + "/video_teacher_v_l1", (student_v_r.float() - teacher_v_r.float()).abs().mean())
-                add(prefix + "/video_gt_x_mse", (student_x_r.float() - video_noisy_r.float()).pow(2).mean())
-                add(prefix + "/video_gt_x_l1", (student_x_r.float() - video_noisy_r.float()).abs().mean())
-                add(prefix + "/video_gt_v_mse", (student_v_r.float() - video_v_target_r.float()).pow(2).mean())
-                add(prefix + "/video_latent_norm", student_x_r.float().pow(2).mean().sqrt())
+                mse, l1 = masked_video_mse_l1(student_x_r - teacher_x_r, video_frame_mask)
+                add(prefix + "/video_teacher_x_mse", mse)
+                add(prefix + "/video_teacher_x_l1", l1)
+                mse, l1 = masked_video_mse_l1(student_v_r - teacher_v_r, video_frame_mask)
+                add(prefix + "/video_teacher_v_mse", mse)
+                add(prefix + "/video_teacher_v_l1", l1)
+                mse, l1 = masked_video_mse_l1(student_x_r - video_noisy_r, video_frame_mask)
+                add(prefix + "/video_gt_x_mse", mse)
+                add(prefix + "/video_gt_x_l1", l1)
+                mse, _ = masked_video_mse_l1(student_v_r - video_v_target_r, video_frame_mask)
+                add(prefix + "/video_gt_v_mse", mse)
+                add(prefix + "/video_latent_norm", masked_video_rms(student_x_r, video_frame_mask))
 
                 if args.eval_empty_cache and k_steps == args.student_steps[-1]:
                     teacher_x_r = teacher_v_r = None

@@ -6,7 +6,17 @@ from .shared_config import va_shared_cfg
 va_robotwin_cfg = EasyDict(__name__='Config: VA robotwin')
 va_robotwin_cfg.update(va_shared_cfg)
 
-va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/path/to/pretrained/model"
+import os as _os
+va_robotwin_cfg.wan22_pretrained_model_name_or_path = _os.environ.get(
+    "WAN22_PRETRAINED_PATH",
+    _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)),
+        "..",
+        "..",
+        "checkpoints",
+        "lingbot-va-posttrain-robotwin",
+    ),
+)
 
 va_robotwin_cfg.attn_window = 72
 va_robotwin_cfg.frame_chunk_size = 2

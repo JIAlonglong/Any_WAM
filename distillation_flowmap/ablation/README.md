@@ -24,6 +24,27 @@ The ablation runner must write one manifest per run containing the git hash,
 variant, seed, task list, checkpoint paths, and exact environment overrides.
 Cosmos is intentionally excluded from these component ablations.
 
+## OPD mechanism calibration
+
+Before rerunning the final task matrix, use the guarded two-task calibration:
+
+```bash
+DRY_RUN=1 bash \
+  distillation_flowmap/ablation/run_opd_mechanism_calibration.sh
+```
+
+The default protocol reuses the existing seed-0 Stage1 checkpoint and runs
+Stage2 only. It is fixed to `place_a2b_right` plus `open_microwave`, 20 train
+and 10 held-out samples per task, seed 0, and 750 optimizer steps. Its five
+variants isolate no OPD, endpoint-only, velocity-only, full last-step credit,
+and full-rollout credit. OPD action and local auxiliary losses are disabled
+for this first mechanism check.
+
+The script refuses larger task/sample settings or more than 1000 steps unless
+`ALLOW_LARGE_CALIBRATION=1` is set explicitly. Do not set that flag for the
+first mechanism gate. Dry-run manifests are saved under
+`protocol_opd_mechanism_calibration_v1/preflight/`.
+
 Example:
 
 ```bash

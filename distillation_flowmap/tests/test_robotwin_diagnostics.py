@@ -47,3 +47,26 @@ def test_opd_diagnostic_aliases_expose_endpoint_velocity_weights_and_ratios():
     assert aliases["opd_loss_scale/beta_end_action"] == 2.0
     assert aliases["opd_loss_ratio/velocity_video"] == 0.3
     assert aliases["opd_modality_weight/action_local"] == 0.5
+
+
+def test_explicit_diagnostics_use_canonical_video_transition_endpoint():
+    metrics = {
+        "opd_video_transition_loss": 4.5,
+        "opd_endpoint_aux_loss": 0.0,
+        "opd_same_state_velocity_loss": 2.5,
+        "opd_video_transition_ratio": 0.6,
+        "opd_endpoint_aux_ratio": 0.0,
+        "opd_same_state_velocity_ratio": 0.4,
+    }
+    config = SimpleNamespace(
+        opd_loss_composition="explicit_hybrid",
+        video_transition_weight=1.25,
+        opd_endpoint_aux_weight=0.0,
+        opd_same_state_velocity_weight=0.75,
+    )
+
+    aliases = opd_diagnostic_aliases(metrics, config)
+
+    assert aliases["opd_loss_scale/L_endpoint_video"] == 4.5
+    assert aliases["opd_loss_scale/beta_end_video"] == 1.25
+    assert aliases["opd_loss_ratio/endpoint_video"] == 0.6

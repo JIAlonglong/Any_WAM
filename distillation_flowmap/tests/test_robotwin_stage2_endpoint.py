@@ -103,6 +103,7 @@ class RobotWinStage2EndpointConfigTest(unittest.TestCase):
             USE_8BIT_OPTIMIZER=None,
             GRADIENT_CHECKPOINTING=None,
             OPD_AUX_GRADIENT_CHECKPOINTING=None,
+            OPD_LOSS_COMPOSITION=None,
         )
 
         self.assertEqual(cfg.opd_teacher_target_mode, "endpoint")
@@ -118,6 +119,19 @@ class RobotWinStage2EndpointConfigTest(unittest.TestCase):
         self.assertTrue(cfg.opd_aux_empty_cache)
         self.assertTrue(cfg.use_8bit_optimizer)
         self.assertTrue(cfg.use_fsdp1)
+        self.assertEqual(cfg.opd_loss_composition, "legacy")
+
+    def test_explicit_hybrid_loss_composition_env_override(self):
+        cfg = load_config(OPD_LOSS_COMPOSITION="explicit_hybrid")
+
+        self.assertEqual(cfg.opd_loss_composition, "explicit_hybrid")
+
+    def test_invalid_loss_composition_is_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "OPD_LOSS_COMPOSITION must be legacy or explicit_hybrid",
+        ):
+            load_config(OPD_LOSS_COMPOSITION="ambiguous")
 
     def test_use_fsdp1_env_override_is_available_for_non_checkpointed_debug(self):
         cfg = load_config(USE_FSDP1="0", GRADIENT_CHECKPOINTING="0")

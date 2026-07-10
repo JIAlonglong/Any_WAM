@@ -34,17 +34,35 @@ def opd_diagnostic_aliases(metrics, config):
     action_transition_weight = cfg("action_transition_block_weight", cfg("action_block_weight", 1.0)) * cfg(
         "action_loss_weight", 1.0)
     action_local_weight = cfg("action_local_fm_block_weight", 1.0) * cfg("action_aware_weight", 0.0)
+    explicit_hybrid = str(getattr(
+        config, "opd_loss_composition", "legacy"
+    )).lower() == "explicit_hybrid"
+    endpoint_loss_key = (
+        "opd_video_transition_loss"
+        if explicit_hybrid
+        else "opd_endpoint_aux_loss"
+    )
+    endpoint_ratio_key = (
+        "opd_video_transition_ratio"
+        if explicit_hybrid
+        else "opd_endpoint_aux_ratio"
+    )
+    beta_end_video = (
+        cfg("video_transition_weight", 1.0)
+        if explicit_hybrid
+        else cfg("opd_endpoint_aux_weight", 0.0)
+    )
 
     return {
-        "opd_loss_scale/L_endpoint_video": metric("opd_endpoint_aux_loss"),
+        "opd_loss_scale/L_endpoint_video": metric(endpoint_loss_key),
         "opd_loss_scale/L_velocity_video": metric("opd_same_state_velocity_loss"),
         "opd_loss_scale/L_endpoint_action": metric("opd_action_transition_loss"),
         "opd_loss_scale/L_velocity_action": 0.0,
-        "opd_loss_scale/beta_end_video": cfg("opd_endpoint_aux_weight", 0.0),
+        "opd_loss_scale/beta_end_video": beta_end_video,
         "opd_loss_scale/beta_vel_video": cfg("opd_same_state_velocity_weight", 0.0),
         "opd_loss_scale/beta_end_action": action_transition_weight,
         "opd_loss_scale/beta_vel_action": 0.0,
-        "opd_loss_ratio/endpoint_video": metric("opd_endpoint_aux_ratio"),
+        "opd_loss_ratio/endpoint_video": metric(endpoint_ratio_key),
         "opd_loss_ratio/velocity_video": metric("opd_same_state_velocity_ratio"),
         "opd_loss_ratio/endpoint_action": metric("opd_action_transition_ratio"),
         "opd_modality_weight/video_transition": cfg("video_transition_weight", 1.0),

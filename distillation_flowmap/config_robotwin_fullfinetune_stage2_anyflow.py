@@ -30,6 +30,13 @@ cfg.wandb_name_prefix = "robotwin_stage2_fullft_anyflow"
 # teacher correction for the rollout lengths used by RobotWin eval.
 cfg.use_onpolicy_transition = _env_bool("USE_ONPOLICY_TRANSITION", False)
 cfg.use_opd_aux = _env_bool("USE_OPD_AUX", True)
+cfg.opd_loss_composition = os.environ.get(
+    "OPD_LOSS_COMPOSITION", "legacy"
+).lower()
+if cfg.opd_loss_composition not in ("legacy", "explicit_hybrid"):
+    raise ValueError(
+        "OPD_LOSS_COMPOSITION must be legacy or explicit_hybrid"
+    )
 cfg.opd_aux_weight = float(os.environ.get("OPD_AUX_WEIGHT", 1.0))
 cfg.opd_aux_warmup_steps = int(os.environ.get("OPD_AUX_WARMUP_STEPS", 0))
 cfg.opd_aux_interval = int(os.environ.get("OPD_AUX_INTERVAL", 4))

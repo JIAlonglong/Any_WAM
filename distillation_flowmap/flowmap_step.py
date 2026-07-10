@@ -94,6 +94,9 @@ from distillation_flowmap.kto_reweighting import (
     compute_normalized_focal_weights,
     piecewise_linear_scale,
 )
+from distillation_flowmap.opd_loss_composition import (
+    compose_explicit_hybrid_opd,
+)
 
 
 class FlowMapStepMixin:
@@ -4694,9 +4697,15 @@ class FlowMapStepMixin:
         else:
             video_transition_loss = (per_sample_loss * weight).mean()
 
+        opd_loss_composition = str(getattr(
+            self.config, 'opd_loss_composition', 'legacy'
+        )).lower()
         opd_endpoint_aux_loss = torch.tensor(0.0, device=self.device)
         opd_endpoint_aux_weight = float(getattr(self.config, 'opd_endpoint_aux_weight', 0.0))
-        if opd_endpoint_aux_weight > 0:
+        if (
+            opd_endpoint_aux_weight > 0
+            and opd_loss_composition != 'explicit_hybrid'
+        ):
             sigma_r = video_r_sigma[:, None, :, None, None].to(student_v_at_r)
             student_endpoint_pred = student_x_r - sigma_r * student_v_at_r
             teacher_endpoint_pred = teacher_x_r - sigma_r.to(teacher_v_at_r) * teacher_v_at_r
@@ -4798,54 +4807,128 @@ class FlowMapStepMixin:
         action_transition_weight = getattr(self.config, 'action_loss_weight', 1.0)
         action_local_fm_weight = getattr(self.config, 'action_aware_weight', 0.0)
 
-        raw_opd_video_transition_contrib = video_transition_weight * video_transition_loss
-        raw_opd_endpoint_aux_contrib = opd_endpoint_aux_weight * opd_endpoint_aux_loss
-        raw_opd_same_state_velocity_contrib = (
-            opd_same_state_velocity_weight * opd_same_state_velocity_loss
-        )
-        raw_opd_local_fm_contrib = local_fm_weight * local_fm_loss
-        raw_opd_action_transition_contrib = (
-            action_transition_block_weight * action_transition_weight * opd_action_transition_loss
-        )
-        raw_opd_action_local_fm_contrib = (
-            action_local_fm_block_weight * action_local_fm_weight * opd_action_local_fm_loss
-        )
+        if opd_loss_composition == 'explicit_hybrid':
+            explicit_loss = compose_explicit_hybrid_opd(
+                endpoint_video_loss=video_transition_loss,
+                velocity_video_loss=opd_same_state_velocity_loss,
+                endpoint_action_loss=opd_action_transition_loss,
+                beta_end_video=video_transition_weight,
+                beta_vel_video=opd_same_state_velocity_weight,
+                beta_end_action=(
+                    action_transition_block_weight * action_transition_weight
+                ),
+            )
+            zero_contrib = torch.zeros_like(explicit_loss.loss)
+            opd_video_transition_contrib = explicit_loss.contributions[
+                'endpoint_video'
+            ]
+            opd_same_state_velocity_contrib = explicit_loss.contributions[
+                'velocity_video'
+            ]
+            opd_action_transition_contrib = explicit_loss.contributions[
+                'endpoint_action'
+            ]
+            opd_endpoint_aux_contrib = zero_contrib
+            opd_local_fm_contrib = zero_contrib
+            opd_action_local_fm_contrib = zero_contrib
+            scaled_transition_group = (
+                opd_video_transition_contrib + opd_action_transition_contrib
+            )
+            scaled_anchor_group = opd_same_state_velocity_contrib
+            transition_scale = torch.ones_like(explicit_loss.loss)
+            anchor_scale = torch.ones_like(explicit_loss.loss)
+            raw_aux_loss = explicit_loss.loss
+            contrib_denom = sum(
+                value.detach().abs()
+                for value in explicit_loss.contributions.values()
+            ).clamp(min=1e-12)
+            opd_transition_group_ratio = (
+                scaled_transition_group.detach().abs() / contrib_denom
+            )
+            opd_anchor_group_ratio = (
+                scaled_anchor_group.detach().abs() / contrib_denom
+            )
+        else:
+            raw_opd_video_transition_contrib = (
+                video_transition_weight * video_transition_loss
+            )
+            raw_opd_endpoint_aux_contrib = (
+                opd_endpoint_aux_weight * opd_endpoint_aux_loss
+            )
+            raw_opd_same_state_velocity_contrib = (
+                opd_same_state_velocity_weight * opd_same_state_velocity_loss
+            )
+            raw_opd_local_fm_contrib = local_fm_weight * local_fm_loss
+            raw_opd_action_transition_contrib = (
+                action_transition_block_weight
+                * action_transition_weight
+                * opd_action_transition_loss
+            )
+            raw_opd_action_local_fm_contrib = (
+                action_local_fm_block_weight
+                * action_local_fm_weight
+                * opd_action_local_fm_loss
+            )
 
-        raw_transition_group = (
-            raw_opd_video_transition_contrib + raw_opd_action_transition_contrib
-        )
-        raw_anchor_group = (
-            raw_opd_endpoint_aux_contrib
-            + raw_opd_same_state_velocity_contrib
-            + raw_opd_local_fm_contrib
-            + raw_opd_action_local_fm_contrib
-        )
-        transition_scale = torch.as_tensor(
-            float(getattr(self.config, 'opd_transition_group_weight', 1.0)),
-            device=self.device,
-            dtype=raw_transition_group.dtype,
-        )
-        scaled_transition_group = raw_transition_group * transition_scale
-        anchor_cap_ratio = float(getattr(self.config, 'opd_anchor_cap_ratio', -1.0))
-        anchor_scale = torch.ones((), device=self.device, dtype=raw_anchor_group.dtype)
-        if anchor_cap_ratio >= 0:
-            anchor_cap = scaled_transition_group.detach().abs() * anchor_cap_ratio
-            raw_anchor_abs = raw_anchor_group.detach().abs().clamp(min=1e-12)
-            anchor_scale = torch.minimum(anchor_scale, anchor_cap / raw_anchor_abs)
-        scaled_anchor_group = raw_anchor_group * anchor_scale
+            raw_transition_group = (
+                raw_opd_video_transition_contrib
+                + raw_opd_action_transition_contrib
+            )
+            raw_anchor_group = (
+                raw_opd_endpoint_aux_contrib
+                + raw_opd_same_state_velocity_contrib
+                + raw_opd_local_fm_contrib
+                + raw_opd_action_local_fm_contrib
+            )
+            transition_scale = torch.as_tensor(
+                float(getattr(self.config, 'opd_transition_group_weight', 1.0)),
+                device=self.device,
+                dtype=raw_transition_group.dtype,
+            )
+            scaled_transition_group = raw_transition_group * transition_scale
+            anchor_cap_ratio = float(getattr(
+                self.config, 'opd_anchor_cap_ratio', -1.0
+            ))
+            anchor_scale = torch.ones(
+                (), device=self.device, dtype=raw_anchor_group.dtype
+            )
+            if anchor_cap_ratio >= 0:
+                anchor_cap = (
+                    scaled_transition_group.detach().abs() * anchor_cap_ratio
+                )
+                raw_anchor_abs = raw_anchor_group.detach().abs().clamp(min=1e-12)
+                anchor_scale = torch.minimum(
+                    anchor_scale, anchor_cap / raw_anchor_abs
+                )
+            scaled_anchor_group = raw_anchor_group * anchor_scale
 
-        opd_video_transition_contrib = raw_opd_video_transition_contrib * transition_scale
-        opd_action_transition_contrib = raw_opd_action_transition_contrib * transition_scale
-        opd_endpoint_aux_contrib = raw_opd_endpoint_aux_contrib * anchor_scale
-        opd_same_state_velocity_contrib = raw_opd_same_state_velocity_contrib * anchor_scale
-        opd_local_fm_contrib = raw_opd_local_fm_contrib * anchor_scale
-        opd_action_local_fm_contrib = raw_opd_action_local_fm_contrib * anchor_scale
-        raw_aux_loss = scaled_transition_group + scaled_anchor_group
-        contrib_denom = (
-            scaled_transition_group.detach().abs() + scaled_anchor_group.detach().abs()
-        ).clamp(min=1e-12)
-        opd_transition_group_ratio = scaled_transition_group.detach().abs() / contrib_denom
-        opd_anchor_group_ratio = scaled_anchor_group.detach().abs() / contrib_denom
+            opd_video_transition_contrib = (
+                raw_opd_video_transition_contrib * transition_scale
+            )
+            opd_action_transition_contrib = (
+                raw_opd_action_transition_contrib * transition_scale
+            )
+            opd_endpoint_aux_contrib = (
+                raw_opd_endpoint_aux_contrib * anchor_scale
+            )
+            opd_same_state_velocity_contrib = (
+                raw_opd_same_state_velocity_contrib * anchor_scale
+            )
+            opd_local_fm_contrib = raw_opd_local_fm_contrib * anchor_scale
+            opd_action_local_fm_contrib = (
+                raw_opd_action_local_fm_contrib * anchor_scale
+            )
+            raw_aux_loss = scaled_transition_group + scaled_anchor_group
+            contrib_denom = (
+                scaled_transition_group.detach().abs()
+                + scaled_anchor_group.detach().abs()
+            ).clamp(min=1e-12)
+            opd_transition_group_ratio = (
+                scaled_transition_group.detach().abs() / contrib_denom
+            )
+            opd_anchor_group_ratio = (
+                scaled_anchor_group.detach().abs() / contrib_denom
+            )
         opd_aux_weight = float(getattr(self.config, 'opd_aux_weight', 0.1))
         weighted_aux_loss = raw_aux_loss * opd_aux_weight
         # OPD aux is scheduled only on the final accumulation microbatch

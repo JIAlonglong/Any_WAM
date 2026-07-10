@@ -461,6 +461,11 @@ def main():
                     student_x_r, student_v_r = rollout_out
                     student_action_seq = None
                 prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{args.teacher_steps}"
+                mse, l1 = masked_video_mse_l1(teacher_x_r - video_noisy_r, video_frame_mask)
+                add(prefix + "/video_teacher_gt_x_mse", mse)
+                add(prefix + "/video_teacher_gt_x_l1", l1)
+                mse, _ = masked_video_mse_l1(teacher_v_r - video_v_target_r, video_frame_mask)
+                add(prefix + "/video_teacher_gt_v_mse", mse)
                 mse, l1 = masked_video_mse_l1(student_x_r - teacher_x_r, video_frame_mask)
                 add(prefix + "/video_teacher_x_mse", mse)
                 add(prefix + "/video_teacher_x_l1", l1)

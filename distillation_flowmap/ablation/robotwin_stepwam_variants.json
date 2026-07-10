@@ -147,6 +147,125 @@
         "OPD_ENDPOINT_AUX_WEIGHT": "0.1",
         "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.1"
       }
+    },
+    {
+      "id": "c0",
+      "name": "calib_w_o_opd",
+      "seeds": [0],
+      "priority": "mechanism_calibration",
+      "requires_code_flag": false,
+      "description": "Small-data Stage2 continuation without OPD from the shared Stage1 checkpoint.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "0"
+      }
+    },
+    {
+      "id": "c1",
+      "name": "calib_endpoint_only",
+      "seeds": [0],
+      "priority": "mechanism_calibration",
+      "requires_code_flag": false,
+      "description": "Explicit video endpoint OPD only with teacher N=8 and student K=4.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "1",
+        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
+        "OPD_AUX_ACTION": "0",
+        "VIDEO_TRANSITION_WEIGHT": "1.0",
+        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
+        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.0",
+        "LOCAL_FM_WEIGHT": "0.0",
+        "ACTION_LOCAL_FM_WEIGHT": "0.0",
+        "OPD_TRANSITION_GROUP_WEIGHT": "1.0",
+        "OPD_ANCHOR_CAP_RATIO": "-1.0",
+        "OPD_ROLLOUT_STEP_PAIRS": "8,4",
+        "OPD_ROLLOUT_GRAD_MODE": "last_step"
+      }
+    },
+    {
+      "id": "c2",
+      "name": "calib_velocity_only",
+      "seeds": [0],
+      "priority": "mechanism_calibration",
+      "requires_code_flag": false,
+      "description": "Explicit same-state video velocity OPD only with no transition-relative cap.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "1",
+        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
+        "OPD_AUX_ACTION": "0",
+        "VIDEO_TRANSITION_WEIGHT": "0.0",
+        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
+        "OPD_SAME_STATE_VELOCITY_WEIGHT": "1.0",
+        "LOCAL_FM_WEIGHT": "0.0",
+        "ACTION_LOCAL_FM_WEIGHT": "0.0",
+        "OPD_TRANSITION_GROUP_WEIGHT": "1.0",
+        "OPD_ANCHOR_CAP_RATIO": "-1.0",
+        "OPD_ROLLOUT_STEP_PAIRS": "8,4",
+        "OPD_ROLLOUT_GRAD_MODE": "last_step"
+      }
+    },
+    {
+      "id": "c3",
+      "name": "calib_full_last_step",
+      "seeds": [0],
+      "priority": "mechanism_calibration",
+      "requires_code_flag": false,
+      "description": "Explicit endpoint plus velocity OPD with final-step rollout credit.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "1",
+        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
+        "OPD_AUX_ACTION": "0",
+        "VIDEO_TRANSITION_WEIGHT": "1.0",
+        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
+        "OPD_SAME_STATE_VELOCITY_WEIGHT": "1.0",
+        "LOCAL_FM_WEIGHT": "0.0",
+        "ACTION_LOCAL_FM_WEIGHT": "0.0",
+        "OPD_TRANSITION_GROUP_WEIGHT": "1.0",
+        "OPD_ANCHOR_CAP_RATIO": "-1.0",
+        "OPD_ROLLOUT_STEP_PAIRS": "8,4",
+        "OPD_ROLLOUT_GRAD_MODE": "last_step"
+      }
+    },
+    {
+      "id": "c4",
+      "name": "calib_full_full_grad",
+      "seeds": [0],
+      "priority": "mechanism_calibration",
+      "requires_code_flag": false,
+      "description": "Explicit endpoint plus velocity OPD with full four-step rollout credit.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "1",
+        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
+        "OPD_AUX_ACTION": "0",
+        "VIDEO_TRANSITION_WEIGHT": "1.0",
+        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
+        "OPD_SAME_STATE_VELOCITY_WEIGHT": "1.0",
+        "LOCAL_FM_WEIGHT": "0.0",
+        "ACTION_LOCAL_FM_WEIGHT": "0.0",
+        "OPD_TRANSITION_GROUP_WEIGHT": "1.0",
+        "OPD_ANCHOR_CAP_RATIO": "-1.0",
+        "OPD_ROLLOUT_STEP_PAIRS": "8,4",
+        "OPD_ROLLOUT_GRAD_MODE": "full"
+      }
     }
   ]
 }

@@ -44,6 +44,44 @@ def run_dry_run(tmp_path, variant):
     )
 
 
+def run_calibration_dry_run(tmp_path, variant):
+    args = [
+        sys.executable,
+        str(LAUNCHER),
+        "--variant",
+        variant,
+        "--seed",
+        "0",
+        "--root",
+        str(tmp_path / "calibration_root"),
+        "--teacher-model-path",
+        "/tmp/teacher",
+        "--dataset-path",
+        "/tmp/dataset",
+        "--task-preset",
+        "core2",
+        "--train-samples-per-task",
+        "20",
+        "--heldout-samples-per-task",
+        "10",
+        "--stage2-steps",
+        "750",
+        "--stage1-ckpt",
+        "/tmp/shared-stage1",
+        "--stage",
+        "stage2",
+        "--dry-run",
+    ]
+    return subprocess.run(
+        args,
+        cwd=REPO_ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
 def test_full_variant_dry_run_contains_hybrid_opd_env(tmp_path):
     result = run_dry_run(tmp_path, "full_stepwam")
 
@@ -288,3 +326,49 @@ def test_protocol_manifest_paths_are_recorded_in_dry_run(tmp_path):
     assert "protocol/manifests/core4_protocol_seed_9" in result.stdout
     assert "DATASET_SAMPLE_MANIFEST=" in result.stdout
     assert "train_manifest.json" in result.stdout
+
+
+def test_calibration_full_grad_uses_explicit_small_protocol(tmp_path):
+    result = run_calibration_dry_run(tmp_path, "calib_full_full_grad")
+    manifest = parse_dry_run_manifest(result.stdout)
+    env = manifest["stage2_env"]
+
+    assert manifest["selected_task_filter"] == [
+        "place_a2b_right",
+        "open_microwave",
+    ]
+    assert manifest["stage1_ckpt"] == "/tmp/shared-stage1"
+    assert manifest["train_samples_per_task"] == 20
+    assert manifest["heldout_samples_per_task"] == 10
+    assert env["OPD_LOSS_COMPOSITION"] == "explicit_hybrid"
+    assert env["OPD_ROLLOUT_GRAD_MODE"] == "full"
+    assert env["OPD_ROLLOUT_STEP_PAIRS"] == "8,4"
+    assert env["OPD_AUX_ACTION"] == "0"
+    assert env["VIDEO_TRANSITION_WEIGHT"] == "1.0"
+    assert env["OPD_SAME_STATE_VELOCITY_WEIGHT"] == "1.0"
+    assert env["OPD_ENDPOINT_AUX_WEIGHT"] == "0.0"
+    assert env["LOCAL_FM_WEIGHT"] == "0.0"
+    assert env["ACTION_LOCAL_FM_WEIGHT"] == "0.0"
+
+
+def test_calibration_variants_cleanly_select_endpoint_and_velocity(tmp_path):
+    endpoint = parse_dry_run_manifest(
+        run_calibration_dry_run(tmp_path, "calib_endpoint_only").stdout
+    )["stage2_env"]
+    velocity = parse_dry_run_manifest(
+        run_calibration_dry_run(tmp_path, "calib_velocity_only").stdout
+    )["stage2_env"]
+    last_step = parse_dry_run_manifest(
+        run_calibration_dry_run(tmp_path, "calib_full_last_step").stdout
+    )["stage2_env"]
+    baseline = parse_dry_run_manifest(
+        run_calibration_dry_run(tmp_path, "calib_w_o_opd").stdout
+    )["stage2_env"]
+
+    assert endpoint["VIDEO_TRANSITION_WEIGHT"] == "1.0"
+    assert endpoint["OPD_SAME_STATE_VELOCITY_WEIGHT"] == "0.0"
+    assert velocity["VIDEO_TRANSITION_WEIGHT"] == "0.0"
+    assert velocity["OPD_SAME_STATE_VELOCITY_WEIGHT"] == "1.0"
+    assert velocity["OPD_ANCHOR_CAP_RATIO"] == "-1.0"
+    assert last_step["OPD_ROLLOUT_GRAD_MODE"] == "last_step"
+    assert baseline["USE_OPD_AUX"] == "0"

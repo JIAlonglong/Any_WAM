@@ -204,7 +204,8 @@ def build_run_plan(args):
     stage2_dir = run_dir / "stage2"
     stage1_steps = args.stage1_steps or int(defaults["stage1_steps"])
     stage2_steps = args.stage2_steps or int(defaults["stage2_steps"])
-    stage1_ckpt = stage1_dir / "checkpoints" / f"step_{stage1_steps}"
+    derived_stage1_ckpt = stage1_dir / "checkpoints" / f"step_{stage1_steps}"
+    stage1_ckpt = args.stage1_ckpt or derived_stage1_ckpt
     stage2_ckpt = stage2_dir / "checkpoints" / f"step_{stage2_steps}"
 
     if args.all_dataset_tasks:
@@ -268,7 +269,11 @@ def build_run_plan(args):
         "empty_emb_path": str(args.empty_emb_path) if args.empty_emb_path else None,
         "run_dir": str(run_dir),
         "stage1_ckpt": str(stage1_ckpt),
-        "shared_stage1_ckpt": str(stage1_ckpt) if args.use_shared_stage1 else None,
+        "shared_stage1_ckpt": (
+            str(stage1_ckpt)
+            if args.use_shared_stage1 or args.stage1_ckpt is not None
+            else None
+        ),
         "stage2_ckpt": str(stage2_ckpt),
         "task_list": tasks,
         "selected_task_filter": task_filter,
@@ -320,6 +325,12 @@ def parse_args():
     parser.add_argument("--stage1-steps", type=int, default=None)
     parser.add_argument("--stage2-steps", type=int, default=None)
     parser.add_argument(
+        "--stage1-ckpt",
+        type=Path,
+        default=None,
+        help="Explicit Stage1 checkpoint for Stage2; overrides the derived path.",
+    )
+    parser.add_argument(
         "--task-filter",
         default=None,
         help="Comma-separated RobotWin task names. Defaults to the metadata Easy+Hard subset.",
@@ -370,7 +381,7 @@ def main():
         return
 
     if (
-        args.use_shared_stage1
+        (args.use_shared_stage1 or args.stage1_ckpt is not None)
         and args.stage == "stage2"
         and not Path(plan["manifest"]["stage1_ckpt"]).exists()
     ):

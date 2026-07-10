@@ -19,6 +19,10 @@ TASK_PRESET="${TASK_PRESET:-representative}"
 MASTER_PORT_BASE="${MASTER_PORT_BASE:-34000}"
 MAX_PARALLEL="${MAX_PARALLEL:-2}"
 EVAL_GPUS="${EVAL_GPUS:-6,7}"
+TEACHER_STEPS="${TEACHER_STEPS:-4}"
+TEACHER_CACHE_SOURCE_VARIANT="${TEACHER_CACHE_SOURCE_VARIANT:-full_stepwam}"
+TEACHER_CACHE_SOURCE_SEED="${TEACHER_CACHE_SOURCE_SEED:-0}"
+BASELINE_VARIANT="${BASELINE_VARIANT:-w_o_opd}"
 
 RUN_HELDOUT_EVAL="${RUN_HELDOUT_EVAL:-1}"
 RUN_TRAIN_EVAL="${RUN_TRAIN_EVAL:-1}"
@@ -125,7 +129,7 @@ build_teacher_cache() {
   local manifest_path="$2"
   local split_name="$3"
   local ckpt
-  ckpt="$(stage2_ckpt full_stepwam 0)"
+  ckpt="$(stage2_ckpt "${TEACHER_CACHE_SOURCE_VARIANT}" "${TEACHER_CACHE_SOURCE_SEED}")"
   require_path "${ckpt}"
   require_path "${manifest_path}"
   require_path "${EVAL_PAIRS}"
@@ -147,7 +151,7 @@ build_teacher_cache() {
     --split-name "${split_name}" \
     --num-batches 0 \
     --student-steps 4 \
-    --teacher-steps 4 \
+    --teacher-steps "${TEACHER_STEPS}" \
     --disable-eval-gradient-checkpointing \
     --disable-eval-force-cfg \
     --eval-rollout-grad-mode endpoint \
@@ -206,7 +210,7 @@ launch_rollout_eval() {
       --resume-from-path "${ckpt}" --result-json "${run_dir}/metrics/${result_name}.json" \
       --teacher-cache-path "${cache_path}" --eval-manifest "${manifest_path}" \
       --eval-pairs-json "${EVAL_PAIRS}" --split-name "${split_name}" --num-batches 0 \
-      --student-steps 4 --teacher-steps 4 --disable-eval-gradient-checkpointing \
+      --student-steps 4 --teacher-steps "${TEACHER_STEPS}" --disable-eval-gradient-checkpointing \
       --disable-eval-force-cfg --eval-rollout-grad-mode endpoint --eval-empty-cache
     return
   fi
@@ -227,7 +231,7 @@ launch_rollout_eval() {
     --split-name "${split_name}" \
     --num-batches 0 \
     --student-steps 4 \
-    --teacher-steps 4 \
+    --teacher-steps "${TEACHER_STEPS}" \
     --disable-eval-gradient-checkpointing \
     --disable-eval-force-cfg \
     --eval-rollout-grad-mode endpoint \
@@ -294,7 +298,7 @@ run_video_eval() {
         --split-name heldout \
         --num-batches 0 \
         --student-steps 4 \
-        --teacher-steps 4 \
+        --teacher-steps "${TEACHER_STEPS}" \
         --video-max-pairs "${VIDEO_MAX_PAIRS}" \
         --video-decode-device cpu \
         --disable-eval-gradient-checkpointing \
@@ -330,7 +334,7 @@ if [ "${RUN_SUMMARY}" = "1" ]; then
   run_or_print "${PYTHON}" distillation_flowmap/ablation/summarize_robotwin_ablation.py \
     --root "${ROOT}" \
     --out "${SUMMARY_DIR}" \
-    --baseline-variant w_o_opd
+    --baseline-variant "${BASELINE_VARIANT}"
 fi
 
 echo "Final RobotWin ablation eval finished. Summary: ${SUMMARY_DIR}"

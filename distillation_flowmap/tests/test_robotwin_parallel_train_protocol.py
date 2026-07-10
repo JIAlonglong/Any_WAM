@@ -16,6 +16,13 @@ def _final_eval_source():
     return (repo_root / "ablation" / "run_final_eval.sh").read_text(encoding="utf-8")
 
 
+def _opd_calibration_eval_source():
+    repo_root = Path(__file__).resolve().parents[1]
+    return (repo_root / "ablation" / "run_opd_mechanism_calibration_eval.sh").read_text(
+        encoding="utf-8"
+    )
+
+
 def test_parallel_train_uses_protocol_controlled_shared_stage1():
     source = _parallel_train_source()
 
@@ -84,3 +91,28 @@ def test_final_eval_launcher_reuses_heldout_cache_and_summarizes():
     assert "rollout_eval_stage2.py" in source
     assert "rollout_eval_video_stage2.py" in source
     assert "summarize_robotwin_ablation.py" in source
+
+
+def test_final_eval_supports_calibrated_teacher_and_cache_source_overrides():
+    source = _final_eval_source()
+
+    assert 'TEACHER_STEPS="${TEACHER_STEPS:-4}"' in source
+    assert 'TEACHER_CACHE_SOURCE_VARIANT="${TEACHER_CACHE_SOURCE_VARIANT:-full_stepwam}"' in source
+    assert 'TEACHER_CACHE_SOURCE_SEED="${TEACHER_CACHE_SOURCE_SEED:-0}"' in source
+    assert 'BASELINE_VARIANT="${BASELINE_VARIANT:-w_o_opd}"' in source
+    assert 'stage2_ckpt "${TEACHER_CACHE_SOURCE_VARIANT}" "${TEACHER_CACHE_SOURCE_SEED}"' in source
+    assert source.count('--teacher-steps "${TEACHER_STEPS}"') == 4
+    assert '--baseline-variant "${BASELINE_VARIANT}"' in source
+
+
+def test_opd_calibration_eval_is_small_and_protocol_controlled():
+    source = _opd_calibration_eval_source()
+
+    assert 'STAGE2_STEPS="${STAGE2_STEPS:-750}"' in source
+    assert 'TASK_PRESET="${TASK_PRESET:-core2}"' in source
+    assert 'SEEDS="${SEEDS:-0}"' in source
+    assert 'TEACHER_STEPS="${TEACHER_STEPS:-8}"' in source
+    assert 'TEACHER_CACHE_SOURCE_VARIANT="${TEACHER_CACHE_SOURCE_VARIANT:-calib_w_o_opd}"' in source
+    assert 'BASELINE_VARIANT="${BASELINE_VARIANT:-calib_w_o_opd}"' in source
+    assert 'VARIANTS="${VARIANTS:-calib_w_o_opd,calib_endpoint_only,calib_velocity_only,calib_full_last_step,calib_full_suffix_grad}"' in source
+    assert 'run_final_eval.sh' in source

@@ -47,6 +47,19 @@ The script refuses larger task/sample settings or more than 1000 steps unless
 first mechanism gate. Dry-run manifests are saved under
 `protocol_opd_mechanism_calibration_v1/preflight/`.
 
+After the five `step_750` checkpoints are present, run the matching evaluator:
+
+```bash
+bash distillation_flowmap/ablation/run_opd_mechanism_calibration_eval.sh
+```
+
+It reuses one teacher cache for every variant, evaluates the same held-out and
+balanced train subsets, fixes the student to four rollout steps, and uses the
+eight-step teacher selected by the held-out N=4 versus N=8 preflight. The
+default eval remains on `core2`, seed 0, one GPU, and one representative video
+pair per variant. Its summary uses `calib_w_o_opd` as the baseline and writes
+trend-only tables under `summary_calibration/`.
+
 Example:
 
 ```bash

@@ -364,6 +364,9 @@ def test_calibration_variants_cleanly_select_endpoint_and_velocity(tmp_path):
     baseline = parse_dry_run_manifest(
         run_calibration_dry_run(tmp_path, "calib_w_o_opd").stdout
     )["stage2_env"]
+    suffix = parse_dry_run_manifest(
+        run_calibration_dry_run(tmp_path, "calib_full_suffix_grad").stdout
+    )["stage2_env"]
 
     assert endpoint["VIDEO_TRANSITION_WEIGHT"] == "1.0"
     assert endpoint["OPD_SAME_STATE_VELOCITY_WEIGHT"] == "0.0"
@@ -371,4 +374,7 @@ def test_calibration_variants_cleanly_select_endpoint_and_velocity(tmp_path):
     assert velocity["OPD_SAME_STATE_VELOCITY_WEIGHT"] == "1.0"
     assert velocity["OPD_ANCHOR_CAP_RATIO"] == "-1.0"
     assert last_step["OPD_ROLLOUT_GRAD_MODE"] == "last_step"
+    assert suffix["OPD_ROLLOUT_GRAD_MODE"] == "suffix"
+    assert suffix["OPD_ROLLOUT_GRAD_STEPS"] == "2"
+    assert suffix["OPD_ROLLOUT_STEP_PAIRS"] == "8,4"
     assert baseline["USE_OPD_AUX"] == "0"

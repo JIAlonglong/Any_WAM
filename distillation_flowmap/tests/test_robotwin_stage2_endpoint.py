@@ -94,6 +94,7 @@ class RobotWinStage2EndpointConfigTest(unittest.TestCase):
             OPD_TEACHER_TARGET_MODE=None,
             OPD_ROLLOUT_GRAD_MODE=None,
             OPD_ACTION_ROLLOUT_GRAD_MODE=None,
+            OPD_ROLLOUT_GRAD_STEPS=None,
             OPD_ROLLOUT_STEP_PAIRS=None,
             VIDEO_TRANSITION_PARAM=None,
             ACTION_TRANSITION_PARAM=None,
@@ -111,6 +112,7 @@ class RobotWinStage2EndpointConfigTest(unittest.TestCase):
         self.assertEqual(cfg.action_transition_param, "x0")
         self.assertEqual(cfg.opd_rollout_grad_mode, "last_step")
         self.assertEqual(cfg.opd_action_rollout_grad_mode, "last_step")
+        self.assertEqual(cfg.opd_rollout_grad_steps, 1)
         self.assertEqual(cfg.opd_rollout_step_pairs, [[4, 1], [4, 2]])
         self.assertEqual(cfg.opd_same_state_velocity_weight, 0.0)
         self.assertTrue(cfg.gradient_checkpointing)
@@ -132,6 +134,23 @@ class RobotWinStage2EndpointConfigTest(unittest.TestCase):
             "OPD_LOSS_COMPOSITION must be legacy or explicit_hybrid",
         ):
             load_config(OPD_LOSS_COMPOSITION="ambiguous")
+
+    def test_suffix_rollout_gradient_window_env_override(self):
+        cfg = load_config(
+            OPD_ROLLOUT_GRAD_MODE="suffix",
+            OPD_ROLLOUT_GRAD_STEPS="2",
+        )
+
+        self.assertEqual(cfg.opd_rollout_grad_mode, "suffix")
+        self.assertEqual(cfg.opd_action_rollout_grad_mode, "suffix")
+        self.assertEqual(cfg.opd_rollout_grad_steps, 2)
+
+    def test_nonpositive_rollout_gradient_window_is_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "OPD_ROLLOUT_GRAD_STEPS must be positive",
+        ):
+            load_config(OPD_ROLLOUT_GRAD_STEPS="0")
 
     def test_use_fsdp1_env_override_is_available_for_non_checkpointed_debug(self):
         cfg = load_config(USE_FSDP1="0", GRADIENT_CHECKPOINTING="0")

@@ -42,7 +42,7 @@ def test_calibration_runner_launches_only_mechanism_variants():
 
     assert (
         'VARIANTS="${VARIANTS:-calib_w_o_opd,calib_endpoint_only,'
-        'calib_velocity_only,calib_full_last_step,calib_full_full_grad}"'
+        'calib_velocity_only,calib_full_last_step,calib_full_suffix_grad}"'
         in source
     )
     assert 'SEED="${SEED:-0}"' in source

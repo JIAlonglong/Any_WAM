@@ -97,6 +97,10 @@ from distillation_flowmap.kto_reweighting import (
 from distillation_flowmap.opd_loss_composition import (
     compose_explicit_hybrid_opd,
 )
+from distillation_flowmap.opd_rollout_grad import (
+    SUPPORTED_ROLLOUT_GRAD_MODES,
+    rollout_step_requires_grad,
+)
 
 
 class FlowMapStepMixin:
@@ -2996,19 +3000,27 @@ class FlowMapStepMixin:
 
         rollout_grad_mode = getattr(self.config, 'opd_rollout_grad_mode', 'endpoint')
         rollout_grad_mode = str(rollout_grad_mode).lower()
-        if rollout_grad_mode not in ('endpoint', 'last_step', 'full'):
+        rollout_grad_steps = int(getattr(
+            self.config, 'opd_rollout_grad_steps', 1
+        ))
+        if rollout_grad_mode not in SUPPORTED_ROLLOUT_GRAD_MODES:
             raise ValueError(
                 f"Invalid opd_rollout_grad_mode={rollout_grad_mode!r}; "
-                "expected endpoint, last_step, or full."
+                "expected endpoint, last_step, suffix, or full."
             )
         force_eval_checkpointing = bool(
             getattr(self.config, 'offline_eval_force_gradient_checkpointing', False)
         )
         force_cfg = bool(getattr(self.config, 'offline_eval_force_cfg', True))
 
-        use_nofsdp_rollout = (
-            rollout_grad_mode == 'endpoint' or
-            (rollout_grad_mode == 'last_step' and K_steps > 1)
+        use_nofsdp_rollout = any(
+            not rollout_step_requires_grad(
+                mode=rollout_grad_mode,
+                step_index=step_index,
+                num_steps=K_steps,
+                suffix_steps=rollout_grad_steps,
+            )
+            for step_index in range(K_steps)
         )
         _rollout_model = (getattr(self, '_student_nofsdp', None) or self.student) if use_nofsdp_rollout else self.student
         if _rollout_model is not self.student:
@@ -3082,9 +3094,11 @@ class FlowMapStepMixin:
                 last_step_start_x = current_x.detach()
                 last_step_start_t = t_i.detach()
 
-            keep_step_grad = (
-                rollout_grad_mode == 'full' or
-                (rollout_grad_mode == 'last_step' and i == K_steps - 1)
+            keep_step_grad = rollout_step_requires_grad(
+                mode=rollout_grad_mode,
+                step_index=i,
+                num_steps=K_steps,
+                suffix_steps=rollout_grad_steps,
             )
             step_model = self.student if keep_step_grad else _rollout_model
             step_latent = base_input_dict['latent_dict'] if keep_step_grad else _rt_latent
@@ -4383,21 +4397,29 @@ class FlowMapStepMixin:
                 action_grad_mode = str(getattr(
                     self.config, 'opd_action_rollout_grad_mode',
                     getattr(self.config, 'opd_rollout_grad_mode', 'endpoint'))).lower()
-                if action_grad_mode not in ('endpoint', 'last_step', 'full'):
+                action_grad_steps = int(getattr(
+                    self.config,
+                    'opd_action_rollout_grad_steps',
+                    getattr(self.config, 'opd_rollout_grad_steps', 1),
+                ))
+                if action_grad_mode not in SUPPORTED_ROLLOUT_GRAD_MODES:
                     raise ValueError(
                         f"Invalid opd_action_rollout_grad_mode={action_grad_mode!r}; "
-                        "expected endpoint, last_step, or full."
+                        "expected endpoint, last_step, suffix, or full."
                     )
 
+                action_num_steps = max(1, K_steps)
                 action_student_path = self._build_timestep_path(
-                    action_t_ds.float(), action_r_ds.float(), max(1, K_steps))
+                    action_t_ds.float(), action_r_ds.float(), action_num_steps)
                 student_action_x = action_noisy_ds
-                for i in range(max(1, K_steps)):
+                for i in range(action_num_steps):
                     t_i = action_student_path[i]
                     r_i = action_student_path[i + 1]
-                    keep_step_grad = (
-                        action_grad_mode == 'full' or
-                        (action_grad_mode == 'last_step' and i == max(1, K_steps) - 1)
+                    keep_step_grad = rollout_step_requires_grad(
+                        mode=action_grad_mode,
+                        step_index=i,
+                        num_steps=action_num_steps,
+                        suffix_steps=action_grad_steps,
                     )
                     action_rollout_model = self.student
                     if not keep_step_grad and getattr(self, '_student_nofsdp', None) is not None:

@@ -12,7 +12,7 @@ SHARED_STAGE1_CKPT="${SHARED_STAGE1_CKPT:-${PROJECT_ROOT}/distillation_flowmap/o
 PYTHON="${PYTHON:-/root/nas/junjie/conda_envs/any_wam/bin/python}"
 TORCHRUN="${TORCHRUN:-/root/nas/junjie/conda_envs/any_wam/bin/torchrun}"
 
-VARIANTS="${VARIANTS:-calib_w_o_opd,calib_endpoint_only,calib_velocity_only,calib_full_last_step,calib_full_full_grad}"
+VARIANTS="${VARIANTS:-calib_w_o_opd,calib_endpoint_only,calib_velocity_only,calib_full_last_step,calib_full_suffix_grad}"
 SEED="${SEED:-0}"
 TASK_PRESET="${TASK_PRESET:-core2}"
 STAGE2_STEPS="${STAGE2_STEPS:-750}"

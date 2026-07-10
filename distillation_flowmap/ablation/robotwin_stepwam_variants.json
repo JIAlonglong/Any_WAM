@@ -266,6 +266,33 @@
         "OPD_ROLLOUT_STEP_PAIRS": "8,4",
         "OPD_ROLLOUT_GRAD_MODE": "full"
       }
+    },
+    {
+      "id": "c5",
+      "name": "calib_full_suffix_grad",
+      "seeds": [0],
+      "priority": "mechanism_calibration",
+      "requires_code_flag": false,
+      "description": "Explicit endpoint plus velocity OPD with a two-step gradient suffix over a K=4 rollout.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "1",
+        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
+        "OPD_AUX_ACTION": "0",
+        "VIDEO_TRANSITION_WEIGHT": "1.0",
+        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
+        "OPD_SAME_STATE_VELOCITY_WEIGHT": "1.0",
+        "LOCAL_FM_WEIGHT": "0.0",
+        "ACTION_LOCAL_FM_WEIGHT": "0.0",
+        "OPD_TRANSITION_GROUP_WEIGHT": "1.0",
+        "OPD_ANCHOR_CAP_RATIO": "-1.0",
+        "OPD_ROLLOUT_STEP_PAIRS": "8,4",
+        "OPD_ROLLOUT_GRAD_MODE": "suffix",
+        "OPD_ROLLOUT_GRAD_STEPS": "2"
+      }
     }
   ]
 }

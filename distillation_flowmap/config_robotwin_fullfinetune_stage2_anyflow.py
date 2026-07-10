@@ -51,6 +51,14 @@ cfg.opd_rollout_grad_mode = os.environ.get(
     "OPD_ROLLOUT_GRAD_MODE", _default_rollout_grad_mode).lower()
 cfg.opd_action_rollout_grad_mode = os.environ.get(
     "OPD_ACTION_ROLLOUT_GRAD_MODE", cfg.opd_rollout_grad_mode).lower()
+cfg.opd_rollout_grad_steps = int(os.environ.get(
+    "OPD_ROLLOUT_GRAD_STEPS", 1))
+if cfg.opd_rollout_grad_steps <= 0:
+    raise ValueError("OPD_ROLLOUT_GRAD_STEPS must be positive")
+cfg.opd_action_rollout_grad_steps = int(os.environ.get(
+    "OPD_ACTION_ROLLOUT_GRAD_STEPS", cfg.opd_rollout_grad_steps))
+if cfg.opd_action_rollout_grad_steps <= 0:
+    raise ValueError("OPD_ACTION_ROLLOUT_GRAD_STEPS must be positive")
 cfg.opd_fuse_action_teacher = _env_bool("OPD_FUSE_ACTION_TEACHER", True)
 cfg.opd_serial_student_cfg = _env_bool("OPD_SERIAL_STUDENT_CFG", cfg.use_opd_aux)
 cfg.opd_aux_empty_cache = _env_bool("OPD_AUX_EMPTY_CACHE", cfg.use_opd_aux)

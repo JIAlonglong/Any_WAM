@@ -37,8 +37,10 @@ The default protocol reuses the existing seed-0 Stage1 checkpoint and runs
 Stage2 only. It is fixed to `place_a2b_right` plus `open_microwave`, 20 train
 and 10 held-out samples per task, seed 0, and 750 optimizer steps. Its five
 variants isolate no OPD, endpoint-only, velocity-only, full last-step credit,
-and full-rollout credit. OPD action and local auxiliary losses are disabled
-for this first mechanism check.
+and a two-step gradient suffix over a four-step rollout. Full four-step
+backprop remains an optional memory diagnostic because it exceeds one H100
+after optimizer-state initialization. OPD action and local auxiliary losses
+are disabled for this first mechanism check.
 
 The script refuses larger task/sample settings or more than 1000 steps unless
 `ALLOW_LARGE_CALIBRATION=1` is set explicitly. Do not set that flag for the

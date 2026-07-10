@@ -85,10 +85,23 @@ Use the existing terminal OPD objective for both modes:
   and terminal velocity query receive gradients.
 - `full`: all four student Euler steps remain in the autograd graph and the
   same terminal endpoint/velocity objective credits the complete trajectory.
+- `suffix`: early rollout steps are detached and the final configurable
+  number of student Euler steps remain in the graph. The calibration fallback
+  uses a two-step suffix while keeping the student rollout at `K=4`.
 
-The mechanism comparison changes only `OPD_ROLLOUT_GRAD_MODE`; it does not add
-intermediate teacher targets. This keeps the comparison aligned with the
+The mechanism comparison changes only rollout credit assignment; it does not
+add intermediate teacher targets. This keeps the comparison aligned with the
 paper OPD definition.
+
+### Full-gradient memory finding
+
+The first K=4 full-gradient smoke completed its first OPD backward but OOMed
+on the second after the 8-bit optimizer initialized a 9.7GB state. Peak GPU
+usage reached 79.16GB on an 80GB H100. An otherwise identical K=2 full-gradient
+probe completed both OPD backwards and checkpoint saving. Therefore the
+single-GPU calibration uses `K=4` with a two-step gradient suffix. The K=4
+full-gradient variant remains available only as a memory diagnostic and is
+not part of the default calibration runner.
 
 The default calibration pair is `teacher N=8 -> student K=4`. Before training,
 run a held-out teacher-only check comparing N=4 and N=8. Use N=8 only when its
@@ -111,7 +124,7 @@ otherwise use N=4 and record the decision in the run manifest.
   - `calib_endpoint_only`
   - `calib_velocity_only`
   - `calib_full_last_step`
-  - `calib_full_full_grad`
+  - `calib_full_suffix_grad`
 
 Each variant runs on one H100. No DDP is used. The launcher must require an
 explicit Stage1 checkpoint and must emit a dry-run manifest showing task,
@@ -137,8 +150,8 @@ The mechanism passes the first gate only when:
    `calib_w_o_opd`;
 3. full does not regress either targeted metric by more than 2% relative to
    its corresponding single-objective variant;
-4. full-gradient improves rollout drift over last-step and takes no more than
-   1.5 times the average optimizer-step time;
+4. suffix-gradient improves rollout drift over last-step and takes no more
+   than 1.5 times the average optimizer-step time;
 5. all enabled OPD branches have finite, nonzero effective contributions and
    gradients.
 

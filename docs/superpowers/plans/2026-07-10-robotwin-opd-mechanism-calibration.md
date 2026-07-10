@@ -342,3 +342,20 @@ SHARED_STAGE1_CKPT=/root/nas/junjie/jj/Any_WAM/distillation_flowmap/output_robot
 
 Expected: five single-GPU jobs start, each manifest reports two tasks and 40
 training samples total, and no Stage1 process is launched.
+
+## Runtime Addendum: Two-Step Gradient Suffix
+
+The K=4 full-gradient smoke OOMed on the second OPD backward after the 8-bit
+optimizer allocated a 9.7GB state. K=2 full-gradient completed under the same
+conditions. Before the 750-step launch:
+
+1. Add `OPD_ROLLOUT_GRAD_MODE=suffix` and
+   `OPD_ROLLOUT_GRAD_STEPS=2` using a pure, unit-tested step-selection helper.
+2. Keep the rollout and terminal OPD target at student `K=4`; detach only the
+   first two rollout steps.
+3. Add `calib_full_suffix_grad` and replace the full-gradient diagnostic with
+   this variant in the guarded runner.
+4. Keep `calib_full_full_grad` available for memory diagnostics but do not
+   launch it in the default single-GPU calibration.
+5. Repeat the 5-step smoke and require both OPD backwards plus checkpoint
+   saving to complete before the 750-step launch.

@@ -96,12 +96,14 @@ def test_final_eval_launcher_reuses_heldout_cache_and_summarizes():
 def test_final_eval_supports_calibrated_teacher_and_cache_source_overrides():
     source = _final_eval_source()
 
+    assert 'STUDENT_STEPS="${STUDENT_STEPS:-1 2 4}"' in source
     assert 'TEACHER_STEPS="${TEACHER_STEPS:-4}"' in source
     assert 'TEACHER_CACHE_SOURCE_VARIANT="${TEACHER_CACHE_SOURCE_VARIANT:-full_stepwam}"' in source
     assert 'TEACHER_CACHE_SOURCE_SEED="${TEACHER_CACHE_SOURCE_SEED:-0}"' in source
     assert 'BASELINE_VARIANT="${BASELINE_VARIANT:-w_o_opd}"' in source
     assert 'stage2_ckpt "${TEACHER_CACHE_SOURCE_VARIANT}" "${TEACHER_CACHE_SOURCE_SEED}"' in source
     assert source.count('--teacher-steps "${TEACHER_STEPS}"') == 4
+    assert '--student-steps "${STUDENT_STEPS}"' in source
     assert '--baseline-variant "${BASELINE_VARIANT}"' in source
 
 

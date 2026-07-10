@@ -19,6 +19,7 @@ TASK_PRESET="${TASK_PRESET:-representative}"
 MASTER_PORT_BASE="${MASTER_PORT_BASE:-34000}"
 MAX_PARALLEL="${MAX_PARALLEL:-2}"
 EVAL_GPUS="${EVAL_GPUS:-6,7}"
+STUDENT_STEPS="${STUDENT_STEPS:-1 2 4}"
 TEACHER_STEPS="${TEACHER_STEPS:-4}"
 TEACHER_CACHE_SOURCE_VARIANT="${TEACHER_CACHE_SOURCE_VARIANT:-full_stepwam}"
 TEACHER_CACHE_SOURCE_SEED="${TEACHER_CACHE_SOURCE_SEED:-0}"
@@ -297,7 +298,7 @@ run_video_eval() {
         --eval-pairs-json "${EVAL_PAIRS}" \
         --split-name heldout \
         --num-batches 0 \
-        --student-steps 4 \
+        --student-steps "${STUDENT_STEPS}" \
         --teacher-steps "${TEACHER_STEPS}" \
         --video-max-pairs "${VIDEO_MAX_PAIRS}" \
         --video-decode-device cpu \

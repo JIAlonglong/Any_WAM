@@ -4191,6 +4191,22 @@ class FlowMapStepMixin:
         current_action = self.train_scheduler_action.add_noise(
             action_clean, action_noise, terminal_action_t, t_dim=2
         )
+        danceopd_terminal_prior_max_error = torch.maximum(
+            (current_video.float() - video_noise.float()).abs().amax(),
+            (current_action.float() - action_noise.float()).abs().amax(),
+        )
+        terminal_prior_tolerance = float(getattr(
+            self.config, 'opd_danceopd_terminal_prior_tolerance', 1e-6
+        ))
+        if (
+            bool(getattr(self.config, 'opd_danceopd_verify_terminal_prior', True))
+            and danceopd_terminal_prior_max_error.detach().item() > terminal_prior_tolerance
+        ):
+            raise RuntimeError(
+                "DanceOPD terminal state is not pure scheduler noise: "
+                f"max_error={danceopd_terminal_prior_max_error.detach().item():.3e}, "
+                f"tolerance={terminal_prior_tolerance:.3e}"
+            )
 
         video_path = self._build_timestep_path(
             terminal_video_t, zero_video_t, rollout_steps
@@ -4371,6 +4387,25 @@ class FlowMapStepMixin:
         query_action_t = select_per_sample_trajectory_state(
             torch.stack(action_timesteps, dim=0), query_indices
         ).detach()
+        danceopd_query_index_mean = query_indices.float().mean().detach()
+        danceopd_query_sigma_mean = (
+            query_video_t.float() / self.config.num_train_timesteps
+        ).mean().detach()
+        diagnostic_interval = int(getattr(
+            self.config, 'opd_danceopd_diagnostic_interval', 50
+        ))
+        if (
+            getattr(self.config, 'rank', 0) == 0
+            and int(getattr(self, 'step', 0)) % diagnostic_interval == 0
+        ):
+            logger.info(
+                "[DanceOPD] rollout_steps=%d query_index=%.2f query_sigma=%.4f "
+                "terminal_prior_max_error=%.3e",
+                rollout_steps,
+                danceopd_query_index_mean.item(),
+                danceopd_query_sigma_mean.item(),
+                danceopd_terminal_prior_max_error.detach().item(),
+            )
 
         student_query_input = _build_joint_input(
             query_video, query_video_t, query_action, query_action_t,
@@ -4432,10 +4467,9 @@ class FlowMapStepMixin:
             'opd_local_fm_ratio': zero,
             'opd_action_transition_ratio': zero,
             'opd_action_local_fm_ratio': zero,
-            'danceopd_query_index_mean': query_indices.float().mean().detach(),
-            'danceopd_query_sigma_mean': (
-                query_video_t.float() / self.config.num_train_timesteps
-            ).mean().detach(),
+            'danceopd_query_index_mean': danceopd_query_index_mean,
+            'danceopd_query_sigma_mean': danceopd_query_sigma_mean,
+            'danceopd_terminal_prior_max_error': danceopd_terminal_prior_max_error.detach(),
             'rollout_steps': rollout_steps,
             'teacher_steps': 1,
             'should_sync': True,

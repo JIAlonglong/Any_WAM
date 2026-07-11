@@ -215,6 +215,8 @@ class RobotWinStage2EndpointConfigTest(unittest.TestCase):
             OPD_DANCEOPD_ROLLOUT_STEPS="8",
             OPD_DANCEOPD_QUERY_ALPHA="5.0",
             OPD_DANCEOPD_QUERY_BETA="2.0",
+            OPD_DANCEOPD_DIAGNOSTIC_INTERVAL="7",
+            OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR="0",
         )
 
         self.assertEqual(default_cfg.opd_query_mode, "legacy")
@@ -222,6 +224,8 @@ class RobotWinStage2EndpointConfigTest(unittest.TestCase):
         self.assertEqual(dance_cfg.opd_danceopd_rollout_steps, 8)
         self.assertEqual(dance_cfg.opd_danceopd_query_alpha, 5.0)
         self.assertEqual(dance_cfg.opd_danceopd_query_beta, 2.0)
+        self.assertEqual(dance_cfg.opd_danceopd_diagnostic_interval, 7)
+        self.assertFalse(dance_cfg.opd_danceopd_verify_terminal_prior)
 
     def test_invalid_danceopd_query_mode_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "OPD_QUERY_MODE"):

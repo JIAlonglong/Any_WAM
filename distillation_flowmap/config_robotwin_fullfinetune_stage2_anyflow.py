@@ -145,6 +145,22 @@ if (
     raise ValueError(
         "OPD_DANCEOPD_QUERY_ALPHA and OPD_DANCEOPD_QUERY_BETA must be finite and positive"
     )
+cfg.opd_danceopd_verify_terminal_prior = _env_bool(
+    "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR", True
+)
+cfg.opd_danceopd_terminal_prior_tolerance = float(os.environ.get(
+    "OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE", 1e-6
+))
+if (
+    not math.isfinite(cfg.opd_danceopd_terminal_prior_tolerance)
+    or cfg.opd_danceopd_terminal_prior_tolerance < 0
+):
+    raise ValueError("OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE must be finite and non-negative")
+cfg.opd_danceopd_diagnostic_interval = int(os.environ.get(
+    "OPD_DANCEOPD_DIAGNOSTIC_INTERVAL", 50
+))
+if cfg.opd_danceopd_diagnostic_interval <= 0:
+    raise ValueError("OPD_DANCEOPD_DIAGNOSTIC_INTERVAL must be positive")
 
 # Conservative continuation hyperparameters for full-model training.
 cfg.learning_rate = float(os.environ.get("LEARNING_RATE", 5e-7))

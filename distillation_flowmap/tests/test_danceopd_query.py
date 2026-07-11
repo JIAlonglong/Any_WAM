@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 
 import torch
+from wan_va.utils.scheduler import FlowMatchScheduler
 
 from distillation_flowmap.danceopd_query import (
     direct_velocity_mse,
@@ -49,6 +50,21 @@ class DanceOPDQueryTest(unittest.TestCase):
         self.assertTrue(torch.allclose(student.grad, torch.tensor([-1.0, -2.0])))
         self.assertIsNone(teacher.grad)
 
+    def test_flowmatch_terminal_timestep_is_exactly_pure_noise(self):
+        scheduler = FlowMatchScheduler(
+            num_inference_steps=1000,
+            num_train_timesteps=1000,
+            shift=5.0,
+        )
+        scheduler.set_timesteps(1000, training=True)
+        clean = torch.randn(2, 3, 4, 1, 1)
+        noise = torch.randn_like(clean)
+        terminal_t = torch.full((2, 4), 1000.0)
+
+        terminal_state = scheduler.add_noise(clean, noise, terminal_t, t_dim=2)
+
+        self.assertTrue(torch.equal(terminal_state, noise))
+
     def test_flowmap_step_has_an_opt_in_danceopd_aux_dispatch(self):
         source = (
             Path(__file__).resolve().parents[1] / "flowmap_step.py"
@@ -57,6 +73,7 @@ class DanceOPDQueryTest(unittest.TestCase):
         self.assertIn("def _danceopd_aux_transition_step(", source)
         self.assertIn("opd_query_mode", source)
         self.assertIn("direct_velocity_mse(", source)
+        self.assertIn("danceopd_terminal_prior_max_error", source)
 
 
 if __name__ == "__main__":

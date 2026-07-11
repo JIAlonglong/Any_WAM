@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -47,6 +48,15 @@ class DanceOPDQueryTest(unittest.TestCase):
         self.assertTrue(torch.allclose(loss, torch.tensor(2.5)))
         self.assertTrue(torch.allclose(student.grad, torch.tensor([-1.0, -2.0])))
         self.assertIsNone(teacher.grad)
+
+    def test_flowmap_step_has_an_opt_in_danceopd_aux_dispatch(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "flowmap_step.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("def _danceopd_aux_transition_step(", source)
+        self.assertIn("opd_query_mode", source)
+        self.assertIn("direct_velocity_mse(", source)
 
 
 if __name__ == "__main__":

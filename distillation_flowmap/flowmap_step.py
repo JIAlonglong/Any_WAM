@@ -101,6 +101,11 @@ from distillation_flowmap.opd_rollout_grad import (
     SUPPORTED_ROLLOUT_GRAD_MODES,
     rollout_step_requires_grad,
 )
+from distillation_flowmap.danceopd_query import (
+    direct_velocity_mse,
+    sample_low_noise_query_indices,
+    select_per_sample_trajectory_state,
+)
 
 
 class FlowMapStepMixin:
@@ -4128,6 +4133,324 @@ class FlowMapStepMixin:
             )
         return result
 
+    def _danceopd_aux_transition_step(self, batch, batch_idx, kto_paopd=False):
+        """Run one DanceOPD-style local video field-matching update.
+
+        The rollout starts at each scheduler's terminal noise distribution and
+        evolves video and action noisy states together without gradient.  One
+        semantic-side state is selected per sample, detached, and then queried
+        by the frozen teacher and trainable student at the same state/time.
+        This is intentionally separate from the endpoint OPD objective.
+        """
+        if kto_paopd:
+            raise ValueError("DanceOPD query mode cannot be combined with KTO-PAOPD")
+
+        batch = self.convert_input_format(batch)
+        B = batch['latents'].shape[0]
+        ref_shape = batch['latents'].shape
+        video_frames = ref_shape[2]
+        action_downsample = int(getattr(self.config, 'action_downsample_factor', 4))
+        action_clean = batch['actions'][:, :, ::action_downsample]
+        action_frames = action_clean.shape[2]
+        if action_frames <= 0:
+            raise ValueError("DanceOPD requires at least one action frame after downsampling")
+
+        input_dict = self._prepare_base_dict(batch)
+        empty_emb = self.empty_emb.expand(B, -1, -1)
+        cfg_scale = self.config.cfg_min + torch.rand(1).item() * (
+            self.config.cfg_max - self.config.cfg_min
+        )
+        rollout_steps = int(getattr(self.config, 'opd_danceopd_rollout_steps', 16))
+        query_alpha = float(getattr(self.config, 'opd_danceopd_query_alpha', 5.0))
+        query_beta = float(getattr(self.config, 'opd_danceopd_query_beta', 2.0))
+        if rollout_steps <= 0:
+            raise ValueError("opd_danceopd_rollout_steps must be positive")
+
+        terminal_video_t = torch.full(
+            (B, video_frames),
+            float(self.config.num_train_timesteps),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        terminal_action_t = torch.full(
+            (B, action_frames),
+            float(self.config.num_train_timesteps),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        zero_video_t = torch.zeros_like(terminal_video_t)
+        zero_action_t = torch.zeros_like(terminal_action_t)
+
+        # At the FlowMatch terminal timestep sigma is exactly one, so these are
+        # pure noise states while preserving any scheduler-specific convention.
+        video_noise = torch.randn_like(batch['latents'])
+        action_noise = torch.randn_like(action_clean)
+        current_video = self.train_scheduler_latent.add_noise(
+            batch['latents'], video_noise, terminal_video_t, t_dim=2
+        )
+        current_action = self.train_scheduler_action.add_noise(
+            action_clean, action_noise, terminal_action_t, t_dim=2
+        )
+
+        video_path = self._build_timestep_path(
+            terminal_video_t, zero_video_t, rollout_steps
+        )
+        action_path = self._build_timestep_path(
+            terminal_action_t, zero_action_t, rollout_steps
+        )
+
+        action_base = input_dict['action_dict']
+        action_grid_id = _downsample_action_grid_id(
+            action_base.get('grid_id'), action_base['latent'], action_downsample
+        )
+        action_mask = action_base.get('actions_mask')
+        if action_mask is not None:
+            action_mask = action_mask[:, :, ::action_downsample]
+
+        use_nofsdp_rollout = getattr(self, '_student_nofsdp', None) is not None
+        rollout_model = self._student_nofsdp if use_nofsdp_rollout else self.student
+        rollout_video_base = input_dict['latent_dict']
+        rollout_action_latent = action_base['latent'][:, :, ::action_downsample]
+        rollout_action_cond_t = action_base['cond_timesteps'][:, ::action_downsample]
+        rollout_action_text = action_base['text_emb']
+        rollout_empty_emb = empty_emb
+        if use_nofsdp_rollout:
+            if not getattr(self, '_nofsdp_synced', False):
+                self._sync_student_nofsdp()
+                self._nofsdp_synced = True
+            rollout_model.train()
+            rollout_video_base = {
+                key: _to_regular_tensor(value) if isinstance(value, torch.Tensor) else value
+                for key, value in rollout_video_base.items()
+            }
+            rollout_action_latent = _to_regular_tensor(rollout_action_latent)
+            rollout_action_cond_t = _to_regular_tensor(rollout_action_cond_t)
+            rollout_action_text = _to_regular_tensor(rollout_action_text)
+            action_grid_id = _to_regular_tensor(action_grid_id)
+            action_mask = _to_regular_tensor(action_mask)
+            rollout_empty_emb = _to_regular_tensor(empty_emb)
+            current_video = _to_regular_tensor(current_video)
+            current_action = _to_regular_tensor(current_action)
+            video_path = _to_regular_tensor(video_path)
+            action_path = _to_regular_tensor(action_path)
+
+        def _build_joint_input(video_x, video_t, action_x, action_t, *, video_base,
+                               action_latent, action_cond_t, action_text,
+                               action_grid, action_valid_mask):
+            action_dict = {
+                'noisy_latents': action_x,
+                'latent': action_latent,
+                'timesteps': action_t,
+                'cond_timesteps': action_cond_t,
+                'text_emb': action_text,
+            }
+            if action_grid is not None:
+                action_dict['grid_id'] = action_grid
+            if action_valid_mask is not None:
+                action_dict['actions_mask'] = action_valid_mask
+            return {
+                'latent_dict': {
+                    **video_base,
+                    'noisy_latents': video_x,
+                    'timesteps': video_t,
+                },
+                'action_dict': action_dict,
+                'chunk_size': input_dict['chunk_size'],
+                'window_size': input_dict['window_size'],
+            }
+
+        def _init_joint_mask(joint_input):
+            from modules.model import FlexAttnFunc
+
+            latent_dict = joint_input['latent_dict']
+            action_dict = joint_input['action_dict']
+            total_length = (
+                latent_dict['noisy_latents'].flatten(0, 1).shape[0] * 2
+                + action_dict['noisy_latents'].flatten(0, 1).shape[0] * 2
+            )
+            padded_length = (128 - total_length % 128) % 128
+            FlexAttnFunc.init_mask(
+                latent_dict['noisy_latents'].shape,
+                action_dict['noisy_latents'].shape,
+                padded_length,
+                joint_input['chunk_size'],
+                window_size=joint_input['window_size'],
+                patch_size=self.patch_size,
+                device=self.device,
+            )
+
+        def _student_joint_forward(model, joint_input, model_empty_emb,
+                                   video_r_t, action_r_t, *, require_action):
+            saved_blocks = None
+            if model is self.student and getattr(self, '_student_blocks_compiled', False):
+                saved_blocks = list(self.student.blocks)
+                for block_index, block in enumerate(saved_blocks):
+                    if hasattr(block, '_orig_mod'):
+                        self.student.blocks[block_index] = block._orig_mod
+            try:
+                return self._student_cfg_forward(
+                    model,
+                    joint_input,
+                    model_empty_emb,
+                    cfg_scale,
+                    B,
+                    ref_shape,
+                    video_r_t,
+                    action_r_t,
+                    force_cfg=True,
+                    return_action=require_action,
+                )
+            finally:
+                if saved_blocks is not None:
+                    for block_index, block in enumerate(saved_blocks):
+                        self.student.blocks[block_index] = block
+
+        video_states = []
+        action_states = []
+        video_timesteps = []
+        action_timesteps = []
+        with torch.no_grad():
+            for step_index in range(rollout_steps):
+                video_t = video_path[step_index]
+                video_r = video_path[step_index + 1]
+                action_t = action_path[step_index]
+                action_r = action_path[step_index + 1]
+                video_states.append(current_video.detach().clone())
+                action_states.append(current_action.detach().clone())
+                video_timesteps.append(video_t.detach().clone())
+                action_timesteps.append(action_t.detach().clone())
+
+                rollout_input = _build_joint_input(
+                    current_video, video_t, current_action, action_t,
+                    video_base=rollout_video_base,
+                    action_latent=rollout_action_latent,
+                    action_cond_t=rollout_action_cond_t,
+                    action_text=rollout_action_text,
+                    action_grid=action_grid_id,
+                    action_valid_mask=action_mask,
+                )
+                _init_joint_mask(rollout_input)
+                video_velocity, action_velocity_seq = _student_joint_forward(
+                    rollout_model,
+                    rollout_input,
+                    rollout_empty_emb,
+                    video_r,
+                    action_r,
+                    require_action=True,
+                )
+                if action_velocity_seq is None:
+                    raise RuntimeError("DanceOPD joint rollout requires a student action output")
+                action_velocity = self._extract_action_v(action_velocity_seq, action_frames)
+                video_sigma = self._timestep_to_sigma_5d(video_t)
+                video_sigma_next = self._timestep_to_sigma_5d(video_r)
+                action_sigma = action_t[:, None, :, None, None] / self.config.num_train_timesteps
+                action_sigma_next = action_r[:, None, :, None, None] / self.config.num_train_timesteps
+                current_video = current_video + video_velocity * (
+                    video_sigma_next.to(video_velocity) - video_sigma.to(video_velocity)
+                )
+                current_action = current_action + action_velocity * (
+                    action_sigma_next.to(action_velocity) - action_sigma.to(action_velocity)
+                )
+
+        query_indices = sample_low_noise_query_indices(
+            n_states=rollout_steps,
+            batch_size=B,
+            alpha=query_alpha,
+            beta=query_beta,
+            device=current_video.device,
+        )
+        query_video = select_per_sample_trajectory_state(
+            torch.stack(video_states, dim=0), query_indices
+        ).detach()
+        query_action = select_per_sample_trajectory_state(
+            torch.stack(action_states, dim=0), query_indices
+        ).detach()
+        query_video_t = select_per_sample_trajectory_state(
+            torch.stack(video_timesteps, dim=0), query_indices
+        ).detach()
+        query_action_t = select_per_sample_trajectory_state(
+            torch.stack(action_timesteps, dim=0), query_indices
+        ).detach()
+
+        student_query_input = _build_joint_input(
+            query_video, query_video_t, query_action, query_action_t,
+            video_base=input_dict['latent_dict'],
+            action_latent=action_base['latent'][:, :, ::action_downsample],
+            action_cond_t=action_base['cond_timesteps'][:, ::action_downsample],
+            action_text=action_base['text_emb'],
+            action_grid=_downsample_action_grid_id(
+                action_base.get('grid_id'), action_base['latent'], action_downsample
+            ),
+            action_valid_mask=(
+                action_base['actions_mask'][:, :, ::action_downsample]
+                if action_base.get('actions_mask') is not None else None
+            ),
+        )
+        _init_joint_mask(student_query_input)
+        student_video_velocity = _student_joint_forward(
+            self.student,
+            student_query_input,
+            empty_emb,
+            query_video_t,
+            query_action_t,
+            require_action=False,
+        )
+        with torch.no_grad():
+            teacher_cond, teacher_uncond, _ = self._batched_cfg_forward(
+                student_query_input, empty_emb
+            )
+            teacher_video_velocity = self._extract_video_v(
+                teacher_uncond + cfg_scale * (teacher_cond - teacher_uncond),
+                ref_shape,
+                B,
+            )
+
+        velocity_loss = direct_velocity_mse(
+            student_video_velocity, teacher_video_velocity
+        )
+        aux_weight = float(getattr(self.config, 'opd_aux_weight', 1.0))
+        loss = velocity_loss * aux_weight
+        zero = torch.zeros((), device=self.device, dtype=loss.dtype)
+        result = {
+            'loss': loss.detach(),
+            'opd_aux_loss': loss.detach(),
+            'opd_same_state_velocity_loss': velocity_loss.detach(),
+            'opd_same_state_velocity_contrib': velocity_loss.detach(),
+            'opd_same_state_velocity_ratio': torch.ones_like(loss.detach()),
+            'opd_video_transition_loss': zero,
+            'opd_endpoint_aux_loss': zero,
+            'opd_local_fm_loss': zero,
+            'opd_action_transition_loss': zero,
+            'opd_action_local_fm_loss': zero,
+            'opd_video_transition_contrib': zero,
+            'opd_endpoint_aux_contrib': zero,
+            'opd_local_fm_contrib': zero,
+            'opd_action_transition_contrib': zero,
+            'opd_action_local_fm_contrib': zero,
+            'opd_video_transition_ratio': zero,
+            'opd_endpoint_aux_ratio': zero,
+            'opd_local_fm_ratio': zero,
+            'opd_action_transition_ratio': zero,
+            'opd_action_local_fm_ratio': zero,
+            'danceopd_query_index_mean': query_indices.float().mean().detach(),
+            'danceopd_query_sigma_mean': (
+                query_video_t.float() / self.config.num_train_timesteps
+            ).mean().detach(),
+            'rollout_steps': rollout_steps,
+            'teacher_steps': 1,
+            'should_sync': True,
+            'skip_step': not bool(torch.isfinite(loss.detach())),
+        }
+        if result['skip_step']:
+            if self.config.rank == 0:
+                logger.warning(f"[step {self.step}] non-finite DanceOPD loss, skipping")
+            result['loss'] = zero
+            result['opd_aux_loss'] = zero
+            return result
+
+        loss.backward()
+        return result
+
     def _opd_aux_transition_step(self, batch, batch_idx, kto_paopd=False):
         """
         Auxiliary teacher-transition loss on top of the regular FlowMap step.
@@ -4135,6 +4458,12 @@ class FlowMapStepMixin:
         This keeps the regular AnyFlow step as the main objective and adds a
         teacher-transition auxiliary for both video and action.
         """
+        if str(getattr(self.config, 'opd_query_mode', 'legacy')).lower() == 'danceopd':
+            return self._danceopd_aux_transition_step(
+                batch,
+                batch_idx,
+                kto_paopd=kto_paopd,
+            )
         teacher_target_mode = str(getattr(
             self.config, 'opd_teacher_target_mode', 'student_state')).lower()
         if (

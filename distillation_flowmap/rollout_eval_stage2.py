@@ -107,7 +107,13 @@ def build_eval_records(trainer, eval_manifest_path=None, num_batches=1, split_na
             f"Eval manifest split is {manifest.get('split')!r}, expected {split_name!r}"
         )
     dataset = trainer.train_loader.dataset
-    indices = dataset_indices_for_manifest(dataset, manifest)
+    indices = dataset_indices_for_manifest(
+        dataset,
+        manifest,
+        manifest_is_compact=bool(
+            getattr(trainer.config, "offline_eval_manifest_is_compact", False)
+        ),
+    )
     if int(num_batches) > 0:
         indices = indices[:int(num_batches)]
     records = []
@@ -270,7 +276,13 @@ def main():
     cfg.output_dir = args.output_dir
     cfg.resume_from_path = args.resume_from_path
     if args.eval_manifest is not None:
-        cfg.dataset_sample_manifest = None
+        eval_manifest = load_json(args.eval_manifest)
+        task_names = [str(entry["task"]) for entry in eval_manifest.get("tasks", [])]
+        if not task_names:
+            raise ValueError("Eval manifest must contain at least one task")
+        cfg.dataset_sample_manifest = str(args.eval_manifest)
+        cfg.dataset_task_filter = ",".join(task_names)
+        cfg.offline_eval_manifest_is_compact = True
     cfg.reset_resume_step = False
     cfg.enable_wandb = False
     cfg.enable_light_eval = False

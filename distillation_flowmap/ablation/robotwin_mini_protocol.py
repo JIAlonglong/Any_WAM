@@ -122,7 +122,7 @@ def build_index_split(
     }
 
 
-def dataset_indices_for_manifest(dataset, manifest):
+def dataset_indices_for_manifest(dataset, manifest, manifest_is_compact=False):
     if isinstance(manifest, (str, Path)):
         with Path(manifest).open("r", encoding="utf-8") as f:
             manifest = json.load(f)
@@ -149,7 +149,15 @@ def dataset_indices_for_manifest(dataset, manifest):
             raise ValueError(f"Manifest task {task_name!r} matched multiple dataset shards: {matched}")
         dset_id, sub_dataset = matches[0]
         offset = int(acc_dset_num.get(dset_id, 0))
-        for local_idx in task_entry.get("indices", []):
+        selected_indices = [int(idx) for idx in task_entry.get("indices", [])]
+        if manifest_is_compact:
+            if len(sub_dataset) != len(selected_indices):
+                raise ValueError(
+                    f"Compact manifest task {task_name!r} expected "
+                    f"{len(selected_indices)} samples, found {len(sub_dataset)}"
+                )
+            selected_indices = list(range(len(sub_dataset)))
+        for local_idx in selected_indices:
             local_idx = int(local_idx)
             if local_idx < 0 or local_idx >= len(sub_dataset):
                 raise IndexError(

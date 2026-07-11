@@ -103,6 +103,34 @@ def test_dataset_indices_for_manifest_maps_task_local_indices_to_global_indices(
     assert dataset_indices_for_manifest(dataset, manifest) == [3, 4, 7]
 
 
+def test_dataset_indices_for_manifest_maps_filtered_manifest_to_compact_indices():
+    dataset = _TinyMultiDataset()
+    dataset._datasets[0].new_metas = dataset._datasets[0].new_metas[3:5]
+    dataset._datasets[1].new_metas = dataset._datasets[1].new_metas[1:2]
+    dataset.acc_dset_num = {0: 0, 1: 2}
+    manifest = {
+        "split": "heldout",
+        "tasks": [
+            {"task": "place_a2b_right", "indices": [3, 4]},
+            {"task": "open_microwave", "indices": [1]},
+        ],
+    }
+
+    assert dataset_indices_for_manifest(
+        dataset, manifest, manifest_is_compact=True
+    ) == [0, 1, 2]
+
+
+def test_offline_eval_uses_manifest_first_dataset_loading_for_rollout_and_video():
+    repo_root = Path(__file__).resolve().parents[1]
+    for name in ("rollout_eval_stage2.py", "rollout_eval_video_stage2.py"):
+        source = (repo_root / name).read_text(encoding="utf-8")
+        assert "cfg.dataset_sample_manifest = str(args.eval_manifest)" in source
+        assert 'cfg.dataset_task_filter = ",".join(' in source
+        assert "cfg.offline_eval_manifest_is_compact = True" in source
+        assert "manifest_is_compact=bool(" in source
+
+
 def test_load_eval_pairs_preserves_pair_ids_and_uses_sample_stable_seeds(tmp_path):
     path = tmp_path / "eval_pairs.json"
     path.write_text(json.dumps({

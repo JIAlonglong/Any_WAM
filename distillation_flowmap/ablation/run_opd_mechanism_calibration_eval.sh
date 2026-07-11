@@ -31,8 +31,8 @@ export ROOT STAGE2_STEPS VARIANTS SEEDS TASK_PRESET PROTOCOL_SEED
 export TEACHER_STEPS TEACHER_CACHE_SOURCE_VARIANT TEACHER_CACHE_SOURCE_SEED
 export BASELINE_VARIANT EVAL_GPUS MAX_PARALLEL VIDEO_VARIANTS VIDEO_SEEDS
 export VIDEO_MAX_PAIRS
-export TEACHER_CACHE="${TEACHER_CACHE:-${ROOT}/protocol/teacher_cache_heldout_calib_t${TEACHER_STEPS}.pt}"
-export TRAIN_TEACHER_CACHE="${TRAIN_TEACHER_CACHE:-${ROOT}/protocol/teacher_cache_train_calib_t${TEACHER_STEPS}.pt}"
+export TEACHER_CACHE="${TEACHER_CACHE:-${ROOT}/protocol/teacher_cache_heldout_calib_manifest_first_t${TEACHER_STEPS}.pt}"
+export TRAIN_TEACHER_CACHE="${TRAIN_TEACHER_CACHE:-${ROOT}/protocol/teacher_cache_train_calib_manifest_first_t${TEACHER_STEPS}.pt}"
 export SUMMARY_DIR="${SUMMARY_DIR:-${ROOT}/summary_calibration}"
 
 exec bash "${SCRIPT_DIR}/run_final_eval.sh" "$@"

@@ -60,6 +60,30 @@ default eval remains on `core2`, seed 0, one GPU, and one representative video
 pair per variant. Its summary uses `calib_w_o_opd` as the baseline and writes
 trend-only tables under `summary_calibration/`.
 
+### DanceOPD query gate
+
+`calib_danceopd_i1` and `calib_danceopd_i4` are deliberately outside the
+default five legacy calibration variants. They use the opt-in `danceopd` query
+path: a joint video-action rollout from the terminal prior, one Beta(5,2)
+trajectory-state query, direct video velocity MSE, and no legacy endpoint,
+Huber, or timestep-weighted velocity term. The two variants differ only in
+whether this auxiliary is applied every update or every fourth update.
+
+Run the small mechanism gate separately so its manifests and results cannot be
+mistaken for the legacy OPD sweep:
+
+```bash
+ROOT=distillation_flowmap/output_robotwin_stepwam_ablation/protocol_danceopd_query_gate_v1 \
+VARIANTS=calib_w_o_opd,calib_danceopd_i1,calib_danceopd_i4 \
+STAGE2_STEPS=250 MAX_PARALLEL=3 \
+bash distillation_flowmap/ablation/run_opd_mechanism_calibration.sh
+```
+
+Evaluate the same root with `run_opd_mechanism_calibration_eval.sh` after all
+three checkpoints are present. This is a mechanism trend gate only; promote a
+variant to the multi-seed core2 run only if its held-out rollout diagnostics
+are finite and improve over `calib_w_o_opd`.
+
 Example:
 
 ```bash

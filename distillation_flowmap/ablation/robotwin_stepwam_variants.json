@@ -293,6 +293,66 @@
         "OPD_ROLLOUT_GRAD_MODE": "suffix",
         "OPD_ROLLOUT_GRAD_STEPS": "2"
       }
+    },
+    {
+      "id": "c6",
+      "name": "calib_danceopd_i1",
+      "seeds": [0],
+      "priority": "mechanism_calibration",
+      "requires_code_flag": false,
+      "description": "On-policy, terminal-prior DanceOPD video velocity matching with a 16-step rollout and one query per optimizer update.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "1",
+        "OPD_QUERY_MODE": "danceopd",
+        "OPD_DANCEOPD_ROLLOUT_STEPS": "16",
+        "OPD_DANCEOPD_QUERY_ALPHA": "5.0",
+        "OPD_DANCEOPD_QUERY_BETA": "2.0",
+        "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR": "1",
+        "OPD_DANCEOPD_DIAGNOSTIC_INTERVAL": "50",
+        "OPD_AUX_INTERVAL": "1",
+        "OPD_AUX_WEIGHT": "1.0",
+        "OPD_AUX_ACTION": "0",
+        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
+        "VIDEO_TRANSITION_WEIGHT": "0.0",
+        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
+        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.0",
+        "LOCAL_FM_WEIGHT": "0.0",
+        "ACTION_LOCAL_FM_WEIGHT": "0.0"
+      }
+    },
+    {
+      "id": "c7",
+      "name": "calib_danceopd_i4",
+      "seeds": [0],
+      "priority": "mechanism_calibration",
+      "requires_code_flag": false,
+      "description": "Cadence control for DanceOPD: identical on-policy 16-step video velocity query, applied every four optimizer updates.",
+      "stage1_env": {
+        "DISTILL_MODE": "flashwam"
+      },
+      "stage2_env": {
+        "DISTILL_MODE": "flashwam",
+        "USE_OPD_AUX": "1",
+        "OPD_QUERY_MODE": "danceopd",
+        "OPD_DANCEOPD_ROLLOUT_STEPS": "16",
+        "OPD_DANCEOPD_QUERY_ALPHA": "5.0",
+        "OPD_DANCEOPD_QUERY_BETA": "2.0",
+        "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR": "1",
+        "OPD_DANCEOPD_DIAGNOSTIC_INTERVAL": "50",
+        "OPD_AUX_INTERVAL": "4",
+        "OPD_AUX_WEIGHT": "1.0",
+        "OPD_AUX_ACTION": "0",
+        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
+        "VIDEO_TRANSITION_WEIGHT": "0.0",
+        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
+        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.0",
+        "LOCAL_FM_WEIGHT": "0.0",
+        "ACTION_LOCAL_FM_WEIGHT": "0.0"
+      }
     }
   ]
 }

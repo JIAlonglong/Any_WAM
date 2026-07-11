@@ -268,6 +268,7 @@ run_rollout_grid() {
 
 run_video_eval() {
   local job_idx=0
+  local active=0
   local gpu
   local port
   local run_dir
@@ -283,7 +284,8 @@ run_video_eval() {
       require_path "${ckpt}"
       mkdir -p "${run_dir}/metrics" "${run_dir}/videos"
       echo "Running video eval ${variant} seed ${seed} on GPU ${gpu}"
-      run_or_print env CUDA_VISIBLE_DEVICES="${gpu}" "${TORCHRUN}" \
+      local video_command=(
+        env "CUDA_VISIBLE_DEVICES=${gpu}" "${TORCHRUN}"
         --nproc_per_node=1 \
         --master_port="${port}" \
         distillation_flowmap/rollout_eval_video_stage2.py \
@@ -307,9 +309,23 @@ run_video_eval() {
         --disable-eval-force-cfg \
         --eval-rollout-grad-mode endpoint \
         --eval-empty-cache
+      )
+      if [ "${DRY_RUN}" = "1" ]; then
+        run_or_print "${video_command[@]}"
+        job_idx=$(( job_idx + 1 ))
+        continue
+      fi
+      "${video_command[@]}" > "${run_dir}/metrics/video_mse.log" 2>&1 &
+      active_pids+=("$!")
+      active=$(( active + 1 ))
       job_idx=$(( job_idx + 1 ))
+      if [ "${active}" -ge "${MAX_PARALLEL}" ]; then
+        wait_batch "video"
+        active=0
+      fi
     done
   done
+  wait_batch "video"
 }
 
 if [ "${RUN_HELDOUT_EVAL}" = "1" ]; then

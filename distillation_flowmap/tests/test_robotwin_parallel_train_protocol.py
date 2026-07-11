@@ -117,5 +117,15 @@ def test_opd_calibration_eval_is_small_and_protocol_controlled():
     assert 'TEACHER_STEPS="${TEACHER_STEPS:-8}"' in source
     assert 'TEACHER_CACHE_SOURCE_VARIANT="${TEACHER_CACHE_SOURCE_VARIANT:-calib_w_o_opd}"' in source
     assert 'BASELINE_VARIANT="${BASELINE_VARIANT:-calib_w_o_opd}"' in source
+    assert 'EVAL_GPUS="${EVAL_GPUS:-0,1,2,3,4}"' in source
+    assert 'MAX_PARALLEL="${MAX_PARALLEL:-5}"' in source
     assert 'VARIANTS="${VARIANTS:-calib_w_o_opd,calib_endpoint_only,calib_velocity_only,calib_full_last_step,calib_full_suffix_grad}"' in source
     assert 'run_final_eval.sh' in source
+
+
+def test_final_eval_runs_video_variants_in_bounded_parallel_batches():
+    source = _final_eval_source()
+
+    assert 'local active=0' in source
+    assert 'wait_batch "video"' in source
+    assert 'metrics/video_mse.log' in source

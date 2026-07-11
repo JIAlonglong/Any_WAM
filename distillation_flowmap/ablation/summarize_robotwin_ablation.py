@@ -116,8 +116,17 @@ def read_run_metrics(run_dir):
     metrics = {}
     for prefix, path in metric_sources(run_dir):
         payload = maybe_read_json(path)
-        for key, value in flatten_numeric(payload).items():
+        aggregate_payload = {
+            key: value for key, value in payload.items() if key != "per_task"
+        }
+        for key, value in flatten_numeric(aggregate_payload).items():
             metrics[f"{prefix}/{key}"] = value
+
+    add_train_heldout_gaps(metrics)
+    return metrics
+
+
+def add_train_heldout_gaps(metrics):
 
     train_prefix = "train/offline_rollout/"
     heldout_prefix = "heldout/offline_rollout/"
@@ -128,7 +137,22 @@ def read_run_metrics(run_dir):
         heldout_key = heldout_prefix + suffix
         if heldout_key in metrics:
             metrics[f"gap/train_minus_heldout/{suffix}"] = value - metrics[heldout_key]
-    return metrics
+
+
+def read_task_metrics(run_dir):
+    per_task = {}
+    for prefix, path in metric_sources(run_dir):
+        payload = maybe_read_json(path)
+        task_payloads = payload.get("per_task", {}) if isinstance(payload, dict) else {}
+        if not isinstance(task_payloads, dict):
+            continue
+        for task, task_payload in task_payloads.items():
+            task_metrics = per_task.setdefault(str(task), {})
+            for key, value in flatten_numeric(task_payload).items():
+                task_metrics[f"{prefix}/{key}"] = value
+    for task_metrics in per_task.values():
+        add_train_heldout_gaps(task_metrics)
+    return per_task
 
 
 def row_from_manifest(manifest_path):
@@ -152,6 +176,7 @@ def row_from_manifest(manifest_path):
         "run_dir": str(run_dir),
     }
     row.update(read_run_metrics(run_dir))
+    row["_per_task_metrics"] = read_task_metrics(run_dir)
     return row
 
 
@@ -241,21 +266,39 @@ def summarize_rows(rows, baseline_variant):
 
 def task_rows(rows):
     out = []
-    metric_names = numeric_metric_names(rows)
     for row in rows:
         tasks = [task for task in str(row.get("tasks", "")).split(",") if task]
+        task_metrics = row.get("_per_task_metrics", {})
         for task in tasks:
+            metrics = task_metrics.get(task)
+            if not metrics:
+                continue
             task_row = {
                 "variant": row.get("variant", ""),
                 "seed": row.get("seed", ""),
                 "task": task,
                 "run_dir": row.get("run_dir", ""),
             }
-            for metric in metric_names:
-                if metric in row:
-                    task_row[metric] = row[metric]
+            task_row.update(metrics)
             out.append(task_row)
     return out
+
+
+def per_task_metric_names(rows):
+    names = set()
+    for row in rows:
+        for metrics in row.get("_per_task_metrics", {}).values():
+            for key, value in metrics.items():
+                if is_number(value):
+                    names.add(key)
+    return sorted(names)
+
+
+def public_rows(rows):
+    return [
+        {key: value for key, value in row.items() if key != "_per_task_metrics"}
+        for row in rows
+    ]
 
 
 def video_asset_rows(rows):
@@ -319,16 +362,17 @@ def summarize(root, out, baseline_variant="w_o_opd"):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     rows = collect_rows(root)
+    output_rows = public_rows(rows)
     metric_names = numeric_metric_names(rows)
     per_seed_columns = PER_SEED_BASE_COLUMNS + metric_names
     summary, delta_column = summarize_rows(rows, baseline_variant)
     summary_columns = SUMMARY_BASE_COLUMNS + [delta_column]
     per_task = task_rows(rows)
-    per_task_columns = ["variant", "seed", "task", "run_dir"] + metric_names
+    per_task_columns = ["variant", "seed", "task", "run_dir"] + per_task_metric_names(rows)
     assets = video_asset_rows(rows)
 
-    write_csv(rows, out / "mini_ablation_per_seed.csv", per_seed_columns)
-    write_jsonl(rows, out / "mini_ablation_per_seed.jsonl")
+    write_csv(output_rows, out / "mini_ablation_per_seed.csv", per_seed_columns)
+    write_jsonl(output_rows, out / "mini_ablation_per_seed.jsonl")
     write_csv(summary, out / "mini_ablation_summary.csv", summary_columns)
     write_markdown_table(summary, summary_columns, out / "mini_ablation_summary.md")
     write_csv(per_task, out / "mini_ablation_per_task.csv", per_task_columns)
@@ -336,10 +380,10 @@ def summarize(root, out, baseline_variant="w_o_opd"):
     write_report(summary, assets, out / "mini_ablation_report.md", delta_column)
 
     # Backward-compatible aliases used by earlier notes/scripts.
-    write_csv(rows, out / "ablation_table.csv", per_seed_columns)
-    write_markdown_table(rows, per_seed_columns, out / "ablation_table.md")
+    write_csv(output_rows, out / "ablation_table.csv", per_seed_columns)
+    write_markdown_table(output_rows, per_seed_columns, out / "ablation_table.md")
     with (out / "ablation_table.json").open("w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=2, sort_keys=True)
+        json.dump(output_rows, f, indent=2, sort_keys=True)
         f.write("\n")
     return {
         "rows": rows,

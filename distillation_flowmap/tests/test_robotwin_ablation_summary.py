@@ -25,17 +25,33 @@ def _write_run(root, variant, seed, heldout_video_error, train_video_error=None)
         "eval_pairs_path": str(root / "protocol" / "pairs.json"),
     }
     _write_json(run_dir / "run_manifest.json", manifest)
+    offline_metric = "rollout_eval/t1000_r0_i0/s4_t4/video_teacher_x_mse"
+    action_metric = "rollout_eval/t1000_r0_i0/s4_t4/action_gt_xr_mse"
     _write_json(
         run_dir / "metrics" / "offline_rollout.json",
         {
-            "rollout_eval/t1000_r0_i0/s4_t4/video_teacher_x_mse": heldout_video_error,
-            "rollout_eval/t1000_r0_i0/s4_t4/action_gt_xr_mse": heldout_video_error / 10.0,
+            offline_metric: heldout_video_error,
+            action_metric: heldout_video_error / 10.0,
+            "per_task": {
+                "place_a2b_right": {
+                    offline_metric: heldout_video_error * 0.5,
+                    action_metric: heldout_video_error / 20.0,
+                },
+                "open_microwave": {
+                    offline_metric: heldout_video_error * 1.5,
+                    action_metric: heldout_video_error * 3.0 / 20.0,
+                },
+            },
         },
     )
     _write_json(
         run_dir / "metrics" / "video_mse.json",
         {
-            "rollout_eval/t1000_r0_i0/s4_t4/video_teacher_x_mse": heldout_video_error,
+            offline_metric: heldout_video_error,
+            "per_task": {
+                "place_a2b_right": {offline_metric: heldout_video_error * 0.5},
+                "open_microwave": {offline_metric: heldout_video_error * 1.5},
+            },
         },
     )
     if train_video_error is not None:
@@ -87,6 +103,17 @@ def test_robotwin_ablation_summary_writes_protocol_outputs(tmp_path):
 
     per_task = _read_csv(out / "mini_ablation_per_task.csv")
     assert {row["task"] for row in per_task} == {"place_a2b_right", "open_microwave"}
+    task_metric = "heldout/offline_rollout/rollout_eval/t1000_r0_i0/s4_t4/video_teacher_x_mse"
+    full_task_rows = {
+        row["task"]: row
+        for row in per_task
+        if row["variant"] == "full_stepwam" and row["seed"] == "0"
+    }
+    assert float(full_task_rows["place_a2b_right"][task_metric]) == 0.20
+    assert abs(float(full_task_rows["open_microwave"][task_metric]) - 0.60) < 1e-12
+    assert float(full_task_rows["place_a2b_right"][task_metric]) != float(
+        full_task_rows["open_microwave"][task_metric]
+    )
 
     assets = [json.loads(line) for line in (out / "mini_ablation_video_assets.jsonl").read_text().splitlines()]
     assert {asset["kind"] for asset in assets} == {"mp4", "contact_sheet"}

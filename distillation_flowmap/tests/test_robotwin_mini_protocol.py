@@ -5,6 +5,7 @@ from distillation_flowmap.ablation.robotwin_mini_protocol import (
     build_eval_pairs,
     build_index_split,
     dataset_indices_for_manifest,
+    dataset_records_for_manifest,
     eval_seed_for_pair,
     load_eval_pairs,
     write_protocol_manifests,
@@ -101,6 +102,23 @@ def test_dataset_indices_for_manifest_maps_task_local_indices_to_global_indices(
     }
 
     assert dataset_indices_for_manifest(dataset, manifest) == [3, 4, 7]
+
+
+def test_dataset_records_for_manifest_preserve_task_identity():
+    dataset = _TinyMultiDataset()
+    manifest = {
+        "split": "heldout",
+        "tasks": [
+            {"task": "place_a2b_right", "indices": [3, 4]},
+            {"task": "open_microwave", "indices": [1]},
+        ],
+    }
+
+    assert dataset_records_for_manifest(dataset, manifest) == [
+        {"global_index": 3, "task": "place_a2b_right"},
+        {"global_index": 4, "task": "place_a2b_right"},
+        {"global_index": 7, "task": "open_microwave"},
+    ]
 
 
 def test_dataset_indices_for_manifest_maps_filtered_manifest_to_compact_indices():

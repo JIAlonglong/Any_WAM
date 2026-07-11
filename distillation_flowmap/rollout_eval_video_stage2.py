@@ -33,7 +33,7 @@ from distillation_flowmap.rollout_masking import (
     video_frame_mask_from_batch,
 )
 from distillation_flowmap.ablation.robotwin_mini_protocol import (
-    dataset_indices_for_manifest,
+    dataset_records_for_manifest,
     eval_seed_for_pair,
     load_eval_pairs,
 )
@@ -88,7 +88,7 @@ def build_eval_records(trainer, eval_manifest_path=None, num_batches=1, split_na
             f"Eval manifest split is {manifest.get('split')!r}, expected {split_name!r}"
         )
     dataset = trainer.train_loader.dataset
-    indices = dataset_indices_for_manifest(
+    records = dataset_records_for_manifest(
         dataset,
         manifest,
         manifest_is_compact=bool(
@@ -96,13 +96,14 @@ def build_eval_records(trainer, eval_manifest_path=None, num_batches=1, split_na
         ),
     )
     if int(num_batches) > 0:
-        indices = indices[:int(num_batches)]
+        records = records[:int(num_batches)]
     return [
         {
-            "batch": default_collate([dataset[global_index]]),
-            "global_index": int(global_index),
+            "batch": default_collate([dataset[int(record["global_index"])]]),
+            "global_index": int(record["global_index"]),
+            "task": record["task"],
         }
-        for global_index in indices
+        for record in records
     ]
 
 
@@ -483,6 +484,9 @@ def main():
     )
     metrics = {}
     counts = {}
+    task_metrics = {}
+    task_counts = {}
+    current_task = None
     video_dir = Path(args.video_dir) if args.video_dir else None
     vae = None
     video_processor = None
@@ -512,6 +516,11 @@ def main():
         value = value.detach().float()
         metrics[name] = metrics.get(name, torch.zeros((), device=trainer.device)) + value
         counts[name] = counts.get(name, 0) + 1
+        if current_task is not None:
+            sums = task_metrics.setdefault(current_task, {})
+            task_counts_for_name = task_counts.setdefault(current_task, {})
+            sums[name] = sums.get(name, torch.zeros((), device=trainer.device)) + value
+            task_counts_for_name[name] = task_counts_for_name.get(name, 0) + 1
 
     eval_records = build_eval_records(
         trainer,
@@ -520,6 +529,7 @@ def main():
         split_name=args.split_name,
     )
     for batch_idx, record in enumerate(eval_records):
+        current_task = record.get("task")
         batch = record["batch"]
         batch = trainer._move_eval_batch_to_device(batch)
         base_input = trainer._prepare_base_dict(batch)
@@ -847,6 +857,16 @@ def main():
         if dist.is_initialized():
             avg = dist_mean(avg)
         out[name] = avg.item()
+    if task_metrics:
+        out["per_task"] = {}
+        for task, task_sums in task_metrics.items():
+            task_out = {}
+            for name, total in task_sums.items():
+                avg = total / max(1, task_counts[task][name])
+                if dist.is_initialized():
+                    avg = dist_mean(avg)
+                task_out[name] = avg.item()
+            out["per_task"][task] = task_out
 
     if rank == 0:
         Path(args.result_json).parent.mkdir(parents=True, exist_ok=True)

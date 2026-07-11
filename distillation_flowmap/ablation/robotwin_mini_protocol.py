@@ -122,7 +122,8 @@ def build_index_split(
     }
 
 
-def dataset_indices_for_manifest(dataset, manifest, manifest_is_compact=False):
+def dataset_records_for_manifest(dataset, manifest, manifest_is_compact=False):
+    """Resolve manifest entries to global dataset indices with task identity."""
     if isinstance(manifest, (str, Path)):
         with Path(manifest).open("r", encoding="utf-8") as f:
             manifest = json.load(f)
@@ -134,9 +135,9 @@ def dataset_indices_for_manifest(dataset, manifest, manifest_is_compact=False):
     if not datasets:
         raise ValueError("dataset must expose _datasets for task-local manifest lookup")
 
-    global_indices = []
+    records = []
     for task_entry in task_entries:
-        task_name = task_entry["task"]
+        task_name = str(task_entry["task"])
         matches = [
             (dset_id, sub_dataset)
             for dset_id, sub_dataset in enumerate(datasets)
@@ -164,10 +165,24 @@ def dataset_indices_for_manifest(dataset, manifest, manifest_is_compact=False):
                     f"Manifest task {task_name!r} local index {local_idx} is out of range "
                     f"for dataset length {len(sub_dataset)}"
                 )
-            global_indices.append(offset + local_idx)
-    if not global_indices:
+            records.append({
+                "global_index": offset + local_idx,
+                "task": task_name,
+            })
+    if not records:
         raise ValueError("manifest did not select any dataset indices")
-    return global_indices
+    return records
+
+
+def dataset_indices_for_manifest(dataset, manifest, manifest_is_compact=False):
+    return [
+        record["global_index"]
+        for record in dataset_records_for_manifest(
+            dataset,
+            manifest,
+            manifest_is_compact=manifest_is_compact,
+        )
+    ]
 
 
 def protocol_manifest_paths(root, task_preset, protocol_seed):

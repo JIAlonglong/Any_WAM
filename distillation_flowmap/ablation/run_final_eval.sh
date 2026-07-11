@@ -58,6 +58,7 @@ IFS=',' read -r -a seed_list <<< "${SEEDS}"
 IFS=',' read -r -a eval_gpu_list <<< "${EVAL_GPUS}"
 IFS=',' read -r -a video_variant_list <<< "${VIDEO_VARIANTS}"
 IFS=',' read -r -a video_seed_list <<< "${VIDEO_SEEDS}"
+read -r -a student_step_list <<< "${STUDENT_STEPS}"
 
 if [ "${#eval_gpu_list[@]}" -eq 0 ]; then
   echo "EVAL_GPUS must contain at least one GPU id" >&2
@@ -298,7 +299,7 @@ run_video_eval() {
         --eval-pairs-json "${EVAL_PAIRS}" \
         --split-name heldout \
         --num-batches 0 \
-        --student-steps "${STUDENT_STEPS}" \
+        --student-steps "${student_step_list[@]}" \
         --teacher-steps "${TEACHER_STEPS}" \
         --video-max-pairs "${VIDEO_MAX_PAIRS}" \
         --video-decode-device cpu \

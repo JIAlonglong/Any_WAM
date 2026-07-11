@@ -103,7 +103,8 @@ def test_final_eval_supports_calibrated_teacher_and_cache_source_overrides():
     assert 'BASELINE_VARIANT="${BASELINE_VARIANT:-w_o_opd}"' in source
     assert 'stage2_ckpt "${TEACHER_CACHE_SOURCE_VARIANT}" "${TEACHER_CACHE_SOURCE_SEED}"' in source
     assert source.count('--teacher-steps "${TEACHER_STEPS}"') == 4
-    assert '--student-steps "${STUDENT_STEPS}"' in source
+    assert 'read -r -a student_step_list <<< "${STUDENT_STEPS}"' in source
+    assert '--student-steps "${student_step_list[@]}"' in source
     assert '--baseline-variant "${BASELINE_VARIANT}"' in source
 
 

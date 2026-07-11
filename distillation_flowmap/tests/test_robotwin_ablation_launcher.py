@@ -12,14 +12,14 @@ def parse_dry_run_manifest(stdout):
     return json.loads(stdout[stdout.index("{"):])
 
 
-def run_dry_run(tmp_path, variant):
+def run_dry_run(tmp_path, variant, seed=0):
     args = [
         sys.executable,
         str(LAUNCHER),
         "--variant",
         variant,
         "--seed",
-        "0",
+        str(seed),
         "--root",
         str(tmp_path / "ablation_root"),
         "--teacher-model-path",
@@ -99,6 +99,16 @@ def test_without_opd_dry_run_disables_opd(tmp_path):
 
     assert "w_o_opd/seed_0" in result.stdout
     assert "USE_OPD_AUX=0" in result.stdout
+
+
+def test_launcher_propagates_requested_training_seed_to_both_stages(tmp_path):
+    manifest = parse_dry_run_manifest(
+        run_dry_run(tmp_path, "w_o_opd", seed=7).stdout
+    )
+
+    assert manifest["seed"] == 7
+    assert manifest["stage1_env"]["TRAIN_SEED"] == "7"
+    assert manifest["stage2_env"]["TRAIN_SEED"] == "7"
 
 
 def test_local_variant_dry_run_contains_adjacent_grid_env(tmp_path):

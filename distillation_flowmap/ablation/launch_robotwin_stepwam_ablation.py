@@ -226,6 +226,7 @@ def build_run_plan(args):
         common_env["DATASET_MAX_EPISODES_PER_TASK"] = str(args.max_episodes_per_task)
     if args.max_samples_per_task is not None:
         common_env["DATASET_MAX_SAMPLES_PER_TASK"] = str(args.max_samples_per_task)
+    common_env["TRAIN_SEED"] = str(args.seed)
 
     stage1 = build_stage_command(
         stage_name="stage1",

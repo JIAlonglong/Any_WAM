@@ -28,6 +28,7 @@ from distributed.util import init_distributed
 from utils import init_logger, logger
 from flowmap_trainer import FlowMapDistiller
 from distillation_flowmap.cosmos_policy_adapter import resolve_cosmos_policy_assets
+from distillation_flowmap.training_seed import configure_training_seed
 
 
 _LIBERO_TEACHER_PATH = "/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero"
@@ -143,6 +144,16 @@ def run(args):
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
+    train_seed = os.environ.get("TRAIN_SEED")
+    if train_seed is not None:
+        config.seed = int(train_seed)
+        effective_seed = configure_training_seed(config.seed, rank=rank)
+        if rank == 0:
+            logger.info(
+                "Configured training RNG seed: base=%d effective=%d",
+                config.seed,
+                effective_seed,
+            )
 
     # 用命令行参数覆盖配置（如果提供）
     if args.output_dir is not None:

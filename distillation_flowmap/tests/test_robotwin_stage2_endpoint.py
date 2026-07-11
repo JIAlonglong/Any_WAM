@@ -208,6 +208,25 @@ class RobotWinStage2EndpointConfigTest(unittest.TestCase):
         cfg = load_config(OPD_SAME_STATE_VELOCITY_WEIGHT="0.25")
         self.assertEqual(cfg.opd_same_state_velocity_weight, 0.25)
 
+    def test_danceopd_query_mode_is_opt_in_and_configurable(self):
+        default_cfg = load_config(OPD_QUERY_MODE=None)
+        dance_cfg = load_config(
+            OPD_QUERY_MODE="danceopd",
+            OPD_DANCEOPD_ROLLOUT_STEPS="8",
+            OPD_DANCEOPD_QUERY_ALPHA="5.0",
+            OPD_DANCEOPD_QUERY_BETA="2.0",
+        )
+
+        self.assertEqual(default_cfg.opd_query_mode, "legacy")
+        self.assertEqual(dance_cfg.opd_query_mode, "danceopd")
+        self.assertEqual(dance_cfg.opd_danceopd_rollout_steps, 8)
+        self.assertEqual(dance_cfg.opd_danceopd_query_alpha, 5.0)
+        self.assertEqual(dance_cfg.opd_danceopd_query_beta, 2.0)
+
+    def test_invalid_danceopd_query_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "OPD_QUERY_MODE"):
+            load_config(OPD_QUERY_MODE="not-a-mode")
+
 
 class SameStateVelocityLossTest(unittest.TestCase):
     def test_weighted_mse_matches_per_sample_average(self):

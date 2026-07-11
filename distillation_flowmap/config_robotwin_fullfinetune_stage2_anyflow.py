@@ -1,5 +1,6 @@
 """Stage 2 OPD continuation for RobotWin full-parameter fine-tuning."""
 import copy
+import math
 import os
 
 from distillation_flowmap.config_robotwin_fullfinetune_stage1_warmup import (
@@ -118,6 +119,32 @@ cfg.opd_query_bias_ratio = float(os.environ.get("OPD_QUERY_BIAS_RATIO", 1.0))
 cfg.opd_low_noise_alpha = float(os.environ.get("OPD_LOW_NOISE_ALPHA", 5.0))
 cfg.opd_low_noise_beta = float(os.environ.get("OPD_LOW_NOISE_BETA", 2.0))
 cfg.opd_low_noise_max_sigma = float(os.environ.get("OPD_LOW_NOISE_MAX_SIGMA", 0.25))
+
+# A separate, opt-in query path for a faithful DanceOPD-style local field
+# matching control.  Legacy Stage2 behavior remains the default.
+cfg.opd_query_mode = os.environ.get("OPD_QUERY_MODE", "legacy").lower()
+if cfg.opd_query_mode not in ("legacy", "danceopd"):
+    raise ValueError("OPD_QUERY_MODE must be legacy or danceopd")
+cfg.opd_danceopd_rollout_steps = int(os.environ.get(
+    "OPD_DANCEOPD_ROLLOUT_STEPS", 16
+))
+if cfg.opd_danceopd_rollout_steps <= 0:
+    raise ValueError("OPD_DANCEOPD_ROLLOUT_STEPS must be positive")
+cfg.opd_danceopd_query_alpha = float(os.environ.get(
+    "OPD_DANCEOPD_QUERY_ALPHA", 5.0
+))
+cfg.opd_danceopd_query_beta = float(os.environ.get(
+    "OPD_DANCEOPD_QUERY_BETA", 2.0
+))
+if (
+    not math.isfinite(cfg.opd_danceopd_query_alpha)
+    or cfg.opd_danceopd_query_alpha <= 0
+    or not math.isfinite(cfg.opd_danceopd_query_beta)
+    or cfg.opd_danceopd_query_beta <= 0
+):
+    raise ValueError(
+        "OPD_DANCEOPD_QUERY_ALPHA and OPD_DANCEOPD_QUERY_BETA must be finite and positive"
+    )
 
 # Conservative continuation hyperparameters for full-model training.
 cfg.learning_rate = float(os.environ.get("LEARNING_RATE", 5e-7))

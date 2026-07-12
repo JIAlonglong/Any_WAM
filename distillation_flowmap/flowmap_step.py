@@ -102,6 +102,7 @@ from distillation_flowmap.opd_rollout_grad import (
     rollout_step_requires_grad,
 )
 from distillation_flowmap.danceopd_query import (
+    denoised_endpoint_mse,
     direct_velocity_mse,
     sample_low_noise_query_indices,
     select_per_sample_trajectory_state,
@@ -4133,6 +4134,136 @@ class FlowMapStepMixin:
             )
         return result
 
+    def _danceopd_independent_endpoint_loss(self, batch, *, cfg_scale):
+        """Return video x0 loss for an independent teacher endpoint rollout."""
+        B = batch['latents'].shape[0]
+        ref_shape = batch['latents'].shape
+        num_frames = ref_shape[2]
+        action_downsample = int(getattr(self.config, 'action_downsample_factor', 4))
+
+        input_dict = self._prepare_base_dict(batch)
+        video_t, video_r, _ = self.sample_timestep_mixed(
+            B,
+            num_frames,
+            dtype=torch.float32,
+            device=self.device,
+            pair_mode=getattr(self.config, 'opd_pair_mode', None),
+        )
+        video_r = self._apply_opd_low_noise_query_bias(video_t, video_r)
+        video_noise = torch.randn_like(batch['latents'])
+        video_noisy_t = self.train_scheduler_latent.add_noise(
+            batch['latents'], video_noise, video_t, t_dim=2
+        )
+        input_dict['latent_dict']['noisy_latents'] = video_noisy_t
+        input_dict['latent_dict']['timesteps'] = video_t
+        input_dict['latent_dict']['targets'] = self.train_scheduler_latent.training_target(
+            batch['latents'], video_noise, video_t
+        )
+
+        action_t = action_r = None
+        if self.distill_action or self.action_aware:
+            action_t, action_r, _ = self.sample_timestep_mixed(
+                B,
+                num_frames,
+                dtype=torch.float32,
+                device=self.device,
+                scheduler=self.train_scheduler_action,
+                pair_mode=getattr(self.config, 'opd_pair_mode', None),
+            )
+            action_r = self._apply_opd_low_noise_query_bias(action_t, action_r)
+            action_noise = torch.randn_like(batch['actions'])
+            action_noisy_t = self.train_scheduler_action.add_noise(
+                batch['actions'], action_noise, action_t, t_dim=2
+            )
+            action_dict = input_dict['action_dict']
+            action_dict['noisy_latents'] = action_noisy_t
+            action_dict['timesteps'] = action_t
+            action_dict['targets'] = self.train_scheduler_action.training_target(
+                batch['actions'], action_noise, action_t
+            )
+            student_input = {
+                'latent_dict': input_dict['latent_dict'],
+                'action_dict': {
+                    'noisy_latents': action_noisy_t[:, :, ::action_downsample],
+                    'latent': action_dict['latent'][:, :, ::action_downsample],
+                    'timesteps': action_t[:, ::action_downsample],
+                    'cond_timesteps': action_dict['cond_timesteps'][:, ::action_downsample],
+                    'text_emb': action_dict['text_emb'],
+                    'grid_id': _downsample_action_grid_id(
+                        action_dict.get('grid_id'), action_dict['latent'], action_downsample
+                    ) if action_dict.get('grid_id') is not None else None,
+                    'actions_mask': action_dict['actions_mask'][:, :, ::action_downsample]
+                    if action_dict.get('actions_mask') is not None else None,
+                },
+                'chunk_size': input_dict['chunk_size'],
+                'window_size': input_dict['window_size'],
+            }
+        else:
+            student_input = input_dict
+
+        rollout_step_pairs = getattr(
+            self.config,
+            'opd_rollout_step_pairs',
+            getattr(self.config, 'rollout_step_pairs', [[1, 1]]),
+        )
+        if not rollout_step_pairs:
+            raise ValueError('opd_rollout_step_pairs must contain at least one (N, K) pair')
+        if dist.is_initialized():
+            pair_index = torch.randint(
+                0, len(rollout_step_pairs), (1,), device=self.device
+            )
+            dist.broadcast(pair_index, src=0)
+            teacher_steps, student_steps = rollout_step_pairs[pair_index.item()]
+        else:
+            import random
+            teacher_steps, student_steps = random.choice(rollout_step_pairs)
+        teacher_steps = max(1, int(teacher_steps))
+        student_steps = max(1, int(student_steps))
+
+        empty_emb = self.empty_emb.expand(
+            input_dict['latent_dict']['text_emb'].shape[0], -1, -1
+        )
+        student_x_r, student_v_r = self._student_euler_integrate(
+            noisy_latents=video_noisy_t,
+            timesteps=video_t,
+            target_r=video_r,
+            base_input_dict=student_input,
+            empty_emb=empty_emb,
+            cfg_scale=cfg_scale,
+            ref_shape=ref_shape,
+            B=B,
+            num_frames=num_frames,
+            K_steps=student_steps,
+            action_target_r=action_r,
+        )
+        teacher_x_r, teacher_v_r = self._teacher_integrate_to_r(
+            noisy_latents=video_noisy_t,
+            timesteps=video_t,
+            target_r=video_r,
+            input_dict=input_dict,
+            empty_emb=empty_emb,
+            cfg_scale=cfg_scale,
+            ref_shape=ref_shape,
+            B=B,
+            num_frames=num_frames,
+            num_steps=teacher_steps,
+        )
+        sigma_r = (video_r / self.config.num_train_timesteps)[:, None, :, None, None]
+        endpoint_loss = denoised_endpoint_mse(
+            student_x_r,
+            student_v_r,
+            teacher_x_r,
+            teacher_v_r,
+            sigma_r,
+        )
+        diagnostics = {
+            'teacher_steps': teacher_steps,
+            'student_steps': student_steps,
+            't_mean': video_t.float().mean().detach(),
+            'r_mean': video_r.float().mean().detach(),
+        }
+        return endpoint_loss, diagnostics
+
     def _danceopd_aux_transition_step(self, batch, batch_idx, kto_paopd=False):
         """Run one DanceOPD-style local video field-matching update.
 
@@ -4443,35 +4574,75 @@ class FlowMapStepMixin:
         velocity_loss = direct_velocity_mse(
             student_video_velocity, teacher_video_velocity
         )
+        velocity_weight = float(getattr(
+            self.config, 'opd_danceopd_velocity_weight', 1.0
+        ))
+        endpoint_weight = float(getattr(
+            self.config, 'opd_danceopd_endpoint_weight', 0.0
+        ))
+        if (
+            not math.isfinite(velocity_weight)
+            or velocity_weight < 0
+            or not math.isfinite(endpoint_weight)
+            or endpoint_weight < 0
+        ):
+            raise ValueError(
+                'DanceOPD endpoint and velocity weights must be finite and non-negative'
+            )
+        zero = torch.zeros((), device=self.device, dtype=velocity_loss.dtype)
+        endpoint_loss = zero
+        endpoint_diagnostics = {}
+        if endpoint_weight > 0:
+            endpoint_loss, endpoint_diagnostics = self._danceopd_independent_endpoint_loss(
+                batch, cfg_scale=cfg_scale
+            )
+        raw_velocity_contrib = velocity_weight * velocity_loss
+        raw_endpoint_contrib = endpoint_weight * endpoint_loss
         aux_weight = float(getattr(self.config, 'opd_aux_weight', 1.0))
-        loss = velocity_loss * aux_weight
-        zero = torch.zeros((), device=self.device, dtype=loss.dtype)
+        loss = (raw_velocity_contrib + raw_endpoint_contrib) * aux_weight
+        velocity_contrib = raw_velocity_contrib * aux_weight
+        endpoint_contrib = raw_endpoint_contrib * aux_weight
+        contrib_denom = (
+            velocity_contrib.detach().abs() + endpoint_contrib.detach().abs()
+        ).clamp(min=1e-12)
         result = {
             'loss': loss.detach(),
             'opd_aux_loss': loss.detach(),
             'opd_same_state_velocity_loss': velocity_loss.detach(),
-            'opd_same_state_velocity_contrib': velocity_loss.detach(),
-            'opd_same_state_velocity_ratio': torch.ones_like(loss.detach()),
+            'opd_same_state_velocity_contrib': velocity_contrib.detach(),
+            'opd_same_state_velocity_ratio': (
+                velocity_contrib.detach().abs() / contrib_denom
+            ),
             'opd_video_transition_loss': zero,
-            'opd_endpoint_aux_loss': zero,
+            'opd_endpoint_aux_loss': endpoint_loss.detach(),
             'opd_local_fm_loss': zero,
             'opd_action_transition_loss': zero,
             'opd_action_local_fm_loss': zero,
             'opd_video_transition_contrib': zero,
-            'opd_endpoint_aux_contrib': zero,
+            'opd_endpoint_aux_contrib': endpoint_contrib.detach(),
             'opd_local_fm_contrib': zero,
             'opd_action_transition_contrib': zero,
             'opd_action_local_fm_contrib': zero,
             'opd_video_transition_ratio': zero,
-            'opd_endpoint_aux_ratio': zero,
+            'opd_endpoint_aux_ratio': (
+                endpoint_contrib.detach().abs() / contrib_denom
+            ),
             'opd_local_fm_ratio': zero,
             'opd_action_transition_ratio': zero,
             'opd_action_local_fm_ratio': zero,
             'danceopd_query_index_mean': danceopd_query_index_mean,
             'danceopd_query_sigma_mean': danceopd_query_sigma_mean,
             'danceopd_terminal_prior_max_error': danceopd_terminal_prior_max_error.detach(),
+            'danceopd_endpoint_teacher_steps': endpoint_diagnostics.get(
+                'teacher_steps', 1
+            ),
+            'danceopd_endpoint_student_steps': endpoint_diagnostics.get(
+                'student_steps', 0
+            ),
+            'danceopd_endpoint_t_mean': endpoint_diagnostics.get('t_mean', zero),
+            'danceopd_endpoint_r_mean': endpoint_diagnostics.get('r_mean', zero),
             'rollout_steps': rollout_steps,
-            'teacher_steps': 1,
+            'teacher_steps': endpoint_diagnostics.get('teacher_steps', 1),
             'should_sync': True,
             'skip_step': not bool(torch.isfinite(loss.detach())),
         }

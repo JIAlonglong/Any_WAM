@@ -417,3 +417,23 @@ def test_calibration_danceopd_variants_use_isolated_on_policy_velocity(tmp_path)
 
     assert interval_1["OPD_AUX_INTERVAL"] == "1"
     assert interval_4["OPD_AUX_INTERVAL"] == "4"
+
+
+def test_calibration_endpoint_danceopd_uses_only_the_new_composite_terms(tmp_path):
+    env = parse_dry_run_manifest(
+        run_calibration_dry_run(tmp_path, "calib_endpoint_danceopd_i1").stdout
+    )["stage2_env"]
+
+    assert env["USE_OPD_AUX"] == "1"
+    assert env["OPD_QUERY_MODE"] == "danceopd"
+    assert env["OPD_DANCEOPD_ENDPOINT_WEIGHT"] == "1.0"
+    assert env["OPD_DANCEOPD_VELOCITY_WEIGHT"] == "1.0"
+    assert env["OPD_ROLLOUT_STEP_PAIRS"] == "8,4"
+    assert env["OPD_TEACHER_TARGET_MODE"] == "endpoint"
+    assert env["OPD_AUX_INTERVAL"] == "1"
+    assert env["OPD_AUX_ACTION"] == "0"
+    assert env["VIDEO_TRANSITION_WEIGHT"] == "0.0"
+    assert env["OPD_ENDPOINT_AUX_WEIGHT"] == "0.0"
+    assert env["OPD_SAME_STATE_VELOCITY_WEIGHT"] == "0.0"
+    assert env["LOCAL_FM_WEIGHT"] == "0.0"
+    assert env["ACTION_LOCAL_FM_WEIGHT"] == "0.0"

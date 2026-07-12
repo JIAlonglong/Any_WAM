@@ -65,3 +65,16 @@ def direct_velocity_mse(
     if student_velocity.shape != teacher_velocity.shape:
         raise ValueError("student and teacher velocity shapes must match")
     return F.mse_loss(student_velocity.float(), teacher_velocity.detach().float())
+
+
+def denoised_endpoint_mse(
+    student_state: torch.Tensor,
+    student_velocity: torch.Tensor,
+    teacher_state: torch.Tensor,
+    teacher_velocity: torch.Tensor,
+    sigma: torch.Tensor,
+) -> torch.Tensor:
+    """Match denoised endpoints while keeping the teacher target detached."""
+    student_x0 = student_state - sigma.to(student_velocity) * student_velocity
+    teacher_x0 = teacher_state.detach() - sigma.to(teacher_velocity) * teacher_velocity.detach()
+    return F.mse_loss(student_x0.float(), teacher_x0.float())

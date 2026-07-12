@@ -5,6 +5,7 @@ import torch
 from wan_va.utils.scheduler import FlowMatchScheduler
 
 from distillation_flowmap.danceopd_query import (
+    denoised_endpoint_mse,
     direct_velocity_mse,
     sample_low_noise_query_indices,
     select_per_sample_trajectory_state,
@@ -50,6 +51,27 @@ class DanceOPDQueryTest(unittest.TestCase):
         self.assertTrue(torch.allclose(student.grad, torch.tensor([-1.0, -2.0])))
         self.assertIsNone(teacher.grad)
 
+    def test_denoised_endpoint_mse_detaches_teacher_endpoint(self):
+        student_x = torch.tensor([2.0], requires_grad=True)
+        student_v = torch.tensor([1.0], requires_grad=True)
+        teacher_x = torch.tensor([2.0], requires_grad=True)
+        teacher_v = torch.tensor([0.5], requires_grad=True)
+
+        loss = denoised_endpoint_mse(
+            student_x,
+            student_v,
+            teacher_x,
+            teacher_v,
+            torch.tensor([0.5]),
+        )
+        loss.backward()
+
+        self.assertTrue(torch.allclose(loss, torch.tensor(0.0625)))
+        self.assertIsNotNone(student_x.grad)
+        self.assertIsNotNone(student_v.grad)
+        self.assertIsNone(teacher_x.grad)
+        self.assertIsNone(teacher_v.grad)
+
     def test_flowmatch_terminal_timestep_is_exactly_pure_noise(self):
         scheduler = FlowMatchScheduler(
             num_inference_steps=1000,
@@ -74,6 +96,26 @@ class DanceOPDQueryTest(unittest.TestCase):
         self.assertIn("opd_query_mode", source)
         self.assertIn("direct_velocity_mse(", source)
         self.assertIn("danceopd_terminal_prior_max_error", source)
+
+    def test_danceopd_can_add_an_independent_endpoint_target_once(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "flowmap_step.py"
+        ).read_text(encoding="utf-8")
+        danceopd_block = source.split(
+            "def _danceopd_aux_transition_step("
+        )[1].split("def _opd_aux_transition_step(")[0]
+
+        self.assertIn("def _danceopd_independent_endpoint_loss(", source)
+        self.assertIn("opd_danceopd_endpoint_weight", danceopd_block)
+        self.assertIn("_danceopd_independent_endpoint_loss(", danceopd_block)
+        self.assertEqual(danceopd_block.count("loss.backward()"), 1)
+
+        config_source = (
+            Path(__file__).resolve().parents[1]
+            / "config_robotwin_fullfinetune_stage2_anyflow.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("OPD_DANCEOPD_ENDPOINT_WEIGHT", config_source)
+        self.assertIn("OPD_DANCEOPD_VELOCITY_WEIGHT", config_source)
 
 
 if __name__ == "__main__":

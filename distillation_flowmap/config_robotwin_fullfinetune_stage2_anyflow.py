@@ -145,6 +145,22 @@ if (
     raise ValueError(
         "OPD_DANCEOPD_QUERY_ALPHA and OPD_DANCEOPD_QUERY_BETA must be finite and positive"
     )
+cfg.opd_danceopd_velocity_weight = float(os.environ.get(
+    "OPD_DANCEOPD_VELOCITY_WEIGHT", 1.0
+))
+cfg.opd_danceopd_endpoint_weight = float(os.environ.get(
+    "OPD_DANCEOPD_ENDPOINT_WEIGHT", 0.0
+))
+if (
+    not math.isfinite(cfg.opd_danceopd_velocity_weight)
+    or cfg.opd_danceopd_velocity_weight < 0
+    or not math.isfinite(cfg.opd_danceopd_endpoint_weight)
+    or cfg.opd_danceopd_endpoint_weight < 0
+):
+    raise ValueError(
+        "OPD_DANCEOPD_VELOCITY_WEIGHT and OPD_DANCEOPD_ENDPOINT_WEIGHT "
+        "must be finite and non-negative"
+    )
 cfg.opd_danceopd_verify_terminal_prior = _env_bool(
     "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR", True
 )

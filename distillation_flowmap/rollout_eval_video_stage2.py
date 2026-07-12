@@ -26,6 +26,7 @@ from distributed.util import init_distributed, dist_mean
 from utils import init_logger, logger
 from distillation_flowmap.flowmap_trainer import FlowMapDistiller
 from distillation_flowmap.flowmap_step import _downsample_action_grid_id
+from distillation_flowmap.rollout_eval_steps import normalize_rollout_steps
 from distillation_flowmap.rollout_masking import (
     crop_latent_video_to_valid_frames,
     masked_video_mse_l1,
@@ -192,6 +193,8 @@ def should_save_student_latent_video(
 
 def set_eval_mode_for_optional_students(trainer):
     trainer.student.eval()
+    if getattr(trainer, "teacher", None) is not None:
+        trainer.teacher.eval()
     if getattr(trainer, "target_student", None) is not None:
         trainer.target_student.eval()
     if getattr(trainer, "_student_nofsdp", None) is not None:
@@ -350,7 +353,7 @@ def main():
     parser.add_argument("--eval-pairs-json", type=Path, default=None)
     parser.add_argument("--split-name", default=None)
     parser.add_argument("--student-steps", nargs="+", type=int, default=[1, 2, 4])
-    parser.add_argument("--teacher-steps", type=int, default=4)
+    parser.add_argument("--teacher-steps", nargs="+", type=int, default=[4])
     parser.add_argument("--video-dir", default=None)
     parser.add_argument("--video-fps", type=int, default=10)
     parser.add_argument("--video-max-pairs", type=int, default=1)
@@ -421,6 +424,7 @@ def main():
         help="Use the full non-FSDP teacher copy during offline eval. Disabled by default to reduce memory.",
     )
     args = parser.parse_args()
+    teacher_steps = normalize_rollout_steps(args.teacher_steps)
 
     init_logger()
     rank = int(os.getenv("RANK", 0))
@@ -622,41 +626,26 @@ def main():
             }
 
             pair_name = str(pair_spec.get("pair_id") or f"t{int(t_value)}_r{int(r_value)}")
-            teacher_x_r = None
-            teacher_v_r = None
-            if not is_cosmos_policy_teacher:
-                teacher_x_r, teacher_v_r = trainer._teacher_integrate_to_r(
-                    noisy_latents=video_noisy_t,
-                    timesteps=video_t,
-                    target_r=video_r,
-                    input_dict=input_dict,
-                    empty_emb=empty_emb,
-                    cfg_scale=args.cfg_scale,
-                    ref_shape=ref_shape,
-                    B=B,
-                    num_frames=num_frames,
-                    num_steps=args.teacher_steps,
-                )
             videos_to_save = {}
             save_official_future_video = False
-            if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
+            should_save_videos = (
+                rank == 0
+                and video_dir is not None
+                and batch_idx == 0
+                and saved_video_pairs < args.video_max_pairs
+            )
+            if should_save_videos:
                 sample_idx = min(max(args.video_sample_index, 0), B - 1)
                 videos_to_save["gt_r"] = crop_latent_video_to_valid_frames(
                     video_noisy_r[sample_idx:sample_idx + 1],
                     video_frame_mask,
                     sample_idx=sample_idx,
                 ).detach().cpu()
-                if is_cosmos_policy_teacher:
-                    save_official_future_video = True
-                else:
-                    videos_to_save[f"teacher_t{args.teacher_steps}"] = (
-                        crop_latent_video_to_valid_frames(
-                            teacher_x_r[sample_idx:sample_idx + 1],
-                            video_frame_mask,
-                            sample_idx=sample_idx,
-                        ).detach().cpu()
-                    )
+                save_official_future_video = is_cosmos_policy_teacher
 
+            # Roll out each student budget once. Every teacher budget below will
+            # compare against these same states, noise realization, and condition.
+            student_rollouts = {}
             for k_steps in args.student_steps:
                 rollout_out = trainer._student_euler_integrate(
                     noisy_latents=video_noisy_t,
@@ -677,7 +666,7 @@ def main():
                 else:
                     student_x_r, student_v_r = rollout_out
                     student_action_seq = None
-                if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
+                if should_save_videos:
                     sample_idx = min(max(args.video_sample_index, 0), B - 1)
                     if save_student_latent_video:
                         videos_to_save[f"student_s{k_steps}"] = crop_latent_video_to_valid_frames(
@@ -685,33 +674,15 @@ def main():
                             video_frame_mask,
                             sample_idx=sample_idx,
                         ).detach().cpu()
-                prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{args.teacher_steps}"
-                if teacher_x_r is not None and teacher_v_r is not None:
-                    mse, l1 = masked_video_mse_l1(teacher_x_r - video_noisy_r, video_frame_mask)
-                    add(prefix + "/video_teacher_gt_x_mse", mse)
-                    add(prefix + "/video_teacher_gt_x_l1", l1)
-                    mse, _ = masked_video_mse_l1(teacher_v_r - video_v_target_r, video_frame_mask)
-                    add(prefix + "/video_teacher_gt_v_mse", mse)
-                    mse, l1 = masked_video_mse_l1(student_x_r - teacher_x_r, video_frame_mask)
-                    add(prefix + "/video_teacher_x_mse", mse)
-                    add(prefix + "/video_teacher_x_l1", l1)
-                    mse, l1 = masked_video_mse_l1(student_v_r - teacher_v_r, video_frame_mask)
-                    add(prefix + "/video_teacher_v_mse", mse)
-                    add(prefix + "/video_teacher_v_l1", l1)
+                student_metrics = {}
                 mse, l1 = masked_video_mse_l1(student_x_r - video_noisy_r, video_frame_mask)
-                add(prefix + "/video_gt_x_mse", mse)
-                add(prefix + "/video_gt_x_l1", l1)
+                student_metrics["/video_gt_x_mse"] = mse
+                student_metrics["/video_gt_x_l1"] = l1
                 mse, _ = masked_video_mse_l1(student_v_r - video_v_target_r, video_frame_mask)
-                add(prefix + "/video_gt_v_mse", mse)
-                add(prefix + "/video_latent_norm", masked_video_rms(student_x_r, video_frame_mask))
-
-                if args.eval_empty_cache and k_steps == args.student_steps[-1]:
-                    teacher_x_r = teacher_v_r = None
-                    student_v_r = None
-                    video_noisy_r = video_v_target_r = None
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                student_metrics["/video_gt_v_mse"] = mse
+                student_metrics["/video_latent_norm"] = masked_video_rms(
+                    student_x_r, video_frame_mask
+                )
 
                 action_input = None
                 if student_action_seq is None:
@@ -752,32 +723,84 @@ def main():
                 mask = batch.get("actions_mask")
                 mask_ds = mask[:, :, ::action_ds] if mask is not None else None
                 mse, l1 = masked_mse_l1(action_pred_xr - action_noisy_r_ds, mask_ds)
-                add(prefix + "/action_gt_xr_mse", mse)
-                add(prefix + "/action_gt_xr_l1", l1)
+                student_metrics["/action_gt_xr_mse"] = mse
+                student_metrics["/action_gt_xr_l1"] = l1
                 mse, l1 = masked_mse_l1(student_action_v - action_v_target_ds, mask_ds)
-                add(prefix + "/action_gt_v_mse", mse)
-                add(prefix + "/action_gt_v_l1", l1)
+                student_metrics["/action_gt_v_mse"] = mse
+                student_metrics["/action_gt_v_l1"] = l1
                 if student_action_v.shape[2] > 1:
                     smooth = (student_action_v[:, :, 1:] - student_action_v[:, :, :-1]).float().abs().mean()
-                    add(prefix + "/action_v_smoothness_l1", smooth)
-                add(prefix + "/action_v_norm", student_action_v.float().pow(2).mean().sqrt())
+                    student_metrics["/action_v_smoothness_l1"] = smooth
+                student_metrics["/action_v_norm"] = student_action_v.float().pow(2).mean().sqrt()
+                student_rollouts[k_steps] = {
+                    "x": student_x_r.detach(),
+                    "v": student_v_r.detach(),
+                    "metrics": student_metrics,
+                }
+                del (
+                    action_input,
+                    student_action_v,
+                    action_noisy_t_ds,
+                    action_noisy_r_ds,
+                    action_v_target_ds,
+                    action_sigma_t,
+                    action_sigma_r,
+                    action_pred_xr,
+                )
 
-                if args.eval_empty_cache:
-                    del (
-                        student_x_r,
-                        student_v_r,
-                        action_input,
-                        student_action_v,
-                        action_noisy_t_ds,
-                        action_noisy_r_ds,
-                        action_v_target_ds,
-                        action_sigma_t,
-                        action_sigma_r,
-                        action_pred_xr,
+            comparison_teacher_steps = (
+                teacher_steps if not is_cosmos_policy_teacher else [teacher_steps[-1]]
+            )
+            for teacher_step in comparison_teacher_steps:
+                teacher_x_r = teacher_v_r = None
+                if not is_cosmos_policy_teacher:
+                    teacher_x_r, teacher_v_r = trainer._teacher_integrate_to_r(
+                        noisy_latents=video_noisy_t,
+                        timesteps=video_t,
+                        target_r=video_r,
+                        input_dict=input_dict,
+                        empty_emb=empty_emb,
+                        cfg_scale=args.cfg_scale,
+                        ref_shape=ref_shape,
+                        B=B,
+                        num_frames=num_frames,
+                        num_steps=teacher_step,
                     )
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    if should_save_videos:
+                        sample_idx = min(max(args.video_sample_index, 0), B - 1)
+                        videos_to_save[f"teacher_t{teacher_step}"] = (
+                            crop_latent_video_to_valid_frames(
+                                teacher_x_r[sample_idx:sample_idx + 1],
+                                video_frame_mask,
+                                sample_idx=sample_idx,
+                            ).detach().cpu()
+                        )
+
+                for k_steps, student_result in student_rollouts.items():
+                    prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{teacher_step}"
+                    if teacher_x_r is not None and teacher_v_r is not None:
+                        mse, l1 = masked_video_mse_l1(
+                            teacher_x_r - video_noisy_r, video_frame_mask
+                        )
+                        add(prefix + "/video_teacher_gt_x_mse", mse)
+                        add(prefix + "/video_teacher_gt_x_l1", l1)
+                        mse, _ = masked_video_mse_l1(
+                            teacher_v_r - video_v_target_r, video_frame_mask
+                        )
+                        add(prefix + "/video_teacher_gt_v_mse", mse)
+                        mse, l1 = masked_video_mse_l1(
+                            student_result["x"] - teacher_x_r, video_frame_mask
+                        )
+                        add(prefix + "/video_teacher_x_mse", mse)
+                        add(prefix + "/video_teacher_x_l1", l1)
+                        mse, l1 = masked_video_mse_l1(
+                            student_result["v"] - teacher_v_r, video_frame_mask
+                        )
+                        add(prefix + "/video_teacher_v_mse", mse)
+                        add(prefix + "/video_teacher_v_l1", l1)
+                    for name, value in student_result["metrics"].items():
+                        add(prefix + name, value)
+                del teacher_x_r, teacher_v_r
 
             if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
                 decoded = {}
@@ -846,7 +869,7 @@ def main():
                 video_frame_mask = None
                 video_noisy_t = video_noisy_r = video_v_target_r = None
                 action_noisy_t = action_noisy_r = action_v_target_t = None
-                input_dict = student_input = videos_to_save = None
+                input_dict = student_input = videos_to_save = student_rollouts = None
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()

@@ -20,7 +20,7 @@ MASTER_PORT_BASE="${MASTER_PORT_BASE:-34000}"
 MAX_PARALLEL="${MAX_PARALLEL:-2}"
 EVAL_GPUS="${EVAL_GPUS:-6,7}"
 STUDENT_STEPS="${STUDENT_STEPS:-1 2 4}"
-TEACHER_STEPS="${TEACHER_STEPS:-4}"
+TEACHER_STEPS="${TEACHER_STEPS:-1 2 4 8}"
 TEACHER_CACHE_SOURCE_VARIANT="${TEACHER_CACHE_SOURCE_VARIANT:-full_stepwam}"
 TEACHER_CACHE_SOURCE_SEED="${TEACHER_CACHE_SOURCE_SEED:-0}"
 BASELINE_VARIANT="${BASELINE_VARIANT:-w_o_opd}"
@@ -59,6 +59,7 @@ IFS=',' read -r -a eval_gpu_list <<< "${EVAL_GPUS}"
 IFS=',' read -r -a video_variant_list <<< "${VIDEO_VARIANTS}"
 IFS=',' read -r -a video_seed_list <<< "${VIDEO_SEEDS}"
 read -r -a student_step_list <<< "${STUDENT_STEPS}"
+read -r -a teacher_step_list <<< "${TEACHER_STEPS}"
 
 if [ "${#eval_gpu_list[@]}" -eq 0 ]; then
   echo "EVAL_GPUS must contain at least one GPU id" >&2
@@ -70,8 +71,8 @@ TRAIN_MANIFEST="${PROTOCOL_DIR}/train_manifest.json"
 HELDOUT_MANIFEST="${PROTOCOL_DIR}/heldout_eval_manifest.json"
 TRAIN_EVAL_MANIFEST="${PROTOCOL_DIR}/train_eval_manifest.json"
 EVAL_PAIRS="${PROTOCOL_DIR}/eval_pairs.json"
-TEACHER_CACHE="${TEACHER_CACHE:-${ROOT}/protocol/teacher_cache_heldout_final.pt}"
-TRAIN_TEACHER_CACHE="${TRAIN_TEACHER_CACHE:-${ROOT}/protocol/teacher_cache_train_eval_final.pt}"
+TEACHER_CACHE="${TEACHER_CACHE:-${ROOT}/protocol/teacher_cache_heldout_equal_nfe.pt}"
+TRAIN_TEACHER_CACHE="${TRAIN_TEACHER_CACHE:-${ROOT}/protocol/teacher_cache_train_eval_equal_nfe.pt}"
 SUMMARY_DIR="${SUMMARY_DIR:-${ROOT}/summary_final}"
 mkdir -p "${ROOT}/protocol" "${SUMMARY_DIR}"
 
@@ -153,7 +154,7 @@ build_teacher_cache() {
     --split-name "${split_name}" \
     --num-batches 0 \
     --student-steps 4 \
-    --teacher-steps "${TEACHER_STEPS}" \
+    --teacher-steps "${teacher_step_list[@]}" \
     --disable-eval-gradient-checkpointing \
     --disable-eval-force-cfg \
     --eval-rollout-grad-mode endpoint \
@@ -212,7 +213,7 @@ launch_rollout_eval() {
       --resume-from-path "${ckpt}" --result-json "${run_dir}/metrics/${result_name}.json" \
       --teacher-cache-path "${cache_path}" --eval-manifest "${manifest_path}" \
       --eval-pairs-json "${EVAL_PAIRS}" --split-name "${split_name}" --num-batches 0 \
-      --student-steps 4 --teacher-steps "${TEACHER_STEPS}" --disable-eval-gradient-checkpointing \
+      --student-steps 4 --teacher-steps "${teacher_step_list[@]}" --disable-eval-gradient-checkpointing \
       --disable-eval-force-cfg --eval-rollout-grad-mode endpoint --eval-empty-cache
     return
   fi
@@ -233,7 +234,7 @@ launch_rollout_eval() {
     --split-name "${split_name}" \
     --num-batches 0 \
     --student-steps 4 \
-    --teacher-steps "${TEACHER_STEPS}" \
+    --teacher-steps "${teacher_step_list[@]}" \
     --disable-eval-gradient-checkpointing \
     --disable-eval-force-cfg \
     --eval-rollout-grad-mode endpoint \
@@ -302,7 +303,7 @@ run_video_eval() {
         --split-name heldout \
         --num-batches 0 \
         --student-steps "${student_step_list[@]}" \
-        --teacher-steps "${TEACHER_STEPS}" \
+        --teacher-steps "${teacher_step_list[@]}" \
         --video-max-pairs "${VIDEO_MAX_PAIRS}" \
         --video-decode-device cpu \
         --disable-eval-gradient-checkpointing \

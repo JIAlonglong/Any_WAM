@@ -30,6 +30,7 @@ from distributed.util import init_distributed, dist_mean
 from utils import init_logger, logger
 from distillation_flowmap.flowmap_trainer import FlowMapDistiller
 from distillation_flowmap.flowmap_step import _downsample_action_grid_id
+from distillation_flowmap.rollout_eval_steps import normalize_rollout_steps
 from distillation_flowmap.rollout_masking import (
     masked_video_mse_l1,
     masked_video_rms,
@@ -176,7 +177,7 @@ def main():
     parser.add_argument("--eval-pairs-json", type=Path, default=None)
     parser.add_argument("--split-name", default=None)
     parser.add_argument("--student-steps", nargs="+", type=int, default=[1, 2, 4])
-    parser.add_argument("--teacher-steps", type=int, default=4)
+    parser.add_argument("--teacher-steps", nargs="+", type=int, default=[4])
     parser.add_argument(
         "--load-target-student",
         action="store_true",
@@ -234,6 +235,7 @@ def main():
         help="Recompute teacher targets even when --teacher-cache-path already exists.",
     )
     args = parser.parse_args()
+    teacher_steps = normalize_rollout_steps(args.teacher_steps)
 
     init_logger()
     rank = int(os.getenv("RANK", 0))
@@ -307,6 +309,8 @@ def main():
 
     trainer = FlowMapDistiller(cfg)
     trainer.student.eval()
+    if getattr(trainer, "teacher", None) is not None:
+        trainer.teacher.eval()
     if trainer.target_student is not None:
         trainer.target_student.eval()
     if getattr(trainer, "_student_nofsdp", None) is not None:
@@ -426,43 +430,69 @@ def main():
                 pair_id=pair_name,
                 sample_key=record.get("sample_key"),
             )
-            if use_teacher_cache:
+
+            def cache_teacher_target(teacher_step, teacher_x_r, teacher_v_r):
+                if teacher_cache_path is None or rank != 0:
+                    return
+                entry = teacher_cache_to_write.setdefault(
+                    cache_key, {"teacher_by_steps": {}}
+                )
+                entry["teacher_by_steps"][str(teacher_step)] = {
+                    "teacher_x_r": teacher_x_r.detach().cpu(),
+                    "teacher_v_r": teacher_v_r.detach().cpu(),
+                }
+
+            def load_teacher_target(teacher_step):
                 targets = teacher_cache.get("targets", {})
                 if cache_key not in targets:
                     raise KeyError(f"Teacher cache missing key: {cache_key}")
                 cached = targets[cache_key]
-                teacher_x_r = cached["teacher_x_r"].to(
-                    device=trainer.device,
-                    dtype=video_noisy_t.dtype,
-                    non_blocking=True,
+                if "teacher_by_steps" in cached:
+                    by_step = cached["teacher_by_steps"]
+                    if str(teacher_step) not in by_step:
+                        raise KeyError(
+                            f"Teacher cache missing step {teacher_step} for key: {cache_key}"
+                        )
+                    cached = by_step[str(teacher_step)]
+                elif len(teacher_steps) != 1:
+                    raise ValueError(
+                        "Legacy scalar teacher cache cannot satisfy multiple teacher steps; "
+                        "rebuild it with --teacher-cache-only."
+                    )
+                return (
+                    cached["teacher_x_r"].to(
+                        device=trainer.device,
+                        dtype=video_noisy_t.dtype,
+                        non_blocking=True,
+                    ),
+                    cached["teacher_v_r"].to(
+                        device=trainer.device,
+                        dtype=video_noisy_t.dtype,
+                        non_blocking=True,
+                    ),
                 )
-                teacher_v_r = cached["teacher_v_r"].to(
-                    device=trainer.device,
-                    dtype=video_noisy_t.dtype,
-                    non_blocking=True,
-                )
-            else:
-                teacher_x_r, teacher_v_r = trainer._teacher_integrate_to_r(
-                    noisy_latents=video_noisy_t,
-                    timesteps=video_t,
-                    target_r=video_r,
-                    input_dict=input_dict,
-                    empty_emb=empty_emb,
-                    cfg_scale=args.cfg_scale,
-                    ref_shape=ref_shape,
-                    B=B,
-                    num_frames=num_frames,
-                    num_steps=args.teacher_steps,
-                )
-                if teacher_cache_path is not None and rank == 0:
-                    teacher_cache_to_write[cache_key] = {
-                        "teacher_x_r": teacher_x_r.detach().cpu(),
-                        "teacher_v_r": teacher_v_r.detach().cpu(),
-                    }
 
             if args.teacher_cache_only:
+                for teacher_step in teacher_steps:
+                    teacher_x_r, teacher_v_r = trainer._teacher_integrate_to_r(
+                        noisy_latents=video_noisy_t,
+                        timesteps=video_t,
+                        target_r=video_r,
+                        input_dict=input_dict,
+                        empty_emb=empty_emb,
+                        cfg_scale=args.cfg_scale,
+                        ref_shape=ref_shape,
+                        B=B,
+                        num_frames=num_frames,
+                        num_steps=teacher_step,
+                    )
+                    cache_teacher_target(teacher_step, teacher_x_r, teacher_v_r)
+                    del teacher_x_r, teacher_v_r
                 continue
 
+            # Compute each student trajectory once. All teacher budgets below
+            # compare against identical x_t, r, noise, and student states.
+            student_rollouts = {}
             for k_steps in args.student_steps:
                 rollout_out = trainer._student_euler_integrate(
                     noisy_latents=video_noisy_t,
@@ -483,32 +513,15 @@ def main():
                 else:
                     student_x_r, student_v_r = rollout_out
                     student_action_seq = None
-                prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{args.teacher_steps}"
-                mse, l1 = masked_video_mse_l1(teacher_x_r - video_noisy_r, video_frame_mask)
-                add(prefix + "/video_teacher_gt_x_mse", mse)
-                add(prefix + "/video_teacher_gt_x_l1", l1)
-                mse, _ = masked_video_mse_l1(teacher_v_r - video_v_target_r, video_frame_mask)
-                add(prefix + "/video_teacher_gt_v_mse", mse)
-                mse, l1 = masked_video_mse_l1(student_x_r - teacher_x_r, video_frame_mask)
-                add(prefix + "/video_teacher_x_mse", mse)
-                add(prefix + "/video_teacher_x_l1", l1)
-                mse, l1 = masked_video_mse_l1(student_v_r - teacher_v_r, video_frame_mask)
-                add(prefix + "/video_teacher_v_mse", mse)
-                add(prefix + "/video_teacher_v_l1", l1)
+                student_metrics = {}
                 mse, l1 = masked_video_mse_l1(student_x_r - video_noisy_r, video_frame_mask)
-                add(prefix + "/video_gt_x_mse", mse)
-                add(prefix + "/video_gt_x_l1", l1)
+                student_metrics["/video_gt_x_mse"] = mse
+                student_metrics["/video_gt_x_l1"] = l1
                 mse, _ = masked_video_mse_l1(student_v_r - video_v_target_r, video_frame_mask)
-                add(prefix + "/video_gt_v_mse", mse)
-                add(prefix + "/video_latent_norm", masked_video_rms(student_x_r, video_frame_mask))
-
-                if args.eval_empty_cache and k_steps == args.student_steps[-1]:
-                    teacher_x_r = teacher_v_r = None
-                    student_v_r = None
-                    video_noisy_r = video_v_target_r = None
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                student_metrics["/video_gt_v_mse"] = mse
+                student_metrics["/video_latent_norm"] = masked_video_rms(
+                    student_x_r, video_frame_mask
+                )
 
                 action_input = None
                 if student_action_seq is None:
@@ -549,32 +562,73 @@ def main():
                 mask = batch.get("actions_mask")
                 mask_ds = mask[:, :, ::action_ds] if mask is not None else None
                 mse, l1 = masked_mse_l1(action_pred_xr - action_noisy_r_ds, mask_ds)
-                add(prefix + "/action_gt_xr_mse", mse)
-                add(prefix + "/action_gt_xr_l1", l1)
+                student_metrics["/action_gt_xr_mse"] = mse
+                student_metrics["/action_gt_xr_l1"] = l1
                 mse, l1 = masked_mse_l1(student_action_v - action_v_target_ds, mask_ds)
-                add(prefix + "/action_gt_v_mse", mse)
-                add(prefix + "/action_gt_v_l1", l1)
+                student_metrics["/action_gt_v_mse"] = mse
+                student_metrics["/action_gt_v_l1"] = l1
                 if student_action_v.shape[2] > 1:
                     smooth = (student_action_v[:, :, 1:] - student_action_v[:, :, :-1]).float().abs().mean()
-                    add(prefix + "/action_v_smoothness_l1", smooth)
-                add(prefix + "/action_v_norm", student_action_v.float().pow(2).mean().sqrt())
+                    student_metrics["/action_v_smoothness_l1"] = smooth
+                student_metrics["/action_v_norm"] = student_action_v.float().pow(2).mean().sqrt()
+                student_rollouts[k_steps] = {
+                    "x": student_x_r.detach(),
+                    "v": student_v_r.detach(),
+                    "metrics": student_metrics,
+                }
+                del (
+                    action_input,
+                    student_action_v,
+                    action_noisy_t_ds,
+                    action_noisy_r_ds,
+                    action_v_target_ds,
+                    action_sigma_t,
+                    action_sigma_r,
+                    action_pred_xr,
+                )
 
-                if args.eval_empty_cache and k_steps == args.student_steps[-1]:
-                    del (
-                        student_x_r,
-                        student_v_r,
-                        action_input,
-                        student_action_v,
-                        action_noisy_t_ds,
-                        action_noisy_r_ds,
-                        action_v_target_ds,
-                        action_sigma_t,
-                        action_sigma_r,
-                        action_pred_xr,
+            for teacher_step in teacher_steps:
+                if use_teacher_cache:
+                    teacher_x_r, teacher_v_r = load_teacher_target(teacher_step)
+                else:
+                    teacher_x_r, teacher_v_r = trainer._teacher_integrate_to_r(
+                        noisy_latents=video_noisy_t,
+                        timesteps=video_t,
+                        target_r=video_r,
+                        input_dict=input_dict,
+                        empty_emb=empty_emb,
+                        cfg_scale=args.cfg_scale,
+                        ref_shape=ref_shape,
+                        B=B,
+                        num_frames=num_frames,
+                        num_steps=teacher_step,
                     )
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    cache_teacher_target(teacher_step, teacher_x_r, teacher_v_r)
+
+                for k_steps, student_result in student_rollouts.items():
+                    prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{teacher_step}"
+                    mse, l1 = masked_video_mse_l1(
+                        teacher_x_r - video_noisy_r, video_frame_mask
+                    )
+                    add(prefix + "/video_teacher_gt_x_mse", mse)
+                    add(prefix + "/video_teacher_gt_x_l1", l1)
+                    mse, _ = masked_video_mse_l1(
+                        teacher_v_r - video_v_target_r, video_frame_mask
+                    )
+                    add(prefix + "/video_teacher_gt_v_mse", mse)
+                    mse, l1 = masked_video_mse_l1(
+                        student_result["x"] - teacher_x_r, video_frame_mask
+                    )
+                    add(prefix + "/video_teacher_x_mse", mse)
+                    add(prefix + "/video_teacher_x_l1", l1)
+                    mse, l1 = masked_video_mse_l1(
+                        student_result["v"] - teacher_v_r, video_frame_mask
+                    )
+                    add(prefix + "/video_teacher_v_mse", mse)
+                    add(prefix + "/video_teacher_v_l1", l1)
+                    for name, value in student_result["metrics"].items():
+                        add(prefix + name, value)
+                del teacher_x_r, teacher_v_r
 
             if args.eval_empty_cache:
                 teacher_x_r = teacher_v_r = None
@@ -582,7 +636,7 @@ def main():
                 video_noise = action_noise = None
                 video_noisy_t = video_noisy_r = video_v_target_r = None
                 action_noisy_t = action_noisy_r = action_v_target_t = None
-                input_dict = student_input = None
+                input_dict = student_input = student_rollouts = None
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -602,7 +656,7 @@ def main():
                     "eval_manifest": str(args.eval_manifest) if args.eval_manifest else None,
                     "eval_pairs_json": str(args.eval_pairs_json) if args.eval_pairs_json else None,
                     "split_name": args.split_name,
-                    "teacher_steps": args.teacher_steps,
+                    "teacher_steps": teacher_steps,
                 },
                 "targets": teacher_cache_to_write,
             },

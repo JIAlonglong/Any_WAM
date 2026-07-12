@@ -31,6 +31,16 @@ class RolloutEvalStepsTest(unittest.TestCase):
         )
         self.assertIn('TEACHER_STEPS="${TEACHER_STEPS:-1 2 4 8}"', source)
 
+    def test_final_eval_propagates_student_curve_to_numeric_rollouts(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "ablation" / "run_final_eval.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("--student-steps 4", source)
+        self.assertGreaterEqual(
+            source.count('--student-steps "${student_step_list[@]}"'), 4
+        )
+
     def test_offline_evaluators_freeze_teacher_in_eval_mode(self):
         root = Path(__file__).resolve().parents[1]
         for filename in ("rollout_eval_stage2.py", "rollout_eval_video_stage2.py"):

@@ -79,7 +79,7 @@ def test_final_eval_launcher_reuses_heldout_cache_and_summarizes():
     assert 'ROOT="${ROOT:-${PROJECT_ROOT}/distillation_flowmap/output_robotwin_stepwam_ablation/protocol_final12_5000}"' in source
     assert 'VARIANTS="${VARIANTS:-full_stepwam,w_o_opd,endpoint_only_opd,velocity_only_opd,local_adjacent_only,action_only}"' in source
     assert 'SEEDS="${SEEDS:-0,1,2}"' in source
-    assert 'TEACHER_CACHE="${TEACHER_CACHE:-${ROOT}/protocol/teacher_cache_heldout_final.pt}"' in source
+    assert 'TEACHER_CACHE="${TEACHER_CACHE:-${ROOT}/protocol/teacher_cache_heldout_equal_nfe.pt}"' in source
     assert "--teacher-cache-only" in source
     assert "--teacher-cache-path" in source
     assert "--disable-eval-gradient-checkpointing" in source
@@ -97,14 +97,14 @@ def test_final_eval_supports_calibrated_teacher_and_cache_source_overrides():
     source = _final_eval_source()
 
     assert 'STUDENT_STEPS="${STUDENT_STEPS:-1 2 4}"' in source
-    assert 'TEACHER_STEPS="${TEACHER_STEPS:-4}"' in source
+    assert 'TEACHER_STEPS="${TEACHER_STEPS:-1 2 4 8}"' in source
     assert 'TEACHER_CACHE_SOURCE_VARIANT="${TEACHER_CACHE_SOURCE_VARIANT:-full_stepwam}"' in source
     assert 'TEACHER_CACHE_SOURCE_SEED="${TEACHER_CACHE_SOURCE_SEED:-0}"' in source
     assert 'BASELINE_VARIANT="${BASELINE_VARIANT:-w_o_opd}"' in source
     assert 'stage2_ckpt "${TEACHER_CACHE_SOURCE_VARIANT}" "${TEACHER_CACHE_SOURCE_SEED}"' in source
-    assert source.count('--teacher-steps "${TEACHER_STEPS}"') == 4
+    assert source.count('--teacher-steps "${teacher_step_list[@]}"') == 4
     assert 'read -r -a student_step_list <<< "${STUDENT_STEPS}"' in source
-    assert '--student-steps "${student_step_list[@]}"' in source
+    assert source.count('--student-steps "${student_step_list[@]}"') == 4
     assert '--baseline-variant "${BASELINE_VARIANT}"' in source
 
 

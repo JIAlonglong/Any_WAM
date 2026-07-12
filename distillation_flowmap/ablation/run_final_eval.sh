@@ -153,7 +153,7 @@ build_teacher_cache() {
     --eval-pairs-json "${EVAL_PAIRS}" \
     --split-name "${split_name}" \
     --num-batches 0 \
-    --student-steps 4 \
+    --student-steps "${student_step_list[@]}" \
     --teacher-steps "${teacher_step_list[@]}" \
     --disable-eval-gradient-checkpointing \
     --disable-eval-force-cfg \
@@ -213,7 +213,7 @@ launch_rollout_eval() {
       --resume-from-path "${ckpt}" --result-json "${run_dir}/metrics/${result_name}.json" \
       --teacher-cache-path "${cache_path}" --eval-manifest "${manifest_path}" \
       --eval-pairs-json "${EVAL_PAIRS}" --split-name "${split_name}" --num-batches 0 \
-      --student-steps 4 --teacher-steps "${teacher_step_list[@]}" --disable-eval-gradient-checkpointing \
+      --student-steps "${student_step_list[@]}" --teacher-steps "${teacher_step_list[@]}" --disable-eval-gradient-checkpointing \
       --disable-eval-force-cfg --eval-rollout-grad-mode endpoint --eval-empty-cache
     return
   fi
@@ -233,7 +233,7 @@ launch_rollout_eval() {
     --eval-pairs-json "${EVAL_PAIRS}" \
     --split-name "${split_name}" \
     --num-batches 0 \
-    --student-steps 4 \
+    --student-steps "${student_step_list[@]}" \
     --teacher-steps "${teacher_step_list[@]}" \
     --disable-eval-gradient-checkpointing \
     --disable-eval-force-cfg \

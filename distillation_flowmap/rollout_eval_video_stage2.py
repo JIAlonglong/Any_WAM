@@ -26,6 +26,9 @@ from distributed.util import init_distributed, dist_mean
 from utils import init_logger, logger
 from distillation_flowmap.flowmap_trainer import FlowMapDistiller
 from distillation_flowmap.flowmap_step import _downsample_action_grid_id
+from distillation_flowmap.rollout_eval_conditioning import (
+    freeze_offline_eval_conditioning,
+)
 from distillation_flowmap.rollout_eval_steps import normalize_rollout_steps
 from distillation_flowmap.rollout_masking import (
     crop_latent_video_to_valid_frames,
@@ -479,6 +482,9 @@ def main():
 
     trainer = FlowMapDistiller(cfg)
     set_eval_mode_for_optional_students(trainer)
+    conditioning_metadata = freeze_offline_eval_conditioning(trainer)
+    if rank == 0:
+        logger.info("Offline eval conditioning: %s", conditioning_metadata)
 
     action_ds = getattr(trainer.config, "action_downsample_factor", 4)
     pair_specs = (

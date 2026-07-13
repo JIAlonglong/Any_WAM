@@ -31,6 +31,11 @@ from utils import init_logger, logger
 from distillation_flowmap.flowmap_trainer import FlowMapDistiller
 from distillation_flowmap.flowmap_step import _downsample_action_grid_id
 from distillation_flowmap.rollout_eval_steps import normalize_rollout_steps
+from distillation_flowmap.rollout_eval_conditioning import (
+    CACHE_CONDITIONING_METADATA_KEY,
+    cache_metadata_matches_offline_conditioning,
+    freeze_offline_eval_conditioning,
+)
 from distillation_flowmap.rollout_masking import (
     masked_video_mse_l1,
     masked_video_rms,
@@ -244,12 +249,42 @@ def main():
     init_distributed(world_size, local_rank, rank)
 
     teacher_cache_path = Path(args.teacher_cache_path) if args.teacher_cache_path else None
+    teacher_cache_payload = None
+    teacher_cache_compatible = False
+    if (
+        teacher_cache_path is not None
+        and teacher_cache_path.exists()
+        and not args.refresh_teacher_cache
+    ):
+        try:
+            teacher_cache_payload = torch.load(
+                teacher_cache_path,
+                map_location="cpu",
+                mmap=True,
+                weights_only=False,
+            )
+            teacher_cache_compatible = cache_metadata_matches_offline_conditioning(
+                teacher_cache_payload.get("metadata", {})
+            )
+        except Exception as exc:
+            if rank == 0:
+                logger.warning(
+                    "Ignoring unreadable teacher cache at %s: %s",
+                    teacher_cache_path,
+                    exc,
+                )
+        if not teacher_cache_compatible and rank == 0:
+            logger.warning(
+                "Ignoring teacher cache without deterministic conditioning schema: %s",
+                teacher_cache_path,
+            )
     if args.teacher_cache_only and teacher_cache_path is None:
         raise ValueError("--teacher-cache-only requires --teacher-cache-path")
     if (
         args.teacher_cache_only
         and teacher_cache_path is not None
         and teacher_cache_path.exists()
+        and teacher_cache_compatible
         and not args.refresh_teacher_cache
     ):
         if rank == 0:
@@ -260,12 +295,12 @@ def main():
     use_teacher_cache = (
         teacher_cache_path is not None
         and teacher_cache_path.exists()
+        and teacher_cache_compatible
         and not args.refresh_teacher_cache
         and not args.teacher_cache_only
     )
-    teacher_cache = None
+    teacher_cache = teacher_cache_payload if use_teacher_cache else None
     if use_teacher_cache:
-        teacher_cache = torch.load(teacher_cache_path, map_location="cpu")
         if rank == 0:
             logger.info("Loaded teacher cache from %s", teacher_cache_path)
     teacher_cache_to_write = {}
@@ -315,6 +350,9 @@ def main():
         trainer.target_student.eval()
     if getattr(trainer, "_student_nofsdp", None) is not None:
         trainer._student_nofsdp.eval()
+    conditioning_metadata = freeze_offline_eval_conditioning(trainer)
+    if rank == 0:
+        logger.info("Offline eval conditioning: %s", conditioning_metadata)
 
     action_ds = getattr(trainer.config, "action_downsample_factor", 4)
     pair_specs = (
@@ -657,6 +695,7 @@ def main():
                     "eval_pairs_json": str(args.eval_pairs_json) if args.eval_pairs_json else None,
                     "split_name": args.split_name,
                     "teacher_steps": teacher_steps,
+                    CACHE_CONDITIONING_METADATA_KEY: conditioning_metadata,
                 },
                 "targets": teacher_cache_to_write,
             },

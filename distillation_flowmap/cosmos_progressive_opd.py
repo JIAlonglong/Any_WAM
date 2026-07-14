@@ -95,3 +95,12 @@ def apply_full_endpoint_focus(
         torch.where(expanded_mask, full_r, target_timesteps),
         focus_mask,
     )
+
+
+def should_run_standalone_opd(*, step, warmup_steps, interval):
+    """Return whether this optimizer update is reserved for a full OPD loss."""
+    if int(warmup_steps) < 0:
+        raise ValueError("warmup_steps must be non-negative")
+    if int(interval) <= 0:
+        raise ValueError("interval must be positive")
+    return int(step) >= int(warmup_steps) and int(step) % int(interval) == 0

@@ -32,6 +32,7 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
     assert module.cfg.opd_danceopd_endpoint_weight > 0
     assert module.cfg.opd_danceopd_velocity_weight > 0
     assert module.cfg.opd_serial_student_cfg is True
+    assert module.cfg.opd_aux_standalone_step is True
 
 
 def test_progressive_k1_uses_four_step_teacher_not_two(monkeypatch):

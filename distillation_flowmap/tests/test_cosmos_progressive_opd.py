@@ -3,6 +3,7 @@ import torch
 from distillation_flowmap.cosmos_progressive_opd import (
     apply_full_endpoint_focus,
     rollout_velocity_field,
+    should_run_standalone_opd,
 )
 
 
@@ -54,3 +55,11 @@ def test_zero_focus_leaves_random_endpoint_pairs_unchanged():
     assert not bool(focus_mask.any())
     assert torch.equal(focused_t, t)
     assert torch.equal(focused_r, r)
+
+
+def test_standalone_opd_schedule_respects_warmup_and_interval():
+    assert not should_run_standalone_opd(step=0, warmup_steps=8, interval=8)
+    assert not should_run_standalone_opd(step=7, warmup_steps=8, interval=8)
+    assert should_run_standalone_opd(step=8, warmup_steps=8, interval=8)
+    assert not should_run_standalone_opd(step=9, warmup_steps=8, interval=8)
+    assert should_run_standalone_opd(step=16, warmup_steps=8, interval=8)

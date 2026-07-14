@@ -42,6 +42,7 @@ from distributed.util import _configure_model, dist_mean
 from modules.utils import WanVAEStreamingWrapper, load_transformer, load_vae
 from utils import logger, warmup_constant_lambda, FlowMatchScheduler
 from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+from distillation_flowmap.cosmos_progressive_opd import should_run_standalone_opd
 from distillation_flowmap.cosmos_teacher_roles import resolve_teacher_roles
 from distillation_flowmap.ablation.robotwin_diagnostics import (
     classify_parameter_branch,
@@ -2534,22 +2535,27 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             use_onpolicy = self.use_onpolicy_transition
             onpolicy_warmup = getattr(self.config, 'onpolicy_warmup_steps', 0)
             use_onpolicy_now = (use_onpolicy and self.step >= onpolicy_warmup)
-
-            if use_onpolicy_now:
-                # Legacy ablation: replacement-style transition matching.
-                result = self._onpolicy_transition_step(batch, step_in_acc)
-            else:
-                result = self._train_step(batch, step_in_acc)
-
             zero_tensor = torch.tensor(0.0, device=self.device)
             opd_aux_result = None
             use_opd_aux_now = False
-            if (self.use_opd_aux and not use_onpolicy_now and
-                    result.get("should_sync", False) and
-                    self.step >= getattr(self.config, 'opd_aux_warmup_steps', 0) and
-                    not result.get("skip_step", False)):
+            standalone_opd = (
+                bool(getattr(self.config, 'opd_aux_standalone_step', False))
+                and self.use_opd_aux
+                and not use_onpolicy_now
+            )
+            if standalone_opd and self.gradient_accumulation_steps != 1:
+                raise ValueError(
+                    'opd_aux_standalone_step requires gradient_accumulation_steps=1 '
+                    'so every scheduled OPD update starts from zero gradients.'
+                )
+
+            if standalone_opd:
                 opd_aux_interval = max(1, int(getattr(self.config, 'opd_aux_interval', 1)))
-                use_opd_aux_now = (self.step % opd_aux_interval == 0)
+                use_opd_aux_now = should_run_standalone_opd(
+                    step=self.step,
+                    warmup_steps=getattr(self.config, 'opd_aux_warmup_steps', 0),
+                    interval=opd_aux_interval,
+                )
                 opd_aux_prob = float(getattr(self.config, 'opd_aux_prob', 1.0))
                 if use_opd_aux_now and opd_aux_prob < 1.0:
                     if dist.is_initialized():
@@ -2559,25 +2565,74 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     else:
                         use_opd_aux_now = torch.rand(1).item() < opd_aux_prob
 
-            if use_opd_aux_now:
-                def _run_opd_aux():
-                    if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
-                        return self._opd_aux_transition_step_kto_paopd(batch, step_in_acc)
-                    return self._opd_aux_transition_step(batch, step_in_acc)
+            def _run_opd_aux():
+                if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
+                    return self._opd_aux_transition_step_kto_paopd(batch, step_in_acc)
+                return self._opd_aux_transition_step(batch, step_in_acc)
 
+            if standalone_opd and use_opd_aux_now:
+                if hasattr(self.student, 'set_requires_gradient_sync'):
+                    self.student.set_requires_gradient_sync(True)
                 if (bool(getattr(self.config, 'opd_aux_empty_cache', False))
                         and torch.cuda.is_available()):
                     torch.cuda.empty_cache()
-
                 opd_aux_checkpointing = bool(getattr(
                     self.config, 'opd_aux_gradient_checkpointing', False))
                 opd_aux_result = _call_with_student_checkpointing(
                     self.student, opd_aux_checkpointing, _run_opd_aux)
-                result["loss"] = result["loss"] + opd_aux_result.get("loss", zero_tensor)
-                result["skip_step"] = (
-                    result.get("skip_step", False) or
-                    opd_aux_result.get("skip_step", False)
-                )
+                result = dict(opd_aux_result)
+                for metric_name in (
+                    'video_loss',
+                    'cosmos_video_endpoint_loss',
+                    'cosmos_video_cdiff_loss',
+                    'local_fm_loss',
+                    'action_loss',
+                    'action_local_fm_loss',
+                    'action_aware_loss',
+                    'gt_regression_loss',
+                    'raw_teacher_gt_mse',
+                    'raw_teacher_gt_l1',
+                    'raw_teacher_abs_mean',
+                    'raw_gt_abs_mean',
+                    'raw_teacher_enabled',
+                ):
+                    result.setdefault(metric_name, zero_tensor)
+                result['should_sync'] = True
+            else:
+                if use_onpolicy_now:
+                    # Legacy ablation: replacement-style transition matching.
+                    result = self._onpolicy_transition_step(batch, step_in_acc)
+                else:
+                    result = self._train_step(batch, step_in_acc)
+
+                if (not standalone_opd and self.use_opd_aux and not use_onpolicy_now and
+                        result.get("should_sync", False) and
+                        self.step >= getattr(self.config, 'opd_aux_warmup_steps', 0) and
+                        not result.get("skip_step", False)):
+                    opd_aux_interval = max(1, int(getattr(self.config, 'opd_aux_interval', 1)))
+                    use_opd_aux_now = (self.step % opd_aux_interval == 0)
+                    opd_aux_prob = float(getattr(self.config, 'opd_aux_prob', 1.0))
+                    if use_opd_aux_now and opd_aux_prob < 1.0:
+                        if dist.is_initialized():
+                            aux_draw = torch.rand(1, device=self.device)
+                            dist.broadcast(aux_draw, src=0)
+                            use_opd_aux_now = aux_draw.item() < opd_aux_prob
+                        else:
+                            use_opd_aux_now = torch.rand(1).item() < opd_aux_prob
+
+                if use_opd_aux_now:
+                    if (bool(getattr(self.config, 'opd_aux_empty_cache', False))
+                            and torch.cuda.is_available()):
+                        torch.cuda.empty_cache()
+                    opd_aux_checkpointing = bool(getattr(
+                        self.config, 'opd_aux_gradient_checkpointing', False))
+                    opd_aux_result = _call_with_student_checkpointing(
+                        self.student, opd_aux_checkpointing, _run_opd_aux)
+                    result["loss"] = result["loss"] + opd_aux_result.get("loss", zero_tensor)
+                    result["skip_step"] = (
+                        result.get("skip_step", False) or
+                        opd_aux_result.get("skip_step", False)
+                    )
 
             # 累积损失值
             acc_losses.append(result["loss"])

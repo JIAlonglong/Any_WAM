@@ -632,12 +632,16 @@ def main():
             }
 
             pair_name = str(pair_spec.get("pair_id") or f"t{int(t_value)}_r{int(r_value)}")
+            asset_task = str(record.get("task", "task")).replace("/", "_")
+            asset_sample_key = str(
+                record.get("sample_key", f"batch{batch_idx}")
+            ).replace("/", "_")
+            asset_prefix = f"{asset_task}_{asset_sample_key}_{pair_name}"
             videos_to_save = {}
             save_official_future_video = False
             should_save_videos = (
                 rank == 0
                 and video_dir is not None
-                and batch_idx == 0
                 and saved_video_pairs < args.video_max_pairs
             )
             if should_save_videos:
@@ -808,7 +812,7 @@ def main():
                         add(prefix + name, value)
                 del teacher_x_r, teacher_v_r
 
-            if rank == 0 and video_dir is not None and batch_idx == 0 and saved_video_pairs < args.video_max_pairs:
+            if rank == 0 and video_dir is not None and saved_video_pairs < args.video_max_pairs:
                 decoded = {}
                 for name, latent_cpu in videos_to_save.items():
                     if vae is None:
@@ -826,7 +830,7 @@ def main():
                         video_processor = VideoProcessor(vae_scale_factor=1)
                     video_np = decode_latents_to_np(vae, video_processor, latent_cpu)
                     decoded[name] = video_np
-                    out_path = video_dir / f"{pair_name}_{name}.mp4"
+                    out_path = video_dir / f"{asset_prefix}_{name}.mp4"
                     video_np = np.stack(
                         pad_frames_to_min_duration(list(video_np), fps=args.video_fps),
                         axis=0,
@@ -856,14 +860,14 @@ def main():
                     )
                     name = "cosmos_teacher_official_future"
                     decoded[name] = video_np
-                    out_path = video_dir / f"{pair_name}_{name}.mp4"
+                    out_path = video_dir / f"{asset_prefix}_{name}.mp4"
                     export_to_video(video_np, str(out_path), fps=args.video_fps)
                     logger.info(
                         "Saved rollout video from %s: %s",
                         OFFICIAL_COSMOS_FUTURE_VIDEO_SOURCE,
                         out_path,
                     )
-                sheet_path = video_dir / f"{pair_name}_contact_sheet.png"
+                sheet_path = video_dir / f"{asset_prefix}_contact_sheet.png"
                 save_contact_sheet(decoded, sheet_path)
                 logger.info("Saved rollout contact sheet: %s", sheet_path)
                 saved_video_pairs += 1

@@ -1,12 +1,13 @@
 import sys
 import os
 import subprocess
+import time
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/path/to/your/robowin")
+robowin_root = Path(os.environ.get("ROBOTWIN_ROOT", "/path/to/your/robowin"))
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -42,6 +43,7 @@ from pathlib import Path
 
 from wan_va.utils.Simple_Remote_Infer.deploy.websocket_client_policy import WebsocketClientPolicy
 from evaluation.robotwin.test_render import Sapien_TEST
+from evaluation.robotwin.closed_loop_metrics import build_closed_loop_task_metrics
 
 def write_json(data: dict, fpath: Path) -> None:
     """Write data to a JSON file.
@@ -399,18 +401,27 @@ def main(usr_args):
     
     model = WebsocketClientPolicy(port=usr_args['port'])
 
-    st_seed, suc_num = eval_policy(task_name,
-                                   TASK_ENV,
-                                   args,
-                                   model,
-                                   st_seed,
-                                   test_num=test_num,
-                                   video_size=video_size,
-                                   instruction_type=instruction_type,
-                                   save_visualization=True,
-                                   video_guidance_scale=video_guidance_scale,
-                                   action_guidance_scale=action_guidance_scale)
+    save_visualization = bool(usr_args.get("save_visualization", True))
+    nfe = usr_args.get("nfe")
+
+    st_seed, suc_num, closed_loop_metrics = eval_policy(
+        task_name,
+        TASK_ENV,
+        args,
+        model,
+        st_seed,
+        test_num=test_num,
+        video_size=video_size,
+        instruction_type=instruction_type,
+        save_visualization=save_visualization,
+        video_guidance_scale=video_guidance_scale,
+        action_guidance_scale=action_guidance_scale,
+        nfe=nfe,
+    )
     suc_nums.append(suc_num)
+    if closed_loop_metrics is not None:
+        metric_path = Path(args["save_root"]) / "metrics" / task_name / "closed_loop_metrics.json"
+        write_json(closed_loop_metrics, metric_path)
 
     file_path = os.path.join(save_dir, f"_result.txt")
     with open(file_path, "w") as file:
@@ -451,7 +462,8 @@ def eval_policy(task_name,
                 instruction_type=None,
                 save_visualization=False,
                 video_guidance_scale=5.0,
-                action_guidance_scale=5.0):
+                action_guidance_scale=5.0,
+                nfe=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -468,6 +480,9 @@ def eval_policy(task_name,
     clear_cache_freq = args["clear_cache_freq"]
 
     args["eval_mode"] = True
+    chunk_latencies_s = []
+    cache_update_seconds = 0.0
+    action_steps = 0
 
     while succ_seed < test_num:
         render_freq = args["render_freq"]
@@ -507,7 +522,7 @@ def eval_policy(task_name,
         instruction = np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
-        if TASK_ENV.eval_video_path is not None:
+        if save_visualization and TASK_ENV.eval_video_path is not None:
             ffmpeg = subprocess.Popen(
                 [
                     "ffmpeg",
@@ -560,7 +575,15 @@ def eval_policy(task_name,
                 observation = TASK_ENV.get_obs()
                 first_obs = format_obs(observation, prompt)
 
-            ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
+            chunk_start = time.perf_counter()
+            ret = model.infer(dict(
+                obs=first_obs,
+                prompt=prompt,
+                save_visualization=save_visualization,
+                video_guidance_scale=video_guidance_scale,
+                action_guidance_scale=action_guidance_scale,
+            ))
+            chunk_latencies_s.append(time.perf_counter() - chunk_start)
             action = ret['action']
             if 'video' in ret:
                 imagined_video = ret['video']
@@ -571,6 +594,7 @@ def eval_policy(task_name,
             action_per_frame = action.shape[2] // 4
 
             start_idx = 1 if first else 0
+            action_steps += (action.shape[1] - start_idx) * action.shape[2]
             for i in range(start_idx, action.shape[1]):
                 for j in range(action.shape[2]):
                     raw_action_step = action[:, i, j].flatten() 
@@ -605,25 +629,34 @@ def eval_policy(task_name,
                     
             first = False
 
-            model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
+            cache_start = time.perf_counter()
+            model.infer(dict(
+                obs=key_frame_list,
+                compute_kv_cache=True,
+                imagine=False,
+                save_visualization=save_visualization,
+                state=action,
+            ))
+            cache_update_seconds += time.perf_counter() - cache_start
   
             if TASK_ENV.eval_success:
                 succ = True
                 break
       
 
-        vis_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'visualization' / task_name
-        vis_dir.mkdir(parents=True, exist_ok=True)
-        video_name = f"{TASK_ENV.test_num}_{prompt.replace(' ', '_')}_{succ}.mp4"
-        out_img_file = vis_dir / video_name
-        save_comparison_video(
-            real_obs_list=full_obs_list,
-            imagined_video=None, #gen_video_list,
-            action_history=full_action_history,
-            save_path=str(out_img_file),
-            fps=15 # Suggest adjusting fps based on simulation step
-        )
-        if TASK_ENV.eval_video_path is not None:
+        if save_visualization:
+            vis_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'visualization' / task_name
+            vis_dir.mkdir(parents=True, exist_ok=True)
+            video_name = f"{TASK_ENV.test_num}_{prompt.replace(' ', '_')}_{succ}.mp4"
+            out_img_file = vis_dir / video_name
+            save_comparison_video(
+                real_obs_list=full_obs_list,
+                imagined_video=None,
+                action_history=full_action_history,
+                save_path=str(out_img_file),
+                fps=15,
+            )
+        if save_visualization and TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
 
         if succ:
@@ -655,7 +688,18 @@ def eval_policy(task_name,
         )
         now_seed += 1
 
-    return now_seed, TASK_ENV.suc
+    closed_loop_metrics = None
+    if nfe is not None:
+        closed_loop_metrics = build_closed_loop_task_metrics(
+            task=task_name,
+            success_count=TASK_ENV.suc,
+            episode_count=TASK_ENV.test_num,
+            chunk_latencies_s=chunk_latencies_s,
+            action_steps=action_steps,
+            cache_update_seconds=cache_update_seconds,
+            nfe=int(nfe),
+        )
+    return now_seed, TASK_ENV.suc, closed_loop_metrics
 
 
 def parse_args_and_config():
@@ -667,6 +711,7 @@ def parse_args_and_config():
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
     parser.add_argument("--action_guidance_scale", type=float, default=5.0)
     parser.add_argument("--test_num", type=int, default=100)
+    parser.add_argument("--no-save-visualization", action="store_true")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -688,6 +733,9 @@ def parse_args_and_config():
     if args.overrides:
         overrides = parse_override_pairs(args.overrides)
         config.update(overrides)
+    if args.no_save_visualization:
+        config["save_visualization"] = False
+        config["eval_video_log"] = False
 
     return config
 

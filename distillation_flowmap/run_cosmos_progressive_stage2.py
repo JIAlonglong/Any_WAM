@@ -71,7 +71,7 @@ def build_stage_chunk_plan(
     torchrun,
     resume_from_path=None,
     teacher_model_path=DEFAULT_TEACHER,
-    gradient_accumulation_steps=8,
+    gradient_accumulation_steps=1,
 ):
     """Build one resumable train/eval chunk without launching it."""
     stage = str(stage).lower()
@@ -82,10 +82,16 @@ def build_stage_chunk_plan(
     output_dir = root / stage
     current_step = int(current_step)
     chunk_size = int(chunk_size)
+    gradient_accumulation_steps = int(gradient_accumulation_steps)
     if current_step < 0 or current_step >= spec["max_steps"]:
         raise ValueError(f"current_step must be in [0, {spec['max_steps'] - 1}]")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
+    if gradient_accumulation_steps != 1:
+        raise ValueError(
+            "Cosmos progressive standalone OPD requires "
+            "gradient_accumulation_steps=1"
+        )
     target_step = min(current_step + chunk_size, spec["max_steps"])
 
     if current_step == 0:
@@ -144,7 +150,7 @@ def build_stage_chunk_plan(
         "--dataset-path", str(dataset_path),
         "--output-dir", str(output_dir),
         "--resume-from-path", str(initial_checkpoint),
-        "--gradient-accumulation-steps", str(int(gradient_accumulation_steps)),
+        "--gradient-accumulation-steps", str(gradient_accumulation_steps),
     ]
 
     checkpoint_dir = output_dir / "checkpoints" / f"step_{target_step}"
@@ -258,7 +264,7 @@ def parse_args():
     parser.add_argument("--master-port", type=int, default=29761)
     parser.add_argument("--train-seed", type=int, default=20260714)
     parser.add_argument("--teacher-model-path", type=Path, default=DEFAULT_TEACHER)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--torchrun", type=Path, default=DEFAULT_TORCHRUN)
     parser.add_argument("--run", action="store_true", help="Execute; otherwise print the plan only.")
     return parser.parse_args()

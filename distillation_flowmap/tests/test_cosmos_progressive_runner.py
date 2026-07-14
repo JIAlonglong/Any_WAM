@@ -39,6 +39,8 @@ def test_initial_s4_chunk_starts_from_fixed_stage1_and_preserves_full_schedule(t
     assert plan["train_env"]["CUDA_VISIBLE_DEVICES"] == "6,7"
     assert plan["train_env"]["COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES"] == "6,7"
     assert "--nproc_per_node=2" in plan["train_argv"]
+    gradient_arg = plan["train_argv"].index("--gradient-accumulation-steps")
+    assert plan["train_argv"][gradient_arg + 1] == "1"
     assert plan["eval_env"]["CUDA_VISIBLE_DEVICES"] == "6"
     assert plan["eval_env"]["COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES"] == "7"
     assert "--student-steps" in plan["eval_argv"]
@@ -66,3 +68,8 @@ def test_later_stage_requires_an_explicit_selected_predecessor_checkpoint(tmp_pa
     assert plan["spec"] == {"teacher_steps": 4, "student_steps": 2, "max_steps": 3000}
     assert plan["train_env"]["RESUME_FROM_PATH"] == "/tmp/s4_selected_step2500"
     assert plan["train_env"]["RESET_RESUME_STEP"] == "1"
+
+
+def test_standalone_opd_runner_rejects_gradient_accumulation_above_one(tmp_path):
+    with pytest.raises(ValueError, match="gradient_accumulation_steps=1"):
+        _plan(tmp_path, gradient_accumulation_steps=8)

@@ -98,6 +98,17 @@ def aligned_teacher_path_indices(*, teacher_steps, student_steps):
     return list(range(0, teacher_steps + 1, stride))
 
 
+def cosmos_latent_shape(config, *, batch_size):
+    """Official Cosmos future-prediction latent shape for raw-policy rollouts."""
+    return (
+        int(batch_size),
+        int(config.cosmos_latent_channels),
+        int(config.cosmos_latent_frames),
+        int(config.cosmos_latent_height),
+        int(config.cosmos_latent_width),
+    )
+
+
 def manifest_digest(manifest):
     payload = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

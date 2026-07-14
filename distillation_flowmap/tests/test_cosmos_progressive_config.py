@@ -35,6 +35,9 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
     assert module.cfg.opd_aux_standalone_step is True
     assert module.cfg.opd_aux_gradient_checkpointing is True
     assert module.cfg.opd_cosmos_spatial_crop_size == 28
+    assert module.cfg.cosmos_use_teacher_action_anchor is True
+    assert module.cfg.opd_joint_action_rollout is True
+    assert module.cfg.opd_danceopd_action_endpoint_weight > 0
 
 
 def test_progressive_k1_uses_four_step_teacher_not_two(monkeypatch):

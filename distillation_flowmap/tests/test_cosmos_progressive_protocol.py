@@ -2,7 +2,9 @@ from distillation_flowmap.cosmos_progressive_protocol import (
     aligned_teacher_path_indices,
     build_dataset_manifest,
     build_task_splits,
+    cosmos_latent_shape,
 )
+from types import SimpleNamespace
 
 
 def test_task_splits_are_disjoint_and_reproducible():
@@ -64,3 +66,14 @@ def test_aligned_teacher_path_indices_require_integer_compression_ratio():
         assert "integer multiple" in str(exc)
     else:
         raise AssertionError("expected invalid teacher/student ratio to fail")
+
+
+def test_cosmos_latent_shape_uses_official_prediction_horizon_not_dataset_cache():
+    config = SimpleNamespace(
+        cosmos_latent_channels=16,
+        cosmos_latent_frames=9,
+        cosmos_latent_height=28,
+        cosmos_latent_width=28,
+    )
+
+    assert cosmos_latent_shape(config, batch_size=2) == (2, 16, 9, 28, 28)

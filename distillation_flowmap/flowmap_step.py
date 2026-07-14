@@ -109,6 +109,7 @@ from distillation_flowmap.danceopd_query import (
 )
 from distillation_flowmap.cosmos_progressive_opd import (
     apply_full_endpoint_focus,
+    broadcast_joint_action_timesteps,
     center_spatial_crop_slices,
     rollout_velocity_field,
 )
@@ -1753,6 +1754,8 @@ class FlowMapStepMixin:
                 batch["latents"] = cosmos_latent_teacher_result[
                     "cosmos_latent_x0"
                 ].to(device=batch["actions"].device, dtype=batch["actions"].dtype)
+                if bool(getattr(self.config, "cosmos_use_teacher_action_anchor", False)):
+                    batch["actions"] = teacher_action_x0_full
         elif getattr(self, "cosmos_video_target", False):
             if not hasattr(teacher, "predict_raw_action_result"):
                 raise RuntimeError(
@@ -2995,7 +2998,8 @@ class FlowMapStepMixin:
                                    K_steps=1, action_target_r=None,
                                    return_last_step_start=False,
                                    return_final_action=False,
-                                   return_trajectory=False):
+                                   return_trajectory=False,
+                                   return_final_action_state=False):
         """
         Student multi-step Euler integration from t to target_r.
 
@@ -3009,6 +3013,14 @@ class FlowMapStepMixin:
         action_target_r_ds = None
         if action_target_r is not None:
             action_target_r_ds = action_target_r[:, ::_ACTION_DS]
+        joint_action_rollout = bool(
+            getattr(self.config, 'opd_joint_action_rollout', False)
+        ) and action_target_r_ds is not None
+        if return_final_action_state and not joint_action_rollout:
+            raise ValueError(
+                "return_final_action_state requires opd_joint_action_rollout=True "
+                "and action_target_r."
+            )
 
         rollout_grad_mode = getattr(self.config, 'opd_rollout_grad_mode', 'endpoint')
         rollout_grad_mode = str(rollout_grad_mode).lower()
@@ -3052,6 +3064,23 @@ class FlowMapStepMixin:
             _rt_action = base_input_dict['action_dict']
             _rt_empty = empty_emb
 
+        current_action = None
+        action_step_ts = None
+        if joint_action_rollout:
+            current_action = base_input_dict['action_dict']['noisy_latents']
+            action_timesteps = base_input_dict['action_dict']['timesteps']
+            if current_action.shape[2] != action_target_r_ds.shape[1]:
+                raise ValueError(
+                    "joint action rollout requires matching action state and target "
+                    f"horizons, got {current_action.shape[2]} and {action_target_r_ds.shape[1]}"
+                )
+            action_step_ts = self._build_timestep_path(
+                action_timesteps.float(), action_target_r_ds.float(), K_steps
+            )
+            if _rollout_model is not self.student:
+                current_action = _to_regular_tensor(current_action)
+                action_step_ts = _to_regular_tensor(action_step_ts)
+
         def _init_mask(step_input):
             _ld = step_input['latent_dict']
             _ad = step_input['action_dict']
@@ -3070,7 +3099,15 @@ class FlowMapStepMixin:
                 device=self.device,
             )
 
-        def _student_cfg_with_optional_uncompile(model, step_input, step_empty, r_timestep_i, action_r_timestep_i):
+        def _student_cfg_with_optional_uncompile(
+            model,
+            step_input,
+            step_empty,
+            r_timestep_i,
+            action_r_timestep_i,
+            *,
+            return_action=False,
+        ):
             saved_blocks = None
             if model is self.student and getattr(self, '_student_blocks_compiled', False):
                 saved_blocks = list(self.student.blocks)
@@ -3088,6 +3125,7 @@ class FlowMapStepMixin:
                     r_timestep_i,
                     action_r_timestep_i,
                     force_cfg=force_cfg,
+                    return_action=return_action,
                 )
             finally:
                 if saved_blocks is not None:
@@ -3121,7 +3159,24 @@ class FlowMapStepMixin:
                 current_x = current_x.to(self.device)
             if keep_step_grad and current_x.dtype != base_input_dict['latent_dict']['latent'].dtype:
                 current_x = current_x.to(base_input_dict['latent_dict']['latent'].dtype)
+            if joint_action_rollout and keep_step_grad:
+                if current_action.device != self.device:
+                    current_action = current_action.to(self.device)
+                if current_action.dtype != base_input_dict['action_dict']['latent'].dtype:
+                    current_action = current_action.to(
+                        base_input_dict['action_dict']['latent'].dtype
+                    )
 
+            if joint_action_rollout:
+                action_t_i = action_step_ts[i]
+                action_r_i = action_step_ts[min(i + 1, K_steps)]
+                step_action = {
+                    **step_action,
+                    'noisy_latents': current_action,
+                    'timesteps': action_t_i,
+                }
+            else:
+                action_t_i = action_r_i = None
             step_input = {
                 'latent_dict': {
                     **step_latent,
@@ -3136,8 +3191,11 @@ class FlowMapStepMixin:
 
             r_timestep_i = r_next
             action_r_timestep_i = (
-                action_target_r_ds if action_target_r_ds is not None
-                else (r_timestep_i[:, ::_ACTION_DS] if (self.distill_action or self.action_aware) else r_timestep_i)
+                action_r_i if joint_action_rollout
+                else (
+                    action_target_r_ds if action_target_r_ds is not None
+                    else (r_timestep_i[:, ::_ACTION_DS] if (self.distill_action or self.action_aware) else r_timestep_i)
+                )
             )
 
             if force_eval_checkpointing:
@@ -3145,20 +3203,47 @@ class FlowMapStepMixin:
             else:
                 grad_context = torch.enable_grad() if keep_step_grad else torch.no_grad()
             with grad_context:
-                v_cfg = _student_cfg_with_optional_uncompile(
-                    step_model, step_input, step_empty, r_timestep_i, action_r_timestep_i)
+                step_forward = _student_cfg_with_optional_uncompile(
+                    step_model,
+                    step_input,
+                    step_empty,
+                    r_timestep_i,
+                    action_r_timestep_i,
+                    return_action=joint_action_rollout,
+                )
+                if joint_action_rollout:
+                    v_cfg, step_action_seq = step_forward
+                    if step_action_seq is None:
+                        raise RuntimeError("joint action rollout requires the student action head")
+                    step_action_v = self._extract_action_v(
+                        step_action_seq, current_action.shape[2]
+                    )
+                else:
+                    v_cfg = step_forward
                 if force_eval_checkpointing and not keep_step_grad:
                     v_cfg = v_cfg.detach()
                 sigma_i = self._timestep_to_sigma_5d(t_i)
                 sigma_next = self._timestep_to_sigma_5d(r_next)
                 current_x = current_x + v_cfg * (sigma_next - sigma_i)
+                if joint_action_rollout:
+                    action_sigma_i = action_t_i[:, None, :, None, None] / self.config.num_train_timesteps
+                    action_sigma_next = action_r_i[:, None, :, None, None] / self.config.num_train_timesteps
+                    current_action = current_action + step_action_v * (
+                        action_sigma_next.to(step_action_v) - action_sigma_i.to(step_action_v)
+                    )
                 if force_eval_checkpointing and not keep_step_grad:
                     current_x = current_x.detach()
+                    if joint_action_rollout:
+                        current_action = current_action.detach()
                 if return_trajectory:
                     trajectory.append(current_x.detach())
 
         current_x_for_loss = current_x if rollout_grad_mode != 'endpoint' else current_x.detach()
         current_x_for_forward = current_x.detach()
+        current_action_for_loss = (
+            current_action if rollout_grad_mode != 'endpoint' else current_action.detach()
+        ) if joint_action_rollout else None
+        current_action_for_forward = current_action.detach() if joint_action_rollout else None
 
         final_input = {
             'latent_dict': {
@@ -3166,7 +3251,14 @@ class FlowMapStepMixin:
                 'noisy_latents': current_x_for_forward,
                 'timesteps': target_r,
             },
-            'action_dict': base_input_dict['action_dict'],
+            'action_dict': (
+                {
+                    **base_input_dict['action_dict'],
+                    'noisy_latents': current_action_for_forward,
+                    'timesteps': action_target_r_ds,
+                }
+                if joint_action_rollout else base_input_dict['action_dict']
+            ),
             'chunk_size': base_input_dict['chunk_size'],
             'window_size': base_input_dict['window_size'],
         }
@@ -3222,7 +3314,22 @@ class FlowMapStepMixin:
 
         if return_final_action:
             if return_trajectory:
+                if return_final_action_state:
+                    return (
+                        current_x_for_loss,
+                        v_final_cfg,
+                        final_action_seq,
+                        current_action_for_loss,
+                        tuple(trajectory),
+                    )
                 return current_x_for_loss, v_final_cfg, final_action_seq, tuple(trajectory)
+            if return_final_action_state:
+                return (
+                    current_x_for_loss,
+                    v_final_cfg,
+                    final_action_seq,
+                    current_action_for_loss,
+                )
             return current_x_for_loss, v_final_cfg, final_action_seq
         if return_trajectory:
             return current_x_for_loss, v_final_cfg, tuple(trajectory)
@@ -4124,6 +4231,19 @@ class FlowMapStepMixin:
         full_anchor = anchor_result['cosmos_latent_x0'].to(
             device=self.device, dtype=batch['actions'].dtype
         )
+        use_teacher_action_anchor = bool(
+            getattr(self.config, 'cosmos_use_teacher_action_anchor', False)
+        )
+        if use_teacher_action_anchor:
+            batch['actions'] = cosmos_actions_to_flowmap_x0(
+                anchor_result['actions'],
+                target_shape=tuple(batch['actions'].shape),
+                q01=self.config.norm_stat['q01'],
+                q99=self.config.norm_stat['q99'],
+                inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
+                device=self.device,
+                dtype=batch['actions'].dtype,
+            )
         full_video_noise = video_noise_teacher.to(
             device=self.device, dtype=full_anchor.dtype
         )
@@ -4167,13 +4287,18 @@ class FlowMapStepMixin:
         action_r = None
         if self.distill_action or self.action_aware:
             action_frames = batch['actions'].shape[2]
-            action_t, action_r, _ = self.sample_timestep_mixed(
-                B,
-                action_frames,
-                dtype=torch.float32,
-                device=self.device,
-                scheduler=self.train_scheduler_action,
-            )
+            if use_teacher_action_anchor:
+                action_t, action_r = broadcast_joint_action_timesteps(
+                    video_t, video_r, action_frames=action_frames
+                )
+            else:
+                action_t, action_r, _ = self.sample_timestep_mixed(
+                    B,
+                    action_frames,
+                    dtype=torch.float32,
+                    device=self.device,
+                    scheduler=self.train_scheduler_action,
+                )
             action_noise = torch.randn_like(batch['actions'])
             action_noisy = self.train_scheduler_action.add_noise(
                 batch['actions'], action_noise, action_t, t_dim=2
@@ -4221,7 +4346,10 @@ class FlowMapStepMixin:
             self.config.cfg_max - self.config.cfg_min
         )
         empty_emb = self.empty_emb.expand(B, -1, -1)
-        student_x_r, student_v_r = self._student_euler_integrate(
+        joint_action_rollout = bool(
+            getattr(self.config, 'opd_joint_action_rollout', False)
+        ) and action_r is not None
+        rollout_out = self._student_euler_integrate(
             noisy_latents=video_noisy_t,
             timesteps=video_t,
             target_r=video_r,
@@ -4233,7 +4361,14 @@ class FlowMapStepMixin:
             num_frames=num_frames,
             K_steps=student_steps,
             action_target_r=action_r,
+            return_final_action=joint_action_rollout,
+            return_final_action_state=joint_action_rollout,
         )
+        if joint_action_rollout:
+            student_x_r, student_v_r, student_action_seq, student_action_x_r = rollout_out
+        else:
+            student_x_r, student_v_r = rollout_out
+            student_action_seq = student_action_x_r = None
 
         def _teacher_velocity_field(state, t_norm):
             result = teacher.predict_raw_latent_velocity(
@@ -4257,9 +4392,35 @@ class FlowMapStepMixin:
             teacher_x_r = teacher_x_r[..., h_slice, w_slice].contiguous()
             teacher_v_r = teacher_v_r[..., h_slice, w_slice].contiguous()
         sigma_r = video_r_norm[:, None, :, None, None]
-        endpoint_loss = denoised_endpoint_mse(
+        video_endpoint_loss = denoised_endpoint_mse(
             student_x_r, student_v_r, teacher_x_r, teacher_v_r, sigma_r
         )
+        action_endpoint_loss = torch.zeros((), device=self.device, dtype=video_endpoint_loss.dtype)
+        action_endpoint_weight = float(getattr(
+            self.config, 'opd_danceopd_action_endpoint_weight', 0.0
+        ))
+        if not math.isfinite(action_endpoint_weight) or action_endpoint_weight < 0:
+            raise ValueError('Cosmos OPD action endpoint weight must be finite and non-negative')
+        if joint_action_rollout:
+            action_downsample = int(getattr(self.config, 'action_downsample_factor', 4))
+            student_action_v = self._extract_action_v(
+                student_action_seq, student_action_x_r.shape[2]
+            )
+            action_sigma_r = (
+                action_r[:, None, ::action_downsample, None, None]
+                / self.config.num_train_timesteps
+            ).to(student_action_v)
+            student_action_x0 = student_action_x_r - action_sigma_r * student_action_v
+            action_target_x0 = batch['actions'][:, :, ::action_downsample]
+            action_mask = batch.get('actions_mask')
+            if action_mask is None:
+                action_mask = torch.ones_like(action_target_x0[:, :1], dtype=torch.float32)
+            else:
+                action_mask = action_mask[:, :, ::action_downsample].float()
+            action_diff = (student_action_x0.float() - action_target_x0.detach().float()) * action_mask
+            action_denom = (action_mask.sum() * student_action_x0.shape[1]).clamp(min=1.0)
+            action_endpoint_loss = action_diff.square().sum() / action_denom
+        endpoint_loss = video_endpoint_loss + action_endpoint_weight * action_endpoint_loss
         velocity_loss, dance_diagnostics = self._cosmos_danceopd_velocity_loss(
             batch,
             teacher,
@@ -4294,11 +4455,16 @@ class FlowMapStepMixin:
             'opd_same_state_velocity_ratio': velocity_contrib.detach().abs() / contrib_denom,
             'opd_video_transition_loss': zero,
             'opd_endpoint_aux_loss': endpoint_loss.detach(),
+            'opd_video_endpoint_loss': video_endpoint_loss.detach(),
+            'opd_action_endpoint_loss': action_endpoint_loss.detach(),
             'opd_local_fm_loss': zero,
             'opd_action_transition_loss': zero,
             'opd_action_local_fm_loss': zero,
             'opd_video_transition_contrib': zero,
             'opd_endpoint_aux_contrib': endpoint_contrib.detach(),
+            'opd_action_endpoint_weight': torch.tensor(
+                action_endpoint_weight, device=self.device, dtype=loss.dtype
+            ),
             'opd_local_fm_contrib': zero,
             'opd_action_transition_contrib': zero,
             'opd_action_local_fm_contrib': zero,

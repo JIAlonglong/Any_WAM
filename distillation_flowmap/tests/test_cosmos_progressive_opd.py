@@ -1,7 +1,9 @@
+import pytest
 import torch
 
 from distillation_flowmap.cosmos_progressive_opd import (
     apply_full_endpoint_focus,
+    broadcast_joint_action_timesteps,
     center_spatial_crop_slices,
     rollout_velocity_field,
     should_stop_training_at_step,
@@ -86,3 +88,25 @@ def test_crop_size_at_or_above_input_keeps_the_full_latent():
 
     assert (h_slice.start, h_slice.stop) == (0, 28)
     assert (w_slice.start, w_slice.stop) == (0, 30)
+
+
+def test_joint_action_timesteps_share_the_endpoint_pair_across_action_tokens():
+    video_t = torch.tensor([[1000.0] * 9, [750.0] * 9])
+    video_r = torch.tensor([[0.0] * 9, [500.0] * 9])
+
+    action_t, action_r = broadcast_joint_action_timesteps(
+        video_t, video_r, action_frames=16
+    )
+
+    assert tuple(action_t.shape) == (2, 16)
+    assert tuple(action_r.shape) == (2, 16)
+    assert torch.equal(action_t[0], torch.full((16,), 1000.0))
+    assert torch.equal(action_r[1], torch.full((16,), 500.0))
+
+
+def test_joint_action_timesteps_reject_per_frame_video_pairs_without_a_mapping_rule():
+    video_t = torch.tensor([[1000.0, 750.0]])
+    video_r = torch.tensor([[750.0, 0.0]])
+
+    with pytest.raises(ValueError, match="constant across video frames"):
+        broadcast_joint_action_timesteps(video_t, video_r, action_frames=4)

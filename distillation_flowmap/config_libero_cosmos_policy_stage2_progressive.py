@@ -95,6 +95,11 @@ cfg.skip_target_student_for_cosmos_latent = _env_bool(
 
 cfg.distill_video = True
 cfg.distill_action = True
+# Keep the joint state wholly in Cosmos teacher coordinates during the
+# progressive refinement; the default training paths retain dataset actions.
+cfg.cosmos_use_teacher_action_anchor = _env_bool(
+    "COSMOS_USE_TEACHER_ACTION_ANCHOR", True
+)
 cfg.use_opd_aux = _env_bool("USE_OPD_AUX", True)
 cfg.opd_aux_variant = "default"
 cfg.opd_teacher_target_mode = "cosmos_latent_full"
@@ -153,9 +158,13 @@ cfg.opd_danceopd_terminal_prior_tolerance = float(
 cfg.opd_danceopd_endpoint_weight = float(
     os.environ.get("OPD_DANCEOPD_ENDPOINT_WEIGHT", 1.0)
 )
+cfg.opd_danceopd_action_endpoint_weight = float(
+    os.environ.get("OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT", 1.0)
+)
 cfg.opd_danceopd_velocity_weight = float(
     os.environ.get("OPD_DANCEOPD_VELOCITY_WEIGHT", _spec["velocity_weight"])
 )
+cfg.opd_joint_action_rollout = _env_bool("OPD_JOINT_ACTION_ROLLOUT", True)
 
 # Legacy Cosmos OPD controls remain neutral. The progressive path reports its
 # endpoint and same-state velocity contributions directly.

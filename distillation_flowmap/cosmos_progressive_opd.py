@@ -30,6 +30,20 @@ def build_uniform_timestep_path(timesteps, target_timesteps, num_steps):
     ).unsqueeze(0) * alpha.view(-1, 1, 1)
 
 
+def broadcast_joint_action_timesteps(video_t, video_r, *, action_frames):
+    """Map a scalar video endpoint pair to every action token in the joint state."""
+    if video_t.ndim != 2 or video_r.ndim != 2 or video_t.shape != video_r.shape:
+        raise ValueError("video_t and video_r must have matching [B, F] shapes")
+    if int(action_frames) <= 0:
+        raise ValueError("action_frames must be positive")
+    if not torch.equal(video_t, video_t[:, :1].expand_as(video_t)):
+        raise ValueError("joint endpoint pairs must be constant across video frames")
+    if not torch.equal(video_r, video_r[:, :1].expand_as(video_r)):
+        raise ValueError("joint endpoint pairs must be constant across video frames")
+    shape = (video_t.shape[0], int(action_frames))
+    return video_t[:, :1].expand(shape), video_r[:, :1].expand(shape)
+
+
 @torch.no_grad()
 def rollout_velocity_field(x_t, timesteps, target_timesteps, *, num_steps, velocity_field):
     """Euler-integrate a frozen normalized-time vector field from `t` to `r`.

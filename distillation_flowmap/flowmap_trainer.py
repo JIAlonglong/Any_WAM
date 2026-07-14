@@ -42,7 +42,10 @@ from distributed.util import _configure_model, dist_mean
 from modules.utils import WanVAEStreamingWrapper, load_transformer, load_vae
 from utils import logger, warmup_constant_lambda, FlowMatchScheduler
 from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
-from distillation_flowmap.cosmos_progressive_opd import should_run_standalone_opd
+from distillation_flowmap.cosmos_progressive_opd import (
+    should_run_standalone_opd,
+    should_stop_training_at_step,
+)
 from distillation_flowmap.cosmos_teacher_roles import resolve_teacher_roles
 from distillation_flowmap.ablation.robotwin_diagnostics import (
     classify_parameter_branch,
@@ -2527,7 +2530,13 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             leave=True, dynamic_ncols=True, initial=self.step,
         )
 
-        while self.step < config.max_train_steps:
+        while (
+            self.step < config.max_train_steps
+            and not should_stop_training_at_step(
+                step=self.step,
+                stop_after_step=getattr(config, 'stop_after_step', None),
+            )
+        ):
             # 获取下一个数据批次
             batch = self._get_next_batch()
 

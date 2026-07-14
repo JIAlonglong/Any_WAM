@@ -46,3 +46,15 @@ def test_progressive_k1_uses_four_step_teacher_not_two(monkeypatch):
 
     assert module.cfg.opd_rollout_step_pairs == [[4, 1]]
     assert module.cfg.opd_endpoint_focus_prob > 0
+
+
+def test_progressive_exposes_chunk_stop_and_training_manifest(monkeypatch):
+    monkeypatch.setenv("DATASET_SAMPLE_MANIFEST", "/tmp/cosmos_train.json")
+    monkeypatch.setenv("STOP_AFTER_STEP", "250")
+    module = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive"
+    )
+    module = importlib.reload(module)
+
+    assert module.cfg.dataset_sample_manifest == "/tmp/cosmos_train.json"
+    assert module.cfg.stop_after_step == 250

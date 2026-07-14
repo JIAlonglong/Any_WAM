@@ -106,6 +106,16 @@ def should_run_standalone_opd(*, step, warmup_steps, interval):
     return int(step) >= int(warmup_steps) and int(step) % int(interval) == 0
 
 
+def should_stop_training_at_step(*, step, stop_after_step):
+    """Return whether a chunked run has reached its requested absolute step."""
+    if stop_after_step in (None, "", 0, "0"):
+        return False
+    stop_after_step = int(stop_after_step)
+    if stop_after_step <= 0:
+        return False
+    return int(step) >= stop_after_step
+
+
 def center_spatial_crop_slices(height, width, *, crop_size):
     """Return a centered square crop, or the full image when no crop is needed."""
     if int(height) <= 0 or int(width) <= 0:

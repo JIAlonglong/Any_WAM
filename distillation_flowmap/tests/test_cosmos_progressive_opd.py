@@ -4,6 +4,7 @@ from distillation_flowmap.cosmos_progressive_opd import (
     apply_full_endpoint_focus,
     center_spatial_crop_slices,
     rollout_velocity_field,
+    should_stop_training_at_step,
     should_run_standalone_opd,
 )
 
@@ -64,6 +65,13 @@ def test_standalone_opd_schedule_respects_warmup_and_interval():
     assert should_run_standalone_opd(step=8, warmup_steps=8, interval=8)
     assert not should_run_standalone_opd(step=9, warmup_steps=8, interval=8)
     assert should_run_standalone_opd(step=16, warmup_steps=8, interval=8)
+
+
+def test_stop_after_step_only_caps_explicit_chunk_boundaries():
+    assert not should_stop_training_at_step(step=249, stop_after_step=250)
+    assert should_stop_training_at_step(step=250, stop_after_step=250)
+    assert not should_stop_training_at_step(step=250, stop_after_step=None)
+    assert not should_stop_training_at_step(step=250, stop_after_step=0)
 
 
 def test_center_spatial_crop_uses_a_symmetric_window():

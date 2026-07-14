@@ -78,6 +78,8 @@ cfg.enable_wandb = _env_bool("ENABLE_WANDB", False)
 cfg.learning_rate = float(os.environ.get("LEARNING_RATE", 2e-7))
 cfg.max_train_steps = int(os.environ.get("MAX_TRAIN_STEPS", _spec["max_steps"]))
 cfg.save_interval = int(os.environ.get("SAVE_INTERVAL", 250))
+cfg.stop_after_step = int(os.environ.get("STOP_AFTER_STEP", 0) or 0)
+cfg.dataset_sample_manifest = os.environ.get("DATASET_SAMPLE_MANIFEST")
 cfg.gradient_checkpointing = _env_bool("GRADIENT_CHECKPOINTING", True)
 # The trainer keeps this true under OPD + activation checkpointing as a second
 # guard against FSDP2 DTensor recompute failures.

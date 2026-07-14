@@ -527,6 +527,7 @@ run_summary() {
     --root "${ROOT}"
     --out "${SUMMARY_DIR}"
     --provenance "${PROVENANCE_JSON}"
+    --require-complete-main
   )
   if [ "${DRY_RUN}" = 1 ]; then
     print_command "${command[@]}"

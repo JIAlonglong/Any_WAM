@@ -41,4 +41,5 @@ def test_final_danceopd_eval_dry_run_freezes_main_protocol(tmp_path):
     assert "--decoded-video-metrics" in output
     assert "--decoded-video-device cuda" in output
     assert "--decoded-video-lpips" in output
+    assert "--require-complete-main" in output
     assert "train.py" not in output

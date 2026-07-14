@@ -130,7 +130,7 @@ git commit -m "feat: add final DanceOPD evaluation runner"
 - Consumes: per-run `offline_rollout.json` with `per_task`, optional train replay JSON, run manifests, and runner provenance JSON.
 - Produces: CSV/JSON/Markdown main table, per-task deltas, K=1/2/4 curves, structural-control table, and bootstrap intervals.
 
-- [ ] **Step 1: Write a failing synthetic-root test**
+- [x] **Step 1: Write a failing synthetic-root test**
 
 ```python
 summary = build_final_summary(tmp_path, baseline_variant="final_w_o_opd", bootstrap_samples=1000)
@@ -138,23 +138,23 @@ assert summary["main"]["final_stepwam_danceopd"]["metric"]["macro_delta"] == pyt
 assert summary["main"]["final_stepwam_danceopd"]["metric"]["bootstrap_unit"] == "tasks"
 ```
 
-- [ ] **Step 2: Run the focused test and verify it fails**
+- [x] **Step 2: Run the focused test and verify it fails**
 
 Run: `python -m pytest -q distillation_flowmap/tests/test_summarize_final_danceopd_ablation.py`
 
 Expected: FAIL because the final report module does not exist.
 
-- [ ] **Step 3: Implement the minimal report contract**
+- [x] **Step 3: Implement the minimal report contract**
 
 Read only the equal-NFE metric keys for K=1/2/4. Compute every macro mean from one value per task. Compute paired deltas against final_w_o_opd task by task and bootstrap resample those twelve deltas with a fixed RNG seed. Write a statement that the CI covers task coverage, not training-seed significance. Write controls to a separate table.
 
-- [ ] **Step 4: Run focused and existing summary tests**
+- [x] **Step 4: Run focused and existing summary tests**
 
 Run: `python -m pytest -q distillation_flowmap/tests/test_summarize_final_danceopd_ablation.py distillation_flowmap/tests/test_robotwin_ablation_summary.py`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add distillation_flowmap/ablation/summarize_final_danceopd_ablation.py distillation_flowmap/tests/test_summarize_final_danceopd_ablation.py

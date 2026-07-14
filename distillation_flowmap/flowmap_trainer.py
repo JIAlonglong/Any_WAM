@@ -315,7 +315,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 config,
                 'opd_teacher_target_mode',
                 'student_state',
-            )).lower() in ('cosmos_latent_student_state', 'cosmos_latent_velocity')
+            )).lower() in (
+                'cosmos_latent_student_state',
+                'cosmos_latent_velocity',
+                'cosmos_latent_full',
+            )
             and not bool(getattr(config, 'opd_aux_action', False))
         )
         if self.skip_target_student and not self.offline_eval_skip_target_student:

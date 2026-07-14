@@ -10,6 +10,7 @@ import argparse
 import gc
 import importlib
 import json
+import numpy as np
 import os
 import sys
 from pathlib import Path
@@ -41,7 +42,10 @@ from distillation_flowmap.rollout_masking import (
     masked_video_rms,
     video_frame_mask_from_batch,
 )
-from distillation_flowmap.rollout_diagnostics import rollout_trajectory_drift
+from distillation_flowmap.rollout_diagnostics import (
+    decoded_video_metrics,
+    rollout_trajectory_drift,
+)
 from distillation_flowmap.ablation.robotwin_mini_protocol import (
     dataset_records_for_manifest,
     eval_seed_for_pair,
@@ -165,6 +169,46 @@ def masked_mse_l1(diff, mask):
             (diff.float().abs() * mask).sum() / denom)
 
 
+def decode_wan_latents_to_np(vae, video_processor, latents):
+    latents = latents.detach().to(next(vae.parameters()).device, dtype=vae.dtype)
+    latents_mean = (
+        torch.tensor(vae.config.latents_mean)
+        .view(1, vae.config.z_dim, 1, 1, 1)
+        .to(latents.device, latents.dtype)
+    )
+    latents_std_inv = (
+        1.0
+        / torch.tensor(vae.config.latents_std)
+        .view(1, vae.config.z_dim, 1, 1, 1)
+        .to(latents.device, latents.dtype)
+    )
+    decoded = vae.decode(latents / latents_std_inv + latents_mean, return_dict=False)[0]
+    return video_processor.postprocess_video(decoded, output_type="np")[0]
+
+
+def load_decoded_video_models(model_root, device, use_lpips):
+    from diffusers.video_processor import VideoProcessor
+    from modules.utils import load_vae
+
+    device = torch.device(device)
+    vae = load_vae(
+        os.path.join(model_root, "vae"),
+        torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
+        torch_device=device,
+    )
+    vae.eval()
+    lpips_model = None
+    if use_lpips:
+        try:
+            import lpips
+        except ImportError as exc:
+            raise RuntimeError(
+                "LPIPS was requested but is unavailable. Install the lpips package first."
+            ) from exc
+        lpips_model = lpips.LPIPS(net="alex").to(device).eval()
+    return vae, VideoProcessor(vae_scale_factor=1), lpips_model, device
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
@@ -261,6 +305,22 @@ def main():
         "--same-state-velocity",
         action="store_true",
         help="Query the teacher at each student terminal state for a true local velocity error.",
+    )
+    parser.add_argument(
+        "--decoded-video-metrics",
+        action="store_true",
+        help="Decode clean r=0 WanVAE endpoints and report frame/video fidelity metrics.",
+    )
+    parser.add_argument(
+        "--decoded-video-device",
+        choices=("cpu", "cuda"),
+        default="cpu",
+        help="Device for WanVAE and optional LPIPS during decoded video metrics.",
+    )
+    parser.add_argument(
+        "--decoded-video-lpips",
+        action="store_true",
+        help="Require pretrained AlexNet LPIPS in addition to decoded frame metrics.",
     )
     args = parser.parse_args()
     teacher_steps = normalize_rollout_steps(args.teacher_steps)
@@ -421,9 +481,36 @@ def main():
     task_metrics = {}
     task_counts = {}
     current_task = None
+    decoded_vae = None
+    decoded_video_processor = None
+    decoded_lpips_model = None
+    decoded_video_device = None
+    if args.decoded_video_lpips and not args.decoded_video_metrics:
+        raise ValueError("--decoded-video-lpips requires --decoded-video-metrics.")
+    if args.decoded_video_metrics:
+        if bool(getattr(trainer, "is_cosmos_policy_teacher", False)):
+            raise ValueError(
+                "Native WanVAE decoded metrics are only valid for LingBot-VA rollouts."
+            )
+        decoded_vae, decoded_video_processor, decoded_lpips_model, decoded_video_device = (
+            load_decoded_video_models(
+                args.teacher_model_path,
+                args.decoded_video_device,
+                args.decoded_video_lpips,
+            )
+        )
+        if rank == 0:
+            logger.info(
+                "Decoded video metrics enabled on %s (LPIPS=%s).",
+                decoded_video_device,
+                bool(decoded_lpips_model is not None),
+            )
 
     def add(name, value):
-        value = value.detach().float()
+        if isinstance(value, torch.Tensor):
+            value = value.detach().float()
+        else:
+            value = torch.as_tensor(value, device=trainer.device, dtype=torch.float32)
         metrics[name] = metrics.get(name, torch.zeros((), device=trainer.device)) + value
         counts[name] = counts.get(name, 0) + 1
         if current_task is not None:
@@ -472,6 +559,12 @@ def main():
                 batch["latents"], video_noise, video_r, t_dim=2)
             video_v_target_r = trainer.train_scheduler_latent.training_target(
                 batch["latents"], video_noise, video_r)
+
+            decoded_gt_video = None
+            if args.decoded_video_metrics and abs(r_value) < 1e-6:
+                decoded_gt_video = decode_wan_latents_to_np(
+                    decoded_vae, decoded_video_processor, batch["latents"]
+                )
 
             action_noisy_t = trainer.train_scheduler_action.add_noise(
                 batch["actions"], action_noise, action_t, t_dim=2)
@@ -660,6 +753,19 @@ def main():
                     student_x_r, video_frame_mask
                 )
 
+                decoded_student_video = None
+                if decoded_gt_video is not None:
+                    decoded_student_video = decode_wan_latents_to_np(
+                        decoded_vae, decoded_video_processor, student_x_r
+                    )
+                    for name, value in decoded_video_metrics(
+                        decoded_student_video,
+                        decoded_gt_video,
+                        lpips_model=decoded_lpips_model,
+                        lpips_device=decoded_video_device,
+                    ).items():
+                        student_metrics[f"/decoded_video_gt_{name}"] = value
+
                 if args.same_state_velocity:
                     _, teacher_v_at_student_state = trainer._teacher_forward_at_student_state(
                         student_x_r,
@@ -727,6 +833,7 @@ def main():
                 student_rollouts[k_steps] = {
                     "x": student_x_r.detach(),
                     "v": student_v_r.detach(),
+                    "decoded_video": decoded_student_video,
                     "trajectory": (
                         tuple(state.detach() for state in student_trajectory)
                         if student_trajectory is not None else None
@@ -773,6 +880,19 @@ def main():
                         teacher_step, teacher_x_r, teacher_v_r, teacher_trajectory
                     )
 
+                decoded_teacher_video = None
+                decoded_teacher_gt_metrics = {}
+                if decoded_gt_video is not None:
+                    decoded_teacher_video = decode_wan_latents_to_np(
+                        decoded_vae, decoded_video_processor, teacher_x_r
+                    )
+                    decoded_teacher_gt_metrics = decoded_video_metrics(
+                        decoded_teacher_video,
+                        decoded_gt_video,
+                        lpips_model=decoded_lpips_model,
+                        lpips_device=decoded_video_device,
+                    )
+
                 for k_steps, student_result in student_rollouts.items():
                     prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{teacher_step}"
                     mse, l1 = masked_video_mse_l1(
@@ -794,6 +914,16 @@ def main():
                     )
                     add(prefix + "/video_teacher_v_mse", mse)
                     add(prefix + "/video_teacher_v_l1", l1)
+                    if decoded_teacher_video is not None:
+                        for name, value in decoded_teacher_gt_metrics.items():
+                            add(prefix + f"/decoded_video_teacher_gt_{name}", value)
+                        for name, value in decoded_video_metrics(
+                            student_result["decoded_video"],
+                            decoded_teacher_video,
+                            lpips_model=decoded_lpips_model,
+                            lpips_device=decoded_video_device,
+                        ).items():
+                            add(prefix + f"/decoded_video_teacher_{name}", value)
                     if args.rollout_drift and k_steps == teacher_step:
                         student_trajectory = student_result["trajectory"]
                         if student_trajectory is None:

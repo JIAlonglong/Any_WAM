@@ -49,7 +49,7 @@ The no-video-loss variant is intentionally excluded.
 
 - Latent: endpoint MSE/L1 to GT and equal-NFE teacher, same-state velocity
   MSE, action endpoint error, and rollout drift at intermediate states.
-- Decoded video: pixel MSE/L1, LPIPS when the pretrained metric is available,
+- Decoded video: pixel MSE/L1, LPIPS (AlexNet) as the primary perceptual metric,
   PSNR/SSIM as supporting metrics, and temporal difference error:
   MSE((I_s[t+1] - I_s[t]) - (I_gt[t+1] - I_gt[t])).
 - FVD is supplementary only and requires a separate 50-clip-per-task
@@ -66,3 +66,16 @@ The no-video-loss variant is intentionally excluded.
 For LingBot-VA, decoded videos are produced by the native WanVAE decoding
 path. The official future_image_predictions API is specific to Cosmos Policy;
 it must not be claimed as a LingBot-VA decoding path.
+
+## Decoded Metric Runtime
+
+- The final numeric runner must use
+  `--decoded-video-metrics --decoded-video-device cuda --decoded-video-lpips`.
+  LPIPS is fail-fast rather than silently omitted.
+- The verified environment is `lpips==0.1.4` with the package's v0.1 AlexNet
+  perceptual head. Torchvision's ImageNet AlexNet checkpoint is cached as
+  `alexnet-owt-7be5be79.pth`; its SHA256 is
+  `7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02`.
+- CPU WanVAE decode was intentionally rejected for the final protocol after a
+  one-record smoke took more than six minutes. CUDA decode completed the same
+  smoke successfully and is required for the 120-record held-out evaluation.

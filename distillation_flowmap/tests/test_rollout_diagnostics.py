@@ -45,3 +45,25 @@ def test_rollout_trajectory_drift_averages_noninitial_states():
 
 def test_rollout_trajectory_drift_rejects_misaligned_paths():
     path = [torch.zeros((1, 1, 1, 2, 2))]
+    with pytest.raises(ValueError, match="same number of states"):
+        rollout_trajectory_drift(path, path + path)
+
+
+class _UnitLPIPS:
+    def __call__(self, prediction, target):
+        assert prediction.shape == target.shape == (2, 3, 8, 8)
+        return torch.ones((2, 1, 1, 1), dtype=prediction.dtype)
+
+
+def test_decoded_video_metrics_support_optional_lpips_model():
+    video = np.zeros((2, 8, 8, 3), dtype=np.float32)
+
+    metrics = decoded_video_metrics(
+        video,
+        video,
+        include_ssim=False,
+        lpips_model=_UnitLPIPS(),
+        lpips_device="cpu",
+    )
+
+    assert metrics["lpips"] == pytest.approx(1.0)

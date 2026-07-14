@@ -33,6 +33,8 @@ def decoded_video_metrics(
     target: np.ndarray,
     *,
     include_ssim: bool = True,
+    lpips_model=None,
+    lpips_device: str | torch.device | None = None,
 ) -> dict[str, float]:
     """Measure decoded-frame fidelity and motion consistency in [0, 1] space."""
     prediction = _as_unit_float_video(prediction)
@@ -79,6 +81,20 @@ def decoded_video_metrics(
                     for index in range(prediction.shape[0])
                 ]
                 metrics["ssim"] = float(np.mean(values, dtype=np.float64))
+    if lpips_model is not None:
+        device = torch.device("cpu") if lpips_device is None else torch.device(lpips_device)
+        prediction_tensor = torch.from_numpy(
+            np.ascontiguousarray(prediction[..., :3].transpose(0, 3, 1, 2))
+        ).to(device)
+        target_tensor = torch.from_numpy(
+            np.ascontiguousarray(target[..., :3].transpose(0, 3, 1, 2))
+        ).to(device)
+        if prediction_tensor.shape[1] == 1:
+            prediction_tensor = prediction_tensor.repeat(1, 3, 1, 1)
+            target_tensor = target_tensor.repeat(1, 3, 1, 1)
+        with torch.no_grad():
+            lpips_value = lpips_model(prediction_tensor * 2.0 - 1.0, target_tensor * 2.0 - 1.0)
+        metrics["lpips"] = float(lpips_value.detach().float().mean().item())
     return metrics
 
 

@@ -109,6 +109,7 @@ from distillation_flowmap.danceopd_query import (
 )
 from distillation_flowmap.cosmos_progressive_opd import (
     apply_full_endpoint_focus,
+    center_spatial_crop_slices,
     rollout_velocity_field,
 )
 
@@ -3812,7 +3813,9 @@ class FlowMapStepMixin:
             kto_paopd=True,
         )
 
-    def _cosmos_danceopd_velocity_loss(self, batch, teacher, input_dict, *, cfg_scale):
+    def _cosmos_danceopd_velocity_loss(
+        self, batch, teacher, input_dict, *, cfg_scale, teacher_crop_context=None
+    ):
         """Return DanceOPD's local video-field loss for a raw Cosmos teacher.
 
         The 16-step trajectory jointly evolves the student video and action
@@ -3849,7 +3852,16 @@ class FlowMapStepMixin:
         )
         zero_video_t = torch.zeros_like(terminal_video_t)
         zero_action_t = torch.zeros_like(terminal_action_t)
-        video_noise = torch.randn_like(batch['latents'])
+        full_dance_noise = None
+        if teacher_crop_context is None:
+            video_noise = torch.randn_like(batch['latents'])
+        else:
+            full_dance_noise = torch.randn_like(
+                teacher_crop_context['full_anchor']
+            )
+            video_noise = full_dance_noise[
+                ..., teacher_crop_context['h_slice'], teacher_crop_context['w_slice']
+            ].to(batch['latents'])
         action_noise = torch.randn_like(action_clean)
         current_video = self.train_scheduler_latent.add_noise(
             batch['latents'], video_noise, terminal_video_t, t_dim=2
@@ -4021,14 +4033,33 @@ class FlowMapStepMixin:
             query_input, query_video_t, query_action_t, return_action=False
         )
         with torch.no_grad():
+            teacher_query = query_video.detach().float()
+            if teacher_crop_context is not None:
+                query_sigma = (
+                    query_video_t / self.config.num_train_timesteps
+                )[:, None, :, None, None].to(
+                    teacher_crop_context['full_anchor']
+                )
+                teacher_query = (
+                    (1.0 - query_sigma) * teacher_crop_context['full_anchor']
+                    + query_sigma * full_dance_noise
+                )
+                teacher_query = teacher_query.clone()
+                teacher_query[
+                    ..., teacher_crop_context['h_slice'], teacher_crop_context['w_slice']
+                ] = query_video.detach().float().to(teacher_query)
             teacher_result = teacher.predict_raw_latent_velocity(
                 batch,
-                query_latent=query_video.detach().float(),
+                query_latent=teacher_query,
                 t=(query_video_t / self.config.num_train_timesteps).detach().float(),
             )
             teacher_velocity = teacher_result['cosmos_latent_velocity'].to(
                 device=student_velocity.device, dtype=student_velocity.dtype
             )
+            if teacher_crop_context is not None:
+                teacher_velocity = teacher_velocity[
+                    ..., teacher_crop_context['h_slice'], teacher_crop_context['w_slice']
+                ]
         velocity_loss = direct_velocity_mse(student_velocity, teacher_velocity)
         diagnostics = {
             'query_index_mean': query_indices.float().mean().detach(),
@@ -4090,14 +4121,41 @@ class FlowMapStepMixin:
                 epsilon=float(getattr(self.config, 'cosmos_latent_epsilon', 0.001)),
                 include_cdiff=False,
             )
-        batch['latents'] = anchor_result['cosmos_latent_x0'].to(
+        full_anchor = anchor_result['cosmos_latent_x0'].to(
             device=self.device, dtype=batch['actions'].dtype
         )
-        video_noise = video_noise_teacher.to(
-            device=self.device, dtype=batch['latents'].dtype
+        full_video_noise = video_noise_teacher.to(
+            device=self.device, dtype=full_anchor.dtype
         )
-        sigma_t = video_t_norm[:, None, :, None, None].to(batch['latents'])
-        video_noisy_t = (1.0 - sigma_t) * batch['latents'] + sigma_t * video_noise
+        sigma_t = video_t_norm[:, None, :, None, None].to(full_anchor)
+        full_video_noisy_t = (
+            (1.0 - sigma_t) * full_anchor + sigma_t * full_video_noise
+        )
+        h_slice, w_slice = center_spatial_crop_slices(
+            full_anchor.shape[-2],
+            full_anchor.shape[-1],
+            crop_size=int(getattr(self.config, 'opd_cosmos_spatial_crop_size', 0)),
+        )
+        crop_is_active = (
+            h_slice.start != 0
+            or h_slice.stop != full_anchor.shape[-2]
+            or w_slice.start != 0
+            or w_slice.stop != full_anchor.shape[-1]
+        )
+        if crop_is_active:
+            batch['latents'] = full_anchor[..., h_slice, w_slice].contiguous()
+            video_noise = full_video_noise[..., h_slice, w_slice].contiguous()
+            video_noisy_t = full_video_noisy_t[..., h_slice, w_slice].contiguous()
+            teacher_crop_context = {
+                'full_anchor': full_anchor.detach(),
+                'h_slice': h_slice,
+                'w_slice': w_slice,
+            }
+        else:
+            batch['latents'] = full_anchor
+            video_noise = full_video_noise
+            video_noisy_t = full_video_noisy_t
+            teacher_crop_context = None
         ref_shape = batch['latents'].shape
         input_dict = self._prepare_base_dict(batch)
         input_dict['latent_dict']['noisy_latents'] = video_noisy_t
@@ -4189,18 +4247,25 @@ class FlowMapStepMixin:
 
         with torch.no_grad():
             teacher_x_r, teacher_v_r, _ = rollout_velocity_field(
-                video_noisy_t.detach().float(),
+                full_video_noisy_t.detach().float(),
                 video_t_norm,
                 video_r_norm,
                 num_steps=teacher_steps,
                 velocity_field=_teacher_velocity_field,
             )
+        if teacher_crop_context is not None:
+            teacher_x_r = teacher_x_r[..., h_slice, w_slice].contiguous()
+            teacher_v_r = teacher_v_r[..., h_slice, w_slice].contiguous()
         sigma_r = video_r_norm[:, None, :, None, None]
         endpoint_loss = denoised_endpoint_mse(
             student_x_r, student_v_r, teacher_x_r, teacher_v_r, sigma_r
         )
         velocity_loss, dance_diagnostics = self._cosmos_danceopd_velocity_loss(
-            batch, teacher, self._prepare_base_dict(batch), cfg_scale=cfg_scale
+            batch,
+            teacher,
+            self._prepare_base_dict(batch),
+            cfg_scale=cfg_scale,
+            teacher_crop_context=teacher_crop_context,
         )
 
         endpoint_weight = float(getattr(self.config, 'opd_danceopd_endpoint_weight', 1.0))

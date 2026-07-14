@@ -2,6 +2,7 @@ import torch
 
 from distillation_flowmap.cosmos_progressive_opd import (
     apply_full_endpoint_focus,
+    center_spatial_crop_slices,
     rollout_velocity_field,
     should_run_standalone_opd,
 )
@@ -63,3 +64,17 @@ def test_standalone_opd_schedule_respects_warmup_and_interval():
     assert should_run_standalone_opd(step=8, warmup_steps=8, interval=8)
     assert not should_run_standalone_opd(step=9, warmup_steps=8, interval=8)
     assert should_run_standalone_opd(step=16, warmup_steps=8, interval=8)
+
+
+def test_center_spatial_crop_uses_a_symmetric_window():
+    h_slice, w_slice = center_spatial_crop_slices(28, 28, crop_size=24)
+
+    assert (h_slice.start, h_slice.stop) == (2, 26)
+    assert (w_slice.start, w_slice.stop) == (2, 26)
+
+
+def test_crop_size_at_or_above_input_keeps_the_full_latent():
+    h_slice, w_slice = center_spatial_crop_slices(28, 30, crop_size=32)
+
+    assert (h_slice.start, h_slice.stop) == (0, 28)
+    assert (w_slice.start, w_slice.stop) == (0, 30)

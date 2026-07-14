@@ -114,6 +114,12 @@ cfg.opd_aux_empty_cache = _env_bool("OPD_AUX_EMPTY_CACHE", True)
 # main and full OPD backward graphs at once. Reserve scheduled updates for OPD
 # so both objectives remain part of the same training run without peak overlap.
 cfg.opd_aux_standalone_step = _env_bool("OPD_AUX_STANDALONE_STEP", True)
+# The full Cosmos latent endpoint remains 28x28. Only the student-side OPD
+# field loss uses this centered crop on two GPUs; the main joint shortcut loss
+# stays full resolution.
+cfg.opd_cosmos_spatial_crop_size = int(
+    os.environ.get("OPD_COSMOS_SPATIAL_CROP_SIZE", 24)
+)
 
 cfg.opd_rollout_step_pairs = [[_spec["teacher_steps"], _spec["student_steps"]]]
 cfg.rollout_step_pairs = copy.deepcopy(cfg.opd_rollout_step_pairs)

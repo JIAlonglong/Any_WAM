@@ -104,3 +104,15 @@ def should_run_standalone_opd(*, step, warmup_steps, interval):
     if int(interval) <= 0:
         raise ValueError("interval must be positive")
     return int(step) >= int(warmup_steps) and int(step) % int(interval) == 0
+
+
+def center_spatial_crop_slices(height, width, *, crop_size):
+    """Return a centered square crop, or the full image when no crop is needed."""
+    if int(height) <= 0 or int(width) <= 0:
+        raise ValueError("height and width must be positive")
+    if int(crop_size) <= 0 or int(crop_size) >= min(int(height), int(width)):
+        return slice(0, int(height)), slice(0, int(width))
+    crop_size = int(crop_size)
+    top = (int(height) - crop_size) // 2
+    left = (int(width) - crop_size) // 2
+    return slice(top, top + crop_size), slice(left, left + crop_size)

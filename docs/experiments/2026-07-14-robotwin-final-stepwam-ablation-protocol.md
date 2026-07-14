@@ -79,3 +79,15 @@ it must not be claimed as a LingBot-VA decoding path.
 - CPU WanVAE decode was intentionally rejected for the final protocol after a
   one-record smoke took more than six minutes. CUDA decode completed the same
   smoke successfully and is required for the 120-record held-out evaluation.
+
+## Reproducible Execution
+
+- Run `distillation_flowmap/ablation/run_final_danceopd_eval.sh` after the
+  requested step_5000 checkpoints exist. It builds one shared teacher cache
+  with T=1/2/4 trajectory states, then replays every compatible checkpoint.
+- Main numerical replay requires CUDA WanVAE/LPIPS and preserves the fixed
+  held-out manifest, pair seeds, teacher cache, and K=1/2/4, T=1/2/4/8 grids.
+- Its asset stage creates a separate one-held-out-record-per-task `1000->0`
+  manifest and exports native WanVAE teacher/baseline/full contact sheets.
+- The action-only structural control is evaluated and reported through action
+  endpoint and closed-loop metrics only; it is excluded from video conclusions.

@@ -32,7 +32,7 @@
 - Consumes: `--video-max-pairs`, `--eval-manifest`, and a one-pair JSON file.
 - Produces: one native WanVAE video/contact sheet for each selected manifest record until `video-max-pairs` is reached.
 
-- [ ] **Step 1: Write the failing regression test**
+- [x] **Step 1: Write the failing regression test**
 
 ```python
 def test_video_eval_does_not_limit_assets_to_first_eval_record():
@@ -40,23 +40,23 @@ def test_video_eval_does_not_limit_assets_to_first_eval_record():
     assert "and batch_idx == 0" not in source
 ```
 
-- [ ] **Step 2: Run the focused test and verify it fails**
+- [x] **Step 2: Run the focused test and verify it fails**
 
 Run: `python -m pytest -q distillation_flowmap/tests/test_robotwin_video_eval_memory.py::test_video_eval_does_not_limit_assets_to_first_eval_record`
 
 Expected: FAIL because both native asset-save guards contain `batch_idx == 0`.
 
-- [ ] **Step 3: Remove only the first-record guards**
+- [x] **Step 3: Remove only the first-record guards**
 
 Use `rank == 0`, non-null `video_dir`, and `saved_video_pairs < args.video_max_pairs` in both save decisions. Leave the counter increment after each contact sheet unchanged.
 
-- [ ] **Step 4: Run focused and related tests**
+- [x] **Step 4: Run focused and related tests**
 
 Run: `python -m pytest -q distillation_flowmap/tests/test_robotwin_video_eval_memory.py distillation_flowmap/tests/test_robotwin_smoke_video_logging.py`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add distillation_flowmap/rollout_eval_video_stage2.py distillation_flowmap/tests/test_robotwin_video_eval_memory.py
@@ -74,7 +74,7 @@ git commit -m "fix: export RobotWin assets across manifest records"
 - Consumes: the frozen training root, 12-task manifests, stage2 step_5000 checkpoints, GPUs 6 and 7.
 - Produces: one trajectory teacher cache, cache SHA256 provenance, held-out metric JSON per run, optional ten-per-task train metrics, and selected baseline/full assets.
 
-- [ ] **Step 1: Write a failing dry-run protocol test**
+- [x] **Step 1: Write a failing dry-run protocol test**
 
 ```python
 result = subprocess.run(["bash", script, "--dry-run"], text=True, capture_output=True, check=True)
@@ -86,13 +86,13 @@ assert "--decoded-video-device cuda" in result.stdout
 assert "--decoded-video-lpips" in result.stdout
 ```
 
-- [ ] **Step 2: Run the focused test and verify it fails**
+- [x] **Step 2: Run the focused test and verify it fails**
 
 Run: `python -m pytest -q distillation_flowmap/tests/test_robotwin_final_danceopd_eval.py`
 
 Expected: FAIL because the dedicated runner does not exist.
 
-- [ ] **Step 3: Implement only the frozen protocol**
+- [x] **Step 3: Implement only the frozen protocol**
 
 The runner must:
 - build `teacher_cache_heldout_equal_nfe_trajectories.pt` from one named shared Stage1 checkpoint;
@@ -103,7 +103,7 @@ The runner must:
 - keep structural controls in a separate execution group and mark action-only video metrics unavailable rather than fabricating them;
 - record cache SHA256 and `git rev-parse HEAD` in a JSON provenance file.
 
-- [ ] **Step 4: Run dry-run and shell syntax verification**
+- [x] **Step 4: Run dry-run and shell syntax verification**
 
 Run: `bash -n distillation_flowmap/ablation/run_final_danceopd_eval.sh && python -m pytest -q distillation_flowmap/tests/test_robotwin_final_danceopd_eval.py`
 
@@ -113,7 +113,7 @@ Expected: PASS and dry-run prints no training command.
 
 Run the runner with its smoke option and verify an output JSON contains finite K=1/2/4 equal-NFE metrics including decoded LPIPS, same-state velocity, and rollout drift.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add distillation_flowmap/ablation/run_final_danceopd_eval.sh distillation_flowmap/tests/test_robotwin_final_danceopd_eval.py docs/experiments/2026-07-14-robotwin-final-stepwam-ablation-protocol.md

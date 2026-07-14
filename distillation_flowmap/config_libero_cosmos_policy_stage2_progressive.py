@@ -105,6 +105,11 @@ cfg.opd_aux_gradient_checkpointing = _env_bool(
 )
 cfg.opd_aux_use_nofsdp_rollout = False
 cfg.opd_profile = _env_bool("OPD_PROFILE", False)
+# CFG=3 is required by the inherited policy setup. Running its conditional and
+# unconditional branches serially is numerically identical to the doubled
+# batch path while fitting the two-GPU FSDP1 budget beside the raw Cosmos worker.
+cfg.opd_serial_student_cfg = _env_bool("OPD_SERIAL_STUDENT_CFG", True)
+cfg.opd_aux_empty_cache = _env_bool("OPD_AUX_EMPTY_CACHE", True)
 
 cfg.opd_rollout_step_pairs = [[_spec["teacher_steps"], _spec["student_steps"]]]
 cfg.rollout_step_pairs = copy.deepcopy(cfg.opd_rollout_step_pairs)

@@ -33,7 +33,8 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
     assert module.cfg.opd_danceopd_velocity_weight > 0
     assert module.cfg.opd_serial_student_cfg is True
     assert module.cfg.opd_aux_standalone_step is True
-    assert module.cfg.opd_cosmos_spatial_crop_size == 24
+    assert module.cfg.opd_aux_gradient_checkpointing is True
+    assert module.cfg.opd_cosmos_spatial_crop_size == 28
 
 
 def test_progressive_k1_uses_four_step_teacher_not_two(monkeypatch):

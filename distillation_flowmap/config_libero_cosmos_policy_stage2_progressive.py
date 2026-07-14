@@ -101,7 +101,7 @@ cfg.opd_aux_warmup_steps = int(os.environ.get("OPD_AUX_WARMUP_STEPS", 8))
 cfg.opd_aux_interval = int(os.environ.get("OPD_AUX_INTERVAL", 8))
 cfg.opd_aux_prob = float(os.environ.get("OPD_AUX_PROB", 1.0))
 cfg.opd_aux_gradient_checkpointing = _env_bool(
-    "OPD_AUX_GRADIENT_CHECKPOINTING", False
+    "OPD_AUX_GRADIENT_CHECKPOINTING", True
 )
 cfg.opd_aux_use_nofsdp_rollout = False
 cfg.opd_profile = _env_bool("OPD_PROFILE", False)
@@ -114,11 +114,11 @@ cfg.opd_aux_empty_cache = _env_bool("OPD_AUX_EMPTY_CACHE", True)
 # main and full OPD backward graphs at once. Reserve scheduled updates for OPD
 # so both objectives remain part of the same training run without peak overlap.
 cfg.opd_aux_standalone_step = _env_bool("OPD_AUX_STANDALONE_STEP", True)
-# The full Cosmos latent endpoint remains 28x28. Only the student-side OPD
-# field loss uses this centered crop on two GPUs; the main joint shortcut loss
-# stays full resolution.
+# Activation checkpointing keeps the full 28x28 Cosmos OPD objective within
+# the two-H100 FSDP1 budget. A smaller value remains an explicit fallback for
+# constrained hardware, not the default training objective.
 cfg.opd_cosmos_spatial_crop_size = int(
-    os.environ.get("OPD_COSMOS_SPATIAL_CROP_SIZE", 24)
+    os.environ.get("OPD_COSMOS_SPATIAL_CROP_SIZE", 28)
 )
 
 cfg.opd_rollout_step_pairs = [[_spec["teacher_steps"], _spec["student_steps"]]]

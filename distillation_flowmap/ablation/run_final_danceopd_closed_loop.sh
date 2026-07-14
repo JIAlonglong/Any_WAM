@@ -468,6 +468,8 @@ fi
 
 require_path "${ROBOTWIN_ROOT}"
 require_path "${ROBOTWIN_ROOT}/policy/ACT/deploy_policy.yml"
+require_path "${ROBOTWIN_ROOT}/assets/objects/objaverse/list.json"
+require_path "${ROBOTWIN_ROOT}/assets/embodiments"
 require_path "${PROJECT_ROOT}/wan_va/wan_va_server.py"
 
 for variant in "${SELECTED_VARIANTS[@]}"; do

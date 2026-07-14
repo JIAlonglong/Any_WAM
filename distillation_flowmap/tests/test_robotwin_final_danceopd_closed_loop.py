@@ -56,3 +56,5 @@ def test_closed_loop_dry_run_freezes_final_main_protocol(tmp_path):
     assert "--nfe 4" in output
     assert "--no-save-visualization" in output
     assert "ROBOTWIN_ROOT=" in output
+    assert "assets/objects/objaverse/list.json" in script.read_text(encoding="utf-8")
+    assert "assets/embodiments" in script.read_text(encoding="utf-8")

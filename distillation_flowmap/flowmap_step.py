@@ -2989,7 +2989,8 @@ class FlowMapStepMixin:
                                    empty_emb, cfg_scale, ref_shape, B, num_frames,
                                    K_steps=1, action_target_r=None,
                                    return_last_step_start=False,
-                                   return_final_action=False):
+                                   return_final_action=False,
+                                   return_trajectory=False):
         """
         Student multi-step Euler integration from t to target_r.
 
@@ -3090,6 +3091,7 @@ class FlowMapStepMixin:
 
         step_ts = self._build_timestep_path(timesteps.float(), target_r.float(), K_steps)
         current_x = noisy_latents
+        trajectory = [current_x.detach()] if return_trajectory else None
         last_step_start_x = current_x
         last_step_start_t = step_ts[0]
 
@@ -3147,6 +3149,8 @@ class FlowMapStepMixin:
                 current_x = current_x + v_cfg * (sigma_next - sigma_i)
                 if force_eval_checkpointing and not keep_step_grad:
                     current_x = current_x.detach()
+                if return_trajectory:
+                    trajectory.append(current_x.detach())
 
         current_x_for_loss = current_x if rollout_grad_mode != 'endpoint' else current_x.detach()
         current_x_for_forward = current_x.detach()
@@ -3199,6 +3203,8 @@ class FlowMapStepMixin:
                     self.student.blocks[_bi] = _block
 
         if return_last_step_start:
+            if return_trajectory:
+                raise ValueError("return_trajectory is incompatible with return_last_step_start.")
             if return_final_action:
                 return (
                     current_x_for_loss,
@@ -3210,12 +3216,17 @@ class FlowMapStepMixin:
             return current_x_for_loss, v_final_cfg, last_step_start_x.detach(), last_step_start_t.detach()
 
         if return_final_action:
+            if return_trajectory:
+                return current_x_for_loss, v_final_cfg, final_action_seq, tuple(trajectory)
             return current_x_for_loss, v_final_cfg, final_action_seq
+        if return_trajectory:
+            return current_x_for_loss, v_final_cfg, tuple(trajectory)
         return current_x_for_loss, v_final_cfg
 
 
     def _teacher_integrate_to_r(self, noisy_latents, timesteps, target_r, input_dict, empty_emb,
-                                 cfg_scale, ref_shape, B, num_frames, num_steps=2):
+                                 cfg_scale, ref_shape, B, num_frames, num_steps=2,
+                                 return_trajectory=False):
         """
         Teacher multi-step Euler integration from t to target_r (no_grad).
 
@@ -3244,6 +3255,7 @@ class FlowMapStepMixin:
         step_ts = self._build_timestep_path(timesteps.float(), target_r.float(), num_steps)
 
         current_x = noisy_latents
+        trajectory = [current_x.detach()] if return_trajectory else None
 
         with torch.no_grad():
             for i in range(num_steps):
@@ -3271,6 +3283,8 @@ class FlowMapStepMixin:
                 sigma_i = self._timestep_to_sigma_5d(t_i)
                 sigma_next = self._timestep_to_sigma_5d(r_i)
                 current_x = current_x + v_cfg_5d * (sigma_next - sigma_i)
+                if return_trajectory:
+                    trajectory.append(current_x.detach())
 
             # 最终 teacher v-prediction at target_r
             final_teacher_input = {
@@ -3287,6 +3301,8 @@ class FlowMapStepMixin:
             v_cfg_final = v_uncond_final + cfg_scale * (v_cond_final - v_uncond_final)
             v_teacher = self._extract_video_v(v_cfg_final, ref_shape, B)
 
+        if return_trajectory:
+            return current_x, v_teacher, tuple(trajectory)
         return current_x, v_teacher
 
     def _teacher_forward_at_student_state(self, student_x_r, target_r, input_dict, empty_emb,

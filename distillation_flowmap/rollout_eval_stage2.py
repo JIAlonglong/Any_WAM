@@ -41,6 +41,7 @@ from distillation_flowmap.rollout_masking import (
     masked_video_rms,
     video_frame_mask_from_batch,
 )
+from distillation_flowmap.rollout_diagnostics import rollout_trajectory_drift
 from distillation_flowmap.ablation.robotwin_mini_protocol import (
     dataset_records_for_manifest,
     eval_seed_for_pair,
@@ -239,8 +240,42 @@ def main():
         action="store_true",
         help="Recompute teacher targets even when --teacher-cache-path already exists.",
     )
+    parser.add_argument(
+        "--cache-teacher-trajectories",
+        action="store_true",
+        help="Persist aligned teacher intermediate states for equal-NFE rollout drift.",
+    )
+    parser.add_argument(
+        "--trajectory-teacher-steps",
+        nargs="+",
+        type=int,
+        default=[1, 2, 4],
+        help="Teacher budgets whose intermediate states are retained in the cache.",
+    )
+    parser.add_argument(
+        "--rollout-drift",
+        action="store_true",
+        help="Report aligned equal-NFE trajectory drift when teacher paths are available.",
+    )
+    parser.add_argument(
+        "--same-state-velocity",
+        action="store_true",
+        help="Query the teacher at each student terminal state for a true local velocity error.",
+    )
     args = parser.parse_args()
     teacher_steps = normalize_rollout_steps(args.teacher_steps)
+    student_steps = normalize_rollout_steps(args.student_steps)
+    trajectory_teacher_steps = normalize_rollout_steps(args.trajectory_teacher_steps)
+    if args.cache_teacher_trajectories and not set(trajectory_teacher_steps).issubset(teacher_steps):
+        raise ValueError("--trajectory-teacher-steps must be a subset of --teacher-steps.")
+    drift_teacher_steps = sorted(set(student_steps).intersection(teacher_steps))
+    if args.rollout_drift and not drift_teacher_steps:
+        raise ValueError("--rollout-drift requires at least one equal-NFE student/teacher budget.")
+    requested_trajectory_steps = set()
+    if args.cache_teacher_trajectories:
+        requested_trajectory_steps.update(trajectory_teacher_steps)
+    if args.rollout_drift:
+        requested_trajectory_steps.update(drift_teacher_steps)
 
     init_logger()
     rank = int(os.getenv("RANK", 0))
@@ -266,6 +301,23 @@ def main():
             teacher_cache_compatible = cache_metadata_matches_offline_conditioning(
                 teacher_cache_payload.get("metadata", {})
             )
+            if teacher_cache_compatible and requested_trajectory_steps:
+                cached_trajectory_steps = set(
+                    teacher_cache_payload.get("metadata", {}).get(
+                        "teacher_trajectory_steps", []
+                    )
+                )
+                missing_trajectory_steps = sorted(
+                    requested_trajectory_steps.difference(cached_trajectory_steps)
+                )
+                if missing_trajectory_steps:
+                    teacher_cache_compatible = False
+                    if rank == 0:
+                        logger.warning(
+                            "Teacher cache is missing trajectory states for equal-NFE steps %s: %s",
+                            missing_trajectory_steps,
+                            teacher_cache_path,
+                        )
         except Exception as exc:
             if rank == 0:
                 logger.warning(
@@ -329,7 +381,7 @@ def main():
     cfg.enable_stage1_start_eval_baseline = False
     cfg.offline_eval_skip_target_student = not args.load_target_student
     cfg.offline_eval_use_fsdp_teacher = not args.use_nofsdp_teacher
-    cfg.offline_eval_skip_teacher = use_teacher_cache
+    cfg.offline_eval_skip_teacher = use_teacher_cache and not args.same_state_velocity
     cfg.offline_eval_force_gradient_checkpointing = not args.disable_eval_gradient_checkpointing
     cfg.offline_eval_force_cfg = not args.disable_eval_force_cfg
     cfg.offline_eval_return_final_action = True
@@ -350,6 +402,10 @@ def main():
         trainer.target_student.eval()
     if getattr(trainer, "_student_nofsdp", None) is not None:
         trainer._student_nofsdp.eval()
+    if args.same_state_velocity and getattr(trainer, "teacher", None) is None:
+        raise RuntimeError(
+            "--same-state-velocity requires a loaded teacher; do not skip the teacher."
+        )
     conditioning_metadata = freeze_offline_eval_conditioning(trainer)
     if rank == 0:
         logger.info("Offline eval conditioning: %s", conditioning_metadata)
@@ -469,16 +525,28 @@ def main():
                 sample_key=record.get("sample_key"),
             )
 
-            def cache_teacher_target(teacher_step, teacher_x_r, teacher_v_r):
+            def cache_teacher_target(
+                teacher_step, teacher_x_r, teacher_v_r, teacher_trajectory=None
+            ):
                 if teacher_cache_path is None or rank != 0:
                     return
-                entry = teacher_cache_to_write.setdefault(
-                    cache_key, {"teacher_by_steps": {}}
-                )
-                entry["teacher_by_steps"][str(teacher_step)] = {
+                target = {
                     "teacher_x_r": teacher_x_r.detach().cpu(),
                     "teacher_v_r": teacher_v_r.detach().cpu(),
                 }
+                if teacher_trajectory is not None:
+                    if len(teacher_trajectory) != teacher_step + 1:
+                        raise ValueError(
+                            "Teacher trajectory must include the start and every Euler state.",
+                        )
+                    target["teacher_x_path"] = tuple(
+                        state.detach().float().cpu()
+                        for state in teacher_trajectory[1:-1]
+                    )
+                entry = teacher_cache_to_write.setdefault(
+                    cache_key, {"teacher_by_steps": {}}
+                )
+                entry["teacher_by_steps"][str(teacher_step)] = target
 
             def load_teacher_target(teacher_step):
                 targets = teacher_cache.get("targets", {})
@@ -497,22 +565,40 @@ def main():
                         "Legacy scalar teacher cache cannot satisfy multiple teacher steps; "
                         "rebuild it with --teacher-cache-only."
                     )
-                return (
-                    cached["teacher_x_r"].to(
-                        device=trainer.device,
-                        dtype=video_noisy_t.dtype,
-                        non_blocking=True,
-                    ),
-                    cached["teacher_v_r"].to(
-                        device=trainer.device,
-                        dtype=video_noisy_t.dtype,
-                        non_blocking=True,
-                    ),
+                teacher_x_r = cached["teacher_x_r"].to(
+                    device=trainer.device,
+                    dtype=video_noisy_t.dtype,
+                    non_blocking=True,
                 )
+                teacher_v_r = cached["teacher_v_r"].to(
+                    device=trainer.device,
+                    dtype=video_noisy_t.dtype,
+                    non_blocking=True,
+                )
+                teacher_x_path = ()
+                if teacher_step in drift_teacher_steps:
+                    if "teacher_x_path" not in cached:
+                        raise KeyError(
+                            f"Teacher cache is missing trajectory states for step {teacher_step}: {cache_key}"
+                        )
+                    teacher_x_path = tuple(
+                        state.to(
+                            device=trainer.device,
+                            dtype=video_noisy_t.dtype,
+                            non_blocking=True,
+                        )
+                        for state in cached["teacher_x_path"]
+                    )
+                    if len(teacher_x_path) != teacher_step - 1:
+                        raise ValueError(
+                            f"Teacher cache trajectory length is invalid for step {teacher_step}: {cache_key}"
+                        )
+                return teacher_x_r, teacher_v_r, teacher_x_path
 
             if args.teacher_cache_only:
                 for teacher_step in teacher_steps:
-                    teacher_x_r, teacher_v_r = trainer._teacher_integrate_to_r(
+                    capture_trajectory = teacher_step in requested_trajectory_steps
+                    teacher_rollout = trainer._teacher_integrate_to_r(
                         noisy_latents=video_noisy_t,
                         timesteps=video_t,
                         target_r=video_r,
@@ -523,15 +609,23 @@ def main():
                         B=B,
                         num_frames=num_frames,
                         num_steps=teacher_step,
+                        return_trajectory=capture_trajectory,
                     )
-                    cache_teacher_target(teacher_step, teacher_x_r, teacher_v_r)
-                    del teacher_x_r, teacher_v_r
+                    if capture_trajectory:
+                        teacher_x_r, teacher_v_r, teacher_trajectory = teacher_rollout
+                    else:
+                        teacher_x_r, teacher_v_r = teacher_rollout
+                        teacher_trajectory = None
+                    cache_teacher_target(
+                        teacher_step, teacher_x_r, teacher_v_r, teacher_trajectory
+                    )
+                    del teacher_x_r, teacher_v_r, teacher_trajectory
                 continue
 
             # Compute each student trajectory once. All teacher budgets below
             # compare against identical x_t, r, noise, and student states.
             student_rollouts = {}
-            for k_steps in args.student_steps:
+            for k_steps in student_steps:
                 rollout_out = trainer._student_euler_integrate(
                     noisy_latents=video_noisy_t,
                     timesteps=video_t,
@@ -545,12 +639,17 @@ def main():
                     K_steps=k_steps,
                     action_target_r=action_r,
                     return_final_action=True,
+                    return_trajectory=args.rollout_drift,
                 )
-                if isinstance(rollout_out, tuple) and len(rollout_out) == 3:
+                if isinstance(rollout_out, tuple) and len(rollout_out) == 4:
+                    student_x_r, student_v_r, student_action_seq, student_trajectory = rollout_out
+                elif isinstance(rollout_out, tuple) and len(rollout_out) == 3:
                     student_x_r, student_v_r, student_action_seq = rollout_out
+                    student_trajectory = None
                 else:
                     student_x_r, student_v_r = rollout_out
                     student_action_seq = None
+                    student_trajectory = None
                 student_metrics = {}
                 mse, l1 = masked_video_mse_l1(student_x_r - video_noisy_r, video_frame_mask)
                 student_metrics["/video_gt_x_mse"] = mse
@@ -561,6 +660,22 @@ def main():
                     student_x_r, video_frame_mask
                 )
 
+                if args.same_state_velocity:
+                    _, teacher_v_at_student_state = trainer._teacher_forward_at_student_state(
+                        student_x_r,
+                        video_r,
+                        input_dict,
+                        empty_emb,
+                        args.cfg_scale,
+                        ref_shape,
+                        B,
+                    )
+                    mse, l1 = masked_video_mse_l1(
+                        student_v_r - teacher_v_at_student_state, video_frame_mask
+                    )
+                    student_metrics["/video_same_state_teacher_v_mse"] = mse
+                    student_metrics["/video_same_state_teacher_v_l1"] = l1
+                    del teacher_v_at_student_state
                 action_input = None
                 if student_action_seq is None:
                     action_input = {
@@ -612,6 +727,10 @@ def main():
                 student_rollouts[k_steps] = {
                     "x": student_x_r.detach(),
                     "v": student_v_r.detach(),
+                    "trajectory": (
+                        tuple(state.detach() for state in student_trajectory)
+                        if student_trajectory is not None else None
+                    ),
                     "metrics": student_metrics,
                 }
                 del (
@@ -626,10 +745,11 @@ def main():
                 )
 
             for teacher_step in teacher_steps:
+                capture_trajectory = teacher_step in requested_trajectory_steps
                 if use_teacher_cache:
-                    teacher_x_r, teacher_v_r = load_teacher_target(teacher_step)
+                    teacher_x_r, teacher_v_r, teacher_x_path = load_teacher_target(teacher_step)
                 else:
-                    teacher_x_r, teacher_v_r = trainer._teacher_integrate_to_r(
+                    teacher_rollout = trainer._teacher_integrate_to_r(
                         noisy_latents=video_noisy_t,
                         timesteps=video_t,
                         target_r=video_r,
@@ -640,8 +760,18 @@ def main():
                         B=B,
                         num_frames=num_frames,
                         num_steps=teacher_step,
+                        return_trajectory=capture_trajectory,
                     )
-                    cache_teacher_target(teacher_step, teacher_x_r, teacher_v_r)
+                    if capture_trajectory:
+                        teacher_x_r, teacher_v_r, teacher_trajectory = teacher_rollout
+                        teacher_x_path = tuple(teacher_trajectory[1:-1])
+                    else:
+                        teacher_x_r, teacher_v_r = teacher_rollout
+                        teacher_trajectory = None
+                        teacher_x_path = ()
+                    cache_teacher_target(
+                        teacher_step, teacher_x_r, teacher_v_r, teacher_trajectory
+                    )
 
                 for k_steps, student_result in student_rollouts.items():
                     prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{teacher_step}"
@@ -664,9 +794,23 @@ def main():
                     )
                     add(prefix + "/video_teacher_v_mse", mse)
                     add(prefix + "/video_teacher_v_l1", l1)
+                    if args.rollout_drift and k_steps == teacher_step:
+                        student_trajectory = student_result["trajectory"]
+                        if student_trajectory is None:
+                            raise RuntimeError("Student rollout did not return a requested trajectory.")
+                        teacher_trajectory = (
+                            student_trajectory[0], *teacher_x_path, teacher_x_r
+                        )
+                        drift = rollout_trajectory_drift(
+                            student_trajectory,
+                            teacher_trajectory,
+                            frame_mask=video_frame_mask,
+                        )
+                        add(prefix + "/video_rollout_drift_mse", drift["mse"])
+                        add(prefix + "/video_rollout_drift_l1", drift["l1"])
                     for name, value in student_result["metrics"].items():
                         add(prefix + name, value)
-                del teacher_x_r, teacher_v_r
+                del teacher_x_r, teacher_v_r, teacher_x_path
 
             if args.eval_empty_cache:
                 teacher_x_r = teacher_v_r = None
@@ -695,6 +839,7 @@ def main():
                     "eval_pairs_json": str(args.eval_pairs_json) if args.eval_pairs_json else None,
                     "split_name": args.split_name,
                     "teacher_steps": teacher_steps,
+                    "teacher_trajectory_steps": sorted(requested_trajectory_steps),
                     CACHE_CONDITIONING_METADATA_KEY: conditioning_metadata,
                 },
                 "targets": teacher_cache_to_write,

@@ -49,9 +49,8 @@ class Sapien_TEST(gym.Env):
         try:
             self.setup_scene()
             print("\033[32m" + "Render Well" + "\033[0m")
-        except:
-            print("\033[31m" + "Render Error" + "\033[0m")
-            exit()
+        except Exception as exc:
+            raise RuntimeError("SAPIEN renderer initialization failed") from exc
 
     def setup_scene(self, **kwargs):
         """

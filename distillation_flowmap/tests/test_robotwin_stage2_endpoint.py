@@ -55,11 +55,11 @@ class RobotWinStage2EndpointConfigTest(unittest.TestCase):
         self.assertEqual(cfg.opd_action_rollout_grad_mode, "last_step")
         self.assertEqual(cfg.opd_rollout_step_pairs, [[4, 1], [4, 2]])
         self.assertEqual(cfg.opd_same_state_velocity_weight, 0.0)
-        self.assertFalse(cfg.gradient_checkpointing)
-
-    def test_gradient_checkpointing_can_be_reenabled_for_non_opd_ablation(self):
-        cfg = load_config(GRADIENT_CHECKPOINTING="1")
         self.assertTrue(cfg.gradient_checkpointing)
+
+    def test_gradient_checkpointing_can_be_disabled_by_env(self):
+        cfg = load_config(GRADIENT_CHECKPOINTING="0")
+        self.assertFalse(cfg.gradient_checkpointing)
 
     def test_same_state_velocity_weight_env_override(self):
         cfg = load_config(OPD_SAME_STATE_VELOCITY_WEIGHT="0.25")

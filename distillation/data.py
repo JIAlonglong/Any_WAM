@@ -290,6 +290,18 @@ class DataMixin:
         返回:
             移动到 GPU 后的数据批次字典
         """
+        def _move_value(value, key=None):
+            # Raw policy inputs are consumed by the Cosmos inference adapter,
+            # which may run in a separate process and expects CPU numpy data.
+            if isinstance(key, str) and key.startswith("raw_"):
+                return value
+            if torch.is_tensor(value):
+                return value.to(self.device, non_blocking=True)
+            if isinstance(value, dict):
+                return {inner_key: _move_value(inner_value, inner_key)
+                        for inner_key, inner_value in value.items()}
+            return value
+
         for key, value in input_dict.items():
-            input_dict[key] = value.to(self.device, non_blocking=True)
+            input_dict[key] = _move_value(value, key)
         return input_dict

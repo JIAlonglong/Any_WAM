@@ -36,8 +36,7 @@ cfg.lora_alpha = 0
 cfg.lora_dropout = 0.0
 
 # Stage 2 keeps the AnyFlow/FlowMap objective as the main loss. OPD is an
-# auxiliary endpoint correction aligned with rollout_eval_video_stage2.py:
-# train fewer-step students (K=1/2) against the 4-step teacher endpoint.
+# auxiliary endpoint correction aligned with rollout_eval_video_stage2.py.
 cfg.use_onpolicy_transition = _env_bool("USE_ONPOLICY_TRANSITION", False)
 cfg.use_opd_aux = _env_bool("USE_OPD_AUX", True)
 cfg.opd_aux_weight = float(os.environ.get("OPD_AUX_WEIGHT", 1.0))
@@ -50,8 +49,7 @@ cfg.opd_teacher_target_mode = os.environ.get("OPD_TEACHER_TARGET_MODE", "endpoin
 _default_rollout_grad_mode = (
     "last_step" if cfg.opd_teacher_target_mode == "endpoint" else "endpoint"
 )
-cfg.opd_rollout_grad_mode = os.environ.get(
-    "OPD_ROLLOUT_GRAD_MODE", _default_rollout_grad_mode).lower()
+cfg.opd_rollout_grad_mode = os.environ.get("OPD_ROLLOUT_GRAD_MODE", _default_rollout_grad_mode).lower()
 cfg.opd_action_rollout_grad_mode = os.environ.get("OPD_ACTION_ROLLOUT_GRAD_MODE", cfg.opd_rollout_grad_mode).lower()
 cfg.opd_same_state_velocity_weight = float(os.environ.get(
     "OPD_SAME_STATE_VELOCITY_WEIGHT", 0.0))
@@ -75,14 +73,12 @@ def _parse_step_pairs(text):
 
 
 # Endpoint mode makes the first pair item meaningful: N-step teacher endpoint
-# vs K-step student endpoint. Defaults focus on the failing s1_t4/s2_t4 eval
-# rows instead of spending OPD on already-good s4_t4.
-_default_rollout_step_pairs = (
+# vs K-step student endpoint. Defaults focus on compressed rollout rows.
+cfg.rollout_step_pairs = (
     [[4, 1], [4, 2]]
     if cfg.opd_teacher_target_mode == "endpoint"
     else [[1, 1], [1, 2], [1, 4]]
 )
-cfg.rollout_step_pairs = _default_rollout_step_pairs
 _rollout_step_pairs = os.environ.get("ROLLOUT_STEP_PAIRS")
 if _rollout_step_pairs:
     cfg.rollout_step_pairs = _parse_step_pairs(_rollout_step_pairs)
@@ -145,8 +141,8 @@ cfg.skip_teacher_compile = os.environ.get(
 # Keep it off by default for Stage 2 unless explicitly re-enabled.
 cfg.gradient_checkpointing = os.environ.get(
     "GRADIENT_CHECKPOINTING", "0").lower() in ("1", "true", "yes", "on")
+cfg.opd_aux_gradient_checkpointing = _env_bool("OPD_AUX_GRADIENT_CHECKPOINTING", False)
 
-# Make OPD/local-FM a regularizer rather than the dominant Stage 2 signal.
 # Endpoint OPD must use x0/endpoint semantics. Velocity matching is only valid
 # when teacher and student are evaluated at the same student-induced state.
 _default_transition_param = (

@@ -36,6 +36,7 @@ class LiberoStage2ConfigTest(unittest.TestCase):
             VIDEO_TRANSITION_PARAM=None,
             ACTION_TRANSITION_PARAM=None,
             OPD_SAME_STATE_VELOCITY_WEIGHT=None,
+            OPD_AUX_GRADIENT_CHECKPOINTING=None,
         )
 
         self.assertEqual(cfg.opd_teacher_target_mode, "endpoint")
@@ -45,6 +46,7 @@ class LiberoStage2ConfigTest(unittest.TestCase):
         self.assertEqual(cfg.opd_action_rollout_grad_mode, "last_step")
         self.assertEqual(cfg.opd_rollout_step_pairs, [[4, 1], [4, 2]])
         self.assertEqual(cfg.opd_same_state_velocity_weight, 0.0)
+        self.assertFalse(cfg.opd_aux_gradient_checkpointing)
 
     def test_env_same_state_velocity_weight_enables_hybrid_regularizer(self):
         cfg = load_config(OPD_SAME_STATE_VELOCITY_WEIGHT="0.1")
@@ -53,6 +55,10 @@ class LiberoStage2ConfigTest(unittest.TestCase):
     def test_env_rollout_step_pairs_override_endpoint_curriculum(self):
         cfg = load_config(OPD_ROLLOUT_STEP_PAIRS="4,1;4,2;4,4")
         self.assertEqual(cfg.opd_rollout_step_pairs, [[4, 1], [4, 2], [4, 4]])
+
+    def test_opd_aux_gradient_checkpointing_can_be_enabled_explicitly(self):
+        cfg = load_config(OPD_AUX_GRADIENT_CHECKPOINTING="1")
+        self.assertTrue(cfg.opd_aux_gradient_checkpointing)
 
 
 if __name__ == "__main__":

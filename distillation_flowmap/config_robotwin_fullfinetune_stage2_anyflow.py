@@ -1,8 +1,13 @@
 """Stage 2 OPD continuation for RobotWin full-parameter fine-tuning."""
 import copy
+import math
 import os
 
-from distillation_flowmap.config_robotwin_fullfinetune_stage1_warmup import cfg as _stage1_cfg, _env_bool
+from distillation_flowmap.config_robotwin_fullfinetune_stage1_warmup import (
+    cfg as _stage1_cfg,
+    _env_bool,
+    _parse_adjacent_grid,
+)
 
 cfg = copy.deepcopy(_stage1_cfg)
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -26,6 +31,13 @@ cfg.wandb_name_prefix = "robotwin_stage2_fullft_anyflow"
 # teacher correction for the rollout lengths used by RobotWin eval.
 cfg.use_onpolicy_transition = _env_bool("USE_ONPOLICY_TRANSITION", False)
 cfg.use_opd_aux = _env_bool("USE_OPD_AUX", True)
+cfg.opd_loss_composition = os.environ.get(
+    "OPD_LOSS_COMPOSITION", "legacy"
+).lower()
+if cfg.opd_loss_composition not in ("legacy", "explicit_hybrid"):
+    raise ValueError(
+        "OPD_LOSS_COMPOSITION must be legacy or explicit_hybrid"
+    )
 cfg.opd_aux_weight = float(os.environ.get("OPD_AUX_WEIGHT", 1.0))
 cfg.opd_aux_warmup_steps = int(os.environ.get("OPD_AUX_WARMUP_STEPS", 0))
 cfg.opd_aux_interval = int(os.environ.get("OPD_AUX_INTERVAL", 4))
@@ -40,9 +52,27 @@ cfg.opd_rollout_grad_mode = os.environ.get(
     "OPD_ROLLOUT_GRAD_MODE", _default_rollout_grad_mode).lower()
 cfg.opd_action_rollout_grad_mode = os.environ.get(
     "OPD_ACTION_ROLLOUT_GRAD_MODE", cfg.opd_rollout_grad_mode).lower()
+cfg.opd_rollout_grad_steps = int(os.environ.get(
+    "OPD_ROLLOUT_GRAD_STEPS", 1))
+if cfg.opd_rollout_grad_steps <= 0:
+    raise ValueError("OPD_ROLLOUT_GRAD_STEPS must be positive")
+cfg.opd_action_rollout_grad_steps = int(os.environ.get(
+    "OPD_ACTION_ROLLOUT_GRAD_STEPS", cfg.opd_rollout_grad_steps))
+if cfg.opd_action_rollout_grad_steps <= 0:
+    raise ValueError("OPD_ACTION_ROLLOUT_GRAD_STEPS must be positive")
 cfg.opd_fuse_action_teacher = _env_bool("OPD_FUSE_ACTION_TEACHER", True)
+cfg.opd_serial_student_cfg = _env_bool("OPD_SERIAL_STUDENT_CFG", cfg.use_opd_aux)
+cfg.opd_aux_empty_cache = _env_bool("OPD_AUX_EMPTY_CACHE", cfg.use_opd_aux)
 cfg.opd_same_state_velocity_weight = float(os.environ.get(
     "OPD_SAME_STATE_VELOCITY_WEIGHT", 0.0))
+cfg.flowmap_pair_mode = os.environ.get("FLOWMAP_PAIR_MODE", cfg.flowmap_pair_mode).lower()
+cfg.opd_pair_mode = os.environ.get("OPD_PAIR_MODE", cfg.flowmap_pair_mode).lower()
+cfg.flowmap_adjacent_grid = _parse_adjacent_grid(
+    os.environ.get(
+        "FLOWMAP_ADJACENT_GRID",
+        ",".join(str(v) for v in cfg.flowmap_adjacent_grid),
+    )
+)
 
 _opd_aux_loss_clip = os.environ.get("OPD_AUX_LOSS_CLIP_VALUE")
 cfg.opd_aux_loss_clip_value = (
@@ -78,12 +108,75 @@ _opd_rollout_step_pairs = os.environ.get("OPD_ROLLOUT_STEP_PAIRS")
 if _opd_rollout_step_pairs:
     cfg.opd_rollout_step_pairs = _parse_step_pairs(_opd_rollout_step_pairs)
 
-# DanceOPD-style low-noise query bias.
-cfg.opd_query_bias = os.environ.get("OPD_QUERY_BIAS", "low_t").lower()
+# DanceOPD-style low-noise query bias. Adjacent-grid OPD is the local
+# transition ablation, so keep those endpoints exact unless explicitly
+# overridden.
+_default_opd_query_bias = (
+    "none" if cfg.opd_pair_mode in ("adjacent_grid", "adjacent", "local") else "low_t"
+)
+cfg.opd_query_bias = os.environ.get("OPD_QUERY_BIAS", _default_opd_query_bias).lower()
 cfg.opd_query_bias_ratio = float(os.environ.get("OPD_QUERY_BIAS_RATIO", 1.0))
 cfg.opd_low_noise_alpha = float(os.environ.get("OPD_LOW_NOISE_ALPHA", 5.0))
 cfg.opd_low_noise_beta = float(os.environ.get("OPD_LOW_NOISE_BETA", 2.0))
 cfg.opd_low_noise_max_sigma = float(os.environ.get("OPD_LOW_NOISE_MAX_SIGMA", 0.25))
+
+# A separate, opt-in query path for a faithful DanceOPD-style local field
+# matching control.  Legacy Stage2 behavior remains the default.
+cfg.opd_query_mode = os.environ.get("OPD_QUERY_MODE", "legacy").lower()
+if cfg.opd_query_mode not in ("legacy", "danceopd"):
+    raise ValueError("OPD_QUERY_MODE must be legacy or danceopd")
+cfg.opd_danceopd_rollout_steps = int(os.environ.get(
+    "OPD_DANCEOPD_ROLLOUT_STEPS", 16
+))
+if cfg.opd_danceopd_rollout_steps <= 0:
+    raise ValueError("OPD_DANCEOPD_ROLLOUT_STEPS must be positive")
+cfg.opd_danceopd_query_alpha = float(os.environ.get(
+    "OPD_DANCEOPD_QUERY_ALPHA", 5.0
+))
+cfg.opd_danceopd_query_beta = float(os.environ.get(
+    "OPD_DANCEOPD_QUERY_BETA", 2.0
+))
+if (
+    not math.isfinite(cfg.opd_danceopd_query_alpha)
+    or cfg.opd_danceopd_query_alpha <= 0
+    or not math.isfinite(cfg.opd_danceopd_query_beta)
+    or cfg.opd_danceopd_query_beta <= 0
+):
+    raise ValueError(
+        "OPD_DANCEOPD_QUERY_ALPHA and OPD_DANCEOPD_QUERY_BETA must be finite and positive"
+    )
+cfg.opd_danceopd_velocity_weight = float(os.environ.get(
+    "OPD_DANCEOPD_VELOCITY_WEIGHT", 1.0
+))
+cfg.opd_danceopd_endpoint_weight = float(os.environ.get(
+    "OPD_DANCEOPD_ENDPOINT_WEIGHT", 0.0
+))
+if (
+    not math.isfinite(cfg.opd_danceopd_velocity_weight)
+    or cfg.opd_danceopd_velocity_weight < 0
+    or not math.isfinite(cfg.opd_danceopd_endpoint_weight)
+    or cfg.opd_danceopd_endpoint_weight < 0
+):
+    raise ValueError(
+        "OPD_DANCEOPD_VELOCITY_WEIGHT and OPD_DANCEOPD_ENDPOINT_WEIGHT "
+        "must be finite and non-negative"
+    )
+cfg.opd_danceopd_verify_terminal_prior = _env_bool(
+    "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR", True
+)
+cfg.opd_danceopd_terminal_prior_tolerance = float(os.environ.get(
+    "OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE", 1e-6
+))
+if (
+    not math.isfinite(cfg.opd_danceopd_terminal_prior_tolerance)
+    or cfg.opd_danceopd_terminal_prior_tolerance < 0
+):
+    raise ValueError("OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE must be finite and non-negative")
+cfg.opd_danceopd_diagnostic_interval = int(os.environ.get(
+    "OPD_DANCEOPD_DIAGNOSTIC_INTERVAL", 50
+))
+if cfg.opd_danceopd_diagnostic_interval <= 0:
+    raise ValueError("OPD_DANCEOPD_DIAGNOSTIC_INTERVAL must be positive")
 
 # Conservative continuation hyperparameters for full-model training.
 cfg.learning_rate = float(os.environ.get("LEARNING_RATE", 5e-7))
@@ -99,15 +192,16 @@ cfg.warmup_steps = int(os.environ.get("WARMUP_STEPS", 100))
 cfg.max_train_steps = int(os.environ.get("MAX_TRAIN_STEPS", 5000))
 cfg.save_interval = int(os.environ.get("SAVE_INTERVAL", 1000))
 cfg.max_grad_norm = float(os.environ.get("MAX_GRAD_NORM", 0.3))
+cfg.use_8bit_optimizer = _env_bool("USE_8BIT_OPTIMIZER", True)
 cfg.resume_optimizer_state = _env_bool("RESUME_OPTIMIZER_STATE", False)
 cfg.reset_resume_step = _env_bool("RESET_RESUME_STEP", True)
 cfg.skip_teacher_compile = _env_bool("SKIP_TEACHER_COMPILE", True)
 cfg.gradient_checkpointing = _env_bool("GRADIENT_CHECKPOINTING", True)
-# OPD aux does an additional student backward path; with PyTorch FSDP2,
-# activation-checkpoint recompute can mix regular Tensor activations from the
-# rollout path with DTensor-sharded weights. Keep checkpointing on for the main
-# train step to fit memory, but disable it around OPD aux unless overridden.
-cfg.opd_aux_gradient_checkpointing = _env_bool("OPD_AUX_GRADIENT_CHECKPOINTING", False)
+cfg.use_fsdp1 = _env_bool("USE_FSDP1", True)
+# OPD aux does an additional student backward path and needs activation
+# checkpointing on a single H100. FSDP1 is forced above for this path, avoiding
+# the FSDP2 DTensor/checkpoint recompute issue while keeping the memory peak low.
+cfg.opd_aux_gradient_checkpointing = _env_bool("OPD_AUX_GRADIENT_CHECKPOINTING", True)
 
 # OPD loss balance. Action OPD is off by default; enable it after checking
 # stage2 speed with video OPD.
@@ -135,4 +229,30 @@ cfg.opd_aux_action = (
 )
 
 cfg.enable_light_eval = _env_bool("ENABLE_LIGHT_EVAL", False)
+cfg.light_eval_interval = int(os.environ.get("LIGHT_EVAL_INTERVAL", cfg.save_interval))
+cfg.light_eval_num_batches = int(os.environ.get("LIGHT_EVAL_NUM_BATCHES", 1))
+cfg.light_eval_seed = int(os.environ.get("LIGHT_EVAL_SEED", 42))
+cfg.light_eval_start_index = int(os.environ.get("LIGHT_EVAL_START_INDEX", 0))
+cfg.light_eval_pairs = [(1000, 1000), (1000, 0), (750, 250)]
+
 cfg.enable_rollout_eval = _env_bool("ENABLE_ROLLOUT_EVAL", False)
+cfg.rollout_eval_interval = int(os.environ.get("ROLLOUT_EVAL_INTERVAL", 1000))
+cfg.rollout_eval_num_batches = int(os.environ.get("ROLLOUT_EVAL_NUM_BATCHES", 1))
+cfg.rollout_eval_seed = int(os.environ.get("ROLLOUT_EVAL_SEED", cfg.light_eval_seed))
+cfg.rollout_eval_cfg_scale = float(os.environ.get("ROLLOUT_EVAL_CFG_SCALE", 5.0))
+cfg.rollout_eval_teacher_steps = int(os.environ.get("ROLLOUT_EVAL_TEACHER_STEPS", 4))
+_rollout_eval_student_steps = os.environ.get("ROLLOUT_EVAL_STUDENT_STEPS", "1,2")
+cfg.rollout_eval_student_steps = [
+    int(v) for v in _rollout_eval_student_steps.split(",") if v.strip()
+]
+_rollout_eval_pairs = os.environ.get("ROLLOUT_EVAL_PAIRS", "1000,0")
+cfg.rollout_eval_pairs = [
+    tuple(float(v) for v in pair.split(","))
+    for pair in _rollout_eval_pairs.split(";")
+    if pair.strip()
+]
+cfg.rollout_eval_save_videos = _env_bool("ROLLOUT_EVAL_SAVE_VIDEOS", False)
+cfg.rollout_eval_video_dir = os.environ.get("ROLLOUT_EVAL_VIDEO_DIR")
+cfg.rollout_eval_video_fps = int(os.environ.get("ROLLOUT_EVAL_VIDEO_FPS", 10))
+cfg.rollout_eval_video_max_pairs = int(os.environ.get("ROLLOUT_EVAL_VIDEO_MAX_PAIRS", 1))
+cfg.rollout_eval_video_sample_index = int(os.environ.get("ROLLOUT_EVAL_VIDEO_SAMPLE_INDEX", 0))

@@ -14,8 +14,121 @@ LCM 蒸馏的兼容性补丁。
 """
 
 import importlib.machinery
+import json
+import os
 import sys
 import types
+
+
+def _split_config_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [v.strip() for v in value.replace(";", ",").split(",") if v.strip()]
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
+def _positive_int_or_none(value):
+    if value in (None, "", 0, "0"):
+        return None
+    value = int(value)
+    return value if value > 0 else None
+
+
+def _repo_task_name(repo_id):
+    name = os.path.basename(str(repo_id).rstrip("/"))
+    return name.split("-", 1)[0]
+
+
+def _repo_matches_task(repo_id, task_names):
+    basename = os.path.basename(str(repo_id).rstrip("/")).lower()
+    canonical = basename.split("-", 1)[0]
+    for task in task_names:
+        task = str(task).strip().lower()
+        if not task:
+            continue
+        if task == basename or task == canonical or basename.startswith(f"{task}-"):
+            return True
+    return False
+
+
+def _filter_repo_list_by_tasks(repo_list, task_filter):
+    task_names = _split_config_list(task_filter)
+    if not task_names:
+        return list(repo_list)
+    return [repo_id for repo_id in repo_list if _repo_matches_task(repo_id, task_names)]
+
+
+def _load_dataset_manifest(path):
+    if path in (None, ""):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _manifest_task_entry_for_repo(repo_id, manifest):
+    if not manifest:
+        return None
+    matches = [
+        entry
+        for entry in manifest.get("tasks", [])
+        if _repo_matches_task(repo_id, [entry.get("task")])
+    ]
+    if len(matches) > 1:
+        tasks = ", ".join(str(entry.get("task")) for entry in matches)
+        raise ValueError(f"Dataset manifest has ambiguous entries for {repo_id}: {tasks}")
+    return matches[0] if matches else None
+
+
+def _filter_dataset_metas_by_manifest(dataset, manifest):
+    metas = getattr(dataset, "new_metas", None)
+    if metas is None:
+        return 0, 0
+    repo_id = getattr(dataset, "repo_id", "")
+    task_entry = _manifest_task_entry_for_repo(repo_id, manifest)
+    if task_entry is None:
+        return len(metas), 0
+
+    selected = []
+    for raw_idx in task_entry.get("indices", []):
+        idx = int(raw_idx)
+        if idx < 0 or idx >= len(metas):
+            task_name = task_entry.get("task")
+            raise IndexError(
+                f"Dataset manifest task {task_name!r} index {idx} is out of range "
+                f"for {repo_id} length {len(metas)}"
+            )
+        selected.append(metas[idx])
+    dataset.new_metas = selected
+    return len(metas), len(selected)
+
+
+def _limit_dataset_metas(dataset, max_episodes=None, max_samples=None):
+    metas = getattr(dataset, "new_metas", None)
+    if metas is None:
+        return 0, 0
+
+    max_episodes = _positive_int_or_none(max_episodes)
+    max_samples = _positive_int_or_none(max_samples)
+    if max_episodes is None and max_samples is None:
+        return len(metas), len(metas)
+
+    selected = []
+    seen_episodes = []
+    seen_set = set()
+    for meta in metas:
+        episode_index = meta.get("episode_index")
+        if max_episodes is not None and episode_index not in seen_set:
+            if len(seen_episodes) >= max_episodes:
+                continue
+            seen_episodes.append(episode_index)
+            seen_set.add(episode_index)
+        selected.append(meta)
+        if max_samples is not None and len(selected) >= max_samples:
+            break
+
+    dataset.new_metas = selected
+    return len(metas), len(selected)
 
 
 def install_flash_attn_stub():
@@ -83,7 +196,6 @@ class SafeMultiLatentLeRobotDataset:
           3. 尝试加载每个子数据集，失败则跳过
           4. 构建全局索引映射
         """
-        import os
         from pathlib import Path
         from dataset.lerobot_latent_dataset import (
             recursive_find_file,
@@ -93,15 +205,75 @@ class SafeMultiLatentLeRobotDataset:
         # 递归查找所有 info.json 文件，确定子数据集路径
         repo_list = recursive_find_file(config.dataset_path, "info.json")
         repo_list = [v.split("/meta/info.json")[0] for v in repo_list]
+        total_discovered = len(repo_list)
+
+        task_filter = _split_config_list(getattr(config, "dataset_task_filter", None))
+        repo_list = _filter_repo_list_by_tasks(repo_list, task_filter)
+        if task_filter:
+            matched_names = ", ".join(_repo_task_name(v) for v in repo_list)
+            print(
+                "Dataset task filter matched "
+                f"{len(repo_list)}/{total_discovered} sub-datasets: {matched_names}"
+            )
+        if not repo_list:
+            raise RuntimeError(
+                "No sub-datasets matched dataset_task_filter="
+                f"{','.join(task_filter)} under {config.dataset_path}"
+            )
+
+        max_episodes = _positive_int_or_none(
+            getattr(config, "dataset_max_episodes_per_task", None)
+        )
+        max_samples = _positive_int_or_none(
+            getattr(config, "dataset_max_samples_per_task", None)
+        )
+        sample_manifest_path = getattr(config, "dataset_sample_manifest", None)
+        sample_manifest = _load_dataset_manifest(sample_manifest_path)
+        defer_cache = bool(getattr(config, "cache_dataset_in_memory", False)) and (
+            max_episodes is not None or max_samples is not None or sample_manifest is not None
+        )
 
         self._datasets = []
         skipped = []
         for repo_id in repo_list:
+            old_cache = getattr(config, "cache_dataset_in_memory", False)
             try:
+                if defer_cache:
+                    config.cache_dataset_in_memory = False
                 ds = LatentLeRobotDataset(repo_id=repo_id, config=config)
+                if sample_manifest is not None:
+                    before, after = _filter_dataset_metas_by_manifest(ds, sample_manifest)
+                    if after == 0:
+                        raise RuntimeError(
+                            "Dataset manifest left no samples in "
+                            f"{os.path.basename(repo_id)}"
+                        )
+                    if after != before:
+                        print(
+                            "Manifest-limited "
+                            f"{os.path.basename(repo_id)} samples: {before} -> {after}"
+                        )
+                before, after = _limit_dataset_metas(ds, max_episodes, max_samples)
+                if after == 0:
+                    raise RuntimeError(
+                        "Dataset filter left no samples in "
+                        f"{os.path.basename(repo_id)}"
+                    )
+                if after != before:
+                    print(
+                        "Limited "
+                        f"{os.path.basename(repo_id)} samples: {before} -> {after}"
+                    )
+                if defer_cache:
+                    ds.cache_in_memory = True
+                    ds._memory_cache = {}
+                    ds._preload_dataset()
                 self._datasets.append(ds)
             except Exception as e:
                 skipped.append((repo_id, e))
+            finally:
+                if defer_cache:
+                    config.cache_dataset_in_memory = old_cache
 
         total = len(repo_list)
         loaded = len(self._datasets)
@@ -156,6 +328,47 @@ class SafeMultiLatentLeRobotDataset:
             acc_dset_num[did] = acc_nums[did]
         return item_id_to_dataset_id, acc_dset_num
 
+    def _resolve_dataset_index(self, idx):
+        assert idx < len(self)
+        dset_id = self.item_id_to_dataset_id[idx]
+        local_idx = idx - self.acc_dset_num[dset_id]
+        return dset_id, self._datasets[dset_id], local_idx
+
+    def get_sample_meta(self, idx):
+        dset_id, cur_dset, local_idx = self._resolve_dataset_index(idx)
+        metas = getattr(cur_dset, "new_metas", None)
+        if metas is None:
+            meta = {}
+        else:
+            meta = dict(metas[local_idx])
+        meta["dataset_id"] = dset_id
+        meta["local_index"] = local_idx
+        meta["repo_id"] = str(getattr(cur_dset, "repo_id", dset_id))
+        return meta
+
+    def get_group_ids(self, group_by="task"):
+        group_by = str(group_by).lower()
+        out = []
+        for idx in range(len(self)):
+            meta = self.get_sample_meta(idx)
+            if group_by in ("task", "tasks"):
+                tasks = meta.get("tasks") or meta.get("task") or meta.get("action_text")
+                if isinstance(tasks, (list, tuple)):
+                    group_id = tasks[0] if tasks else "task:unknown"
+                else:
+                    group_id = tasks or "task:unknown"
+            elif group_by == "episode":
+                group_id = f"episode:{meta.get('episode_index', 'unknown')}"
+            elif group_by == "dataset":
+                group_id = meta.get("repo_id", f"dataset:{meta.get('dataset_id', 'unknown')}")
+            else:
+                raise ValueError(
+                    "group_by must be one of 'task', 'episode', or 'dataset', "
+                    f"got {group_by!r}"
+                )
+            out.append(str(group_id))
+        return out
+
     def __getitem__(self, idx):
         """
         通过全局索引获取样本。
@@ -168,10 +381,8 @@ class SafeMultiLatentLeRobotDataset:
 
         查找过程：
           1. 通过 item_id_to_dataset_id 找到子数据集 ID
-          2. 计算局部索引 = 全局索引 - 子数据集起始索引
-          3. 从子数据集中获取样本
+            2. 计算局部索引 = 全局索引 - 子数据集起始索引
+            3. 从子数据集中获取样本
         """
-        assert idx < len(self)
-        cur_dset = self._datasets[self.item_id_to_dataset_id[idx]]
-        local_idx = idx - self.acc_dset_num[self.item_id_to_dataset_id[idx]]
+        _, cur_dset, local_idx = self._resolve_dataset_index(idx)
         return cur_dset[local_idx]

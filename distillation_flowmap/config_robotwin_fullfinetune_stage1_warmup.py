@@ -25,6 +25,38 @@ cfg.use_onpolicy_transition = False
 cfg.use_opd_aux = False
 cfg.use_dmd = False
 
+
+def _env_list(name):
+    value = os.environ.get(name)
+    if not value:
+        return None
+    return [v.strip() for v in value.replace(";", ",").split(",") if v.strip()]
+
+
+def _env_positive_int(name):
+    value = os.environ.get(name)
+    if value in (None, "", "0"):
+        return None
+    value = int(value)
+    return value if value > 0 else None
+
+
+cfg.dataset_task_filter = _env_list("DATASET_TASK_FILTER")
+cfg.dataset_sample_manifest = os.environ.get("DATASET_SAMPLE_MANIFEST")
+cfg.dataset_max_episodes_per_task = _env_positive_int("DATASET_MAX_EPISODES_PER_TASK")
+cfg.dataset_max_samples_per_task = _env_positive_int("DATASET_MAX_SAMPLES_PER_TASK")
+
+
+def _parse_adjacent_grid(text):
+    return [int(v.strip()) for v in text.split(",") if v.strip()]
+
+
+cfg.flowmap_pair_mode = os.environ.get("FLOWMAP_PAIR_MODE", "arbitrary").lower()
+cfg.opd_pair_mode = os.environ.get("OPD_PAIR_MODE", cfg.flowmap_pair_mode).lower()
+cfg.flowmap_adjacent_grid = _parse_adjacent_grid(
+    os.environ.get("FLOWMAP_ADJACENT_GRID", "1000,750,500,250,0")
+)
+
 # Keep the single-node RobotWin effective batch when launched with torchrun.
 cfg.auto_scale_gradient_accumulation = _env_bool("AUTO_SCALE_GRADIENT_ACCUMULATION", True)
 cfg.gradient_accumulation_reference = int(os.environ.get(
@@ -57,3 +89,4 @@ cfg.gradient_checkpointing = _env_bool("GRADIENT_CHECKPOINTING", True)
 # Disabled by default to avoid extra evaluation memory during warmup.
 cfg.enable_light_eval = _env_bool("ENABLE_LIGHT_EVAL", False)
 cfg.enable_rollout_eval = _env_bool("ENABLE_ROLLOUT_EVAL", False)
+cfg.enable_grad_branch_diagnostics = _env_bool("ENABLE_GRAD_BRANCH_DIAGNOSTICS", False)

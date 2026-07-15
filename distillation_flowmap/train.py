@@ -27,6 +27,8 @@ torch._dynamo.config.suppress_errors = True
 from distributed.util import init_distributed
 from utils import init_logger, logger
 from flowmap_trainer import FlowMapDistiller
+from distillation_flowmap.cosmos_policy_adapter import resolve_cosmos_policy_assets
+from distillation_flowmap.training_seed import configure_training_seed
 
 
 _LIBERO_TEACHER_PATH = "/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero"
@@ -36,12 +38,21 @@ _STALE_LIBERO_TEACHER_PATHS = {
 }
 
 
-def _normalize_teacher_model_path(path):
+def _normalize_teacher_model_path(path, teacher_backend="wanva"):
     """Return the teacher root directory expected by FlowMapDistiller."""
     if path is None:
         return path
 
     path = os.path.abspath(os.path.expanduser(path))
+    backend = str(teacher_backend or "wanva").lower()
+    if backend in ("cosmos", "cosmos_policy", "cosmos-policy"):
+        return resolve_cosmos_policy_assets(path)["root"]
+    if backend not in ("wanva", "lingbot_va", "lingbot-va"):
+        raise ValueError(
+            f"Unsupported teacher_backend={teacher_backend!r}; "
+            "expected 'wanva' or 'cosmos_policy'."
+        )
+
     if path in _STALE_LIBERO_TEACHER_PATHS:
         logger.warning(
             "Teacher path %s is the old LIBERO location; using %s instead.",
@@ -62,6 +73,10 @@ def _normalize_teacher_model_path(path):
         )
 
     return path
+
+
+def _resolve_empty_emb_path(dataset_path):
+    return os.environ.get("EMPTY_EMB_PATH", os.path.join(dataset_path, "empty_emb.pt"))
 
 
 def _maybe_auto_scale_gradient_accumulation(config, args, world_size, rank=0):
@@ -129,16 +144,30 @@ def run(args):
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
+    train_seed = os.environ.get("TRAIN_SEED")
+    if train_seed is not None:
+        config.seed = int(train_seed)
+        effective_seed = configure_training_seed(config.seed, rank=rank)
+        if rank == 0:
+            logger.info(
+                "Configured training RNG seed: base=%d effective=%d",
+                config.seed,
+                effective_seed,
+            )
 
     # 用命令行参数覆盖配置（如果提供）
     if args.output_dir is not None:
         config.output_dir = args.output_dir
     if args.teacher_model_path is not None:
         config.teacher_model_path = args.teacher_model_path
-    config.teacher_model_path = _normalize_teacher_model_path(config.teacher_model_path)
+    config.teacher_backend = getattr(config, "teacher_backend", "wanva")
+    config.teacher_model_path = _normalize_teacher_model_path(
+        config.teacher_model_path,
+        teacher_backend=config.teacher_backend,
+    )
     if args.dataset_path is not None:
         config.dataset_path = args.dataset_path
-        config.empty_emb_path = os.path.join(args.dataset_path, "empty_emb.pt")
+        config.empty_emb_path = _resolve_empty_emb_path(args.dataset_path)
     if args.resume_from_step is not None:
         config.resume_from_step = args.resume_from_step
     if args.resume_from_path is not None:
@@ -155,6 +184,7 @@ def run(args):
     if rank == 0:
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
         logger.info(f"Teacher: {config.teacher_model_path}")
+        logger.info(f"Teacher backend: {config.teacher_backend}")
         logger.info(f"Dataset: {config.dataset_path}")
         logger.info(f"Output:  {config.output_dir}")
 

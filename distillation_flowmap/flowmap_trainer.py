@@ -24,21 +24,29 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import math
 import torch.distributed as dist
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
 )
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from safetensors.torch import save_file
 
+from distillation_flowmap.samplers import build_stage2_sampler
 from distributed.fsdp import shard_model, apply_ac
 from wan_va.distributed.fsdp import shard_model_fsdp1
 from distributed.util import _configure_model, dist_mean
-from modules.utils import load_transformer
+from modules.utils import WanVAEStreamingWrapper, load_transformer, load_vae
 from utils import logger, warmup_constant_lambda, FlowMatchScheduler
+from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+from distillation_flowmap.cosmos_teacher_roles import resolve_teacher_roles
+from distillation_flowmap.ablation.robotwin_diagnostics import (
+    classify_parameter_branch,
+    opd_diagnostic_aliases,
+)
 
 try:
     import wandb
@@ -71,19 +79,126 @@ except ImportError:
     HAS_DISCRIMINATOR = False
 
 
+def _iter_flowmap_checkpointing_targets(student):
+    stack = [student]
+    seen = set()
+    while stack:
+        module = stack.pop()
+        if module is None or id(module) in seen:
+            continue
+        seen.add(id(module))
+        yield module
+        for attr in ("module", "_fsdp_wrapped_module"):
+            child = getattr(module, attr, None)
+            if child is not None and child is not module:
+                stack.append(child)
+
+
 def _call_with_student_checkpointing(student, enabled, fn):
-    old_enabled = getattr(student, "_flowmap_gradient_checkpointing", None)
-    student._flowmap_gradient_checkpointing = bool(enabled)
+    old_states = []
+    for module in _iter_flowmap_checkpointing_targets(student):
+        has_attr = hasattr(module, "_flowmap_gradient_checkpointing")
+        old_states.append((
+            module,
+            has_attr,
+            getattr(module, "_flowmap_gradient_checkpointing", None),
+        ))
+        module._flowmap_gradient_checkpointing = bool(enabled)
     try:
         return fn()
     finally:
-        if old_enabled is None:
-            try:
-                delattr(student, "_flowmap_gradient_checkpointing")
-            except AttributeError:
-                pass
-        else:
-            student._flowmap_gradient_checkpointing = old_enabled
+        for module, has_attr, old_enabled in reversed(old_states):
+            if not has_attr:
+                try:
+                    delattr(module, "_flowmap_gradient_checkpointing")
+                except AttributeError:
+                    pass
+            else:
+                module._flowmap_gradient_checkpointing = old_enabled
+
+
+def _resolve_use_fsdp1(config):
+    use_fsdp1 = bool(getattr(config, 'use_fsdp1', False))
+    use_onpolicy = bool(getattr(config, 'use_onpolicy_transition', False))
+    risky_opd_checkpoint = (
+        bool(getattr(config, 'use_opd_aux', False))
+        and bool(getattr(config, 'gradient_checkpointing', False))
+    )
+
+    if use_onpolicy:
+        use_fsdp1 = True
+    if risky_opd_checkpoint and not use_fsdp1:
+        logger.warning(
+            "Forcing FSDP1 because use_opd_aux=True with "
+            "gradient_checkpointing=True can mix Tensor/DTensor during "
+            "checkpoint recompute under FSDP2."
+        )
+        use_fsdp1 = True
+
+    config.use_fsdp1 = use_fsdp1
+    return use_fsdp1
+
+
+def _is_dtensor_param(param):
+    try:
+        from torch.distributed.tensor import DTensor
+    except Exception:
+        return False
+    return isinstance(param, DTensor)
+
+
+def _assert_no_dtensor_params(module, name):
+    offenders = [
+        param_name
+        for param_name, param in module.named_parameters()
+        if _is_dtensor_param(param)
+    ]
+    if offenders:
+        preview = ", ".join(offenders[:8])
+        extra = "" if len(offenders) <= 8 else f", ... (+{len(offenders) - 8})"
+        raise RuntimeError(
+            f"{name} is expected to use FSDP1 but still has DTensor "
+            f"parameters: {preview}{extra}. Check use_fsdp1/FSDP wrapping."
+        )
+
+
+def _set_video_channel_config_from_heads(config_dict, model=None, state_dict=None):
+    """Persist channel config from the actual video head shapes."""
+    patch_size = config_dict.get("patch_size")
+    if patch_size is None and model is not None:
+        patch_size = getattr(model, "patch_size", None)
+    if patch_size is None:
+        return config_dict
+
+    patch_size = list(patch_size)
+    patch_volume = math.prod(patch_size)
+    if patch_volume <= 0:
+        return config_dict
+
+    in_features = None
+    out_features = None
+    if state_dict is not None:
+        in_weight = state_dict.get("patch_embedding_mlp.weight")
+        out_weight = state_dict.get("proj_out.weight")
+        if in_weight is not None and len(in_weight.shape) >= 2:
+            in_features = int(in_weight.shape[1])
+        if out_weight is not None and len(out_weight.shape) >= 1:
+            out_features = int(out_weight.shape[0])
+
+    if model is not None:
+        patch_embedding_mlp = getattr(model, "patch_embedding_mlp", None)
+        proj_out = getattr(model, "proj_out", None)
+        if in_features is None and patch_embedding_mlp is not None:
+            in_features = int(getattr(patch_embedding_mlp, "in_features", 0) or 0)
+        if out_features is None and proj_out is not None:
+            out_features = int(getattr(proj_out, "out_features", 0) or 0)
+
+    config_dict["patch_size"] = patch_size
+    if in_features and in_features % patch_volume == 0:
+        config_dict["in_channels"] = in_features // patch_volume
+    if out_features and out_features % patch_volume == 0:
+        config_dict["out_channels"] = out_features // patch_volume
+    return config_dict
 
 
 class FlowMapDistiller(DataMixin, FlowMapStepMixin):
@@ -135,6 +250,20 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.distill_action = getattr(config, 'distill_action', False)   # 是否蒸馏动作
         self.action_distill_mode = getattr(config, 'action_distill_mode', 'consistency')  # 动作参数化方式
         self.action_aware = getattr(config, 'action_aware', False)       # 是否使用动作感知正则
+        self.teacher_backend = str(getattr(config, 'teacher_backend', 'wanva')).lower()
+        self.is_cosmos_policy_teacher = self.teacher_backend in (
+            'cosmos', 'cosmos_policy', 'cosmos-policy')
+        self.teacher_roles = resolve_teacher_roles(config)
+        self.video_teacher = None
+        self._teacher_nofsdp = None
+        self._video_teacher_nofsdp = None
+        self.cosmos_video_target = bool(getattr(config, 'cosmos_video_target', False))
+        self.cosmos_latent_target = bool(getattr(config, 'cosmos_latent_target', False))
+        self.cosmos_video_cdiff_aux = bool(
+            getattr(config, 'cosmos_video_cdiff_aux', False)
+        )
+        self.cosmos_video_vae = None
+        self.cosmos_video_streaming_vae = None
         # 动作的跳步数（可能与视频不同）
         self.k_action = config.num_train_timesteps // getattr(
             config, 'num_ddim_timesteps_action', config.num_ddim_timesteps)
@@ -161,6 +290,56 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.use_dmd = getattr(config, 'use_dmd', False)
         self.use_onpolicy_transition = getattr(config, 'use_onpolicy_transition', False)
         self.use_opd_aux = getattr(config, 'use_opd_aux', False)
+        self.use_fsdp1 = _resolve_use_fsdp1(config)
+        self.opd_aux_variant = str(getattr(config, 'opd_aux_variant', 'default')).lower()
+        if self.opd_aux_variant not in ('default', 'kto_paopd', 'kto_paopd_norm_focal'):
+            raise ValueError(
+                f"Unsupported opd_aux_variant={self.opd_aux_variant!r}; "
+                "expected 'default', 'kto_paopd', or 'kto_paopd_norm_focal'."
+            )
+        self.target_student = None
+        self.offline_eval_skip_target_student = bool(
+            getattr(config, 'offline_eval_skip_target_student', False)
+        )
+        self.offline_eval_use_fsdp_teacher = bool(
+            getattr(config, 'offline_eval_use_fsdp_teacher', False)
+        )
+        self.skip_target_student = (
+            bool(getattr(config, 'skip_target_student_for_cosmos_latent', False))
+            or self.offline_eval_skip_target_student
+        )
+        cosmos_latent_opd_without_target_student = (
+            self.cosmos_latent_target
+            and self.use_opd_aux
+            and str(getattr(
+                config,
+                'opd_teacher_target_mode',
+                'student_state',
+            )).lower() in ('cosmos_latent_student_state', 'cosmos_latent_velocity')
+            and not bool(getattr(config, 'opd_aux_action', False))
+        )
+        if self.skip_target_student and not self.offline_eval_skip_target_student:
+            blockers = []
+            if not self.cosmos_latent_target:
+                blockers.append("cosmos_latent_target=False")
+            if getattr(config, 'use_action_distill', True):
+                blockers.append("use_action_distill=True")
+            if getattr(config, 'action_use_flowmap', False):
+                blockers.append("action_use_flowmap=True")
+            if self.use_dmd:
+                blockers.append("use_dmd=True")
+            if self.use_onpolicy_transition:
+                blockers.append("use_onpolicy_transition=True")
+            if self.use_opd_aux and not cosmos_latent_opd_without_target_student:
+                blockers.append("use_opd_aux=True")
+            if getattr(config, 'opd_aux_use_nofsdp_rollout', False):
+                blockers.append("opd_aux_use_nofsdp_rollout=True")
+            if blockers:
+                raise ValueError(
+                    "skip_target_student_for_cosmos_latent is only valid for "
+                    "the pure Cosmos latent target path without EMA/target-student "
+                    f"losses; blockers: {', '.join(blockers)}"
+                )
         self.discriminator = None
         self.discriminator_optimizer = None
 
@@ -212,6 +391,13 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info(f"Distill video: {self.distill_video}")
             logger.info(f"Distill action: {self.distill_action}")
             logger.info(f"Action aware: {self.action_aware}")
+            logger.info(f"Action teacher backend: {self.teacher_roles.action_backend}")
+            logger.info(f"Video teacher backend: {self.teacher_roles.video_backend}")
+            logger.info(f"Video teacher path: {self.teacher_roles.video_model_path}")
+            logger.info(f"Cosmos video target: {self.cosmos_video_target}")
+            logger.info(f"Cosmos latent target: {self.cosmos_latent_target}")
+            logger.info(f"Cosmos video central-diff aux: {self.cosmos_video_cdiff_aux}")
+            logger.info(f"Skip target student: {self.skip_target_student}")
             if self.distill_action:
                 logger.info(f"  k_action = {self.k_action}, "
                             f"action_loss_weight = {config.action_loss_weight}, "
@@ -232,13 +418,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             logger.info(f"  gt_regression_weight = {self.gt_regression_weight} (GT 回归 loss 权重)")
             logger.info(f"  use_lora           = {self.use_lora} (LoRA 微调)")
             logger.info(f"  use_opd_aux        = {self.use_opd_aux} (teacher-transition auxiliary)")
+            logger.info(f"  use_fsdp1          = {self.use_fsdp1} (FSDP backend guard)")
             if self.use_opd_aux:
+                logger.info(f"  opd_aux_variant    = {self.opd_aux_variant}")
                 logger.info(f"  opd_aux_weight     = {getattr(config, 'opd_aux_weight', 0.1)}")
                 logger.info(f"  opd_aux_interval   = {getattr(config, 'opd_aux_interval', 1)}")
                 logger.info(f"  flowmap_aux_weight = {getattr(config, 'flowmap_aux_weight', 1.0)}")
                 logger.info(f"  endpoint_aux_weight= {getattr(config, 'opd_endpoint_aux_weight', 0.0)}")
+                logger.info(f"  same_state_velocity_weight= {getattr(config, 'opd_same_state_velocity_weight', 0.0)}")
                 logger.info(f"  opd_target_mode    = {getattr(config, 'opd_teacher_target_mode', 'student_state')}")
                 logger.info(f"  opd_grad_mode      = {getattr(config, 'opd_rollout_grad_mode', 'endpoint')}")
+                logger.info(f"  opd_aux_gradient_checkpointing = {getattr(config, 'opd_aux_gradient_checkpointing', False)}")
+                logger.info(f"  opd_aux_empty_cache = {getattr(config, 'opd_aux_empty_cache', False)}")
                 logger.info(f"  action_transition_block = {getattr(config, 'action_transition_block_weight', getattr(config, 'action_block_weight', 1.0))}")
                 logger.info(f"  action_local_fm_block   = {getattr(config, 'action_local_fm_block_weight', 1.0)}")
                 logger.info(f"  action_local_fm_weight  = {getattr(config, 'action_aware_weight', 0.0)}")
@@ -255,47 +446,190 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # ==============================================================
         # 三个模型的初始化
         # ==============================================================
-        teacher_path = os.path.join(config.teacher_model_path, "transformer")
+        if self.is_cosmos_policy_teacher:
+            student_base_model_path = getattr(config, 'student_base_model_path', None)
+            if student_base_model_path is None:
+                raise ValueError(
+                    "teacher_backend='cosmos_policy' requires cfg.student_base_model_path "
+                    "pointing to a WanVA teacher/checkpoint root for student initialization."
+                )
+            student_base_model_path = os.path.abspath(os.path.expanduser(student_base_model_path))
+            if os.path.basename(student_base_model_path) == "transformer":
+                teacher_path = student_base_model_path
+            else:
+                teacher_path = os.path.join(student_base_model_path, "transformer")
+            if not os.path.isfile(os.path.join(teacher_path, "config.json")):
+                raise FileNotFoundError(
+                    "Invalid student_base_model_path for Cosmos Policy backend: "
+                    f"expected {os.path.join(teacher_path, 'config.json')}"
+                )
+        else:
+            teacher_path = os.path.join(config.teacher_model_path, "transformer")
 
         # 1. 教师模型（frozen）：预训练好的 LingBot-VA，不参与训练
         #    注意：教师模型保持原始结构，不添加 delta_embedder
-        logger.info("Loading teacher (frozen) ...")
-        self.teacher = load_transformer(teacher_path, torch_dtype=self.dtype, torch_device="cpu")
-        self.teacher.requires_grad_(False)  # 冻结所有参数
-        self.teacher.eval()                 # 评估模式
-        self.teacher = self.teacher.to(self.dtype)
-
-        # 创建非 FSDP 教师副本（用于纯推理 forward，避免 FSDP all-gather 通信开销）
-        # 教师 frozen + eval，不需要梯度同步，非 FSDP forward 结果完全一致
-        import copy
-        logger.info("Creating non-FSDP teacher copy for inference ...")
-        self._teacher_nofsdp = copy.deepcopy(self.teacher)
-        self._teacher_nofsdp = self._teacher_nofsdp.to(self.dtype)
-        self._teacher_nofsdp.eval()
-        for p in self._teacher_nofsdp.parameters():
-            p.requires_grad_(False)
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self._teacher_nofsdp = self._teacher_nofsdp.to(f"cuda:{local_rank}")
-        logger.info(f"Non-FSDP teacher copy created (on cuda:{local_rank}).")
-        if self.use_onpolicy_transition:
-            # On-policy mode: use FSDP1 (no DTensor issues)
-            self.teacher = shard_model_fsdp1(self.teacher, param_dtype=self.dtype)
-            logger.info("Teacher wrapped with FSDP1 (on-policy mode)")
-        else:
-            # FSDP2 mode
-            self.teacher = _configure_model(
-                model=self.teacher, shard_fn=shard_model,
-                param_dtype=self.dtype, device=self.device, eval_mode=True,
+        if bool(getattr(config, 'offline_eval_skip_teacher', False)):
+            self.teacher = None
+            self._teacher_nofsdp = None
+            logger.info("Skipping teacher load for offline eval cache replay.")
+        elif self.is_cosmos_policy_teacher:
+            logger.info("Loading Cosmos Policy action teacher metadata ...")
+            self.teacher = CosmosPolicyActionTeacher(
+                config.teacher_model_path, dtype=self.dtype, device="cpu", config=config)
+            if bool(getattr(config, 'cosmos_policy_validate_weights', False)):
+                metadata = self.teacher.load_state_metadata()
+                if config.rank == 0:
+                    logger.info(
+                        "Cosmos Policy checkpoint readable: %s keys, sample=%s",
+                        metadata["num_keys"],
+                        metadata["sample_keys"],
+                    )
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self._teacher_nofsdp = self.teacher.to(f"cuda:{local_rank}")
+            self.teacher.requires_grad_(False).eval()
+            logger.info(
+                "Cosmos Policy action teacher ready; WanVA student base: %s",
+                teacher_path,
             )
-            if not getattr(config, 'skip_teacher_compile', False):
-                logger.info("Compiling teacher model with torch.compile ...")
-                self.teacher = torch.compile(self.teacher, mode="default")
-                logger.info("Teacher model compiled.")
+            if self.cosmos_latent_target:
+                if not bool(getattr(config, 'cosmos_policy_use_raw_inference', False)):
+                    raise ValueError(
+                        "cfg.cosmos_latent_target=True requires "
+                        "cfg.cosmos_policy_use_raw_inference=True."
+                    )
+                logger.info(
+                    "Cosmos latent central-diff target enabled; WanVA VAE video "
+                    "encoding is skipped for this path."
+                )
+            if self.cosmos_video_target:
+                if not bool(getattr(config, 'cosmos_policy_use_raw_inference', False)):
+                    raise ValueError(
+                        "cfg.cosmos_video_target=True requires "
+                        "cfg.cosmos_policy_use_raw_inference=True."
+                    )
+                vae_root = getattr(config, 'cosmos_video_vae_model_path', None)
+                if vae_root is None:
+                    vae_root = getattr(config, 'student_base_model_path', None)
+                vae_root = os.path.abspath(os.path.expanduser(vae_root))
+                vae_path = (
+                    vae_root if os.path.basename(vae_root) == "vae"
+                    else os.path.join(vae_root, "vae")
+                )
+                if not os.path.isdir(vae_path):
+                    raise FileNotFoundError(
+                        "Invalid cosmos_video_vae_model_path: "
+                        f"expected VAE directory at {vae_path}"
+                    )
+                logger.info("Loading WanVA VAE encoder for Cosmos future video targets ...")
+                self.cosmos_video_vae = load_vae(
+                    vae_path,
+                    torch_dtype=self.dtype,
+                    torch_device=f"cuda:{local_rank}",
+                )
+                self.cosmos_video_vae.requires_grad_(False)
+                self.cosmos_video_vae.eval()
+                self.cosmos_video_streaming_vae = WanVAEStreamingWrapper(self.cosmos_video_vae)
+                logger.info("WanVA VAE encoder ready for Cosmos future video targets.")
+                if self.cosmos_video_cdiff_aux:
+                    video_root = getattr(
+                        config, 'cosmos_video_cdiff_teacher_model_path', None)
+                    if video_root is None:
+                        video_root = getattr(config, 'student_base_model_path', None)
+                    video_root = os.path.abspath(os.path.expanduser(video_root))
+                    if os.path.basename(video_root) == "transformer":
+                        video_teacher_path = video_root
+                    else:
+                        video_teacher_path = os.path.join(video_root, "transformer")
+                    if not os.path.isfile(os.path.join(video_teacher_path, "config.json")):
+                        raise FileNotFoundError(
+                            "Invalid cosmos_video_cdiff_teacher_model_path: "
+                            f"expected {os.path.join(video_teacher_path, 'config.json')}"
+                        )
+                    logger.info(
+                        "Loading WanVA video teacher for Cosmos central-diff aux ..."
+                    )
+                    self.video_teacher = load_transformer(
+                        video_teacher_path,
+                        torch_dtype=self.dtype,
+                        torch_device="cpu",
+                    )
+                    self.video_teacher.requires_grad_(False)
+                    self.video_teacher.eval()
+                    self.video_teacher = self.video_teacher.to(self.dtype)
+                    self._video_teacher_nofsdp = self.video_teacher.to(
+                        f"cuda:{local_rank}")
+                    self.video_teacher = None
+                    logger.info(
+                        "WanVA video teacher ready for Cosmos central-diff aux."
+                    )
+            if self.teacher_roles.uses_separate_video_teacher:
+                video_root = os.path.abspath(os.path.expanduser(self.teacher_roles.video_model_path))
+                if os.path.basename(video_root) == "transformer":
+                    video_teacher_path = video_root
+                else:
+                    video_teacher_path = os.path.join(video_root, "transformer")
+                if not os.path.isfile(os.path.join(video_teacher_path, "config.json")):
+                    raise FileNotFoundError(
+                        "Invalid video_teacher_model_path for Cosmos dual-teacher mode: "
+                        f"expected {os.path.join(video_teacher_path, 'config.json')}"
+                    )
+                logger.info("Loading WanVA video teacher for Cosmos dual-teacher mode ...")
+                self.video_teacher = load_transformer(
+                    video_teacher_path,
+                    torch_dtype=self.dtype,
+                    torch_device="cpu",
+                )
+                self.video_teacher.requires_grad_(False)
+                self.video_teacher.eval()
+                self.video_teacher = self.video_teacher.to(self.dtype)
+                self._video_teacher_nofsdp = self.video_teacher.to(f"cuda:{local_rank}")
+                self.video_teacher = None
+                logger.info("WanVA video teacher ready for Cosmos dual-teacher mode.")
+        else:
+            logger.info("Loading teacher (frozen) ...")
+            self.teacher = load_transformer(teacher_path, torch_dtype=self.dtype, torch_device="cpu")
+            self.teacher.requires_grad_(False)  # 冻结所有参数
+            self.teacher.eval()                 # 评估模式
+            self.teacher = self.teacher.to(self.dtype)
+
+            if self.offline_eval_use_fsdp_teacher:
+                logger.info(
+                    "Offline eval uses the FSDP teacher; skipping non-FSDP teacher copy."
+                )
+            else:
+                # 创建非 FSDP 教师副本（用于纯推理 forward，避免 FSDP all-gather 通信开销）
+                # 教师 frozen + eval，不需要梯度同步，非 FSDP forward 结果完全一致
+                import copy
+                logger.info("Creating non-FSDP teacher copy for inference ...")
+                self._teacher_nofsdp = copy.deepcopy(self.teacher)
+                self._teacher_nofsdp = self._teacher_nofsdp.to(self.dtype)
+                self._teacher_nofsdp.eval()
+                for p in self._teacher_nofsdp.parameters():
+                    p.requires_grad_(False)
+                local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                self._teacher_nofsdp = self._teacher_nofsdp.to(f"cuda:{local_rank}")
+                logger.info(f"Non-FSDP teacher copy created (on cuda:{local_rank}).")
+            if self.use_fsdp1:
+                # FSDP1 avoids DTensor/checkpoint recompute type mixing.
+                self.teacher = shard_model_fsdp1(self.teacher, param_dtype=self.dtype)
+                logger.info("Teacher wrapped with FSDP1")
+            else:
+                # FSDP2 mode
+                self.teacher = _configure_model(
+                    model=self.teacher, shard_fn=shard_model,
+                    param_dtype=self.dtype, device=self.device, eval_mode=True,
+                )
+                if not getattr(config, 'skip_teacher_compile', False):
+                    logger.info("Compiling teacher model with torch.compile ...")
+                    self.teacher = torch.compile(self.teacher, mode="default")
+                    logger.info("Teacher model compiled.")
             # 释放 FSDP teacher（推理用 _teacher_nofsdp），省 ~10GB/卡
             if self._teacher_nofsdp is not None:
                 del self.teacher
                 self.teacher = None
                 logger.info("FSDP teacher released (inference uses non-FSDP copy).")
+            elif self.offline_eval_use_fsdp_teacher:
+                logger.info("FSDP teacher retained for offline eval.")
 
         # 确定学生模型的初始化路径（从检查点恢复或从教师初始化）
         resume_path = getattr(config, "resume_from_path", None)
@@ -427,11 +761,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.student._flowmap_gradient_checkpointing = bool(
             getattr(config, "gradient_checkpointing", True)
         )
+        self.student._flowmap_force_gradient_checkpointing = bool(
+            getattr(config, "offline_eval_force_gradient_checkpointing", False)
+        )
         if config.rank == 0:
             logger.info(
                 "Student gradient checkpointing: %s",
                 self.student._flowmap_gradient_checkpointing,
             )
+            if self.student._flowmap_force_gradient_checkpointing:
+                logger.info("Student force gradient checkpointing enabled for offline eval.")
 
         def load_flowmap_delta_weights(model, transformer_dir, label):
             """Restore FlowMap-only weights dropped by the base Wan loader."""
@@ -459,6 +798,64 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
         if not self._is_lora_resume:
             load_flowmap_delta_weights(self.student, student_path, "online student")
+
+        def adapt_cosmos_latent_video_heads(model, label):
+            if not self.cosmos_latent_target:
+                return model
+            channels = int(getattr(config, "cosmos_latent_channels", 16))
+            patch_dim = channels * math.prod(model.patch_size)
+            old_in = model.patch_embedding_mlp
+            old_out = model.proj_out
+            if old_in.in_features == patch_dim and old_out.out_features == patch_dim:
+                return model
+
+            new_in = nn.Linear(
+                patch_dim,
+                old_in.out_features,
+                bias=old_in.bias is not None,
+                device=old_in.weight.device,
+                dtype=old_in.weight.dtype,
+            )
+            new_out = nn.Linear(
+                old_out.in_features,
+                patch_dim,
+                bias=old_out.bias is not None,
+                device=old_out.weight.device,
+                dtype=old_out.weight.dtype,
+            )
+            with torch.no_grad():
+                new_in.weight.zero_()
+                copy_cols = min(patch_dim, old_in.in_features)
+                new_in.weight[:, :copy_cols].copy_(old_in.weight[:, :copy_cols])
+                if old_in.bias is not None:
+                    new_in.bias.copy_(old_in.bias)
+
+                new_out.weight.zero_()
+                copy_rows = min(patch_dim, old_out.out_features)
+                new_out.weight[:copy_rows].copy_(old_out.weight[:copy_rows])
+                if old_out.bias is not None:
+                    new_out.bias.zero_()
+                    new_out.bias[:copy_rows].copy_(old_out.bias[:copy_rows])
+
+            model.patch_embedding_mlp = new_in
+            model.proj_out = new_out
+            if hasattr(model, "config"):
+                try:
+                    model.config.in_channels = channels
+                    model.config.out_channels = channels
+                except Exception:
+                    pass
+            if config.rank == 0:
+                logger.info(
+                    "Adapted %s video heads for Cosmos latent channels: "
+                    "input %d->%d, output %d->%d",
+                    label,
+                    old_in.in_features,
+                    patch_dim,
+                    old_out.out_features,
+                    patch_dim,
+                )
+            return model
 
         # ==============================================================
         # LoRA 可选：为学生模型添加 LoRA adapter（降低显存开销）
@@ -501,6 +898,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # have the same dtype; LoRA parameters default to float32, which
         # conflicts with the bfloat16 base model.
         self.student = self.student.to(self.dtype)
+        self.student = adapt_cosmos_latent_video_heads(self.student, "online student")
 
         # 创建非 FSDP 学生副本（用于 DMD rollout 和 on-policy transition rollout）
         if (self.use_dmd or self.use_onpolicy_transition or
@@ -528,12 +926,13 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         else:
             self._student_nofsdp = None
 
-        if self.use_onpolicy_transition:
-            # On-policy mode: use FSDP1 (shards parameters across GPUs)
+        if self.use_fsdp1:
+            # FSDP1 shards parameters without DTensor dispatch in checkpoint recompute.
             # apply_ac disabled - checkpointing + batched CFG = mask mismatch during backward
             # apply_ac(self.student)
             self.student = shard_model_fsdp1(self.student, param_dtype=self.dtype)
-            logger.info("Student wrapped with FSDP1 (on-policy mode)")
+            _assert_no_dtensor_params(self.student, "student")
+            logger.info("Student wrapped with FSDP1")
         else:
             self.student = _configure_model(
                 model=self.student, shard_fn=shard_model,
@@ -552,71 +951,78 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             self._student_blocks_compiled = True
         # 3. 目标学生（EMA, frozen）：在线学生的指数移动平均副本
         # 如果从 LoRA checkpoint 恢复，需要先加载基座模型，再加载 LoRA adapter
-        if self._is_lora_resume:
-            logger.info("Loading target student from LoRA checkpoint ...")
-            logger.info("  Step 1: Loading base model from teacher ...")
-            self.target_student = load_transformer(teacher_path, torch_dtype=self.dtype, torch_device="cpu")
-        else:
-            logger.info("Loading target student (EMA, frozen) ...")
-            self.target_student = load_transformer(target_path, torch_dtype=self.dtype, torch_device="cpu")
-        self.target_student = self.target_student.to(self.dtype)
-
-        # 为目标学生模型添加 Flow Map 能力（与学生模型相同的改造）
-        logger.info("Setting up Flow Map for target student ...")
-        self.target_student = setup_flowmap_model(
-            self.target_student, gate_value=config.gate_value, deltatime_type=config.deltatime_type)
-        self.target_student = patch_model_forward(self.target_student)
-        if not self._is_lora_resume:
-            load_flowmap_delta_weights(self.target_student, target_path, "target student")
-
-        # 如果从 LoRA checkpoint 恢复，为目标学生也添加 LoRA 并加载权重
-        if self._is_lora_resume and self.use_lora:
-            logger.info("  Step 2: Adding LoRA to target student ...")
-            target_lora_config = LoraConfig(
-                r=config.lora_rank,
-                lora_alpha=config.lora_alpha,
-                target_modules=config.lora_target_modules,
-                lora_dropout=getattr(config, 'lora_dropout', 0.0),
-                bias='none',
+        if self.skip_target_student:
+            logger.info(
+                "Skipping target student load/EMA."
             )
-            self.target_student = get_peft_model(self.target_student, target_lora_config, adapter_name='default')
-
-            # 加载目标学生的 LoRA adapter 权重
-            target_adapter_path = os.path.join(target_path, "diffusion_pytorch_model.safetensors")
-            if os.path.exists(target_adapter_path):
-                from safetensors.torch import load_file as safetensors_load_file
-                target_adapter_state = safetensors_load_file(target_adapter_path)
-                missing, unexpected = self.target_student.load_state_dict(target_adapter_state, strict=False)
-                if config.rank == 0:
-                    logger.info(f"  Loaded {len(target_adapter_state)} target adapter parameters")
+        else:
+            if self._is_lora_resume:
+                logger.info("Loading target student from LoRA checkpoint ...")
+                logger.info("  Step 1: Loading base model from teacher ...")
+                self.target_student = load_transformer(teacher_path, torch_dtype=self.dtype, torch_device="cpu")
             else:
-                logger.warning(f"  Target adapter weights not found: {target_adapter_path}")
-        elif self.use_lora:
-            # 非 LoRA 恢复模式：正常为目标学生添加 LoRA
-            target_lora_config = LoraConfig(
-                r=config.lora_rank,
-                lora_alpha=config.lora_alpha,
-                target_modules=config.lora_target_modules,
-                lora_dropout=getattr(config, 'lora_dropout', 0.0),
-                bias='none',
-            )
-            self.target_student = get_peft_model(self.target_student, target_lora_config, adapter_name='default')
+                logger.info("Loading target student (EMA, frozen) ...")
+                self.target_student = load_transformer(target_path, torch_dtype=self.dtype, torch_device="cpu")
+            self.target_student = self.target_student.to(self.dtype)
+            self.target_student = adapt_cosmos_latent_video_heads(self.target_student, "target student")
 
-        # Cast entire model (including LoRA parameters) to uniform dtype
-        # before FSDP wrapping (same reason as online student above).
-        self.target_student = self.target_student.to(self.dtype)
+            # 为目标学生模型添加 Flow Map 能力（与学生模型相同的改造）
+            logger.info("Setting up Flow Map for target student ...")
+            self.target_student = setup_flowmap_model(
+                self.target_student, gate_value=config.gate_value, deltatime_type=config.deltatime_type)
+            self.target_student = patch_model_forward(self.target_student)
+            if not self._is_lora_resume:
+                load_flowmap_delta_weights(self.target_student, target_path, "target student")
 
-        if self.use_onpolicy_transition:
-            # On-policy mode: use FSDP1 (shards parameters across GPUs)
-            self.target_student = shard_model_fsdp1(self.target_student, param_dtype=self.dtype)
-            logger.info("Target student wrapped with FSDP1 (on-policy mode)")
-        else:
-            self.target_student = _configure_model(
-                model=self.target_student, shard_fn=shard_model,
-                param_dtype=self.dtype, device=self.device, eval_mode=False,
-            )
-        self.target_student.requires_grad_(False)  # 冻结，仅用于推理
-        self.target_student.eval()
+            # 如果从 LoRA checkpoint 恢复，为目标学生也添加 LoRA 并加载权重
+            if self._is_lora_resume and self.use_lora:
+                logger.info("  Step 2: Adding LoRA to target student ...")
+                target_lora_config = LoraConfig(
+                    r=config.lora_rank,
+                    lora_alpha=config.lora_alpha,
+                    target_modules=config.lora_target_modules,
+                    lora_dropout=getattr(config, 'lora_dropout', 0.0),
+                    bias='none',
+                )
+                self.target_student = get_peft_model(self.target_student, target_lora_config, adapter_name='default')
+
+                # 加载目标学生的 LoRA adapter 权重
+                target_adapter_path = os.path.join(target_path, "diffusion_pytorch_model.safetensors")
+                if os.path.exists(target_adapter_path):
+                    from safetensors.torch import load_file as safetensors_load_file
+                    target_adapter_state = safetensors_load_file(target_adapter_path)
+                    missing, unexpected = self.target_student.load_state_dict(target_adapter_state, strict=False)
+                    if config.rank == 0:
+                        logger.info(f"  Loaded {len(target_adapter_state)} target adapter parameters")
+                else:
+                    logger.warning(f"  Target adapter weights not found: {target_adapter_path}")
+            elif self.use_lora:
+                # 非 LoRA 恢复模式：正常为目标学生添加 LoRA
+                target_lora_config = LoraConfig(
+                    r=config.lora_rank,
+                    lora_alpha=config.lora_alpha,
+                    target_modules=config.lora_target_modules,
+                    lora_dropout=getattr(config, 'lora_dropout', 0.0),
+                    bias='none',
+                )
+                self.target_student = get_peft_model(self.target_student, target_lora_config, adapter_name='default')
+
+            # Cast entire model (including LoRA parameters) to uniform dtype
+            # before FSDP wrapping (same reason as online student above).
+            self.target_student = self.target_student.to(self.dtype)
+
+            if self.use_fsdp1:
+                # FSDP1 avoids DTensor/checkpoint recompute type mixing.
+                self.target_student = shard_model_fsdp1(self.target_student, param_dtype=self.dtype)
+                _assert_no_dtensor_params(self.target_student, "target_student")
+                logger.info("Target student wrapped with FSDP1")
+            else:
+                self.target_student = _configure_model(
+                    model=self.target_student, shard_fn=shard_model,
+                    param_dtype=self.dtype, device=self.device, eval_mode=False,
+                )
+            self.target_student.requires_grad_(False)  # 冻结，仅用于推理
+            self.target_student.eval()
 
         # ==============================================================
         # 优化器和学习率调度器
@@ -750,11 +1156,13 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         from distillation.patches import SafeMultiLatentLeRobotDataset as MultiLatentLeRobotDataset
         train_dataset = MultiLatentLeRobotDataset(config=config)
         # 分布式采样器：确保每个 GPU 看到不同的数据子集
-        train_sampler = (
-            DistributedSampler(train_dataset, num_replicas=config.world_size,
-                               rank=config.rank, shuffle=True, seed=config.seed)
-            if config.world_size > 1 else None
-        )
+        train_sampler = build_stage2_sampler(train_dataset, config)
+        if config.rank == 0:
+            logger.info(
+                "Stage2 sampler: %s (group_by=%s)",
+                getattr(config, "stage2_sampler", "default"),
+                getattr(config, "stage2_group_by", "task"),
+            )
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
@@ -817,6 +1225,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         恢复时可以直接加载，无需再次调用 setup_flowmap_model。
         """
         model = self.student if which == "online_student" else self.target_student
+        if model is None:
+            if self.config.rank == 0:
+                logger.info(f"  Skipped {which} checkpoint because target student is disabled.")
+            if dist.is_initialized():
+                dist.barrier(device_ids=[torch.cuda.current_device()])
+            return
         try:
             if self.use_lora:
                 # LoRA 模式：只保存 adapter 权重（不含基座模型权重，文件更小）
@@ -849,6 +1263,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 config_dict['patch_size'] = list(getattr(self.config, 'patch_size', (1, 2, 2)))
                 config_dict['distill_mode'] = getattr(self.config, 'distill_mode', 'flashwam')
                 config_dict['checkpoint_step'] = self.step
+                _set_video_channel_config_from_heads(config_dict, model, state_dict_bf16)
                 # 保存 LoRA 元信息，方便恢复时重建 LoRA 结构
                 if self.use_lora:
                     config_dict['use_lora'] = True
@@ -899,6 +1314,31 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
     # ==================================================================
     def _light_eval_is_enabled(self):
         return bool(getattr(self.config, "enable_light_eval", False))
+
+    def _compute_student_grad_branch_norms(self):
+        sq_sums = {
+            "video": torch.zeros((), device=self.device),
+            "action": torch.zeros((), device=self.device),
+            "shared": torch.zeros((), device=self.device),
+        }
+        for name, param in self.student.named_parameters():
+            grad = getattr(param, "grad", None)
+            if grad is None:
+                continue
+            if grad.is_sparse:
+                grad = grad.coalesce().values()
+            branch = classify_parameter_branch(name)
+            sq_sums[branch] = sq_sums[branch] + grad.detach().float().pow(2).sum()
+
+        packed = torch.stack([sq_sums["video"], sq_sums["action"], sq_sums["shared"]])
+        if dist.is_initialized():
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        packed = packed.clamp(min=0).sqrt()
+        return {
+            "video": packed[0].item(),
+            "action": packed[1].item(),
+            "shared": packed[2].item(),
+        }
 
     def _get_light_eval_batches(self):
         if self._light_eval_batches is not None:
@@ -1153,7 +1593,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
         was_training = self.student.training
         self.student.eval()
-        self.target_student.eval()
+        if self.target_student is not None:
+            self.target_student.eval()
         if getattr(self, "_student_nofsdp", None) is not None:
             self._student_nofsdp.eval()
 
@@ -1940,6 +2381,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         f"{getattr(config, 'dmd_rollout_steps_max', 8)}]")
         if self.use_opd_aux:
             logger.info(f"  OPD aux enabled: weight={getattr(config, 'opd_aux_weight', 0.1)}, "
+                        f"variant={self.opd_aux_variant}, "
                         f"warmup={getattr(config, 'opd_aux_warmup_steps', 0)}, "
                         f"interval={getattr(config, 'opd_aux_interval', 1)}, "
                         f"prob={getattr(config, 'opd_aux_prob', 1.0)}, "
@@ -1947,6 +2389,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         f"grad={getattr(config, 'opd_rollout_grad_mode', 'endpoint')}, "
                         f"flowmap_aux={getattr(config, 'flowmap_aux_weight', 1.0)}, "
                         f"endpoint_aux={getattr(config, 'opd_endpoint_aux_weight', 0.0)}, "
+                        f"same_state_vel={getattr(config, 'opd_same_state_velocity_weight', 0.0)}, "
                         f"aux_gc={getattr(config, 'opd_aux_gradient_checkpointing', False)}, "
                         f"action_transition_block={getattr(config, 'action_transition_block_weight', getattr(config, 'action_block_weight', 1.0))}, "
                         f"action_local_fm_block={getattr(config, 'action_local_fm_block_weight', 1.0)}, "
@@ -2017,11 +2460,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.optimizer.zero_grad()
         acc_losses = []              # 累积的总损失
         acc_video_losses = []        # 累积的视频损失
+        acc_cosmos_video_endpoint_losses = []
+        acc_cosmos_video_cdiff_losses = []
         acc_video_local_fm_losses = []  # 累积的视频 local FM 损失
         acc_action_losses = []       # 累积的动作损失
         acc_action_local_fm_losses = []  # 累积的动作 local FM 损失
         acc_action_aware_losses = [] # 累积的动作感知损失
         acc_gt_regression_losses = []  # 累积的 GT 回归损失（Flow Map 特有）
+        acc_raw_teacher_gt_mses = []
+        acc_raw_teacher_gt_l1s = []
+        acc_raw_teacher_abs_means = []
+        acc_raw_gt_abs_means = []
+        acc_raw_teacher_enabled = []
         acc_d_losses = []            # 累积的判别器损失（DMD 特有）
         acc_dmd_grad_norms = []      # 累积的 DMD 梯度范数（DMD 特有）
         acc_opd_aux_losses = []
@@ -2049,6 +2499,17 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         acc_opd_anchor_scales = []
         acc_opd_transition_group_ratios = []
         acc_opd_anchor_group_ratios = []
+        acc_kto_good_ratios = []
+        acc_kto_weight_means = []
+        acc_kto_weight_mins = []
+        acc_kto_weight_maxs = []
+        acc_kto_thresholds = []
+        acc_kto_main_actives = []
+        acc_kto_main_good_ratios = []
+        acc_kto_main_weight_means = []
+        acc_kto_main_weight_mins = []
+        acc_kto_main_weight_maxs = []
+        acc_kto_main_thresholds = []
         step_in_acc = 0              # 当前累积步数
         # DMD 参数
         dmd_weight = getattr(config, 'dmd_weight', 0.1)
@@ -2095,13 +2556,19 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         use_opd_aux_now = torch.rand(1).item() < opd_aux_prob
 
             if use_opd_aux_now:
+                def _run_opd_aux():
+                    if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
+                        return self._opd_aux_transition_step_kto_paopd(batch, step_in_acc)
+                    return self._opd_aux_transition_step(batch, step_in_acc)
+
+                if (bool(getattr(self.config, 'opd_aux_empty_cache', False))
+                        and torch.cuda.is_available()):
+                    torch.cuda.empty_cache()
+
                 opd_aux_checkpointing = bool(getattr(
                     self.config, 'opd_aux_gradient_checkpointing', False))
                 opd_aux_result = _call_with_student_checkpointing(
-                    self.student,
-                    opd_aux_checkpointing,
-                    lambda: self._opd_aux_transition_step(batch, step_in_acc),
-                )
+                    self.student, opd_aux_checkpointing, _run_opd_aux)
                 result["loss"] = result["loss"] + opd_aux_result.get("loss", zero_tensor)
                 result["skip_step"] = (
                     result.get("skip_step", False) or
@@ -2114,6 +2581,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_video_losses.append(result.get("video_transition_loss", torch.tensor(0.0, device=self.device)))
             else:
                 acc_video_losses.append(result["video_loss"])
+            acc_cosmos_video_endpoint_losses.append(result.get(
+                "cosmos_video_endpoint_loss", zero_tensor))
+            acc_cosmos_video_cdiff_losses.append(result.get(
+                "cosmos_video_cdiff_loss", zero_tensor))
             acc_video_local_fm_losses.append(result.get(
                 "local_fm_loss", zero_tensor))
             acc_action_losses.append(result["action_loss"])
@@ -2122,6 +2593,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             acc_action_aware_losses.append(result["action_aware_loss"])
             acc_gt_regression_losses.append(result.get(
                 "gt_regression_loss", zero_tensor))
+            acc_raw_teacher_gt_mses.append(result.get(
+                "raw_teacher_gt_mse", zero_tensor))
+            acc_raw_teacher_gt_l1s.append(result.get(
+                "raw_teacher_gt_l1", zero_tensor))
+            acc_raw_teacher_abs_means.append(result.get(
+                "raw_teacher_abs_mean", zero_tensor))
+            acc_raw_gt_abs_means.append(result.get(
+                "raw_gt_abs_mean", zero_tensor))
+            acc_raw_teacher_enabled.append(result.get(
+                "raw_teacher_enabled", zero_tensor))
             acc_opd_aux_losses.append(
                 opd_aux_result.get("opd_aux_loss", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
@@ -2197,6 +2678,27 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             acc_opd_anchor_group_ratios.append(
                 opd_aux_result.get("opd_anchor_group_ratio", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
+            acc_kto_good_ratios.append(
+                opd_aux_result.get("kto_good_ratio", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_kto_weight_means.append(
+                opd_aux_result.get("kto_weight_mean", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_kto_weight_mins.append(
+                opd_aux_result.get("kto_weight_min", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_kto_weight_maxs.append(
+                opd_aux_result.get("kto_weight_max", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_kto_thresholds.append(
+                opd_aux_result.get("kto_threshold", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_kto_main_actives.append(result.get("kto_main_active", zero_tensor))
+            acc_kto_main_good_ratios.append(result.get("kto_main_good_ratio", zero_tensor))
+            acc_kto_main_weight_means.append(result.get("kto_main_weight_mean", zero_tensor))
+            acc_kto_main_weight_mins.append(result.get("kto_main_weight_min", zero_tensor))
+            acc_kto_main_weight_maxs.append(result.get("kto_main_weight_max", zero_tensor))
+            acc_kto_main_thresholds.append(result.get("kto_main_threshold", zero_tensor))
             step_in_acc += 1
 
             # ---- 第二阶段：DMD（条件满足时执行）----
@@ -2239,10 +2741,21 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
             # 检查是否需要梯度同步（达到累积步数）
             if result["should_sync"]:
+                log_interval = max(1, int(getattr(config, "log_interval", 1)))
+                will_log_step = (
+                    (self.step % log_interval == 0) or
+                    (self.step + 1 >= config.max_train_steps)
+                )
+                grad_branch_norms = {}
                 if skip_step:
                     total_norm = torch.tensor(float("nan"), device=self.device)
                     self.optimizer.zero_grad()
                 else:
+                    if (
+                        bool(getattr(config, "enable_grad_branch_diagnostics", False))
+                        and will_log_step
+                    ):
+                        grad_branch_norms = self._compute_student_grad_branch_norms()
                     # 梯度裁剪
                     total_norm = torch.nn.utils.clip_grad_norm_(
                         self.student.parameters(), config.max_grad_norm)
@@ -2266,22 +2779,30 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         ema_warmup_steps = int(getattr(config, 'ema_warmup_steps', 0))
                         ema_decay = 0.0 if self.step < ema_warmup_steps else config.ema_decay
                         self._last_ema_decay = float(ema_decay)
-                        update_ema(
-                            self.target_student.parameters(),
-                            self.student.parameters(),
-                            rate=ema_decay,
-                        )
+                        if self.target_student is not None:
+                            update_ema(
+                                self.target_student.parameters(),
+                                self.student.parameters(),
+                                rate=ema_decay,
+                            )
 
                 # 计算平均损失（跨所有进程）
                 lr = self.lr_scheduler.get_last_lr()[0]
-                metric_values = torch.stack([
+                metric_tensors = [
                     torch.stack(acc_losses).sum(),
                     torch.stack(acc_video_losses).sum(),
+                    torch.stack(acc_cosmos_video_endpoint_losses).sum(),
+                    torch.stack(acc_cosmos_video_cdiff_losses).sum(),
                     torch.stack(acc_video_local_fm_losses).sum(),
                     torch.stack(acc_action_losses).sum(),
                     torch.stack(acc_action_local_fm_losses).sum(),
                     torch.stack(acc_action_aware_losses).sum(),
                     torch.stack(acc_gt_regression_losses).sum(),
+                    torch.stack(acc_raw_teacher_gt_mses).sum(),
+                    torch.stack(acc_raw_teacher_gt_l1s).sum(),
+                    torch.stack(acc_raw_teacher_abs_means).sum(),
+                    torch.stack(acc_raw_gt_abs_means).sum(),
+                    torch.stack(acc_raw_teacher_enabled).sum(),
                     torch.stack(acc_d_losses).sum(),
                     torch.stack(acc_dmd_grad_norms).sum(),
                     torch.stack(acc_opd_aux_losses).sum(),
@@ -2309,15 +2830,43 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     torch.stack(acc_opd_anchor_scales).sum(),
                     torch.stack(acc_opd_transition_group_ratios).sum(),
                     torch.stack(acc_opd_anchor_group_ratios).sum(),
-                ]).float()
+                ]
+                kto_main_enabled = bool(getattr(self.config, 'kto_main_video_reweight', False))
+                if kto_main_enabled:
+                    metric_tensors.extend([
+                        torch.stack(acc_kto_main_actives).sum(),
+                        torch.stack(acc_kto_main_good_ratios).sum(),
+                        torch.stack(acc_kto_main_weight_means).sum(),
+                        torch.stack(acc_kto_main_weight_mins).sum(),
+                        torch.stack(acc_kto_main_weight_maxs).sum(),
+                        torch.stack(acc_kto_main_thresholds).sum(),
+                    ])
+                if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
+                    metric_tensors.extend([
+                        torch.stack(acc_kto_good_ratios).sum(),
+                        torch.stack(acc_kto_weight_means).sum(),
+                        torch.stack(acc_kto_weight_mins).sum(),
+                        torch.stack(acc_kto_weight_maxs).sum(),
+                        torch.stack(acc_kto_thresholds).sum(),
+                    ])
+                metric_values = torch.stack(metric_tensors).float()
+                metric_results = dist_mean(metric_values).tolist()
+                base_metric_count = 41
                 (
                     avg_loss,
                     avg_video_loss,
+                    avg_cosmos_video_endpoint_loss,
+                    avg_cosmos_video_cdiff_loss,
                     avg_video_local_fm_loss,
                     avg_action_loss,
                     avg_action_local_fm_loss,
                     avg_action_aware_loss,
                     avg_gt_regression_loss,
+                    avg_raw_teacher_gt_mse_sum,
+                    avg_raw_teacher_gt_l1_sum,
+                    avg_raw_teacher_abs_mean_sum,
+                    avg_raw_gt_abs_mean_sum,
+                    avg_raw_teacher_enabled,
                     avg_d_loss,
                     avg_dmd_grad_norm,
                     avg_opd_aux_loss,
@@ -2345,21 +2894,65 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     avg_opd_anchor_scale,
                     avg_opd_transition_group_ratio,
                     avg_opd_anchor_group_ratio,
-                ) = dist_mean(metric_values).tolist()
+                ) = metric_results[:base_metric_count]
+                metric_cursor = base_metric_count
+                if kto_main_enabled:
+                    (
+                        avg_kto_main_active,
+                        avg_kto_main_good_ratio,
+                        avg_kto_main_weight_mean,
+                        avg_kto_main_weight_min,
+                        avg_kto_main_weight_max,
+                        avg_kto_main_threshold,
+                    ) = metric_results[metric_cursor:metric_cursor + 6]
+                    metric_cursor += 6
+                else:
+                    avg_kto_main_active = 0.0
+                    avg_kto_main_good_ratio = 0.0
+                    avg_kto_main_weight_mean = 0.0
+                    avg_kto_main_weight_min = 0.0
+                    avg_kto_main_weight_max = 0.0
+                    avg_kto_main_threshold = 0.0
+                if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
+                    (
+                        avg_kto_good_ratio,
+                        avg_kto_weight_mean,
+                        avg_kto_weight_min,
+                        avg_kto_weight_max,
+                        avg_kto_threshold,
+                    ) = metric_results[metric_cursor:]
+                else:
+                    avg_kto_good_ratio = 0.0
+                    avg_kto_weight_mean = 0.0
+                    avg_kto_weight_min = 0.0
+                    avg_kto_weight_max = 0.0
+                    avg_kto_threshold = 0.0
                 action_total_raw = (
                     avg_action_loss
                     + self.gt_regression_weight * avg_gt_regression_loss
                     + getattr(self.config, "action_aware_weight", 0.0) * avg_action_aware_loss
                 )
                 action_total = self.action_block_weight * action_total_raw
+                raw_teacher_count = max(avg_raw_teacher_enabled, 1e-12)
+                avg_raw_teacher_gt_mse = avg_raw_teacher_gt_mse_sum / raw_teacher_count
+                avg_raw_teacher_gt_l1 = avg_raw_teacher_gt_l1_sum / raw_teacher_count
+                avg_raw_teacher_abs_mean = avg_raw_teacher_abs_mean_sum / raw_teacher_count
+                avg_raw_gt_abs_mean = avg_raw_gt_abs_mean_sum / raw_teacher_count
                 # 重置累积器
                 acc_losses = []
                 acc_video_losses = []
+                acc_cosmos_video_endpoint_losses = []
+                acc_cosmos_video_cdiff_losses = []
                 acc_video_local_fm_losses = []
                 acc_action_losses = []
                 acc_action_local_fm_losses = []
                 acc_action_aware_losses = []
                 acc_gt_regression_losses = []
+                acc_raw_teacher_gt_mses = []
+                acc_raw_teacher_gt_l1s = []
+                acc_raw_teacher_abs_means = []
+                acc_raw_gt_abs_means = []
+                acc_raw_teacher_enabled = []
                 acc_d_losses = []
                 acc_dmd_grad_norms = []
                 acc_opd_aux_losses = []
@@ -2387,6 +2980,17 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_opd_anchor_scales = []
                 acc_opd_transition_group_ratios = []
                 acc_opd_anchor_group_ratios = []
+                acc_kto_good_ratios = []
+                acc_kto_weight_means = []
+                acc_kto_weight_mins = []
+                acc_kto_weight_maxs = []
+                acc_kto_thresholds = []
+                acc_kto_main_actives = []
+                acc_kto_main_good_ratios = []
+                acc_kto_main_weight_means = []
+                acc_kto_main_weight_mins = []
+                acc_kto_main_weight_maxs = []
+                acc_kto_main_thresholds = []
                 step_in_acc = 0
 
                 # 定期清理显存；只在真正清理时同步，避免每个 optimizer step 强制等待 GPU。
@@ -2396,8 +3000,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     gc.collect()
 
                 # 记录日志（仅主进程）
-                log_interval = max(1, int(getattr(config, "log_interval", 1)))
-                should_log = (self.step % log_interval == 0) or (self.step + 1 >= config.max_train_steps)
+                should_log = will_log_step
                 if config.rank == 0 and should_log:
                     progress_bar.n = self.step + 1
                     postfix = {
@@ -2411,6 +3014,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         "train/lr": lr,
                         "train/ema_decay": getattr(self, '_last_ema_decay', config.ema_decay),
                     }
+                    if grad_branch_norms:
+                        log_dict["grad_norm/video_branch"] = grad_branch_norms["video"]
+                        log_dict["grad_norm/action_branch"] = grad_branch_norms["action"]
+                        log_dict["grad_norm/shared_branch"] = grad_branch_norms["shared"]
                     if self.distill_video:
                         if use_onpolicy_now:
                             postfix["vt"] = f"{avg_video_loss:.4f}"
@@ -2420,12 +3027,32 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         else:
                             postfix["v"] = f"{avg_video_loss:.4f}"
                             log_dict["loss/video_consistency"] = avg_video_loss
+                            if bool(getattr(self.config, 'cosmos_video_cdiff_aux', False)):
+                                postfix["vep"] = f"{avg_cosmos_video_endpoint_loss:.4f}"
+                                postfix["vcd"] = f"{avg_cosmos_video_cdiff_loss:.4f}"
+                                log_dict["loss/cosmos_video_endpoint"] = avg_cosmos_video_endpoint_loss
+                                log_dict["loss/cosmos_video_cdiff"] = avg_cosmos_video_cdiff_loss
+                    if kto_main_enabled:
+                        postfix["mkto"] = f"{avg_kto_main_good_ratio:.2f}/{avg_kto_main_weight_mean:.2f}"
+                        log_dict["kto_main/active"] = avg_kto_main_active
+                        log_dict["kto_main/good_ratio"] = avg_kto_main_good_ratio
+                        log_dict["kto_main/adaptive_weight_mean"] = avg_kto_main_weight_mean
+                        log_dict["kto_main/adaptive_weight_min"] = avg_kto_main_weight_min
+                        log_dict["kto_main/adaptive_weight_max"] = avg_kto_main_weight_max
+                        log_dict["kto_main/threshold"] = avg_kto_main_threshold
                     if self.distill_action:
                         postfix["a"] = f"{avg_action_loss:.4f}"
                         postfix["at"] = f"{action_total:.4f}"
                         log_dict["loss/action_consistency"] = avg_action_loss
                         log_dict["loss/action_total_raw"] = action_total_raw
                         log_dict["loss/action_total"] = action_total
+                    if avg_raw_teacher_enabled > 0:
+                        postfix["ctgt"] = f"{avg_raw_teacher_gt_mse:.3f}/{avg_raw_teacher_gt_l1:.3f}"
+                        log_dict["cosmos_raw/teacher_gt_mse"] = avg_raw_teacher_gt_mse
+                        log_dict["cosmos_raw/teacher_gt_l1"] = avg_raw_teacher_gt_l1
+                        log_dict["cosmos_raw/teacher_abs_mean"] = avg_raw_teacher_abs_mean
+                        log_dict["cosmos_raw/gt_abs_mean"] = avg_raw_gt_abs_mean
+                        log_dict["cosmos_raw/enabled_microbatches"] = avg_raw_teacher_enabled
                     if self.action_aware:
                         postfix["alfm"] = f"{avg_action_local_fm_loss:.4f}"
                         postfix["aa"] = f"{avg_action_aware_loss:.4f}"
@@ -2460,6 +3087,21 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         log_dict["loss_ratio/opd_endpoint_aux"] = avg_opd_endpoint_aux_ratio
                         log_dict["loss_ratio/opd_same_state_velocity"] = avg_opd_same_state_velocity_ratio
                         log_dict["loss_ratio/opd_local_fm"] = avg_opd_local_fm_ratio
+                        log_dict.update(opd_diagnostic_aliases({
+                            "opd_endpoint_aux_loss": avg_opd_endpoint_aux_loss,
+                            "opd_same_state_velocity_loss": avg_opd_same_state_velocity_loss,
+                            "opd_action_transition_loss": avg_opd_action_transition_loss,
+                            "opd_endpoint_aux_ratio": avg_opd_endpoint_aux_ratio,
+                            "opd_same_state_velocity_ratio": avg_opd_same_state_velocity_ratio,
+                            "opd_action_transition_ratio": avg_opd_action_transition_ratio,
+                        }, self.config))
+                        if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
+                            postfix["kto"] = f"{avg_kto_good_ratio:.2f}/{avg_kto_weight_mean:.2f}"
+                            log_dict["kto/good_ratio"] = avg_kto_good_ratio
+                            log_dict["kto/adaptive_weight_mean"] = avg_kto_weight_mean
+                            log_dict["kto/adaptive_weight_min"] = avg_kto_weight_min
+                            log_dict["kto/adaptive_weight_max"] = avg_kto_weight_max
+                            log_dict["kto/threshold"] = avg_kto_threshold
                         if self.distill_action:
                             postfix["oat"] = f"{avg_opd_action_transition_loss:.2e}"
                             postfix["woat"] = f"{avg_opd_action_transition_contrib:.2e}"
@@ -2538,7 +3180,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 # 定期保存检查点（保留最近 3 个 + 最佳 loss 的）
                 if self.step % config.save_interval == 0:
                     self._save_checkpoint("online_student")
-                    self._save_checkpoint("target_student")
+                    if self.target_student is not None:
+                        self._save_checkpoint("target_student")
 
 
             # 常规训练不需要每个 microbatch barrier；仅保留可选 debug barrier。
@@ -2551,7 +3194,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         logger.info("Flow Map distillation completed!")
         # 保存最终检查点
         self._save_checkpoint("online_student")
-        self._save_checkpoint("target_student")
+        if self.target_student is not None:
+            self._save_checkpoint("target_student")
         # 关闭 TensorBoard writer
         if self.tb_writer is not None:
             self.tb_writer.flush()

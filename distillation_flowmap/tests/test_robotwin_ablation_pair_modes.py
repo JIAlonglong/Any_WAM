@@ -9,10 +9,14 @@ import torch
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 FLOWMAP_DIR = os.path.join(REPO_ROOT, "distillation_flowmap")
-WANVA_UTILS_DIR = os.path.join(REPO_ROOT, "wan_va", "utils")
-for path in (FLOWMAP_DIR, WANVA_UTILS_DIR):
+WANVA_ROOT = os.path.join(REPO_ROOT, "wan_va")
+for path in (FLOWMAP_DIR, WANVA_ROOT):
     if path not in sys.path:
         sys.path.insert(0, path)
+
+
+def test_module_does_not_put_wanva_utils_directory_on_sys_path():
+    assert os.path.join(REPO_ROOT, "wan_va", "utils") not in sys.path
 
 
 def load_config(module_name, **env):

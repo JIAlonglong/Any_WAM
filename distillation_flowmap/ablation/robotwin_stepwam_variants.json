@@ -10,424 +10,11 @@
   },
   "variants": [
     {
-      "id": "v1",
-      "name": "full_stepwam",
-      "seeds": [0, 1, 2],
-      "priority": "first_pass",
-      "requires_code_flag": false,
-      "description": "Arbitrary t->r shortcut plus hybrid endpoint/same-state OPD with joint video-action distillation.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_AUX_ACTION": "1",
-        "VIDEO_TRANSITION_WEIGHT": "1.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.1",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.1"
-      }
-    },
-    {
-      "id": "v2",
-      "name": "w_o_opd",
-      "seeds": [0, 1, 2],
-      "priority": "first_pass",
-      "requires_code_flag": false,
-      "description": "Stage 1 arbitrary shortcut distillation only; Stage 2 OPD disabled.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "0"
-      }
-    },
-    {
-      "id": "v3",
-      "name": "endpoint_only_opd",
-      "seeds": [0],
-      "backfill_seeds": [1, 2],
-      "priority": "first_pass",
-      "requires_code_flag": false,
-      "description": "Endpoint/x0 OPD without same-state velocity regularization.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_AUX_ACTION": "1",
-        "VIDEO_TRANSITION_WEIGHT": "1.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.1",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.0"
-      }
-    },
-    {
-      "id": "v4",
-      "name": "velocity_only_opd",
-      "seeds": [0],
-      "backfill_seeds": [1, 2],
-      "priority": "first_pass",
-      "requires_code_flag": false,
-      "description": "Same-state velocity regularizer only; action OPD is off to avoid endpoint leakage.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_AUX_ACTION": "0",
-        "VIDEO_TRANSITION_WEIGHT": "0.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.1"
-      }
-    },
-    {
-      "id": "v5",
-      "name": "local_adjacent_only",
-      "seeds": [0, 1, 2],
-      "priority": "first_pass",
-      "requires_code_flag": true,
-      "description": "No arbitrary shortcut. Stage 1 and OPD sample only adjacent 4-step grid edges.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam",
-        "FLOWMAP_PAIR_MODE": "adjacent_grid",
-        "FLOWMAP_ADJACENT_GRID": "1000,750,500,250,0"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_AUX_ACTION": "1",
-        "FLOWMAP_PAIR_MODE": "adjacent_grid",
-        "OPD_PAIR_MODE": "adjacent_grid",
-        "FLOWMAP_ADJACENT_GRID": "1000,750,500,250,0",
-        "VIDEO_TRANSITION_WEIGHT": "1.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.1",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.1"
-      }
-    },
-    {
-      "id": "v6",
-      "name": "action_only",
-      "seeds": [0],
-      "backfill_seeds": [1, 2],
-      "priority": "first_pass",
-      "requires_code_flag": false,
-      "description": "Action-only distillation control. Stage 2 action OPD is enabled only after smoke passes.",
-      "stage1_env": {
-        "DISTILL_MODE": "action"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "action",
-        "USE_OPD_AUX": "1",
-        "OPD_AUX_ACTION": "1",
-        "VIDEO_TRANSITION_WEIGHT": "0.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.0"
-      }
-    },
-    {
-      "id": "v7",
-      "name": "no_video_loss_optional",
-      "seeds": [],
-      "priority": "optional",
-      "requires_code_flag": true,
-      "description": "Optional no-video-loss/video-detached control. Run only if implementation remains small and smoke passes.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam",
-        "VIDEO_LOSS_WEIGHT": "0.0"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_AUX_ACTION": "1",
-        "VIDEO_LOSS_WEIGHT": "0.0",
-        "VIDEO_TRANSITION_WEIGHT": "1.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.1",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.1"
-      }
-    },
-    {
-      "id": "c0",
-      "name": "calib_w_o_opd",
-      "seeds": [0],
-      "priority": "mechanism_calibration",
-      "requires_code_flag": false,
-      "description": "Small-data Stage2 continuation without OPD from the shared Stage1 checkpoint.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "0"
-      }
-    },
-    {
-      "id": "c1",
-      "name": "calib_endpoint_only",
-      "seeds": [0],
-      "priority": "mechanism_calibration",
-      "requires_code_flag": false,
-      "description": "Explicit video endpoint OPD only with teacher N=8 and student K=4.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
-        "OPD_AUX_ACTION": "0",
-        "VIDEO_TRANSITION_WEIGHT": "1.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.0",
-        "LOCAL_FM_WEIGHT": "0.0",
-        "ACTION_LOCAL_FM_WEIGHT": "0.0",
-        "OPD_TRANSITION_GROUP_WEIGHT": "1.0",
-        "OPD_ANCHOR_CAP_RATIO": "-1.0",
-        "OPD_ROLLOUT_STEP_PAIRS": "8,4",
-        "OPD_ROLLOUT_GRAD_MODE": "last_step"
-      }
-    },
-    {
-      "id": "c2",
-      "name": "calib_velocity_only",
-      "seeds": [0],
-      "priority": "mechanism_calibration",
-      "requires_code_flag": false,
-      "description": "Explicit same-state video velocity OPD only with no transition-relative cap.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
-        "OPD_AUX_ACTION": "0",
-        "VIDEO_TRANSITION_WEIGHT": "0.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "1.0",
-        "LOCAL_FM_WEIGHT": "0.0",
-        "ACTION_LOCAL_FM_WEIGHT": "0.0",
-        "OPD_TRANSITION_GROUP_WEIGHT": "1.0",
-        "OPD_ANCHOR_CAP_RATIO": "-1.0",
-        "OPD_ROLLOUT_STEP_PAIRS": "8,4",
-        "OPD_ROLLOUT_GRAD_MODE": "last_step"
-      }
-    },
-    {
-      "id": "c3",
-      "name": "calib_full_last_step",
-      "seeds": [0],
-      "priority": "mechanism_calibration",
-      "requires_code_flag": false,
-      "description": "Explicit endpoint plus velocity OPD with final-step rollout credit.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
-        "OPD_AUX_ACTION": "0",
-        "VIDEO_TRANSITION_WEIGHT": "1.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "1.0",
-        "LOCAL_FM_WEIGHT": "0.0",
-        "ACTION_LOCAL_FM_WEIGHT": "0.0",
-        "OPD_TRANSITION_GROUP_WEIGHT": "1.0",
-        "OPD_ANCHOR_CAP_RATIO": "-1.0",
-        "OPD_ROLLOUT_STEP_PAIRS": "8,4",
-        "OPD_ROLLOUT_GRAD_MODE": "last_step"
-      }
-    },
-    {
-      "id": "c4",
-      "name": "calib_full_full_grad",
-      "seeds": [0],
-      "priority": "mechanism_calibration",
-      "requires_code_flag": false,
-      "description": "Explicit endpoint plus velocity OPD with full four-step rollout credit.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
-        "OPD_AUX_ACTION": "0",
-        "VIDEO_TRANSITION_WEIGHT": "1.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "1.0",
-        "LOCAL_FM_WEIGHT": "0.0",
-        "ACTION_LOCAL_FM_WEIGHT": "0.0",
-        "OPD_TRANSITION_GROUP_WEIGHT": "1.0",
-        "OPD_ANCHOR_CAP_RATIO": "-1.0",
-        "OPD_ROLLOUT_STEP_PAIRS": "8,4",
-        "OPD_ROLLOUT_GRAD_MODE": "full"
-      }
-    },
-    {
-      "id": "c5",
-      "name": "calib_full_suffix_grad",
-      "seeds": [0],
-      "priority": "mechanism_calibration",
-      "requires_code_flag": false,
-      "description": "Explicit endpoint plus velocity OPD with a two-step gradient suffix over a K=4 rollout.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
-        "OPD_AUX_ACTION": "0",
-        "VIDEO_TRANSITION_WEIGHT": "1.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "1.0",
-        "LOCAL_FM_WEIGHT": "0.0",
-        "ACTION_LOCAL_FM_WEIGHT": "0.0",
-        "OPD_TRANSITION_GROUP_WEIGHT": "1.0",
-        "OPD_ANCHOR_CAP_RATIO": "-1.0",
-        "OPD_ROLLOUT_STEP_PAIRS": "8,4",
-        "OPD_ROLLOUT_GRAD_MODE": "suffix",
-        "OPD_ROLLOUT_GRAD_STEPS": "2"
-      }
-    },
-    {
-      "id": "c6",
-      "name": "calib_danceopd_i1",
-      "seeds": [0],
-      "priority": "mechanism_calibration",
-      "requires_code_flag": false,
-      "description": "On-policy, terminal-prior DanceOPD video velocity matching with a 16-step rollout and one query per optimizer update.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_QUERY_MODE": "danceopd",
-        "OPD_DANCEOPD_ROLLOUT_STEPS": "16",
-        "OPD_DANCEOPD_QUERY_ALPHA": "5.0",
-        "OPD_DANCEOPD_QUERY_BETA": "2.0",
-        "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR": "1",
-        "OPD_DANCEOPD_DIAGNOSTIC_INTERVAL": "50",
-        "OPD_AUX_INTERVAL": "1",
-        "OPD_AUX_WEIGHT": "1.0",
-        "OPD_AUX_ACTION": "0",
-        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
-        "VIDEO_TRANSITION_WEIGHT": "0.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.0",
-        "LOCAL_FM_WEIGHT": "0.0",
-        "ACTION_LOCAL_FM_WEIGHT": "0.0"
-      }
-    },
-    {
-      "id": "c7",
-      "name": "calib_danceopd_i4",
-      "seeds": [0],
-      "priority": "mechanism_calibration",
-      "requires_code_flag": false,
-      "description": "Cadence control for DanceOPD: identical on-policy 16-step video velocity query, applied every four optimizer updates.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_QUERY_MODE": "danceopd",
-        "OPD_DANCEOPD_ROLLOUT_STEPS": "16",
-        "OPD_DANCEOPD_QUERY_ALPHA": "5.0",
-        "OPD_DANCEOPD_QUERY_BETA": "2.0",
-        "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR": "1",
-        "OPD_DANCEOPD_DIAGNOSTIC_INTERVAL": "50",
-        "OPD_AUX_INTERVAL": "4",
-        "OPD_AUX_WEIGHT": "1.0",
-        "OPD_AUX_ACTION": "0",
-        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
-        "VIDEO_TRANSITION_WEIGHT": "0.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.0",
-        "LOCAL_FM_WEIGHT": "0.0",
-        "ACTION_LOCAL_FM_WEIGHT": "0.0"
-      }
-    },
-    {
-      "id": "c8",
-      "name": "calib_endpoint_only_danceopd_i1",
-      "seeds": [0],
-      "priority": "mechanism_calibration",
-      "requires_code_flag": false,
-      "description": "Independent teacher endpoint x0 alignment only, executed through the same DanceOPD rollout path as the composite control.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_QUERY_MODE": "danceopd",
-        "OPD_DANCEOPD_ROLLOUT_STEPS": "16",
-        "OPD_DANCEOPD_QUERY_ALPHA": "5.0",
-        "OPD_DANCEOPD_QUERY_BETA": "2.0",
-        "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR": "1",
-        "OPD_DANCEOPD_DIAGNOSTIC_INTERVAL": "50",
-        "OPD_DANCEOPD_VELOCITY_WEIGHT": "0.0",
-        "OPD_DANCEOPD_ENDPOINT_WEIGHT": "1.0",
-        "OPD_AUX_INTERVAL": "1",
-        "OPD_AUX_WEIGHT": "1.0",
-        "OPD_AUX_ACTION": "0",
-        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
-        "OPD_TEACHER_TARGET_MODE": "endpoint",
-        "OPD_ROLLOUT_STEP_PAIRS": "8,4",
-        "OPD_ROLLOUT_GRAD_MODE": "last_step",
-        "VIDEO_TRANSITION_WEIGHT": "0.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.0",
-        "LOCAL_FM_WEIGHT": "0.0",
-        "ACTION_LOCAL_FM_WEIGHT": "0.0"
-      }
-    },
-    {
-      "id": "c9",
-      "name": "calib_endpoint_danceopd_i1",
-      "seeds": [0],
-      "priority": "mechanism_calibration",
-      "requires_code_flag": false,
-      "description": "Independent teacher endpoint x0 alignment plus on-policy DanceOPD video velocity matching, both applied every optimizer update.",
-      "stage1_env": {
-        "DISTILL_MODE": "flashwam"
-      },
-      "stage2_env": {
-        "DISTILL_MODE": "flashwam",
-        "USE_OPD_AUX": "1",
-        "OPD_QUERY_MODE": "danceopd",
-        "OPD_DANCEOPD_ROLLOUT_STEPS": "16",
-        "OPD_DANCEOPD_QUERY_ALPHA": "5.0",
-        "OPD_DANCEOPD_QUERY_BETA": "2.0",
-        "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR": "1",
-        "OPD_DANCEOPD_DIAGNOSTIC_INTERVAL": "50",
-        "OPD_DANCEOPD_VELOCITY_WEIGHT": "1.0",
-        "OPD_DANCEOPD_ENDPOINT_WEIGHT": "1.0",
-        "OPD_AUX_INTERVAL": "1",
-        "OPD_AUX_WEIGHT": "1.0",
-        "OPD_AUX_ACTION": "0",
-        "OPD_LOSS_COMPOSITION": "explicit_hybrid",
-        "OPD_TEACHER_TARGET_MODE": "endpoint",
-        "OPD_ROLLOUT_STEP_PAIRS": "8,4",
-        "OPD_ROLLOUT_GRAD_MODE": "last_step",
-        "VIDEO_TRANSITION_WEIGHT": "0.0",
-        "OPD_ENDPOINT_AUX_WEIGHT": "0.0",
-        "OPD_SAME_STATE_VELOCITY_WEIGHT": "0.0",
-        "LOCAL_FM_WEIGHT": "0.0",
-        "ACTION_LOCAL_FM_WEIGHT": "0.0"
-      }
-    },
-    {
       "id": "f0",
       "name": "final_w_o_opd",
-      "seeds": [0],
+      "seeds": [
+        0
+      ],
       "priority": "final_ablation",
       "requires_code_flag": false,
       "description": "Final-ablation shortcut-only baseline. It uses the same joint video-action Stage1 checkpoint as every OPD variant and disables Stage2 OPD.",
@@ -442,7 +29,9 @@
     {
       "id": "f1",
       "name": "final_endpoint_only_danceopd",
-      "seeds": [0],
+      "seeds": [
+        0
+      ],
       "priority": "final_ablation",
       "requires_code_flag": false,
       "description": "Final-ablation endpoint-only control through the identical DanceOPD rollout/query path. Stage2 OPD is video-only; Stage1 remains joint video-action.",
@@ -477,7 +66,9 @@
     {
       "id": "f2",
       "name": "final_danceopd_velocity_only",
-      "seeds": [0],
+      "seeds": [
+        0
+      ],
       "priority": "final_ablation",
       "requires_code_flag": false,
       "description": "Final-ablation on-policy terminal-prior DanceOPD local video velocity control. Stage2 OPD is video-only; Stage1 remains joint video-action.",
@@ -509,7 +100,9 @@
     {
       "id": "f3",
       "name": "final_stepwam_danceopd",
-      "seeds": [0],
+      "seeds": [
+        0
+      ],
       "priority": "final_ablation",
       "requires_code_flag": false,
       "description": "Final StepWAM: independent teacher endpoint x0 alignment plus on-policy terminal-prior DanceOPD local video velocity matching. Stage1 is joint video-action shortcut distillation.",
@@ -544,7 +137,9 @@
     {
       "id": "s1",
       "name": "final_local_adjacent_only",
-      "seeds": [0],
+      "seeds": [
+        0
+      ],
       "priority": "structural_control",
       "requires_code_flag": false,
       "description": "Structural control only: remove arbitrary t-to-r shortcuts in both stages and train a separate local-adjacent Stage1 before the same endpoint plus DanceOPD Stage2 objective.",
@@ -584,7 +179,9 @@
     {
       "id": "s2",
       "name": "final_action_only",
-      "seeds": [0],
+      "seeds": [
+        0
+      ],
       "priority": "structural_control",
       "requires_code_flag": false,
       "description": "Structural control only: action-only Stage1 and Stage2 without the joint video branch or video OPD. Report action and closed-loop outcomes separately from the OPD table.",

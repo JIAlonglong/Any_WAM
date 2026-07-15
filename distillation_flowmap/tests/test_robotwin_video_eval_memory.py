@@ -51,3 +51,17 @@ def test_legacy_video_eval_wrapper_is_not_a_stable_entrypoint():
     repo_root = Path(__file__).resolve().parents[1]
 
     assert not (repo_root / "run_eval_video_stage2.sh").exists()
+
+
+def test_video_eval_preserves_unmanifested_start_index_without_eager_dataset_cache():
+    source = _video_eval_source()
+
+    assert 'parser.add_argument("--start-index", type=int, default=0)' in source
+    assert (
+        "cfg.light_eval_start_index = (\n"
+        "        args.start_index if args.eval_manifest is None else 0\n"
+        "    )"
+    ) in source
+    assert source.index("cfg.cache_dataset_in_memory = False") < source.index(
+        "is_cosmos_policy_teacher_cfg ="
+    )

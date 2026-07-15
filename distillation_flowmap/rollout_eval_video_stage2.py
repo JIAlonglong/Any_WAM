@@ -361,6 +361,7 @@ def main():
     parser.add_argument("--video-fps", type=int, default=10)
     parser.add_argument("--video-max-pairs", type=int, default=1)
     parser.add_argument("--video-sample-index", type=int, default=0)
+    parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--video-decode-device",
         default="cpu",
         choices=("cpu", "cuda"),
@@ -467,9 +468,13 @@ def main():
     cfg.skip_teacher_compile = True
     cfg.light_eval_num_batches = max(1, args.num_batches)
     cfg.light_eval_seed = args.seed
-    cfg.light_eval_start_index = 0
+    cfg.light_eval_start_index = (
+        args.start_index if args.eval_manifest is None else 0
+    )
     # Keep memory closer to training but avoid the full no-FSDP student copy for this offline pass.
     cfg.opd_aux_use_nofsdp_rollout = False
+    # Offline video eval samples only a few items; avoid preloading every RobotWin subdataset.
+    cfg.cache_dataset_in_memory = False
     is_cosmos_policy_teacher_cfg = str(getattr(cfg, "teacher_backend", "wanva")).lower() in (
         "cosmos",
         "cosmos_policy",
@@ -478,7 +483,6 @@ def main():
     if is_cosmos_policy_teacher_cfg and args.video_dir is not None:
         cfg.cosmos_policy_use_raw_inference = True
         cfg.return_raw_observation = True
-        cfg.cache_dataset_in_memory = False
 
     trainer = FlowMapDistiller(cfg)
     set_eval_mode_for_optional_students(trainer)

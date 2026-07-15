@@ -230,6 +230,29 @@ build_client_command() {
   )
 }
 
+build_renderer_preflight_command() {
+  local -n command_ref="$1"
+  local gpu="$2"
+  command_ref=(
+    env
+    "CUDA_VISIBLE_DEVICES=${gpu}"
+    "ROBOTWIN_ROOT=${ROBOTWIN_ROOT}"
+    "PYTHONPATH=$(server_env_pythonpath)"
+    "PYTHONWARNINGS=ignore::UserWarning"
+    "${PYTHON}"
+    -c
+    'from evaluation.robotwin.test_render import Sapien_TEST; Sapien_TEST()'
+  )
+}
+
+run_renderer_preflight() {
+  local gpu="$1"
+  local -a command=()
+  build_renderer_preflight_command command "${gpu}"
+  echo "Renderer preflight: gpu=${gpu}"
+  "${command[@]}"
+}
+
 cleanup_servers() {
   local pid
   for pid in "${SERVER_PIDS[@]}"; do
@@ -357,6 +380,11 @@ print_dry_run() {
   local run_dir
   local -a command=()
 
+  for gpu in "${GPU_LIST[@]}"; do
+    build_renderer_preflight_command command "${gpu}"
+    print_command "${command[@]}"
+  done
+
   for variant in "${SELECTED_VARIANTS[@]}"; do
     checkpoint="$(checkpoint_for_variant "${variant}")"
     run_dir="${ROOT}/${variant}/seed_0/stage2/closed_loop"
@@ -474,6 +502,10 @@ require_path "${PROJECT_ROOT}/wan_va/wan_va_server.py"
 
 for variant in "${SELECTED_VARIANTS[@]}"; do
   require_path "$(checkpoint_for_variant "${variant}")"
+done
+
+for gpu in "${GPU_LIST[@]}"; do
+  run_renderer_preflight "${gpu}"
 done
 
 variant_index=0

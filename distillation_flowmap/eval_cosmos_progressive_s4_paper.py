@@ -70,6 +70,24 @@ def _load_json(path):
         return json.load(handle)
 
 
+def _require_nonempty_string(value, *, name):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _validate_record_and_pair(record, pair):
+    """Return strict task/pair identities before cache lookup or aggregation."""
+    if not isinstance(record, Mapping):
+        raise ValueError("record must be a mapping")
+    if not isinstance(pair, Mapping):
+        raise ValueError("pair must be a mapping")
+    return (
+        _require_nonempty_string(record.get("task"), name="task"),
+        _require_nonempty_string(pair.get("pair_id"), name="pair_id"),
+    )
+
+
 def validate_s4_contract(*, student_steps, teacher_steps, pairs):
     """Reject settings that cannot represent the paper's deployed S4 path."""
     if int(student_steps) != S4_STUDENT_STEPS:
@@ -85,8 +103,7 @@ def validate_s4_contract(*, student_steps, teacher_steps, pairs):
     for pair in pairs:
         if not isinstance(pair, Mapping):
             raise ValueError("Each fixed pair must be a mapping")
-        if not str(pair.get("pair_id", "")).strip():
-            raise ValueError("Each fixed pair needs a non-empty pair_id")
+        _require_nonempty_string(pair.get("pair_id"), name="pair_id")
         if "pair_seed" not in pair:
             raise ValueError("Each fixed pair needs pair_seed for deterministic action noise")
         try:
@@ -583,9 +600,9 @@ def _load_test_manifest(path):
     if not records:
         raise ValueError("Test manifest did not provide any records")
     for record in records:
-        task = record.get("task")
-        if not isinstance(task, str) or not task.strip():
-            raise ValueError("Test manifest record needs a non-empty string task")
+        if not isinstance(record, Mapping):
+            raise ValueError("Test manifest record must be a mapping")
+        _require_nonempty_string(record.get("task"), name="task")
         int(record["index"])
     return manifest, records
 
@@ -616,6 +633,7 @@ def _run_cache_only_smoke(
     """Run exactly one K=4 student rollout and never construct/query Cosmos."""
     record = records[0]
     pair = pairs[0]
+    _task, pair_id = _validate_record_and_pair(record, pair)
     batch = runtime["move_batch"](
         runtime["default_collate"]([dataset[int(record["index"])]]) ,
         device,
@@ -683,7 +701,7 @@ def _run_cache_only_smoke(
         "manifest": str(Path(args.manifest).resolve()),
         "manifest_digest": digest,
         "record_index": int(record["index"]),
-        "pair_id": pair["pair_id"],
+        "pair_id": pair_id,
         "skip_same_state_velocity": True,
     })
     output_dir = Path(args.output_dir)
@@ -716,6 +734,7 @@ def _run_paper_evaluation(
         )
         source_actions = batch["actions"].detach().clone()
         for pair in pairs:
+            task, pair_id = _validate_record_and_pair(record, pair)
             # One exact cache payload supplies both the video prior and y0 for
             # this row.  No cached trajectory is used for off-path diagnostics.
             batch["actions"] = source_actions.clone()
@@ -797,9 +816,9 @@ def _run_paper_evaluation(
                     teacher_field=teacher_field,
                 )
             output_records.append({
-                "task": str(record["task"]),
+                "task": task,
                 "record_index": int(record["index"]),
-                "pair_id": str(pair["pair_id"]),
+                "pair_id": pair_id,
                 "metrics": metrics,
             })
             print(
@@ -824,7 +843,7 @@ def _run_paper_evaluation(
     )
 
 
-def main(argv=None):
+def main(argv=None, *, runtime=None):
     args = parse_args(argv)
     if args.limit < 0:
         raise ValueError("--limit must be non-negative")
@@ -847,7 +866,7 @@ def main(argv=None):
         raise ValueError("No test-manifest records remain after --limit")
     digest = manifest_digest(manifest)
 
-    runtime = _runtime_dependencies()
+    runtime = _runtime_dependencies() if runtime is None else runtime
     device = torch.device(args.device)
     if device.type == "cuda":
         torch.cuda.set_device(device)

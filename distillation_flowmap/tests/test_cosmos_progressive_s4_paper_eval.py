@@ -1,7 +1,10 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
+
+import distillation_flowmap.eval_cosmos_progressive_s4_paper as paper_eval
 
 from distillation_flowmap.eval_cosmos_progressive_s4_paper import (
     DEPLOYMENT_GRID,
@@ -213,5 +216,221 @@ def test_test_manifest_rejects_non_string_task_identity(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="non-empty string task"):
+    with pytest.raises(ValueError, match="task.*non-empty string"):
         _load_test_manifest(manifest_path)
+
+
+def test_cache_only_main_uses_injected_runtime_before_any_cosmos_access(
+    tmp_path, monkeypatch
+):
+    data_path = tmp_path / "data"
+    data_path.mkdir()
+    torch.save(torch.zeros(1, 1, 1), data_path / "empty_emb.pt")
+    manifest_path = tmp_path / "test_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "split": "test",
+                "records": [{"index": 0, "task": "task-a"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pairs_path = tmp_path / "eval_pairs.json"
+    pairs_path.write_text(
+        json.dumps(
+            {
+                "pairs": [
+                    {
+                        "pair_id": "same-prior",
+                        "t": 1000,
+                        "r": 0,
+                        "pair_seed": 7,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    video = torch.zeros(1, 16, 1, 1, 1, dtype=torch.bfloat16)
+    actions = torch.zeros(1, 2, 4, 1, 1, dtype=torch.bfloat16)
+    cache = {
+        "video_x0": video.clone(),
+        "video_noise": video.clone(),
+        "teacher_x_r": video.clone(),
+        "teacher_v_r": video.clone(),
+        "teacher_action_x0": actions.clone(),
+    }
+    cfg = SimpleNamespace(
+        action_downsample_factor=4,
+        teacher_model_path="/must-not-resolve-cosmos",
+    )
+    cosmos_calls = []
+    validated = []
+    harnesses = []
+
+    class FakeDataset:
+        def __init__(self, config):
+            assert config is cfg
+
+        def __getitem__(self, index):
+            assert index == 0
+            return {
+                "latents": video.clone(),
+                "actions": actions.clone(),
+                "text_emb": torch.zeros(1, 1, 1, dtype=torch.bfloat16),
+            }
+
+    class FakeHarness:
+        def __init__(self, student, config, device):
+            assert config is cfg
+            self.k_steps = []
+            self.input_shapes = []
+            harnesses.append(self)
+
+        def _student_euler_integrate(self, **kwargs):
+            self.k_steps.append(kwargs["K_steps"])
+            self.input_shapes.append(tuple(kwargs["noisy_latents"].shape))
+            return (
+                kwargs["noisy_latents"],
+                torch.zeros_like(kwargs["noisy_latents"]),
+                None,
+                kwargs["base_input_dict"]["action_dict"]["noisy_latents"],
+            )
+
+    def forbidden_cosmos(*args, **kwargs):
+        cosmos_calls.append((args, kwargs))
+        raise AssertionError("cache-only smoke touched Cosmos")
+
+    def configure_offline_eval_config(config, *, skip_same_state_velocity):
+        assert skip_same_state_velocity is True
+        config.cosmos_policy_use_raw_inference = False
+        config.return_raw_observation = False
+
+    def prepare_base_dict(batch, config, device):
+        return {
+            "latent_dict": {
+                "latent": batch["latents"],
+                "cond_timesteps": torch.zeros(1, 1),
+                "text_emb": batch["text_emb"],
+            },
+            "action_dict": {
+                "latent": batch["actions"],
+                "cond_timesteps": torch.zeros(1, 4),
+                "text_emb": batch["text_emb"],
+            },
+            "chunk_size": 1,
+            "window_size": 1,
+        }
+
+    def student_input(
+        batch, base, video_x0, video_noise, video_t, action_noise, action_t, action_ds
+    ):
+        base_input = base["input"]
+        return (
+            {
+                "latent_dict": {
+                    **base_input["latent_dict"],
+                    "noisy_latents": video_noise,
+                    "timesteps": video_t,
+                },
+                "action_dict": {
+                    **base_input["action_dict"],
+                    "noisy_latents": batch["actions"][:, :, ::action_ds],
+                    "timesteps": action_t[:, ::action_ds],
+                },
+                "chunk_size": base_input["chunk_size"],
+                "window_size": base_input["window_size"],
+            },
+            action_noise,
+        )
+
+    def install_cached_teacher_anchor(batch, payload, *, device, dtype):
+        retained = batch["actions"].clone()
+        batch["latents"] = payload["video_x0"].to(device=device, dtype=dtype)
+        batch["actions"] = payload["teacher_action_x0"].to(
+            device=device, dtype=dtype
+        )
+        return retained
+
+    runtime = {
+        "CosmosPolicyActionTeacher": forbidden_cosmos,
+        "SafeMultiLatentLeRobotDataset": FakeDataset,
+        "StudentRolloutHarness": FakeHarness,
+        "cache_payload": lambda *args, **kwargs: cache,
+        "configure_offline_eval_config": configure_offline_eval_config,
+        "default_collate": lambda items: items[0],
+        "install_cached_teacher_anchor": install_cached_teacher_anchor,
+        "load_stage1_model": lambda *args, **kwargs: object(),
+        "move_batch": lambda batch, device: batch,
+        "prepare_base_dict": prepare_base_dict,
+        "resolve_cosmos_policy_assets": forbidden_cosmos,
+        "student_input": student_input,
+    }
+    original_require_video = paper_eval._require_video_latent
+
+    def spy_require_video(name, tensor, *, reference_shape=None):
+        validated.append((name, tuple(tensor.shape)))
+        return original_require_video(name, tensor, reference_shape=reference_shape)
+
+    monkeypatch.setattr(
+        paper_eval.importlib,
+        "import_module",
+        lambda _name: SimpleNamespace(cfg=cfg),
+    )
+    monkeypatch.setattr(paper_eval, "_runtime_dependencies", forbidden_cosmos)
+    monkeypatch.setattr(paper_eval, "_require_video_latent", spy_require_video)
+
+    output_dir = tmp_path / "out"
+    summary = paper_eval.main(
+        [
+            "--checkpoint-transformer",
+            str(tmp_path / "checkpoint"),
+            "--dataset-path",
+            str(data_path),
+            "--manifest",
+            str(manifest_path),
+            "--pairs",
+            str(pairs_path),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--output-dir",
+            str(output_dir),
+            "--cache-only-smoke",
+            "--skip-same-state-velocity",
+            "--device",
+            "cpu",
+        ],
+        runtime=runtime,
+    )
+
+    assert cosmos_calls == []
+    assert len(harnesses) == 1
+    assert harnesses[0].k_steps == [4]
+    assert harnesses[0].input_shapes == [(1, 16, 1, 1, 1)]
+    assert {name for name, _shape in validated} >= {
+        "video_noise",
+        "cache smoke student video",
+        "cache smoke student field",
+    }
+    assert summary["is_paper_metric"] is False
+    assert "metrics" not in summary
+    assert "per_task" not in summary
+    assert summary["validated_video_shapes"]["student_video"] == [1, 16, 1, 1, 1]
+    assert not (output_dir / "records.jsonl").exists()
+    assert json.loads((output_dir / "summary.json").read_text(encoding="utf-8")) == summary
+
+
+@pytest.mark.parametrize(
+    ("record", "pair", "message"),
+    [
+        ({"index": 0, "task": None}, {"pair_id": "same-prior"}, "task"),
+        ({"index": 0, "task": "task-a"}, {"pair_id": None}, "pair_id"),
+    ],
+)
+def test_validate_record_and_pair_requires_nonempty_string_identities(
+    record, pair, message
+):
+    with pytest.raises(ValueError, match=message):
+        paper_eval._validate_record_and_pair(record, pair)

@@ -183,18 +183,22 @@ def validate_policy_source_isolation(
     root: str | Path,
     *,
     protocol_source_root: str | Path,
-    stage1_checkpoint: str | Path,
+    stage1_checkpoint: str | Path | None,
     teacher_model_path: str | Path,
     dataset_path: str | Path,
 ) -> None:
     """Ensure output writes cannot land in immutable protocol/source artifacts."""
     resolved_root = _resolve_path(root)
-    sources = (
+    sources: tuple[tuple[str, Path], ...] = (
         ("protocol source root", _resolve_path(protocol_source_root)),
-        ("Stage-1 source checkpoint", _resolve_path(stage1_checkpoint)),
         ("teacher model path", _resolve_path(teacher_model_path)),
         ("dataset path", _resolve_path(dataset_path)),
     )
+    if stage1_checkpoint is not None:
+        sources = (
+            ("Stage-1 source checkpoint", _resolve_path(stage1_checkpoint)),
+            *sources,
+        )
     for label, source in sources:
         if _paths_overlap(resolved_root, source):
             raise ValueError(
@@ -433,6 +437,104 @@ def build_multibudget_eval_plans(
             }
         )
     return plans
+
+
+def validate_owned_policy_checkpoint(
+    *, root: str | Path, checkpoint_dir: str | Path
+) -> Path:
+    """Require an evaluation checkpoint to be a direct checkpoint of ``root``.
+
+    Evaluation is deliberately unable to point a policy root at a checkpoint
+    owned by a different experiment.  Resolving both sides also rejects a
+    symlink inside ``root/checkpoints`` that escapes into another output tree.
+    """
+    resolved_root = _resolve_path(root)
+    resolved_checkpoint = _resolve_path(checkpoint_dir)
+    checkpoints_dir = resolved_root / "checkpoints"
+    try:
+        checkpoint_step = int(resolved_checkpoint.name.removeprefix("step_"))
+    except ValueError as exc:
+        raise ValueError(
+            "Cosmos mixed-step evaluation checkpoint must be a direct "
+            f"owned checkpoints/step_N directory: {resolved_checkpoint}"
+        ) from exc
+    if checkpoint_step < 0 or resolved_checkpoint.parent != checkpoints_dir:
+        raise ValueError(
+            "Cosmos mixed-step evaluation checkpoint must be a direct "
+            f"owned checkpoints/step_N directory: {resolved_checkpoint}"
+        )
+    return resolved_checkpoint
+
+
+def build_policy_eval_plan(
+    *,
+    policy_name: str,
+    root: str | Path,
+    checkpoint_dir: str | Path,
+    dataset_path: str | Path,
+    protocol_source_root: str | Path,
+    teacher_model_path: str | Path = DEFAULT_TEACHER_MODEL,
+    legacy_root: str | Path = LEGACY_PROGRESSIVE_ROOT,
+    eval_device_list: str = "0",
+    eval_worker_device_list: str = "0",
+    python_executable: str | Path | None = None,
+) -> dict[str, Any]:
+    """Build a target-free three-budget evaluation plan without any training.
+
+    This is intentionally separate from :func:`build_policy_train_plan` so a
+    launcher cannot accidentally retrain when the requested operation is an
+    offline fixed-cache proxy evaluation.  The plan owns no train argv and
+    only has the reviewed S1/S2/S4 evaluator child plans.
+    """
+    policy = _policy_payload(policy_name)
+    root = validate_policy_root(root, legacy_root=legacy_root, resume=True)
+    protocol_source_root = _resolve_path(protocol_source_root)
+    dataset_path = _resolve_path(dataset_path)
+    teacher_model_path = _resolve_path(teacher_model_path)
+    validate_policy_source_isolation(
+        root,
+        protocol_source_root=protocol_source_root,
+        # The Stage-1 source is irrelevant to an eval-only plan; there is no
+        # training/resume operation in this branch.
+        stage1_checkpoint=None,
+        teacher_model_path=teacher_model_path,
+        dataset_path=dataset_path,
+    )
+    validate_resume_policy_ownership(root, policy["name"])
+    checkpoint_dir = validate_owned_policy_checkpoint(
+        root=root, checkpoint_dir=checkpoint_dir
+    )
+    selection_manifest = protocol_source_root / "selection_manifest.json"
+    eval_pairs = protocol_source_root / "eval_pairs.json"
+    eval_plans = build_multibudget_eval_plans(
+        checkpoint_dir=checkpoint_dir,
+        dataset_path=dataset_path,
+        selection_manifest=selection_manifest,
+        eval_pairs=eval_pairs,
+        shared_protocol_root=protocol_source_root,
+        output_dir=root,
+        teacher_model_path=teacher_model_path,
+        mixed_policy_name=policy["name"],
+        python_executable=python_executable,
+        eval_device_list=eval_device_list,
+        eval_worker_device_list=eval_worker_device_list,
+    )
+    return {
+        "schema": "cosmos_mixed_step_policy_eval_plan_v1",
+        "policy": policy,
+        "root": root,
+        "output_dir": root,
+        "protocol_source_root": protocol_source_root,
+        "dataset_path": dataset_path,
+        "teacher_model_path": teacher_model_path,
+        "checkpoint_dir": checkpoint_dir,
+        "selection_proxy_path": root
+        / "metrics"
+        / "selection"
+        / checkpoint_dir.name
+        / "selection_proxy.json",
+        "eval_plans": eval_plans,
+    }
 
 
 def build_policy_train_plan(
@@ -769,6 +871,22 @@ def _validate_checkpoint_transformer(checkpoint_dir: str | Path, *, role: str) -
         raise FileNotFoundError(f"Missing {role} online student transformer: {config_path}")
 
 
+def validate_target_free_online_student(checkpoint_dir: str | Path, *, role: str) -> None:
+    """Require the deployable online student and reject a target-EMA checkpoint.
+
+    The independent Cosmos mixed policies are explicitly target-free.  This
+    small validation is shared by the full train completion path and the
+    eval-only path so neither can silently report a target-student artifact as
+    a deployable policy.
+    """
+    _validate_checkpoint_transformer(checkpoint_dir, role=role)
+    target_student = _as_path(checkpoint_dir) / "target_student"
+    if target_student.exists() or target_student.is_symlink():
+        raise RuntimeError(
+            f"Expected target-free {role} checkpoint, found target_student: {target_student}"
+        )
+
+
 def validate_eval_caches(eval_plans: Sequence[Mapping[str, Any]]) -> None:
     """Verify each planned cache has every fixed selection record/pair payload."""
     for plan in eval_plans:
@@ -849,7 +967,35 @@ def execute_policy_plan(plan: Mapping[str, Any]) -> None:
     print(f"Wrote policy manifest: {manifest_path}", flush=True)
     train_env = {**os.environ, **dict(plan["train_env"])}
     subprocess.run(list(plan["train_argv"]), cwd=REPO_ROOT, env=train_env, check=True)
-    _validate_checkpoint_transformer(plan["checkpoint_dir"], role="trained")
+    validate_target_free_online_student(plan["checkpoint_dir"], role="trained")
+    for eval_plan in plan["eval_plans"]:
+        eval_env = {**os.environ, **dict(eval_plan["env"])}
+        subprocess.run(list(eval_plan["argv"]), cwd=REPO_ROOT, env=eval_env, check=True)
+    selection_proxy_path = _write_selection_proxy(plan)
+    print(f"Wrote selection proxy: {selection_proxy_path}", flush=True)
+
+
+def execute_policy_eval_plan(plan: Mapping[str, Any]) -> None:
+    """Run only the three fixed-cache proxy evaluators from an owned checkpoint.
+
+    This function deliberately has no train command, no protocol-copy side
+    effect, and no Stage-1 resume behavior.  It is the only execution helper
+    used by the launcher's ``eval`` command.
+    """
+    validate_policy_root(plan["root"], resume=True)
+    validate_policy_source_isolation(
+        plan["root"],
+        protocol_source_root=plan["protocol_source_root"],
+        stage1_checkpoint=None,
+        teacher_model_path=plan["teacher_model_path"],
+        dataset_path=plan["dataset_path"],
+    )
+    validate_resume_policy_ownership(plan["root"], plan["policy"]["name"])
+    checkpoint_dir = validate_owned_policy_checkpoint(
+        root=plan["root"], checkpoint_dir=plan["checkpoint_dir"]
+    )
+    validate_target_free_online_student(checkpoint_dir, role="evaluation")
+    validate_eval_caches(plan["eval_plans"])
     for eval_plan in plan["eval_plans"]:
         eval_env = {**os.environ, **dict(eval_plan["env"])}
         subprocess.run(list(eval_plan["argv"]), cwd=REPO_ROOT, env=eval_env, check=True)
@@ -877,6 +1023,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--stage1-checkpoint", type=Path, default=DEFAULT_STAGE1_CHECKPOINT)
     parser.add_argument("--resume-from-path", type=Path, default=None)
+    parser.add_argument(
+        "--eval-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Evaluate this owned policy checkpoint only. This selects the "
+            "three-budget fixed-cache proxy path and never trains."
+        ),
+    )
     parser.add_argument("--current-step", type=int, default=0)
     parser.add_argument(
         "--chunk-size",
@@ -910,31 +1065,46 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
-    plan = build_policy_train_plan(
-        policy_name=args.policy,
-        root=args.root,
-        dataset_path=args.dataset_path,
-        protocol_source_root=args.protocol_source_root,
-        stage1_checkpoint=args.stage1_checkpoint,
-        current_step=args.current_step,
-        chunk_size=args.chunk_size,
-        max_train_steps=args.max_train_steps,
-        save_interval=args.save_interval,
-        stop_after_step=args.stop_after_step,
-        master_port=args.master_port,
-        train_seed=args.train_seed,
-        torchrun=args.torchrun,
-        teacher_model_path=args.teacher_model_path,
-        device_list=args.device_list,
-        world_size=args.world_size,
-        force_sequence=args.force_sequence,
-        resume_from_path=args.resume_from_path,
-        eval_device_list=args.eval_device_list,
-        eval_worker_device_list=args.eval_worker_device_list,
-    )
+    if args.eval_checkpoint is not None:
+        plan = build_policy_eval_plan(
+            policy_name=args.policy,
+            root=args.root,
+            checkpoint_dir=args.eval_checkpoint,
+            dataset_path=args.dataset_path,
+            protocol_source_root=args.protocol_source_root,
+            teacher_model_path=args.teacher_model_path,
+            eval_device_list=args.eval_device_list,
+            eval_worker_device_list=args.eval_worker_device_list,
+        )
+    else:
+        plan = build_policy_train_plan(
+            policy_name=args.policy,
+            root=args.root,
+            dataset_path=args.dataset_path,
+            protocol_source_root=args.protocol_source_root,
+            stage1_checkpoint=args.stage1_checkpoint,
+            current_step=args.current_step,
+            chunk_size=args.chunk_size,
+            max_train_steps=args.max_train_steps,
+            save_interval=args.save_interval,
+            stop_after_step=args.stop_after_step,
+            master_port=args.master_port,
+            train_seed=args.train_seed,
+            torchrun=args.torchrun,
+            teacher_model_path=args.teacher_model_path,
+            device_list=args.device_list,
+            world_size=args.world_size,
+            force_sequence=args.force_sequence,
+            resume_from_path=args.resume_from_path,
+            eval_device_list=args.eval_device_list,
+            eval_worker_device_list=args.eval_worker_device_list,
+        )
     print(json.dumps(_json_ready(plan), indent=2, sort_keys=True))
     if args.run:
-        execute_policy_plan(plan)
+        if args.eval_checkpoint is not None:
+            execute_policy_eval_plan(plan)
+        else:
+            execute_policy_plan(plan)
 
 
 if __name__ == "__main__":

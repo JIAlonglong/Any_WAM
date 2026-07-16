@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,8 @@ from distillation_flowmap.run_cosmos_mixed_step_policy import (
     build_policy_manifest_payload,
     build_policy_train_plan,
     build_torchrun_command,
+    execute_policy_plan,
+    parse_args,
     parse_device_list,
     validate_policy_root,
 )
@@ -90,6 +93,10 @@ def test_default_stage1_source_is_the_agreed_common_online_student_checkpoint():
 
 def test_resume_plan_uses_only_its_own_online_checkpoint_and_optimizer_state(tmp_path):
     root = tmp_path / "universe"
+    (root / "policy_manifest.json").parent.mkdir(parents=True)
+    (root / "policy_manifest.json").write_text(
+        json.dumps({"policy": {"name": "universe"}}), encoding="utf-8"
+    )
     plan = _plan(tmp_path, root=root, current_step=250, chunk_size=250)
 
     assert plan["checkpoint_dir"] == root / "checkpoints" / "step_500"
@@ -111,6 +118,89 @@ def test_root_guard_rejects_legacy_root_alias_and_existing_checkpoints(tmp_path)
         validate_policy_root(root, legacy_root=legacy_root)
 
     assert validate_policy_root(root, legacy_root=legacy_root, resume=True) == root.resolve()
+
+
+def test_root_guard_rejects_an_ancestor_that_contains_the_legacy_root(tmp_path):
+    legacy_root = tmp_path / "legacy_s4" / "run"
+
+    with pytest.raises(ValueError, match="legacy"):
+        validate_policy_root(legacy_root.parent, legacy_root=legacy_root)
+
+
+def test_policy_plan_rejects_output_overlap_with_protocol_and_stage1_sources(tmp_path):
+    protocol_source_root = tmp_path / "shared_protocol"
+    with pytest.raises(ValueError, match="protocol source"):
+        _plan(
+            tmp_path,
+            root=protocol_source_root / "new_policy",
+            protocol_source_root=protocol_source_root,
+        )
+
+    stage1_checkpoint = tmp_path / "stage1" / "checkpoints" / "step_5000"
+    with pytest.raises(ValueError, match="Stage-1"):
+        _plan(
+            tmp_path,
+            root=stage1_checkpoint.parents[1],
+            protocol_source_root=tmp_path / "other_protocol",
+            stage1_checkpoint=stage1_checkpoint,
+        )
+
+
+def test_resume_requires_a_matching_policy_manifest(tmp_path):
+    root = tmp_path / "universe"
+    resume_kwargs = {"root": root, "current_step": 250, "chunk_size": 250}
+
+    with pytest.raises(FileNotFoundError, match="policy_manifest"):
+        _plan(tmp_path, **resume_kwargs)
+
+    root.mkdir(parents=True)
+    (root / "policy_manifest.json").write_text("not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed"):
+        _plan(tmp_path, **resume_kwargs)
+
+    (root / "policy_manifest.json").write_text(
+        json.dumps({"policy": {"name": "s2"}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="requested policy"):
+        _plan(tmp_path, **resume_kwargs)
+
+    (root / "policy_manifest.json").write_text(
+        json.dumps({"policy": {"name": "universe"}}), encoding="utf-8"
+    )
+    assert _plan(tmp_path, **resume_kwargs)["policy"]["name"] == "universe"
+
+
+def test_execute_revalidates_resume_manifest_before_any_subprocess(tmp_path):
+    root = tmp_path / "universe"
+    root.mkdir(parents=True)
+    manifest_path = root / "policy_manifest.json"
+    manifest_path.write_text(
+        json.dumps({"policy": {"name": "universe"}}), encoding="utf-8"
+    )
+    plan = _plan(tmp_path, root=root, current_step=250, chunk_size=250)
+    manifest_path.write_text(
+        json.dumps({"policy": {"name": "s1"}}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="requested policy"):
+        execute_policy_plan(plan)
+
+
+def test_policy_allowlist_rejects_unknown_registry_entries_in_builder_and_cli(tmp_path):
+    with pytest.raises(ValueError, match="Unsupported Cosmos mixed-step policy"):
+        _plan(tmp_path, policy_name="s4")
+
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--policy",
+                "s4",
+                "--root",
+                str(tmp_path / "new_policy"),
+                "--protocol-source-root",
+                str(tmp_path / "protocol"),
+            ]
+        )
 
 
 def test_policy_plan_rejects_nonempty_checkpoint_directory_without_resume(tmp_path):

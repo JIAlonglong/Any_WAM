@@ -28,7 +28,6 @@ from typing import Any, Mapping, Sequence
 
 from distillation_flowmap.cosmos_mixed_step_policy import (
     get_mixed_step_policy_spec,
-    mixed_step_policy_names,
     parse_forced_indices,
 )
 
@@ -51,6 +50,7 @@ DEFAULT_MAX_TRAIN_STEPS = 5000
 DEFAULT_SAVE_INTERVAL = 250
 DEFAULT_MASTER_PORT = 29801
 DEFAULT_TRAIN_SEED = 20260716
+SUPPORTED_POLICY_NAMES = ("universe", "s2", "s1")
 
 # This is forbidden, including a symlink alias or a descendant path.  The
 # independent-policy runner must never touch the old staged S4 experiment.
@@ -101,6 +101,21 @@ def _is_within(path: Path, parent: Path) -> bool:
     return path == parent or parent in path.parents
 
 
+def _paths_overlap(left: Path, right: Path) -> bool:
+    """Return whether either resolved path is contained by the other."""
+    return _is_within(left, right) or _is_within(right, left)
+
+
+def _require_supported_policy_name(policy_name: str) -> str:
+    normalized_name = str(policy_name).strip().lower()
+    if normalized_name not in SUPPORTED_POLICY_NAMES:
+        raise ValueError(
+            "Unsupported Cosmos mixed-step policy "
+            f"{normalized_name!r}; expected one of {list(SUPPORTED_POLICY_NAMES)}"
+        )
+    return normalized_name
+
+
 def parse_device_list(
     device_list: str | Sequence[int | str], *, world_size: int = DEFAULT_WORLD_SIZE
 ) -> tuple[str, ...]:
@@ -143,10 +158,10 @@ def validate_policy_root(
     """
     resolved_root = _resolve_path(root)
     resolved_legacy = _resolve_path(legacy_root)
-    if _is_within(resolved_root, resolved_legacy):
+    if _paths_overlap(resolved_root, resolved_legacy):
         raise ValueError(
-            "Cosmos mixed-step policy root must not be the legacy progressive "
-            f"S4 root or its descendant: {resolved_root}"
+            "Cosmos mixed-step policy root must not overlap the legacy progressive "
+            f"S4 root: root={resolved_root}, legacy={resolved_legacy}"
         )
     checkpoints_dir = resolved_root / "checkpoints"
     if not resume and checkpoints_dir.exists() and any(checkpoints_dir.iterdir()):
@@ -155,6 +170,56 @@ def validate_policy_root(
             f"checkpoints: {checkpoints_dir}. Pass an explicit valid resume mode instead."
         )
     return resolved_root
+
+
+def validate_policy_source_isolation(
+    root: str | Path,
+    *,
+    protocol_source_root: str | Path,
+    stage1_checkpoint: str | Path,
+) -> None:
+    """Ensure output writes cannot land in immutable protocol/source artifacts."""
+    resolved_root = _resolve_path(root)
+    sources = (
+        ("protocol source root", _resolve_path(protocol_source_root)),
+        ("Stage-1 source checkpoint", _resolve_path(stage1_checkpoint)),
+    )
+    for label, source in sources:
+        if _paths_overlap(resolved_root, source):
+            raise ValueError(
+                "Cosmos mixed-step policy output root must not overlap "
+                f"{label}: root={resolved_root}, source={source}"
+            )
+
+
+def validate_resume_policy_ownership(root: str | Path, policy_name: str) -> Path:
+    """Require a root-level manifest that proves a resume owns this policy."""
+    root = _resolve_path(root)
+    expected_policy = _require_supported_policy_name(policy_name)
+    manifest_path = root / "policy_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            "Cannot resume mixed-step policy without root policy_manifest.json: "
+            f"{manifest_path}"
+        )
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Mixed-step resume policy_manifest is malformed: {manifest_path}"
+        ) from exc
+    try:
+        actual_policy = str(payload["policy"]["name"]).strip().lower()
+    except (KeyError, TypeError):
+        raise ValueError(
+            f"Mixed-step resume policy_manifest is malformed: {manifest_path}"
+        ) from None
+    if actual_policy != expected_policy:
+        raise ValueError(
+            "Mixed-step resume policy_manifest belongs to "
+            f"{actual_policy!r}, not requested policy {expected_policy!r}: {manifest_path}"
+        )
+    return manifest_path
 
 
 def _validate_positive_int(value: int, *, name: str, allow_zero: bool = False) -> int:
@@ -214,7 +279,7 @@ def build_torchrun_command(
 
 
 def _policy_payload(policy_name: str) -> dict[str, Any]:
-    spec = get_mixed_step_policy_spec(policy_name)
+    spec = get_mixed_step_policy_spec(_require_supported_policy_name(policy_name))
     return {
         "name": spec.name,
         "rollout_step_pairs": [list(pair) for pair in spec.rollout_step_pairs],
@@ -403,7 +468,13 @@ def build_policy_train_plan(
     initial_plan = current_step == 0
     root = validate_policy_root(root, legacy_root=legacy_root, resume=not initial_plan)
     output_dir = root
-    stage1_checkpoint = _as_path(stage1_checkpoint)
+    stage1_checkpoint = _resolve_path(stage1_checkpoint)
+    protocol_source_root = _resolve_path(protocol_source_root)
+    validate_policy_source_isolation(
+        output_dir,
+        protocol_source_root=protocol_source_root,
+        stage1_checkpoint=stage1_checkpoint,
+    )
 
     if initial_plan:
         if resume_from_path is not None and _resolve_path(resume_from_path) != _resolve_path(
@@ -417,6 +488,7 @@ def build_policy_train_plan(
         reset_resume_step = "1"
         resume_optimizer_state = "0"
     else:
+        validate_resume_policy_ownership(output_dir, policy["name"])
         own_checkpoint = output_dir / "checkpoints" / f"step_{current_step}"
         if resume_from_path is not None and _resolve_path(resume_from_path) != _resolve_path(
             own_checkpoint
@@ -436,7 +508,6 @@ def build_policy_train_plan(
         else ",".join(str(item).strip() for item in forced_sequence)
     )
     forced_indices = parse_forced_indices(forced_sequence_for_env, policy_spec)
-    protocol_source_root = _as_path(protocol_source_root)
     protocol_dir = output_dir / "protocol"
     train_manifest = protocol_dir / "train_manifest.json"
     selection_manifest = protocol_dir / "selection_manifest.json"
@@ -746,6 +817,13 @@ def execute_policy_plan(plan: Mapping[str, Any]) -> None:
     """
     is_resume = int(plan["current_step"]) > 0
     validate_policy_root(plan["root"], resume=is_resume)
+    validate_policy_source_isolation(
+        plan["root"],
+        protocol_source_root=plan["protocol_source_root"],
+        stage1_checkpoint=plan["source_checkpoint"],
+    )
+    if is_resume:
+        validate_resume_policy_ownership(plan["root"], plan["policy"]["name"])
     _validate_checkpoint_transformer(plan["resume_from_path"], role="resume")
     copy_immutable_protocol_metadata(plan)
     validate_eval_caches(plan["eval_plans"])
@@ -765,7 +843,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate or explicitly run one isolated eight-GPU Cosmos mixed-step policy."
     )
-    parser.add_argument("--policy", choices=mixed_step_policy_names(), required=True)
+    parser.add_argument("--policy", choices=SUPPORTED_POLICY_NAMES, required=True)
     parser.add_argument(
         "--root",
         type=Path,

@@ -153,8 +153,9 @@ def validate_policy_root(
     """Reject unsafe roots without deleting or modifying any existing output.
 
     A fresh policy may reuse a root containing immutable protocol metadata, but
-    it may not reuse a root which already has checkpoints.  Resuming is an
-    explicit mode and is validated separately against its own checkpoint.
+    it may not reuse a root carrying another policy's manifest or checkpoints.
+    Resuming is an explicit mode and is validated separately against its own
+    checkpoint and manifest ownership.
     """
     resolved_root = _resolve_path(root)
     resolved_legacy = _resolve_path(legacy_root)
@@ -162,6 +163,12 @@ def validate_policy_root(
         raise ValueError(
             "Cosmos mixed-step policy root must not overlap the legacy progressive "
             f"S4 root: root={resolved_root}, legacy={resolved_legacy}"
+        )
+    manifest_path = resolved_root / "policy_manifest.json"
+    if not resume and (manifest_path.exists() or manifest_path.is_symlink()):
+        raise FileExistsError(
+            "Refusing to start a fresh independent policy in a root with an "
+            f"existing policy_manifest.json: {manifest_path}"
         )
     checkpoints_dir = resolved_root / "checkpoints"
     if not resume and checkpoints_dir.exists() and any(checkpoints_dir.iterdir()):
@@ -177,12 +184,16 @@ def validate_policy_source_isolation(
     *,
     protocol_source_root: str | Path,
     stage1_checkpoint: str | Path,
+    teacher_model_path: str | Path,
+    dataset_path: str | Path,
 ) -> None:
     """Ensure output writes cannot land in immutable protocol/source artifacts."""
     resolved_root = _resolve_path(root)
     sources = (
         ("protocol source root", _resolve_path(protocol_source_root)),
         ("Stage-1 source checkpoint", _resolve_path(stage1_checkpoint)),
+        ("teacher model path", _resolve_path(teacher_model_path)),
+        ("dataset path", _resolve_path(dataset_path)),
     )
     for label, source in sources:
         if _paths_overlap(resolved_root, source):
@@ -470,10 +481,14 @@ def build_policy_train_plan(
     output_dir = root
     stage1_checkpoint = _resolve_path(stage1_checkpoint)
     protocol_source_root = _resolve_path(protocol_source_root)
+    teacher_model_path = _resolve_path(teacher_model_path)
+    dataset_path = _resolve_path(dataset_path)
     validate_policy_source_isolation(
         output_dir,
         protocol_source_root=protocol_source_root,
         stage1_checkpoint=stage1_checkpoint,
+        teacher_model_path=teacher_model_path,
+        dataset_path=dataset_path,
     )
 
     if initial_plan:
@@ -596,7 +611,8 @@ def build_policy_train_plan(
         "output_dir": output_dir,
         "protocol_source_root": protocol_source_root,
         "protocol_dir": protocol_dir,
-        "dataset_path": _as_path(dataset_path),
+        "dataset_path": dataset_path,
+        "teacher_model_path": teacher_model_path,
         "source_checkpoint": stage1_checkpoint,
         "resume_from_path": train_resume_path,
         "current_step": current_step,
@@ -821,6 +837,8 @@ def execute_policy_plan(plan: Mapping[str, Any]) -> None:
         plan["root"],
         protocol_source_root=plan["protocol_source_root"],
         stage1_checkpoint=plan["source_checkpoint"],
+        teacher_model_path=plan["teacher_model_path"],
+        dataset_path=plan["dataset_path"],
     )
     if is_resume:
         validate_resume_policy_ownership(plan["root"], plan["policy"]["name"])

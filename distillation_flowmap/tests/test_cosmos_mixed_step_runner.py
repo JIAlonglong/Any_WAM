@@ -146,6 +146,38 @@ def test_policy_plan_rejects_output_overlap_with_protocol_and_stage1_sources(tmp
         )
 
 
+@pytest.mark.parametrize(
+    ("input_name", "input_path", "root_contains_input", "match"),
+    [
+        ("teacher_model_path", "teacher", False, "teacher model"),
+        ("teacher_model_path", "teacher", True, "teacher model"),
+        ("dataset_path", "dataset", False, "dataset"),
+        ("dataset_path", "dataset", True, "dataset"),
+    ],
+)
+def test_policy_plan_rejects_output_overlap_with_every_read_only_input(
+    tmp_path, input_name, input_path, root_contains_input, match
+):
+    root = tmp_path / "new_policy"
+    read_only_source = root / input_path if root_contains_input else tmp_path / input_path
+    if not root_contains_input:
+        root = read_only_source / "new_policy"
+    with pytest.raises(ValueError, match=match):
+        _plan(tmp_path, root=root, **{input_name: read_only_source})
+
+
+def test_fresh_policy_rejects_existing_root_manifest_even_without_checkpoints(tmp_path):
+    root = tmp_path / "fresh_policy"
+    root.mkdir(parents=True)
+
+    for manifest_policy in ("universe", "s2"):
+        (root / "policy_manifest.json").write_text(
+            json.dumps({"policy": {"name": manifest_policy}}), encoding="utf-8"
+        )
+        with pytest.raises(FileExistsError, match="policy_manifest"):
+            _plan(tmp_path, root=root, policy_name="universe")
+
+
 def test_resume_requires_a_matching_policy_manifest(tmp_path):
     root = tmp_path / "universe"
     resume_kwargs = {"root": root, "current_step": 250, "chunk_size": 250}
@@ -183,6 +215,28 @@ def test_execute_revalidates_resume_manifest_before_any_subprocess(tmp_path):
     )
 
     with pytest.raises(ValueError, match="requested policy"):
+        execute_policy_plan(plan)
+
+
+@pytest.mark.parametrize(
+    ("input_key", "suffix", "match"),
+    [
+        ("teacher_model_path", "teacher", "teacher model"),
+        ("dataset_path", "dataset", "dataset"),
+    ],
+)
+def test_execute_revalidates_teacher_and_dataset_isolation_before_any_subprocess(
+    tmp_path, input_key, suffix, match
+):
+    root = tmp_path / "universe"
+    root.mkdir(parents=True)
+    (root / "policy_manifest.json").write_text(
+        json.dumps({"policy": {"name": "universe"}}), encoding="utf-8"
+    )
+    plan = _plan(tmp_path, root=root, current_step=250, chunk_size=250)
+    plan[input_key] = root / "read_only" / suffix
+
+    with pytest.raises(ValueError, match=match):
         execute_policy_plan(plan)
 
 

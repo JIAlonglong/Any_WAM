@@ -14,6 +14,8 @@ import argparse
 import importlib
 import json
 import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -35,6 +37,69 @@ from evaluation.libero.cosmos_progressive_s4_server import (
 
 
 S4_STEPS = 4
+_MIN_COSMOS_DRIVER = (570, 124, 6)
+_MIN_COSMOS_CUDA = (12, 8)
+_DEFAULT_COSMOS_PYTHON = "/root/nas/junjie/cosmos_predict2_5/envs/predict2_py310/bin/python"
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    """Extract a comparable numeric version without importing CUDA packages."""
+    return tuple(int(part) for part in re.findall(r"\d+", str(value)))
+
+
+def _nvidia_driver_version() -> str | None:
+    """Read the installed NVIDIA driver without initializing a CUDA context."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return lines[0] if lines else None
+
+
+def _cosmos_python_cuda_version(cosmos_python: str | Path) -> str:
+    """Prove the external worker has an importable official Cosmos CUDA runtime."""
+    env = os.environ.copy()
+    repo = env.get("COSMOS_PREDICT2_REPO", "").strip()
+    if repo:
+        env["PYTHONPATH"] = repo + os.pathsep + env.get("PYTHONPATH", "")
+    try:
+        result = subprocess.run(
+            [
+                str(cosmos_python),
+                "-c",
+                "import torch; import cosmos_predict2; print(torch.version.cuda or '')",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CosmosRuntimePrerequisiteError(
+            "Could not execute COSMOS_POLICY_PYTHON to validate the official Cosmos cu128 runtime."
+        ) from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic output"
+        raise CosmosRuntimePrerequisiteError(
+            "COSMOS_POLICY_PYTHON cannot import the official Cosmos runtime "
+            f"(cosmos_predict2): {detail}"
+        )
+    value = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+    if not value:
+        raise CosmosRuntimePrerequisiteError(
+            "COSMOS_POLICY_PYTHON reported no CUDA runtime; use the official Cosmos cu128 environment."
+        )
+    return value
 
 
 def require_live_s4_prerequisites(*, device: str, checkpoint_transformer: str | Path) -> None:
@@ -74,6 +139,33 @@ def require_live_s4_prerequisites(*, device: str, checkpoint_transformer: str | 
             )
     except ValueError as exc:
         raise CosmosRuntimePrerequisiteError(f"Invalid CUDA device specifier: {device!r}") from exc
+
+    driver = _nvidia_driver_version()
+    if driver is None:
+        raise CosmosRuntimePrerequisiteError(
+            "Could not determine the NVIDIA driver with nvidia-smi. Official Cosmos cu128 "
+            "requires NVIDIA driver >=570.124.06; do not start the raw worker on this host."
+        )
+    if _version_tuple(driver) < _MIN_COSMOS_DRIVER:
+        raise CosmosRuntimePrerequisiteError(
+            f"NVIDIA driver {driver} is incompatible with official Cosmos cu128; "
+            "requires >=570.124.06. Do not start the raw worker on this host."
+        )
+
+    cosmos_python = Path(
+        os.environ.get("COSMOS_POLICY_PYTHON", _DEFAULT_COSMOS_PYTHON)
+    )
+    if not cosmos_python.is_file():
+        raise CosmosRuntimePrerequisiteError(
+            f"Official Cosmos Python is missing: {cosmos_python}. Set COSMOS_POLICY_PYTHON "
+            "to the cu128 Cosmos environment; do not substitute the Flash-WAM Python."
+        )
+    cosmos_cuda = _cosmos_python_cuda_version(cosmos_python)
+    if _version_tuple(cosmos_cuda) < _MIN_COSMOS_CUDA:
+        raise CosmosRuntimePrerequisiteError(
+            f"Cosmos worker CUDA runtime {cosmos_cuda!r} is incompatible; requires CUDA >=12.8 "
+            "from the official cu128 Cosmos environment."
+        )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -1,4 +1,5 @@
 import json
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -193,6 +194,49 @@ def test_live_runtime_preflight_rejects_cpu_with_actionable_error(tmp_path):
         require_live_s4_prerequisites(
             device="cpu",
             checkpoint_transformer=tmp_path / "s4-checkpoint",
+        )
+
+
+def _cuda_available_torch(*, device_count=1):
+    return SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: int(device_count),
+        )
+    )
+
+
+def test_live_runtime_preflight_rejects_incompatible_host_driver(tmp_path, monkeypatch):
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    checkpoint = tmp_path / "s4-checkpoint"
+    checkpoint.mkdir()
+    monkeypatch.setitem(sys.modules, "torch", _cuda_available_torch())
+    monkeypatch.setattr(rollout, "_nvidia_driver_version", lambda: "550.90.07")
+
+    with pytest.raises(RuntimeError, match="NVIDIA driver.*570.124.06"):
+        rollout.require_live_s4_prerequisites(
+            device="cuda:0",
+            checkpoint_transformer=checkpoint,
+        )
+
+
+def test_live_runtime_preflight_rejects_non_cu128_cosmos_python(tmp_path, monkeypatch):
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    checkpoint = tmp_path / "s4-checkpoint"
+    checkpoint.mkdir()
+    cosmos_python = tmp_path / "cosmos-python"
+    cosmos_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "torch", _cuda_available_torch())
+    monkeypatch.setattr(rollout, "_nvidia_driver_version", lambda: "570.124.06")
+    monkeypatch.setattr(rollout, "_cosmos_python_cuda_version", lambda _path: "12.4")
+    monkeypatch.setenv("COSMOS_POLICY_PYTHON", str(cosmos_python))
+
+    with pytest.raises(RuntimeError, match="Cosmos worker CUDA runtime.*12.8"):
+        rollout.require_live_s4_prerequisites(
+            device="cuda:0",
+            checkpoint_transformer=checkpoint,
         )
 
 

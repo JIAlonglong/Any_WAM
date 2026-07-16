@@ -439,6 +439,123 @@ def build_multibudget_eval_plans(
     return plans
 
 
+def _raise_invalid_eval_execution_plan(detail: str) -> None:
+    raise ValueError(
+        "Cosmos mixed-step eval execution plan violates approved evaluator-only "
+        f"contract: {detail}"
+    )
+
+
+def validate_policy_eval_execution_contract(
+    plan: Mapping[str, Any], *, checkpoint_dir: str | Path
+) -> None:
+    """Reject malformed public eval plans before any evaluator subprocess runs.
+
+    ``execute_policy_eval_plan`` accepts a mapping to keep plan generation
+    testable, so it must not trust a caller-provided ``eval_plans`` list.  This
+    validates the exact approved S1/S2/S4 evaluator shape, fixed t4/t4/t8
+    caches, output locations, and evaluator-only argv tail before execution.
+    """
+    try:
+        policy_name = _require_supported_policy_name(plan["policy"]["name"])
+        root = _resolve_path(plan["root"])
+        protocol_root = _resolve_path(plan["protocol_source_root"])
+        dataset_path = _resolve_path(plan["dataset_path"])
+        teacher_model_path = _resolve_path(plan["teacher_model_path"])
+        eval_plans = plan["eval_plans"]
+    except (KeyError, TypeError, ValueError) as exc:
+        _raise_invalid_eval_execution_plan(f"missing or invalid plan metadata: {exc}")
+    if isinstance(eval_plans, (str, bytes)) or not isinstance(eval_plans, Sequence):
+        _raise_invalid_eval_execution_plan("eval_plans must be a three-item sequence")
+    if len(eval_plans) != len(_BUDGET_SPECS):
+        _raise_invalid_eval_execution_plan(
+            f"expected exactly {len(_BUDGET_SPECS)} eval plans, got {len(eval_plans)}"
+        )
+    checkpoint_dir = _resolve_path(checkpoint_dir)
+    metrics_dir = root / "metrics" / "selection" / checkpoint_dir.name
+    for eval_plan, (budget, teacher_steps, student_steps, cache_name) in zip(
+        eval_plans, _BUDGET_SPECS
+    ):
+        if not isinstance(eval_plan, Mapping):
+            _raise_invalid_eval_execution_plan(f"{budget} plan is not a mapping")
+        expected_cache_dir = protocol_root / "teacher_cache" / "selection" / cache_name
+        expected_output_json = metrics_dir / f"{budget}.json"
+        expected_transformer = _checkpoint_transformer_dir(checkpoint_dir)
+        try:
+            actual_budget = str(eval_plan["budget"])
+            actual_teacher_steps = int(eval_plan["teacher_steps"])
+            actual_student_steps = int(eval_plan["student_steps"])
+            actual_checkpoint = _resolve_path(eval_plan["checkpoint_dir"])
+            actual_transformer = _resolve_path(eval_plan["checkpoint_transformer"])
+            actual_cache_dir = _resolve_path(eval_plan["cache_dir"])
+            actual_output_json = _resolve_path(eval_plan["output_json"])
+            env = eval_plan["env"]
+            argv = eval_plan["argv"]
+        except (KeyError, TypeError, ValueError) as exc:
+            _raise_invalid_eval_execution_plan(f"{budget} plan is malformed: {exc}")
+        if (
+            actual_budget != budget
+            or actual_teacher_steps != teacher_steps
+            or actual_student_steps != student_steps
+            or actual_checkpoint != checkpoint_dir
+            or actual_transformer != _resolve_path(expected_transformer)
+            or actual_cache_dir != _resolve_path(expected_cache_dir)
+            or actual_output_json != _resolve_path(expected_output_json)
+        ):
+            _raise_invalid_eval_execution_plan(
+                f"{budget} must use ({teacher_steps},{student_steps}) with {cache_name} cache"
+            )
+        if not isinstance(env, Mapping):
+            _raise_invalid_eval_execution_plan(f"{budget} env is not a mapping")
+        required_env = {
+            "CONFIG_FILE": "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive",
+            "COSMOS_PROGRESSIVE_STAGE": "s4",
+            "COSMOS_MIXED_STEP_POLICY": policy_name,
+            "CACHE_DATASET_IN_MEMORY": "0",
+            "HF_DATASETS_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "HF_HUB_OFFLINE": "1",
+        }
+        if any(str(env.get(key, "")) != value for key, value in required_env.items()):
+            _raise_invalid_eval_execution_plan(f"{budget} env is not the approved proxy env")
+        if not str(env.get("CUDA_VISIBLE_DEVICES", "")).strip() or not str(
+            env.get("COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES", "")
+        ).strip():
+            _raise_invalid_eval_execution_plan(f"{budget} env has an empty evaluator device list")
+        if isinstance(argv, (str, bytes)) or not isinstance(argv, Sequence):
+            _raise_invalid_eval_execution_plan(f"{budget} argv is not a sequence")
+        argv = list(argv)
+        if not argv or not isinstance(argv[0], str) or not argv[0]:
+            _raise_invalid_eval_execution_plan(f"{budget} argv has no executable")
+        expected_argv_tail = [
+            "distillation_flowmap/eval_cosmos_progressive_stage2.py",
+            "--checkpoint-transformer",
+            str(expected_transformer),
+            "--config",
+            "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive",
+            "--teacher-model-path",
+            str(teacher_model_path),
+            "--dataset-path",
+            str(dataset_path),
+            "--manifest",
+            str(protocol_root / "selection_manifest.json"),
+            "--pairs",
+            str(protocol_root / "eval_pairs.json"),
+            "--cache-dir",
+            str(expected_cache_dir),
+            "--student-steps",
+            str(student_steps),
+            "--teacher-steps",
+            str(teacher_steps),
+            "--output-json",
+            str(expected_output_json),
+        ]
+        if argv[1:] != expected_argv_tail or "distillation_flowmap/train.py" in argv:
+            _raise_invalid_eval_execution_plan(
+                f"{budget} argv must be the approved evaluator-only command"
+            )
+
+
 def validate_owned_policy_checkpoint(
     *, root: str | Path, checkpoint_dir: str | Path
 ) -> Path:
@@ -451,14 +568,19 @@ def validate_owned_policy_checkpoint(
     resolved_root = _resolve_path(root)
     resolved_checkpoint = _resolve_path(checkpoint_dir)
     checkpoints_dir = resolved_root / "checkpoints"
-    try:
-        checkpoint_step = int(resolved_checkpoint.name.removeprefix("step_"))
-    except ValueError as exc:
+    checkpoint_name = resolved_checkpoint.name
+    checkpoint_suffix = checkpoint_name.removeprefix("step_")
+    if (
+        not checkpoint_name.startswith("step_")
+        or not checkpoint_suffix
+        or not checkpoint_suffix.isascii()
+        or not checkpoint_suffix.isdecimal()
+    ):
         raise ValueError(
             "Cosmos mixed-step evaluation checkpoint must be a direct "
             f"owned checkpoints/step_N directory: {resolved_checkpoint}"
-        ) from exc
-    if checkpoint_step < 0 or resolved_checkpoint.parent != checkpoints_dir:
+        )
+    if resolved_checkpoint.parent != checkpoints_dir:
         raise ValueError(
             "Cosmos mixed-step evaluation checkpoint must be a direct "
             f"owned checkpoints/step_N directory: {resolved_checkpoint}"
@@ -994,6 +1116,7 @@ def execute_policy_eval_plan(plan: Mapping[str, Any]) -> None:
     checkpoint_dir = validate_owned_policy_checkpoint(
         root=plan["root"], checkpoint_dir=plan["checkpoint_dir"]
     )
+    validate_policy_eval_execution_contract(plan, checkpoint_dir=checkpoint_dir)
     validate_target_free_online_student(checkpoint_dir, role="evaluation")
     validate_eval_caches(plan["eval_plans"])
     for eval_plan in plan["eval_plans"]:

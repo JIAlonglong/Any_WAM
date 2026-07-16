@@ -8,6 +8,7 @@ from distillation_flowmap.run_cosmos_mixed_step_policy import (
     build_policy_eval_plan,
     execute_policy_eval_plan,
     parse_args,
+    validate_owned_policy_checkpoint,
 )
 
 
@@ -45,6 +46,12 @@ def _launcher_source() -> str:
     return LAUNCHER_PATH.read_text(encoding="utf-8")
 
 
+def _function_body(source: str, name: str, next_name: str) -> str:
+    start = source.index(f"\n{name}() {{")
+    end = source.index(f"\n{next_name}() {{", start)
+    return source[start:end]
+
+
 def test_eval_only_plan_owns_its_checkpoint_and_contains_only_three_budget_evaluators(
     tmp_path,
 ):
@@ -62,6 +69,19 @@ def test_eval_only_plan_owns_its_checkpoint_and_contains_only_three_budget_evalu
 def test_eval_only_plan_rejects_checkpoint_outside_the_owned_policy_root(tmp_path):
     with pytest.raises(ValueError, match="owned checkpoints"):
         _eval_plan(tmp_path, checkpoint_dir=tmp_path / "other" / "step_5000")
+
+
+@pytest.mark.parametrize("checkpoint_name", ["5000", "step_+1", "step_-1", "step_1.0", "step_"])
+def test_eval_only_checkpoint_validator_accepts_only_exact_step_decimal_names(
+    tmp_path, checkpoint_name
+):
+    root = tmp_path / "universe"
+    root.mkdir()
+
+    with pytest.raises(ValueError, match="owned checkpoints/step_N"):
+        validate_owned_policy_checkpoint(
+            root=root, checkpoint_dir=root / "checkpoints" / checkpoint_name
+        )
 
 
 def test_eval_only_cli_keeps_evaluation_explicit_and_does_not_select_training_mode(tmp_path):
@@ -124,6 +144,35 @@ def test_eval_only_executor_invokes_only_evaluator_argvs_with_no_real_subprocess
     assert all("distillation_flowmap/train.py" not in call[0] for call in calls)
 
 
+@pytest.mark.parametrize(
+    "mutate_plan",
+    [
+        lambda plan: plan["eval_plans"][0]["argv"].__setitem__(
+            1, "distillation_flowmap/train.py"
+        ),
+        lambda plan: plan["eval_plans"][2].__setitem__(
+            "cache_dir", plan["protocol_source_root"] / "teacher_cache" / "selection" / "t4"
+        ),
+    ],
+)
+def test_eval_only_executor_rejects_programmatic_nonapproved_plans_before_subprocess(
+    tmp_path, monkeypatch, mutate_plan
+):
+    plan = _eval_plan(tmp_path)
+    mutate_plan(plan)
+    calls = []
+    monkeypatch.setattr(
+        mixed_runner.subprocess,
+        "run",
+        lambda argv, **kwargs: calls.append((list(argv), kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="approved evaluator-only contract"):
+        execute_policy_eval_plan(plan)
+
+    assert calls == []
+
+
 def test_launcher_declares_static_safe_shell_contract_and_never_runs_in_this_test():
     source = _launcher_source()
 
@@ -178,3 +227,55 @@ def test_launcher_tmux_command_status_eval_and_unknown_command_are_fail_safe():
     assert 'Refusing to overwrite existing selection proxy' in source
     assert 'die "Unknown command: $command"' in source
     assert 'Usage:' in source
+
+
+def test_launcher_reserves_fixed_operation_identity_before_logs_workers_or_tmux():
+    source = _launcher_source()
+    preflight = _function_body(source, "start_preflight", "start_policy")
+    policy = _function_body(source, "start_policy", "start_eval")
+    evaluation = _function_body(source, "start_eval", "main")
+
+    assert 'RESERVATION_ROOT_NAME=".cosmos_mixed_step_reservations"' in source
+    assert 'if ! mkdir "$reservation_dir"; then' in source
+    assert 'Operation already has an in-flight reservation' in source
+    assert 'reserve_operation "$ROOT_BASE" "preflight"' in preflight
+    assert 'reserve_operation "$root_base" "policy-${policy}"' in policy
+    assert 'reserve_operation "$root_base" "eval-${policy}-${checkpoint_label}"' in evaluation
+    for body in (preflight, policy, evaluation):
+        assert body.index("reserve_operation") < body.index("prepare_artifact_paths")
+        assert body.index("reserve_operation") < body.index("launch_tmux_session")
+        assert body.index("launch_tmux_session") < body.index(
+            "transfer_active_reservation_to_worker"
+        )
+    assert 'rmdir "$RESERVATION_DIR"' in source
+    assert 'if (( exit_code != 0 )); then\n        write_failure_marker\n    fi\n    release_reservation' in source
+    assert 'in-flight reservation:' in source
+
+
+def test_launcher_rejects_bidirectional_input_overlap_before_artifact_creation():
+    source = _launcher_source()
+    training_validation = _function_body(source, "validate_training_inputs", "validate_eval_inputs")
+    eval_validation = _function_body(source, "validate_eval_inputs", "new_run_tag")
+
+    assert 'assert_root_base_input_isolation' in source
+    assert '"$root_base" == "$input_path"/*' in source
+    assert '"$input_path" == "$root_base"/*' in source
+    assert training_validation.index("assert_root_base_input_isolation") < training_validation.index(
+        "require_program"
+    )
+    assert eval_validation.index("assert_root_base_input_isolation") < eval_validation.index(
+        "require_program"
+    )
+    assert '"$ROOT_BASE" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH"' in training_validation
+    assert '"$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT"' in training_validation
+    assert '"$ROOT_BASE" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH"' in eval_validation
+    assert '"$TEACHER_MODEL_PATH"' in eval_validation
+    assert '"$STAGE1_CHECKPOINT"' in eval_validation
+
+    for body in (
+        _function_body(source, "start_preflight", "start_policy"),
+        _function_body(source, "start_policy", "start_eval"),
+        _function_body(source, "start_eval", "main"),
+    ):
+        validation_call = "validate_eval_inputs" if body.startswith("\nstart_eval") else "validate_training_inputs"
+        assert body.index(validation_call) < body.index("prepare_artifact_paths")

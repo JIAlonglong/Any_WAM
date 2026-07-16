@@ -32,6 +32,18 @@ present, and all S1/S2/S4 fixed-cache proxy JSONs plus the combined proxy are
 present.  A failed worker writes a separate `*_FAILED` marker; the launcher
 will not overwrite it or delete any output.
 
+Before it creates a log, worker script, or tmux session, the launcher takes an
+atomic directory reservation below
+`ROOT_BASE/.cosmos_mixed_step_reservations/`. The identities are stable rather
+than timestamp-based: `preflight`, `policy-universe`, `policy-s2`, `policy-s1`,
+and `eval-<policy>-<step_N>`. A second invocation of the same operation fails
+while that reservation exists, so it cannot race the same output or port. The
+worker writes its terminal marker and then releases the reservation on both
+success and failure. If setup or tmux creation fails first, the caller writes a
+`*_FAILED` marker and releases the empty reservation; if release itself fails,
+the reservation remains deliberately visible for manual inspection instead of
+being deleted unsafely.
+
 ## Inputs to confirm before any future launch
 
 The launcher deliberately requires explicit paths rather than selecting an
@@ -50,6 +62,13 @@ output/protocol/dataset automatically:
 For a full run, use a root base that has no old `PREFLIGHT_*` marker and no
 pre-existing `universe`, `s2`, or `s1` output.  The launcher never removes old
 markers, logs, worker scripts, checkpoints, or caches to make this true.
+
+`ROOT_BASE` must be completely disjoint from every immutable input in both
+directions: it may not equal, contain, or be contained by the protocol source,
+dataset, teacher model, or Stage-1 checkpoint. Evaluation does not consume a
+Stage-1 checkpoint, but it still validates the explicit `--stage1-checkpoint`
+or the launcher default as immutable to prevent an eval root from ever writing
+into that source tree.
 
 ## Future preflight command
 
@@ -124,8 +143,9 @@ claim.
 
 ## Status and offline proxy evaluation
 
-Status is read-only: it lists existing markers, available tmux sessions, and
-the last 20 lines of each launcher log.  It creates no output.
+Status is read-only: it lists existing markers, in-flight atomic reservations,
+available tmux sessions, and the last 20 lines of each launcher log. It creates
+no output.
 
 ```bash
 bash distillation_flowmap/launch_cosmos_mixed_step_8gpu.sh status \
@@ -154,3 +174,8 @@ The eval worker calls the dedicated `--eval-checkpoint ... --run` branch in
 uses the reviewed distinct t4/t8 fixed caches and writes a combined selection
 proxy only after all three S1/S2/S4 evaluator JSONs exist.  These metrics are
 an offline fixed-cache proxy, not a claim of real robot rollout success.
+
+Before an eval subprocess can run, the public executor revalidates the exact
+approved S1/S2/S4 plan, including the t4/t4/t8 cache mapping, expected output
+paths, fixed proxy environment, and evaluator-only argv. A malformed in-memory
+plan therefore fails before it can accidentally invoke a training command.

@@ -134,11 +134,21 @@ cfg.opd_cosmos_spatial_crop_size = int(
 
 _mixed_policy_name = os.environ.get("COSMOS_MIXED_STEP_POLICY", "").strip().lower()
 _forced_mixed_sequence = os.environ.get("COSMOS_MIXED_STEP_FORCE_SEQUENCE", "").strip()
+# Generic OPD consumers keep their historical singleton pair.  The full
+# Cosmos endpoint path below reads the explicit mixed-endpoint fields instead.
+cfg.opd_rollout_step_pairs = [[_spec["teacher_steps"], _spec["student_steps"]]]
+cfg.opd_rollout_step_pair_weights = None
+cfg.opd_mixed_endpoint_rollout_step_pairs = None
+cfg.opd_mixed_endpoint_rollout_step_pair_weights = None
 if _mixed_policy_name:
     _mixed_policy_spec = get_mixed_step_policy_spec(_mixed_policy_name)
     cfg.cosmos_mixed_step_policy = _mixed_policy_spec.name
-    cfg.opd_rollout_step_pairs = [list(pair) for pair in _mixed_policy_spec.rollout_step_pairs]
-    cfg.opd_rollout_step_pair_weights = list(_mixed_policy_spec.weights)
+    cfg.opd_mixed_endpoint_rollout_step_pairs = [
+        list(pair) for pair in _mixed_policy_spec.rollout_step_pairs
+    ]
+    cfg.opd_mixed_endpoint_rollout_step_pair_weights = list(
+        _mixed_policy_spec.weights
+    )
     cfg.opd_rollout_step_forced_indices = parse_forced_indices(
         _forced_mixed_sequence,
         _mixed_policy_spec,
@@ -161,8 +171,6 @@ else:
     # Keep legacy progressive stages byte-for-byte equivalent in their rollout
     # choice: no mixed policy, no forced selector, and no sidecar metrics file.
     cfg.cosmos_mixed_step_policy = None
-    cfg.opd_rollout_step_pairs = [[_spec["teacher_steps"], _spec["student_steps"]]]
-    cfg.opd_rollout_step_pair_weights = None
     cfg.opd_rollout_step_forced_indices = ()
     cfg.opd_rollout_selection_seed = int(
         os.environ.get("COSMOS_MIXED_STEP_SELECTOR_SEED", os.environ.get("TRAIN_SEED", "0"))

@@ -3,8 +3,10 @@ import json
 import math
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -25,8 +27,9 @@ from distillation_flowmap.cosmos_mixed_step_policy import (
     record_selection,
     select_rank_synchronized_pair,
 )
+import distillation_flowmap.flowmap_step as flowmap_step
 from distillation_flowmap.flowmap_step import (
-    _select_cosmos_mixed_step_endpoint_rollout,
+    FlowMapStepMixin,
 )
 
 
@@ -89,32 +92,145 @@ def test_rank_zero_weighted_pair_is_broadcast_without_nonzero_resampling():
     assert rank_one.label == rank_zero.label
 
 
-class _MixedPolicyConfig:
-    cosmos_mixed_step_policy = "universe"
-    opd_rollout_step_pairs = [[4, 1], [4, 2], [8, 4]]
-    opd_rollout_step_pair_weights = [0.50, 0.30, 0.20]
-    opd_rollout_step_forced_indices = (1,)
-    opd_rollout_selection_seed = 123
-    opd_danceopd_rollout_steps = 16
+class _EndpointTeacher:
+    raw_inference_enabled = True
+
+    def predict_raw_latent_target(self, _batch, *, noise, **_kwargs):
+        return {"cosmos_latent_x0": torch.zeros_like(noise)}
+
+    def predict_raw_latent_velocity(self, _batch, *, query_latent, **_kwargs):
+        return {"cosmos_latent_velocity": torch.zeros_like(query_latent)}
 
 
-def test_one_endpoint_selection_controls_both_rollout_branches_but_not_danceopd():
-    config = _MixedPolicyConfig()
-    selection = _select_cosmos_mixed_step_endpoint_rollout(
-        config,
-        device=None,
-        global_step=7,
-        selection_ordinal=0,
-        rank=0,
+class _EndpointLatentScheduler:
+    @staticmethod
+    def training_target(latents, _noise, _timesteps):
+        return torch.zeros_like(latents)
+
+
+class _EndpointWireProbe(FlowMapStepMixin):
+    """Minimal CPU-only probe that executes the real full-OPD endpoint method."""
+
+    def __init__(self, metrics_path):
+        self.config = SimpleNamespace(
+            cosmos_mixed_step_policy="universe",
+            # Generic OPD paths remain at the legacy S4 singleton pair.
+            opd_rollout_step_pairs=[[8, 4]],
+            rollout_step_pairs=[[8, 4]],
+            opd_rollout_step_pair_weights=None,
+            # Only the full-OPD endpoint selector owns the mixed distribution.
+            opd_mixed_endpoint_rollout_step_pairs=[[4, 1], [4, 2], [8, 4]],
+            opd_mixed_endpoint_rollout_step_pair_weights=[0.50, 0.30, 0.20],
+            opd_rollout_step_forced_indices=(1,),
+            opd_rollout_selection_seed=23,
+            opd_rollout_selection_metrics_path=str(metrics_path),
+            opd_selected_rollout_pair_context=None,
+            cosmos_latent_channels=1,
+            cosmos_latent_frames=1,
+            cosmos_latent_height=1,
+            cosmos_latent_width=1,
+            cosmos_latent_epsilon=0.001,
+            cosmos_use_teacher_action_anchor=False,
+            opd_endpoint_focus_prob=0.0,
+            opd_cosmos_spatial_crop_size=0,
+            num_train_timesteps=10,
+            cfg_min=1.0,
+            cfg_max=1.0,
+            opd_joint_action_rollout=False,
+            opd_danceopd_action_endpoint_weight=0.0,
+            opd_danceopd_endpoint_weight=1.0,
+            opd_danceopd_velocity_weight=1.0,
+            opd_aux_weight=1.0,
+            opd_danceopd_rollout_steps=16,
+            rank=0,
+        )
+        self._teacher_nofsdp = _EndpointTeacher()
+        self.train_scheduler_latent = _EndpointLatentScheduler()
+        self.device = torch.device("cpu")
+        self.step = 3
+        self.distill_action = False
+        self.action_aware = False
+        self.empty_emb = torch.zeros(1, 1, 1)
+        self.student_k_steps = []
+
+    @staticmethod
+    def convert_input_format(batch):
+        return batch
+
+    def sample_cosmos_latent_timestep_mixed(self, batch_size, num_frames, *, dtype, device):
+        video_t = torch.full((batch_size, num_frames), 2.0, dtype=dtype, device=device)
+        video_r = torch.full((batch_size, num_frames), 1.0, dtype=dtype, device=device)
+        return video_t, video_r, video_t / 10.0, video_r / 10.0, None
+
+    @staticmethod
+    def _prepare_base_dict(_batch):
+        return {
+            "latent_dict": {},
+            "action_dict": {},
+            "chunk_size": None,
+            "window_size": None,
+        }
+
+    def _student_euler_integrate(self, **kwargs):
+        self.student_k_steps.append(kwargs["K_steps"])
+        state = torch.ones_like(kwargs["noisy_latents"], requires_grad=True)
+        velocity = torch.zeros_like(state, requires_grad=True)
+        return state, velocity
+
+    def _cosmos_danceopd_velocity_loss(self, *_args, **_kwargs):
+        zero = torch.zeros((), device=self.device, requires_grad=True)
+        return zero, {
+            "query_index_mean": zero.detach(),
+            "query_sigma_mean": zero.detach(),
+            "terminal_prior_max_error": zero.detach(),
+        }
+
+
+def test_real_full_opd_endpoint_wiring_uses_mixed_pair_without_touching_generic_paths(
+    monkeypatch, tmp_path
+):
+    teacher_rollout_steps = []
+    monkeypatch.setattr(
+        flowmap_step,
+        "apply_full_endpoint_focus",
+        lambda video_t, video_r, **_kwargs: (
+            video_t,
+            video_r,
+            torch.zeros_like(video_t, dtype=torch.bool),
+        ),
+    )
+    monkeypatch.setattr(
+        flowmap_step,
+        "center_spatial_crop_slices",
+        lambda height, width, **_kwargs: (slice(0, height), slice(0, width)),
     )
 
-    student_euler_call = {"K_steps": selection.student_steps}
-    teacher_velocity_call = {"num_steps": selection.teacher_steps}
+    def fake_rollout_velocity_field(initial_state, *_args, num_steps, **_kwargs):
+        teacher_rollout_steps.append(num_steps)
+        zero = torch.zeros_like(initial_state)
+        return zero, zero, None
 
-    assert selection.rollout_step_pair == (4, 2)
-    assert student_euler_call["K_steps"] == 2
-    assert teacher_velocity_call["num_steps"] == 4
-    assert config.opd_danceopd_rollout_steps == 16
+    monkeypatch.setattr(flowmap_step, "rollout_velocity_field", fake_rollout_velocity_field)
+    monkeypatch.setattr(
+        flowmap_step,
+        "denoised_endpoint_mse",
+        lambda student_x, *_args: student_x.sum(),
+    )
+
+    probe = _EndpointWireProbe(tmp_path / "mixed_endpoint.jsonl")
+    result = probe._cosmos_latent_full_opd_aux_transition_step(
+        {"actions": torch.zeros(1, 1, 1, 1, 1)},
+        batch_idx=0,
+    )
+
+    assert probe.student_k_steps == [2]
+    assert teacher_rollout_steps == [4]
+    assert result["cosmos_mixed_step_pair_index"] == 1
+    assert result["cosmos_mixed_step_pair_label"] == "s2"
+    assert probe.config.opd_rollout_step_pairs == [[8, 4]]
+    assert probe.config.rollout_step_pairs == [[8, 4]]
+    assert probe.config.opd_danceopd_rollout_steps == 16
+    assert probe.config.opd_selected_rollout_pair_context["pair_label"] == "s2"
 
 
 def test_selection_record_updates_pair_label_histogram_and_persists_provenance(tmp_path):
@@ -150,17 +266,27 @@ def test_selection_record_updates_pair_label_histogram_and_persists_provenance(t
     assert json.loads(path.read_text().strip()) == record
 
 
-def test_progressive_config_exposes_policy_weights_and_forced_preflight_sequence(monkeypatch):
+def test_progressive_config_isolates_mixed_endpoint_pairs_from_generic_opd(monkeypatch):
     monkeypatch.setenv("COSMOS_MIXED_STEP_POLICY", "universe")
     monkeypatch.setenv("COSMOS_MIXED_STEP_FORCE_SEQUENCE", "s1,s2,s4")
     monkeypatch.setenv("COSMOS_MIXED_STEP_SELECTOR_SEED", "31")
+    monkeypatch.setenv("COSMOS_PROGRESSIVE_STAGE", "s4")
     module = importlib.import_module(
         "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive"
     )
     module = importlib.reload(module)
 
     assert module.cfg.cosmos_mixed_step_policy == "universe"
-    assert module.cfg.opd_rollout_step_pairs == [[4, 1], [4, 2], [8, 4]]
-    assert module.cfg.opd_rollout_step_pair_weights == pytest.approx([0.50, 0.30, 0.20])
+    assert module.cfg.opd_rollout_step_pairs == [[8, 4]]
+    assert module.cfg.rollout_step_pairs == [[8, 4]]
+    assert module.cfg.opd_rollout_step_pair_weights is None
+    assert module.cfg.opd_mixed_endpoint_rollout_step_pairs == [
+        [4, 1],
+        [4, 2],
+        [8, 4],
+    ]
+    assert module.cfg.opd_mixed_endpoint_rollout_step_pair_weights == pytest.approx(
+        [0.50, 0.30, 0.20]
+    )
     assert module.cfg.opd_rollout_step_forced_indices == (0, 1, 2)
     assert module.cfg.opd_rollout_selection_seed == 31

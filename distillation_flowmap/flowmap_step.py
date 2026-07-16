@@ -143,24 +143,28 @@ def _select_cosmos_mixed_step_endpoint_rollout(
     spec = get_mixed_step_policy_spec(policy_name)
     configured_pairs = tuple(
         (int(teacher_steps), int(student_steps))
-        for teacher_steps, student_steps in getattr(config, "opd_rollout_step_pairs", ())
+        for teacher_steps, student_steps in getattr(
+            config, "opd_mixed_endpoint_rollout_step_pairs", ()
+        )
     )
     if configured_pairs != spec.rollout_step_pairs:
         raise ValueError(
-            "Configured Cosmos rollout pairs do not match "
+            "Configured Cosmos mixed endpoint rollout pairs do not match "
             f"mixed policy {spec.name!r}: {configured_pairs!r} vs "
             f"{spec.rollout_step_pairs!r}"
         )
     configured_weights = tuple(
         float(weight)
-        for weight in getattr(config, "opd_rollout_step_pair_weights", ())
+        for weight in getattr(
+            config, "opd_mixed_endpoint_rollout_step_pair_weights", ()
+        )
     )
     if len(configured_weights) != len(spec.weights) or any(
         not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-12)
         for actual, expected in zip(configured_weights, spec.weights)
     ):
         raise ValueError(
-            "Configured Cosmos rollout weights do not match "
+            "Configured Cosmos mixed endpoint rollout weights do not match "
             f"mixed policy {spec.name!r}: {configured_weights!r} vs {spec.weights!r}"
         )
 

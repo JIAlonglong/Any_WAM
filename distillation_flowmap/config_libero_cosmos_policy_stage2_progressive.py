@@ -6,6 +6,10 @@ import os
 from distillation_flowmap.config_libero_cosmos_policy_stage2_cosmos_latent_cdiff import (
     cfg as _base_cfg,
 )
+from distillation_flowmap.cosmos_mixed_step_policy import (
+    get_mixed_step_policy_spec,
+    parse_forced_indices,
+)
 
 
 cfg = copy.deepcopy(_base_cfg)
@@ -128,7 +132,43 @@ cfg.opd_cosmos_spatial_crop_size = int(
     os.environ.get("OPD_COSMOS_SPATIAL_CROP_SIZE", 28)
 )
 
-cfg.opd_rollout_step_pairs = [[_spec["teacher_steps"], _spec["student_steps"]]]
+_mixed_policy_name = os.environ.get("COSMOS_MIXED_STEP_POLICY", "").strip().lower()
+_forced_mixed_sequence = os.environ.get("COSMOS_MIXED_STEP_FORCE_SEQUENCE", "").strip()
+if _mixed_policy_name:
+    _mixed_policy_spec = get_mixed_step_policy_spec(_mixed_policy_name)
+    cfg.cosmos_mixed_step_policy = _mixed_policy_spec.name
+    cfg.opd_rollout_step_pairs = [list(pair) for pair in _mixed_policy_spec.rollout_step_pairs]
+    cfg.opd_rollout_step_pair_weights = list(_mixed_policy_spec.weights)
+    cfg.opd_rollout_step_forced_indices = parse_forced_indices(
+        _forced_mixed_sequence,
+        _mixed_policy_spec,
+    )
+    cfg.opd_rollout_selection_seed = int(
+        os.environ.get(
+            "COSMOS_MIXED_STEP_SELECTOR_SEED",
+            os.environ.get("TRAIN_SEED", "0"),
+        )
+    )
+    cfg.opd_rollout_selection_metrics_path = os.environ.get(
+        "COSMOS_MIXED_STEP_METRICS_PATH",
+        os.path.join(cfg.output_dir, "cosmos_mixed_step_opd.jsonl"),
+    )
+else:
+    if _forced_mixed_sequence:
+        raise ValueError(
+            "COSMOS_MIXED_STEP_FORCE_SEQUENCE requires COSMOS_MIXED_STEP_POLICY"
+        )
+    # Keep legacy progressive stages byte-for-byte equivalent in their rollout
+    # choice: no mixed policy, no forced selector, and no sidecar metrics file.
+    cfg.cosmos_mixed_step_policy = None
+    cfg.opd_rollout_step_pairs = [[_spec["teacher_steps"], _spec["student_steps"]]]
+    cfg.opd_rollout_step_pair_weights = None
+    cfg.opd_rollout_step_forced_indices = ()
+    cfg.opd_rollout_selection_seed = int(
+        os.environ.get("COSMOS_MIXED_STEP_SELECTOR_SEED", os.environ.get("TRAIN_SEED", "0"))
+    )
+    cfg.opd_rollout_selection_metrics_path = None
+cfg.opd_selected_rollout_pair_context = None
 cfg.rollout_step_pairs = copy.deepcopy(cfg.opd_rollout_step_pairs)
 cfg.opd_rollout_grad_mode = os.environ.get(
     "OPD_ROLLOUT_GRAD_MODE", _spec["grad_mode"]

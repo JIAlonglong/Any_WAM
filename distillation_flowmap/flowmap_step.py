@@ -113,6 +113,84 @@ from distillation_flowmap.cosmos_progressive_opd import (
     center_spatial_crop_slices,
     rollout_velocity_field,
 )
+from distillation_flowmap.cosmos_mixed_step_policy import (
+    append_selection_jsonl,
+    build_selection_record,
+    get_mixed_step_policy_spec,
+    record_selection,
+    select_rank_synchronized_pair,
+)
+
+
+def _select_cosmos_mixed_step_endpoint_rollout(
+    config,
+    *,
+    device,
+    global_step,
+    selection_ordinal,
+    rank=None,
+    broadcast_index=None,
+):
+    """Select the one mixed full-OPD endpoint pair shared by all ranks.
+
+    This helper intentionally has no model inputs.  The caller reuses its
+    returned ``teacher_steps`` and ``student_steps`` for the two endpoint
+    rollouts, while DanceOPD keeps its own fixed same-state rollout setting.
+    """
+    policy_name = str(getattr(config, "cosmos_mixed_step_policy", "") or "").strip()
+    if not policy_name:
+        raise ValueError("Cosmos mixed-step endpoint selection needs a policy name")
+    spec = get_mixed_step_policy_spec(policy_name)
+    configured_pairs = tuple(
+        (int(teacher_steps), int(student_steps))
+        for teacher_steps, student_steps in getattr(config, "opd_rollout_step_pairs", ())
+    )
+    if configured_pairs != spec.rollout_step_pairs:
+        raise ValueError(
+            "Configured Cosmos rollout pairs do not match "
+            f"mixed policy {spec.name!r}: {configured_pairs!r} vs "
+            f"{spec.rollout_step_pairs!r}"
+        )
+    configured_weights = tuple(
+        float(weight)
+        for weight in getattr(config, "opd_rollout_step_pair_weights", ())
+    )
+    if len(configured_weights) != len(spec.weights) or any(
+        not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-12)
+        for actual, expected in zip(configured_weights, spec.weights)
+    ):
+        raise ValueError(
+            "Configured Cosmos rollout weights do not match "
+            f"mixed policy {spec.name!r}: {configured_weights!r} vs {spec.weights!r}"
+        )
+
+    distributed = dist.is_initialized()
+    if rank is None:
+        rank = dist.get_rank() if distributed else 0
+    if broadcast_index is None and distributed:
+        if device is None:
+            raise ValueError("Distributed Cosmos mixed-step selection needs a device")
+
+        def broadcast_index(index):
+            index_tensor = torch.tensor(
+                [index if rank == 0 else 0], device=device, dtype=torch.long
+            )
+            dist.broadcast(index_tensor, src=0)
+            return int(index_tensor.item())
+
+    seed = int(getattr(config, "opd_rollout_selection_seed", 0)) + int(global_step)
+    forced_indices = tuple(
+        int(index)
+        for index in getattr(config, "opd_rollout_step_forced_indices", ())
+    )
+    return select_rank_synchronized_pair(
+        spec,
+        rank=int(rank),
+        broadcast_index=broadcast_index,
+        seed=seed,
+        forced_indices=forced_indices,
+        selection_ordinal=int(selection_ordinal),
+    )
 
 
 class FlowMapStepMixin:
@@ -4331,17 +4409,79 @@ class FlowMapStepMixin:
         else:
             student_input = input_dict
 
-        rollout_step_pairs = getattr(self.config, 'opd_rollout_step_pairs', [[8, 4]])
-        if not rollout_step_pairs:
-            raise ValueError('opd_rollout_step_pairs must contain at least one (N, K) pair')
-        if dist.is_initialized():
-            pair_index = torch.randint(0, len(rollout_step_pairs), (1,), device=self.device)
-            dist.broadcast(pair_index, src=0)
-            teacher_steps, student_steps = rollout_step_pairs[pair_index.item()]
+        mixed_step_selection = None
+        mixed_policy_name = str(
+            getattr(self.config, 'cosmos_mixed_step_policy', '') or ''
+        ).strip()
+        if mixed_policy_name:
+            selection_ordinal = int(
+                getattr(self, '_cosmos_mixed_step_selection_ordinal', 0)
+            )
+            mixed_step_selection = _select_cosmos_mixed_step_endpoint_rollout(
+                self.config,
+                device=self.device,
+                global_step=self.step,
+                selection_ordinal=selection_ordinal,
+            )
+            self._cosmos_mixed_step_selection_ordinal = selection_ordinal + 1
+            teacher_steps = mixed_step_selection.teacher_steps
+            student_steps = mixed_step_selection.student_steps
+            self._cosmos_mixed_step_selected_pair_context = {
+                'policy_name': mixed_step_selection.policy_name,
+                'pair_index': mixed_step_selection.index,
+                'pair_label': mixed_step_selection.label,
+                'teacher_steps': teacher_steps,
+                'student_steps': student_steps,
+                'global_step': int(self.step),
+                'selection_ordinal': selection_ordinal,
+            }
+            self.config.opd_selected_rollout_pair_context = (
+                self._cosmos_mixed_step_selected_pair_context
+            )
+            rank_is_zero = (
+                dist.get_rank() == 0 if dist.is_initialized()
+                else int(getattr(self.config, 'rank', 0)) == 0
+            )
+            if rank_is_zero:
+                histogram = getattr(self, '_cosmos_mixed_step_histogram', {})
+                histogram = record_selection(histogram, mixed_step_selection)
+                self._cosmos_mixed_step_histogram = histogram
+                selection_record = build_selection_record(
+                    spec=get_mixed_step_policy_spec(mixed_step_selection.policy_name),
+                    selection=mixed_step_selection,
+                    histogram=histogram,
+                    seed=int(getattr(self.config, 'opd_rollout_selection_seed', 0)),
+                    global_step=int(self.step),
+                    selection_ordinal=selection_ordinal,
+                )
+                self._cosmos_mixed_step_selected_pair_context['histogram'] = histogram
+                metrics_path = getattr(
+                    self.config, 'opd_rollout_selection_metrics_path', None
+                )
+                if metrics_path:
+                    try:
+                        append_selection_jsonl(metrics_path, selection_record)
+                    except OSError as exc:
+                        logger.warning(
+                            '[step %s] failed to append Cosmos mixed-step selection: %s',
+                            self.step,
+                            exc,
+                        )
         else:
-            teacher_steps, student_steps = rollout_step_pairs[0]
-        teacher_steps = max(1, int(teacher_steps))
-        student_steps = max(1, int(student_steps))
+            # Retain the legacy progressive behavior exactly when no mixed
+            # policy is requested, including its single-pair non-distributed
+            # fallback and rank-zero broadcast in distributed training.
+            rollout_step_pairs = getattr(self.config, 'opd_rollout_step_pairs', [[8, 4]])
+            if not rollout_step_pairs:
+                raise ValueError('opd_rollout_step_pairs must contain at least one (N, K) pair')
+            if dist.is_initialized():
+                pair_index = torch.randint(0, len(rollout_step_pairs), (1,), device=self.device)
+                dist.broadcast(pair_index, src=0)
+                teacher_steps, student_steps = rollout_step_pairs[pair_index.item()]
+            else:
+                teacher_steps, student_steps = rollout_step_pairs[0]
+            teacher_steps = max(1, int(teacher_steps))
+            student_steps = max(1, int(student_steps))
         cfg_scale = self.config.cfg_min + torch.rand(1).item() * (
             self.config.cfg_max - self.config.cfg_min
         )
@@ -4486,6 +4626,16 @@ class FlowMapStepMixin:
             'should_sync': True,
             'skip_step': not is_finite,
         }
+        if mixed_step_selection is not None:
+            # These scalar fields make the selected endpoint mode visible to
+            # callers without changing the trainer's existing loss plumbing.
+            result.update({
+                'cosmos_mixed_step_policy': mixed_step_selection.policy_name,
+                'cosmos_mixed_step_pair_index': mixed_step_selection.index,
+                'cosmos_mixed_step_pair_label': mixed_step_selection.label,
+                'cosmos_mixed_step_teacher_steps': teacher_steps,
+                'cosmos_mixed_step_student_steps': student_steps,
+            })
         if not is_finite:
             if getattr(self.config, 'rank', 0) == 0:
                 logger.warning('[step %s] non-finite Cosmos full OPD loss, skipping', self.step)

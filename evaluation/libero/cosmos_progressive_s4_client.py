@@ -95,12 +95,14 @@ class CosmosProgressiveS4Client:
         prompt: str,
         env_steps: int,
         chunks: int,
+        rollout_seed: int,
         exc: Exception,
     ) -> dict[str, Any]:
         record = {
             "task_idx": int(task_idx),
             "episode_idx": int(episode_idx),
             "prompt": str(prompt),
+            "seed": int(rollout_seed),
             "done": False,
             "success": False,
             "server_failure": True,
@@ -122,6 +124,7 @@ class CosmosProgressiveS4Client:
         episode_idx: int,
         prompt: str,
         max_env_steps: int,
+        rollout_seed: int,
         init_env_fn: Callable[..., Any] | None = None,
         extract_video_fn: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
         save_video_fn: Callable[..., Any] | None = None,
@@ -135,6 +138,7 @@ class CosmosProgressiveS4Client:
         ``rollout_cosmos_policy.py`` so its reset, warm-up, flip, and video
         behavior stays identical to the established LIBERO evaluator.
         """
+        rollout_seed = int(rollout_seed)
         init_env_fn = init_env_fn or _init_env_like_official_loop
         extract_video_fn = extract_video_fn or _video_observation
         frames: list[Mapping[str, Any]] = []
@@ -162,6 +166,7 @@ class CosmosProgressiveS4Client:
                     prompt=prompt,
                     env_steps=env_steps,
                     chunks=chunks,
+                    rollout_seed=rollout_seed,
                     exc=exc,
                 )
             while int(env.env.timestep) < int(max_env_steps) and not done:
@@ -175,6 +180,7 @@ class CosmosProgressiveS4Client:
                         prompt=prompt,
                         env_steps=env_steps,
                         chunks=chunks,
+                        rollout_seed=rollout_seed,
                         exc=exc,
                     )
                 service_metadata = {
@@ -196,6 +202,7 @@ class CosmosProgressiveS4Client:
                 "task_idx": int(task_idx),
                 "episode_idx": int(episode_idx),
                 "prompt": str(prompt),
+                "seed": int(rollout_seed),
                 "done": bool(done),
                 "success": bool(done),
                 "server_failure": False,
@@ -213,6 +220,7 @@ class CosmosProgressiveS4Client:
                 "task_idx": int(task_idx),
                 "episode_idx": int(episode_idx),
                 "prompt": str(prompt),
+                "seed": int(rollout_seed),
                 "done": False,
                 "success": False,
                 "server_failure": False,
@@ -244,6 +252,9 @@ class CosmosProgressiveS4Client:
         video_fps: int = 15,
     ) -> dict[str, Any]:
         """Construct a real LIBERO task while reusing the official rollout helpers."""
+        if env_seed is None:
+            raise ValueError("env_seed is required for durable rollout seed provenance")
+        rollout_seed = int(env_seed)
         try:
             from libero.libero import benchmark
             from libero.libero.envs import OffScreenRenderEnv
@@ -274,6 +285,7 @@ class CosmosProgressiveS4Client:
                 "task_idx": int(task_idx),
                 "episode_idx": int(episode_idx),
                 "prompt": prompt,
+                "seed": rollout_seed,
                 "done": False,
                 "success": False,
                 "server_failure": False,
@@ -291,7 +303,7 @@ class CosmosProgressiveS4Client:
             "camera_heights": int(camera_size),
             "camera_widths": int(camera_size),
         }
-        env = construct_single_env(env_args, env_seed=env_seed)
+        env = construct_single_env(env_args, env_seed=rollout_seed)
         task_name = prompt.replace(" ", "_").replace("/", "_")
         video_path = (
             self.output_dir
@@ -309,6 +321,7 @@ class CosmosProgressiveS4Client:
             episode_idx=episode_idx,
             prompt=prompt,
             max_env_steps=bounded_steps,
+            rollout_seed=rollout_seed,
             init_env_fn=lambda current_env, state, *, warmup_steps, warmup_gripper: __import__(
                 "evaluation.libero.rollout_cosmos_policy", fromlist=["init_single_env"]
             ).init_single_env(

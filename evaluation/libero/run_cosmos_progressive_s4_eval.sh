@@ -123,8 +123,14 @@ for record_path in sorted(root.glob("shard_*/seed_*/records/task_*_episode_*.jso
         raise SystemExit(f"seed mismatch: task {task} is not assigned to shard {shard}")
     if int(record.get("episode_idx", -1)) != 0:
         raise SystemExit(f"seed mismatch: expected episode_idx=0 for shared seed {seed}")
-    if "seed" in record and int(record["seed"]) != seed:
-        raise SystemExit(f"seed mismatch: record seed={record['seed']} path seed={seed}")
+    if "seed" not in record:
+        raise SystemExit(f"seed mismatch: missing record seed for task={task} path seed={seed}")
+    try:
+        record_seed = int(record["seed"])
+    except (TypeError, ValueError):
+        raise SystemExit(f"seed mismatch: invalid record seed={record['seed']!r} path seed={seed}")
+    if record_seed != seed:
+        raise SystemExit(f"seed mismatch: record seed={record_seed} path seed={seed}")
     if record.get("s4_checkpoint") != expected_checkpoint:
         raise SystemExit(f"checkpoint mismatch: task={task} seed={seed} expected={expected_checkpoint!r} got={record.get('s4_checkpoint')!r}")
     key = (task, seed)

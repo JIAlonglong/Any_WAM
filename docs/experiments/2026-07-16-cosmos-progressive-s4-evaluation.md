@@ -175,7 +175,10 @@ records on the 0/1 pair only. Formal uses 50 shared seeds for every task:
 command receives the phase-specific CUDA_VISIBLE_DEVICES,
 COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES, task range, and env seed.
 
-After formal children finish, the embedded merge verifier rejects missing
-task/seed records, duplicate task/seed records, task-to-shard/seed mismatch,
-or an S4 checkpoint mismatch before writing formal_summary.json. It then
-reports equal-task macro success and a deterministic bootstrap_ci_95.
+Each durable trial record persists the integer CLI env seed as `seed`,
+including success, server-failure, setup-failure, and skipped records. After
+formal children finish, the embedded merge verifier rejects missing task/seed
+records, duplicate task/seed records, a missing or path-mismatched record
+`seed`, task-to-shard mismatch, or an S4 checkpoint mismatch before
+writing formal_summary.json. It then reports equal-task macro success and a
+deterministic bootstrap_ci_95.

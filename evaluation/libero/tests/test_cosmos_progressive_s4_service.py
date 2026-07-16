@@ -1,6 +1,6 @@
 import json
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -178,13 +178,179 @@ def test_client_records_server_failure_as_unsuccessful_trial(tmp_path):
         episode_idx=5,
         prompt="open the drawer",
         max_env_steps=2,
+        rollout_seed=17,
     )
 
     assert record["success"] is False
     assert record["done"] is False
     assert record["server_failure"] is True
+    assert record["seed"] == 17
     record_path = tmp_path / "records" / "task_2_episode_5.json"
-    assert json.loads(record_path.read_text(encoding="utf-8"))["success"] is False
+    persisted = json.loads(record_path.read_text(encoding="utf-8"))
+    assert persisted["success"] is False
+    assert persisted["seed"] == 17
+
+
+class _SuccessfulService:
+    def infer(self, request):
+        if request.get("reset"):
+            return {"ok": True, "s4_checkpoint": "s4-checkpoint"}
+        return {
+            "action": np.zeros((16, 7), dtype=np.float32),
+            "s4_checkpoint": "s4-checkpoint",
+        }
+
+
+class _DoneEnv:
+    def __init__(self):
+        self.env = type("_Inner", (), {"timestep": 0})()
+
+    def step(self, _action):
+        self.env.timestep += 1
+        return OBS, 0.0, True, {}
+
+    def close(self):
+        return None
+
+
+def test_client_records_rollout_seed_on_success(tmp_path):
+    client = CosmosProgressiveS4Client(_SuccessfulService(), output_dir=tmp_path, warmup_steps=0)
+
+    record = client.run_with_env(
+        env=_DoneEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=3,
+        episode_idx=0,
+        prompt="open the drawer",
+        max_env_steps=1,
+        init_env_fn=lambda *_args, **_kwargs: OBS,
+        extract_video_fn=lambda _obs: {},
+        rollout_seed=23,
+    )
+
+    assert record["success"] is True
+    assert record["server_failure"] is False
+    assert record["seed"] == 23
+    persisted = json.loads(
+        (tmp_path / "records" / "task_3_episode_0.json").read_text(encoding="utf-8")
+    )
+    assert persisted["seed"] == 23
+
+
+def test_client_records_rollout_seed_on_setup_failure(tmp_path):
+    client = CosmosProgressiveS4Client(_SuccessfulService(), output_dir=tmp_path, warmup_steps=0)
+
+    def fail_init(*_args, **_kwargs):
+        raise RuntimeError("fixture setup failure")
+
+    record = client.run_with_env(
+        env=_DoneEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=4,
+        episode_idx=0,
+        prompt="open the drawer",
+        max_env_steps=1,
+        init_env_fn=fail_init,
+        rollout_seed=29,
+    )
+
+    assert record["success"] is False
+    assert record["server_failure"] is False
+    assert record["seed"] == 29
+    persisted = json.loads(
+        (tmp_path / "records" / "task_4_episode_0.json").read_text(encoding="utf-8")
+    )
+    assert persisted["seed"] == 29
+
+
+def _install_fake_libero(monkeypatch, *, skipped):
+    libero_package = ModuleType("libero")
+    libero_package.__path__ = []
+    libero_module = ModuleType("libero.libero")
+    libero_module.__path__ = []
+    benchmark_module = ModuleType("libero.libero.benchmark")
+    envs_module = ModuleType("libero.libero.envs")
+    envs_module.OffScreenRenderEnv = object
+
+    class _Benchmark:
+        def get_num_tasks(self):
+            return 10
+
+        def get_task(self, _task_idx):
+            return SimpleNamespace(language="open the drawer")
+
+        def get_task_bddl_file_path(self, _task_idx):
+            return "fixture.bddl"
+
+    benchmark_module.get_benchmark_dict = lambda: {"libero_10": _Benchmark}
+    libero_module.benchmark = benchmark_module
+
+    rollout_module = ModuleType("evaluation.libero.rollout_cosmos_policy")
+    rollout_module.TASK_MAX_STEPS = {"libero_10": 1}
+    rollout_module.construct_single_env = lambda *_args, **_kwargs: _DoneEnv()
+    rollout_module.extract_video_obs = lambda _obs: {}
+    rollout_module.init_single_env = lambda *_args, **_kwargs: OBS
+    rollout_module.resolve_initial_state = lambda *_args, **_kwargs: (
+        np.zeros(1, dtype=np.float32),
+        "fixture initial state",
+        skipped,
+    )
+    rollout_module.save_video = lambda *_args, **_kwargs: None
+
+    monkeypatch.setitem(sys.modules, "libero", libero_package)
+    monkeypatch.setitem(sys.modules, "libero.libero", libero_module)
+    monkeypatch.setitem(sys.modules, "libero.libero.benchmark", benchmark_module)
+    monkeypatch.setitem(sys.modules, "libero.libero.envs", envs_module)
+    monkeypatch.setitem(sys.modules, "evaluation.libero.rollout_cosmos_policy", rollout_module)
+
+
+def test_run_libero_task_persists_env_seed_for_skipped_record_without_libero(tmp_path, monkeypatch):
+    _install_fake_libero(monkeypatch, skipped=True)
+    client = CosmosProgressiveS4Client(_SuccessfulService(), output_dir=tmp_path)
+
+    record = client.run_libero_task(
+        libero_benchmark="libero_10",
+        task_idx=6,
+        episode_idx=0,
+        camera_size=128,
+        max_env_steps=1,
+        env_seed=31,
+    )
+
+    assert record["skipped"] is True
+    assert record["seed"] == 31
+    persisted = json.loads(
+        (tmp_path / "records" / "task_6_episode_0.json").read_text(encoding="utf-8")
+    )
+    assert persisted["seed"] == 31
+
+
+def test_run_libero_task_forwards_env_seed_to_run_with_env_without_libero(tmp_path, monkeypatch):
+    _install_fake_libero(monkeypatch, skipped=False)
+    client = CosmosProgressiveS4Client(_SuccessfulService(), output_dir=tmp_path)
+    captured = {}
+
+    def fake_run_with_env(**kwargs):
+        captured.update(kwargs)
+        return {
+            "task_idx": kwargs["task_idx"],
+            "episode_idx": kwargs["episode_idx"],
+            "seed": kwargs["rollout_seed"],
+        }
+
+    monkeypatch.setattr(client, "run_with_env", fake_run_with_env)
+
+    record = client.run_libero_task(
+        libero_benchmark="libero_10",
+        task_idx=7,
+        episode_idx=0,
+        camera_size=128,
+        max_env_steps=1,
+        env_seed=37,
+    )
+
+    assert captured["rollout_seed"] == 37
+    assert record["seed"] == 37
 
 
 def test_live_runtime_preflight_rejects_cpu_with_actionable_error(tmp_path):

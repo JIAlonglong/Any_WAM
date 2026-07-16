@@ -1,9 +1,12 @@
+import json
 import os
 import shlex
 import stat
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -160,6 +163,60 @@ def test_smoke_dry_run_requires_prebuilt_cache_inputs_and_is_nonpaper(tmp_path):
     assert "SMOKE_RESULT=non-paper-cache-only" in output
 
 
+def _formal_merge_program():
+    source = SCRIPT.read_text(encoding="utf-8")
+    start_marker = (
+        '    "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" <<'
+        "'PY'\n"
+    )
+    end_marker = "\nPY\n}\n\n\nprepare_prompt_table"
+    start = source.index(start_marker) + len(start_marker)
+    end = source.index(end_marker, start)
+    return source[start:end]
+
+
+def _run_formal_merge(root, checkpoint):
+    return subprocess.run(
+        [sys.executable, "-", str(root), str(checkpoint), "50"],
+        cwd=ROOT,
+        input=_formal_merge_program(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload_seed", "expected_error"),
+    [
+        (None, "seed mismatch: missing record seed"),
+        (1, "seed mismatch: record seed=1 path seed=0"),
+    ],
+)
+def test_formal_merge_rejects_missing_or_mismatched_payload_seed(
+    tmp_path, payload_seed, expected_error
+):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    output_root = tmp_path / "formal output"
+    record_path = output_root / "shard_0" / "seed_0" / "records" / "task_0_episode_0.json"
+    record_path.parent.mkdir(parents=True)
+    record = {
+        "task_idx": 0,
+        "episode_idx": 0,
+        "s4_checkpoint": str(checkpoint.resolve()),
+        "success": False,
+    }
+    if payload_seed is not None:
+        record["seed"] = payload_seed
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    result = _run_formal_merge(output_root, checkpoint)
+
+    assert result.returncode != 0
+    assert expected_error in result.stderr
+
+
 def test_launcher_syntax_and_merge_guards_are_present():
     syntax = subprocess.run(
         ["bash", "-n", str(SCRIPT)],
@@ -177,7 +234,8 @@ def test_launcher_syntax_and_merge_guards_are_present():
     assert "seed mismatch" in source
     assert "bootstrap_ci_95" in source
     assert "record_path.relative_to(root).parts" in source
-    assert 'if "seed" in record and int(record["seed"]) != seed:' in source
+    assert 'if "seed" not in record:' in source
+    assert "record_seed != seed" in source
 
 
 def test_dry_run_plans_prompt_materialization_without_invoking_a_child(tmp_path):

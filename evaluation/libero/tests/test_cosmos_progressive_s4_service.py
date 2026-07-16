@@ -220,3 +220,108 @@ def test_s4_action_encoder_preserves_sixteen_decodable_actions_after_downsample(
     encoder(np.zeros((1, 16, 7), dtype=np.float32))
 
     assert captured["target_shape"] == (1, 7, 16, 4, 1)
+
+
+def test_flowmap_joint_s4_runner_starts_from_fresh_video_noise_at_raw_t1000():
+    import torch
+
+    from evaluation.libero.rollout_cosmos_progressive_s4 import FlowMapJointS4Runner
+
+    class RecordingHarness:
+        def __init__(self):
+            self.calls = []
+
+        def _student_euler_integrate(self, **kwargs):
+            self.calls.append(kwargs)
+            return (
+                kwargs["noisy_latents"],
+                torch.zeros_like(kwargs["noisy_latents"]),
+                None,
+                kwargs["base_input_dict"]["action_dict"]["noisy_latents"].clone(),
+            )
+
+    def prepare_base_dict(_batch, _config, _device):
+        return {
+            "latent_dict": {},
+            "action_dict": {},
+            "chunk_size": 1,
+            "window_size": 1,
+        }
+
+    def build_paired_eval_timesteps(
+        *, batch_size, video_frames, action_frames, t, r, device
+    ):
+        return (
+            torch.full((batch_size, video_frames), float(t), device=device),
+            torch.full((batch_size, video_frames), float(r), device=device),
+            torch.full((batch_size, action_frames), float(t), device=device),
+            torch.full((batch_size, action_frames), float(r), device=device),
+        )
+
+    def student_input(
+        batch,
+        base,
+        video_x0,
+        video_noise,
+        video_t,
+        action_noise,
+        action_t,
+        action_downsample,
+    ):
+        video_scale = video_t[:, None, :, None, None].to(video_x0)
+        video_noisy = (1.0 - video_scale) * video_x0 + video_scale * video_noise.to(video_x0)
+        return (
+            {
+                "latent_dict": {
+                    "noisy_latents": video_noisy,
+                    "timesteps": video_t,
+                },
+                "action_dict": {
+                    "noisy_latents": batch["actions"][:, :, ::action_downsample],
+                },
+                "chunk_size": base["input"]["chunk_size"],
+                "window_size": base["input"]["window_size"],
+            },
+            action_noise,
+        )
+
+    harness = RecordingHarness()
+    runner = FlowMapJointS4Runner(
+        harness=harness,
+        config=SimpleNamespace(action_downsample_factor=4),
+        device="cpu",
+        torch_module=torch,
+        prepare_base_dict=prepare_base_dict,
+        student_input=student_input,
+        build_paired_eval_timesteps=build_paired_eval_timesteps,
+        empty_embedding=None,
+        cfg_scale=3.0,
+    )
+    video_x0 = torch.zeros((1, 16, 9, 28, 28), dtype=torch.bfloat16)
+    video_noise = torch.full_like(video_x0, 0.25)
+    action_x0 = torch.zeros((1, 7, 16, 4, 1), dtype=torch.bfloat16)
+    text_emb = torch.zeros((1, 512, 4096), dtype=torch.bfloat16)
+
+    final_action = runner(
+        video_x0,
+        action_x0,
+        text_emb,
+        noise=video_noise,
+        t1000=np.ones((1, 9), dtype=np.float32),
+        t0=np.zeros((1, 9), dtype=np.float32),
+        k_steps=4,
+    )
+
+    assert len(harness.calls) == 1
+    call = harness.calls[0]
+    torch.testing.assert_close(call["noisy_latents"], video_noise, rtol=0, atol=0)
+    torch.testing.assert_close(
+        call["timesteps"],
+        torch.full((1, 9), 1000.0),
+        rtol=0,
+        atol=0,
+    )
+    assert call["K_steps"] == 4
+    decoded = decode_student_action(final_action, _template())
+    assert decoded.shape == (16, 7)
+    assert decoded.dtype == np.float32

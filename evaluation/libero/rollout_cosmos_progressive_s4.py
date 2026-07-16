@@ -306,6 +306,13 @@ class FlowMapJointS4Runner:
             action_t,
             action_downsample,
         )
+        # ``_student_input`` mixes video states with a normalized sigma, while
+        # FlowMap's deployment timestep remains in the raw 0..1000 domain.
+        # At the S4 prior (t=1000), the state must be exactly the fresh noise;
+        # passing the raw timestep into that mixing rule would produce an
+        # invalid -999*x0 + 1000*noise state.
+        rollout_input["latent_dict"]["noisy_latents"] = video_noise
+        rollout_input["latent_dict"]["timesteps"] = video_t
         with torch.no_grad():
             _video, _field, _action_sequence, final_action = self.harness._student_euler_integrate(
                 noisy_latents=rollout_input["latent_dict"]["noisy_latents"],

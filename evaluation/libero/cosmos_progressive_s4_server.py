@@ -38,6 +38,12 @@ def _as_numpy(value: Any) -> np.ndarray:
     detach = getattr(value, "detach", None)
     if callable(detach):
         value = detach()
+    # PyTorch does not support ``Tensor.numpy()`` for bfloat16.  The public S4
+    # student commonly emits bfloat16 actions, whereas this rollout boundary
+    # deliberately returns a portable float32 NumPy array.
+    to_float = getattr(value, "float", None)
+    if callable(to_float):
+        value = to_float()
     cpu = getattr(value, "cpu", None)
     if callable(cpu):
         value = cpu()

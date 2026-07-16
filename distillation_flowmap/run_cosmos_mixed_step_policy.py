@@ -1,0 +1,845 @@
+#!/usr/bin/env python3
+"""Plan and (only when explicitly requested) run isolated Cosmos mixed policies.
+
+The legacy ``run_cosmos_progressive_stage2.py`` runner represents a chained
+S4 -> S2 -> S1 experiment and deliberately remains untouched.  This runner
+instead owns one independent policy root at a time: ``universe``, ``s2``, or
+``s1``.  Each fresh policy starts from the common Stage-1 *online student*
+checkpoint, uses the frozen full Cosmos objective template, and changes only
+the mixed endpoint rollout distribution supplied by ``cosmos_mixed_step_policy``.
+
+Without ``--run`` this module is a side-effect-free plan generator.  That is
+intentional: generating a command must never start an eight-GPU job, make a
+cache, or mutate a training root.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+from typing import Any, Mapping, Sequence
+
+from distillation_flowmap.cosmos_mixed_step_policy import (
+    get_mixed_step_policy_spec,
+    mixed_step_policy_names,
+    parse_forced_indices,
+)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATASET = REPO_ROOT / "training_data" / "libero-long-lerobot"
+DEFAULT_STAGE1_CHECKPOINT = (
+    Path("/root/nas/junjie/jj/Any_WAM/distillation_flowmap")
+    / "output_libero_cosmos_policy_stage1_cosmos_latent_cdiff_8gpu_20260706_cosmos_latent_s1s2_8gpu"
+    / "checkpoints"
+    / "step_5000"
+)
+DEFAULT_TEACHER_MODEL = Path(
+    "/root/nas/junjie/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B"
+)
+DEFAULT_TORCHRUN = Path("/root/nas/junjie/conda_envs/any_wam/bin/torchrun")
+DEFAULT_DEVICE_LIST = "0,1,2,3,4,5,6,7"
+DEFAULT_WORLD_SIZE = 8
+DEFAULT_MAX_TRAIN_STEPS = 5000
+DEFAULT_SAVE_INTERVAL = 250
+DEFAULT_MASTER_PORT = 29801
+DEFAULT_TRAIN_SEED = 20260716
+
+# This is forbidden, including a symlink alias or a descendant path.  The
+# independent-policy runner must never touch the old staged S4 experiment.
+LEGACY_PROGRESSIVE_ROOT = (
+    REPO_ROOT
+    / "distillation_flowmap"
+    / "output_libero_cosmos_policy_stage2_progressive_20260714_full"
+)
+
+_METADATA_FILENAMES = (
+    "protocol.json",
+    "train_manifest.json",
+    "selection_manifest.json",
+    "test_manifest.json",
+    "eval_pairs.json",
+)
+_BUDGET_SPECS = (
+    ("s1", 4, 1, "t4"),
+    ("s2", 4, 2, "t4"),
+    ("s4", 8, 4, "t8"),
+)
+
+
+def _as_path(value: str | Path) -> Path:
+    return Path(value).expanduser()
+
+
+def _resolve_path(value: str | Path) -> Path:
+    """Resolve aliases without requiring that the final path already exists."""
+    return _as_path(value).resolve(strict=False)
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
+
+
+def _as_str_env(values: Mapping[str, Any]) -> dict[str, str]:
+    return {str(key): str(value) for key, value in values.items()}
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    return path == parent or parent in path.parents
+
+
+def parse_device_list(
+    device_list: str | Sequence[int | str], *, world_size: int = DEFAULT_WORLD_SIZE
+) -> tuple[str, ...]:
+    """Parse and strictly validate the eight CUDA devices used by all ranks."""
+    world_size = int(world_size)
+    if world_size != DEFAULT_WORLD_SIZE:
+        raise ValueError(
+            "Cosmos mixed-step policies require exactly 8 ranks; "
+            f"got world_size={world_size}"
+        )
+    tokens = (
+        [part.strip() for part in str(device_list).split(",")]
+        if isinstance(device_list, str)
+        else [str(part).strip() for part in device_list]
+    )
+    if not tokens or any(not token for token in tokens):
+        raise ValueError("CUDA device list must contain non-empty comma-separated devices")
+    if any(not token.isdecimal() for token in tokens):
+        raise ValueError("CUDA device list must contain numeric device ordinals")
+    if len(tokens) != world_size:
+        raise ValueError(
+            f"Cosmos mixed-step policies require {world_size} devices; got {len(tokens)}"
+        )
+    if len(set(tokens)) != len(tokens):
+        raise ValueError("CUDA device list entries must be unique")
+    return tuple(tokens)
+
+
+def validate_policy_root(
+    root: str | Path,
+    *,
+    legacy_root: str | Path = LEGACY_PROGRESSIVE_ROOT,
+    resume: bool = False,
+) -> Path:
+    """Reject unsafe roots without deleting or modifying any existing output.
+
+    A fresh policy may reuse a root containing immutable protocol metadata, but
+    it may not reuse a root which already has checkpoints.  Resuming is an
+    explicit mode and is validated separately against its own checkpoint.
+    """
+    resolved_root = _resolve_path(root)
+    resolved_legacy = _resolve_path(legacy_root)
+    if _is_within(resolved_root, resolved_legacy):
+        raise ValueError(
+            "Cosmos mixed-step policy root must not be the legacy progressive "
+            f"S4 root or its descendant: {resolved_root}"
+        )
+    checkpoints_dir = resolved_root / "checkpoints"
+    if not resume and checkpoints_dir.exists() and any(checkpoints_dir.iterdir()):
+        raise FileExistsError(
+            "Refusing to start an independent policy in a root with existing "
+            f"checkpoints: {checkpoints_dir}. Pass an explicit valid resume mode instead."
+        )
+    return resolved_root
+
+
+def _validate_positive_int(value: int, *, name: str, allow_zero: bool = False) -> int:
+    value = int(value)
+    if value < 0 or (value == 0 and not allow_zero):
+        comparator = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{name} must be {comparator}")
+    return value
+
+
+def _validate_master_port(master_port: int) -> int:
+    master_port = int(master_port)
+    if not 1 <= master_port <= 65535:
+        raise ValueError("master_port must be in [1, 65535]")
+    return master_port
+
+
+def build_torchrun_command(
+    *,
+    torchrun: str | Path,
+    world_size: int,
+    master_port: int,
+    teacher_model_path: str | Path,
+    dataset_path: str | Path,
+    output_dir: str | Path,
+    resume_from_path: str | Path,
+    gradient_accumulation_steps: int = 1,
+) -> list[str]:
+    """Build the exact eight-rank training argv without launching it."""
+    world_size = int(world_size)
+    if world_size != DEFAULT_WORLD_SIZE:
+        raise ValueError(
+            "Cosmos mixed-step policies require --nproc_per_node=8; "
+            f"got {world_size}"
+        )
+    if int(gradient_accumulation_steps) != 1:
+        raise ValueError(
+            "Cosmos full standalone OPD requires gradient_accumulation_steps=1"
+        )
+    master_port = _validate_master_port(master_port)
+    return [
+        str(_as_path(torchrun)),
+        f"--nproc_per_node={world_size}",
+        f"--master_port={master_port}",
+        "distillation_flowmap/train.py",
+        "--teacher-model-path",
+        str(_as_path(teacher_model_path)),
+        "--dataset-path",
+        str(_as_path(dataset_path)),
+        "--output-dir",
+        str(_as_path(output_dir)),
+        "--resume-from-path",
+        str(_as_path(resume_from_path)),
+        "--gradient-accumulation-steps",
+        "1",
+    ]
+
+
+def _policy_payload(policy_name: str) -> dict[str, Any]:
+    spec = get_mixed_step_policy_spec(policy_name)
+    return {
+        "name": spec.name,
+        "rollout_step_pairs": [list(pair) for pair in spec.rollout_step_pairs],
+        "weights": list(spec.weights),
+    }
+
+
+def _checkpoint_transformer_dir(checkpoint_dir: str | Path) -> Path:
+    return _as_path(checkpoint_dir) / "online_student" / "transformer"
+
+
+def _plan_target_step(
+    *,
+    current_step: int,
+    chunk_size: int,
+    max_train_steps: int,
+    stop_after_step: int,
+) -> tuple[int, int]:
+    """Return expected checkpoint step and the exact STOP_AFTER_STEP value."""
+    current_step = _validate_positive_int(
+        current_step, name="current_step", allow_zero=True
+    )
+    chunk_size = _validate_positive_int(
+        chunk_size, name="chunk_size", allow_zero=True
+    )
+    max_train_steps = _validate_positive_int(max_train_steps, name="max_train_steps")
+    stop_after_step = _validate_positive_int(
+        stop_after_step, name="stop_after_step", allow_zero=True
+    )
+    if current_step >= max_train_steps:
+        raise ValueError("current_step must be smaller than max_train_steps")
+    if stop_after_step:
+        if not current_step < stop_after_step <= max_train_steps:
+            raise ValueError(
+                "stop_after_step must be greater than current_step and no larger "
+                "than max_train_steps"
+            )
+        return stop_after_step, stop_after_step
+    if chunk_size:
+        target_step = min(current_step + chunk_size, max_train_steps)
+        return target_step, target_step
+    # Zero means the normal full-run semantics understood by train.py.
+    return max_train_steps, 0
+
+
+def build_multibudget_eval_plans(
+    *,
+    checkpoint_dir: str | Path,
+    dataset_path: str | Path,
+    selection_manifest: str | Path,
+    eval_pairs: str | Path,
+    shared_protocol_root: str | Path,
+    output_dir: str | Path,
+    teacher_model_path: str | Path,
+    mixed_policy_name: str | None = None,
+    python_executable: str | Path | None = None,
+    eval_device_list: str = "0",
+    eval_worker_device_list: str = "0",
+) -> list[dict[str, Any]]:
+    """Build isolated fixed-cache S1/S2/S4 evaluator child plans.
+
+    The t4 and t8 cache directories intentionally differ because cache file
+    names do not encode teacher-step count.  This helper only builds argv/env;
+    it never launches evaluation or cache construction.
+    """
+    checkpoint_dir = _as_path(checkpoint_dir)
+    dataset_path = _as_path(dataset_path)
+    selection_manifest = _as_path(selection_manifest)
+    eval_pairs = _as_path(eval_pairs)
+    shared_protocol_root = _as_path(shared_protocol_root)
+    output_dir = _as_path(output_dir)
+    teacher_model_path = _as_path(teacher_model_path)
+    python_executable = str(python_executable or sys.executable)
+    eval_device_list = str(eval_device_list).strip()
+    eval_worker_device_list = str(eval_worker_device_list).strip()
+    if not eval_device_list or not eval_worker_device_list:
+        raise ValueError("Evaluator CUDA device lists must be non-empty")
+
+    try:
+        checkpoint_step = int(checkpoint_dir.name.removeprefix("step_"))
+    except ValueError:
+        checkpoint_step = None
+    checkpoint_label = (
+        f"step_{checkpoint_step}" if checkpoint_step is not None else checkpoint_dir.name
+    )
+    metrics_dir = output_dir / "metrics" / "selection" / checkpoint_label
+    base_env = _as_str_env(
+        {
+            "CONFIG_FILE": "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive",
+            "COSMOS_PROGRESSIVE_STAGE": "s4",
+            "CUDA_VISIBLE_DEVICES": eval_device_list,
+            "COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES": eval_worker_device_list,
+            "CACHE_DATASET_IN_MEMORY": "0",
+            "HF_DATASETS_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "HF_HUB_OFFLINE": "1",
+        }
+    )
+    if mixed_policy_name:
+        base_env["COSMOS_MIXED_STEP_POLICY"] = str(mixed_policy_name)
+    plans: list[dict[str, Any]] = []
+    for budget, teacher_steps, student_steps, cache_name in _BUDGET_SPECS:
+        cache_dir = shared_protocol_root / "teacher_cache" / "selection" / cache_name
+        output_json = metrics_dir / f"{budget}.json"
+        argv = [
+            python_executable,
+            "distillation_flowmap/eval_cosmos_progressive_stage2.py",
+            "--checkpoint-transformer",
+            str(_checkpoint_transformer_dir(checkpoint_dir)),
+            "--config",
+            "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive",
+            "--teacher-model-path",
+            str(teacher_model_path),
+            "--dataset-path",
+            str(dataset_path),
+            "--manifest",
+            str(selection_manifest),
+            "--pairs",
+            str(eval_pairs),
+            "--cache-dir",
+            str(cache_dir),
+            "--student-steps",
+            str(student_steps),
+            "--teacher-steps",
+            str(teacher_steps),
+            "--output-json",
+            str(output_json),
+        ]
+        plans.append(
+            {
+                "budget": budget,
+                "teacher_steps": teacher_steps,
+                "student_steps": student_steps,
+                "checkpoint_dir": checkpoint_dir,
+                "checkpoint_transformer": _checkpoint_transformer_dir(checkpoint_dir),
+                "cache_dir": cache_dir,
+                "output_json": output_json,
+                "env": dict(base_env),
+                "argv": argv,
+            }
+        )
+    return plans
+
+
+def build_policy_train_plan(
+    *,
+    policy_name: str,
+    root: str | Path,
+    dataset_path: str | Path,
+    protocol_source_root: str | Path,
+    stage1_checkpoint: str | Path = DEFAULT_STAGE1_CHECKPOINT,
+    current_step: int = 0,
+    chunk_size: int = 0,
+    max_train_steps: int = DEFAULT_MAX_TRAIN_STEPS,
+    save_interval: int = DEFAULT_SAVE_INTERVAL,
+    stop_after_step: int = 0,
+    master_port: int = DEFAULT_MASTER_PORT,
+    train_seed: int = DEFAULT_TRAIN_SEED,
+    torchrun: str | Path = DEFAULT_TORCHRUN,
+    teacher_model_path: str | Path = DEFAULT_TEACHER_MODEL,
+    device_list: str | Sequence[int | str] = DEFAULT_DEVICE_LIST,
+    world_size: int = DEFAULT_WORLD_SIZE,
+    force_sequence: str | Sequence[int | str] | None = None,
+    resume_from_path: str | Path | None = None,
+    legacy_root: str | Path = LEGACY_PROGRESSIVE_ROOT,
+    eval_device_list: str = "0",
+    eval_worker_device_list: str = "0",
+    python_executable: str | Path | None = None,
+) -> dict[str, Any]:
+    """Build an independent initial or resume policy plan without side effects."""
+    policy = _policy_payload(policy_name)
+    policy_spec = get_mixed_step_policy_spec(policy["name"])
+    devices = parse_device_list(device_list, world_size=world_size)
+    world_size = int(world_size)
+    current_step = _validate_positive_int(
+        current_step, name="current_step", allow_zero=True
+    )
+    max_train_steps = _validate_positive_int(max_train_steps, name="max_train_steps")
+    save_interval = _validate_positive_int(save_interval, name="save_interval")
+    target_step, effective_stop_after = _plan_target_step(
+        current_step=current_step,
+        chunk_size=chunk_size,
+        max_train_steps=max_train_steps,
+        stop_after_step=stop_after_step,
+    )
+    initial_plan = current_step == 0
+    root = validate_policy_root(root, legacy_root=legacy_root, resume=not initial_plan)
+    output_dir = root
+    stage1_checkpoint = _as_path(stage1_checkpoint)
+
+    if initial_plan:
+        if resume_from_path is not None and _resolve_path(resume_from_path) != _resolve_path(
+            stage1_checkpoint
+        ):
+            raise ValueError(
+                "A fresh mixed-step policy must start from the common Stage-1 "
+                "online student, not an arbitrary resume checkpoint"
+            )
+        train_resume_path = stage1_checkpoint
+        reset_resume_step = "1"
+        resume_optimizer_state = "0"
+    else:
+        own_checkpoint = output_dir / "checkpoints" / f"step_{current_step}"
+        if resume_from_path is not None and _resolve_path(resume_from_path) != _resolve_path(
+            own_checkpoint
+        ):
+            raise ValueError(
+                "A mixed-step resume must use this policy's own online checkpoint: "
+                f"{own_checkpoint}"
+            )
+        train_resume_path = own_checkpoint
+        reset_resume_step = "0"
+        resume_optimizer_state = "1"
+
+    forced_sequence = "" if force_sequence is None else force_sequence
+    forced_sequence_for_env = (
+        str(forced_sequence).strip()
+        if isinstance(forced_sequence, str)
+        else ",".join(str(item).strip() for item in forced_sequence)
+    )
+    forced_indices = parse_forced_indices(forced_sequence_for_env, policy_spec)
+    protocol_source_root = _as_path(protocol_source_root)
+    protocol_dir = output_dir / "protocol"
+    train_manifest = protocol_dir / "train_manifest.json"
+    selection_manifest = protocol_dir / "selection_manifest.json"
+    eval_pairs = protocol_dir / "eval_pairs.json"
+    checkpoint_dir = output_dir / "checkpoints" / f"step_{target_step}"
+    objective_settings = {
+        "progressive_template_stage": "s4",
+        "full_cosmos_objective": True,
+        "target_free_online_student": True,
+        "mixed_endpoint_sampling": True,
+        "cosmos_mixed_step_policy": policy["name"],
+        "rollout_step_pairs": policy["rollout_step_pairs"],
+        "rollout_step_pair_weights": policy["weights"],
+        "gradient_accumulation_steps": 1,
+        "opd_aux_standalone_step": True,
+        "opd_serial_student_cfg": True,
+        "opd_spatial_crop_size": 28,
+    }
+    train_env = _as_str_env(
+        {
+            "CONFIG_FILE": "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive",
+            # The old stage names choose full-objective hyperparameters.  The
+            # actual S1/S2/S4 endpoint distribution comes only from the mixed
+            # policy, never from a non-existent `universe` legacy stage.
+            "COSMOS_PROGRESSIVE_STAGE": "s4",
+            "COSMOS_MIXED_STEP_POLICY": policy["name"],
+            "COSMOS_MIXED_STEP_SELECTOR_SEED": int(train_seed),
+            "COSMOS_MIXED_STEP_FORCE_SEQUENCE": forced_sequence_for_env,
+            "COSMOS_MIXED_STEP_METRICS_PATH": output_dir
+            / "metrics"
+            / "cosmos_mixed_step_opd.jsonl",
+            "CUDA_VISIBLE_DEVICES": ",".join(devices),
+            "COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES": ",".join(devices),
+            "CACHE_DATASET_IN_MEMORY": "0",
+            "COSMOS_PROGRESSIVE_OUTPUT_ROOT": output_dir,
+            "OUTPUT_DIR": output_dir,
+            "RESUME_FROM_PATH": train_resume_path,
+            "RESUME_ONLINE_FROM_TARGET": "0",
+            "RESET_RESUME_STEP": reset_resume_step,
+            "RESUME_OPTIMIZER_STATE": resume_optimizer_state,
+            "SKIP_TARGET_STUDENT_FOR_COSMOS_LATENT": "1",
+            "MAX_TRAIN_STEPS": max_train_steps,
+            "SAVE_INTERVAL": save_interval,
+            "STOP_AFTER_STEP": effective_stop_after,
+            "DATASET_SAMPLE_MANIFEST": train_manifest,
+            "TRAIN_SEED": int(train_seed),
+            "ENABLE_WANDB": "0",
+            "USE_FSDP1": "1",
+            "GRADIENT_CHECKPOINTING": "1",
+            "OPD_AUX_GRADIENT_CHECKPOINTING": "1",
+            "OPD_SERIAL_STUDENT_CFG": "1",
+            "OPD_AUX_STANDALONE_STEP": "1",
+            "OPD_COSMOS_SPATIAL_CROP_SIZE": "28",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "HF_DATASETS_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "HF_HUB_OFFLINE": "1",
+        }
+    )
+    train_argv = build_torchrun_command(
+        torchrun=torchrun,
+        world_size=world_size,
+        master_port=master_port,
+        teacher_model_path=teacher_model_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        resume_from_path=train_resume_path,
+    )
+    eval_plans = build_multibudget_eval_plans(
+        checkpoint_dir=checkpoint_dir,
+        dataset_path=dataset_path,
+        selection_manifest=selection_manifest,
+        eval_pairs=eval_pairs,
+        shared_protocol_root=protocol_source_root,
+        output_dir=output_dir,
+        teacher_model_path=teacher_model_path,
+        mixed_policy_name=policy["name"],
+        python_executable=python_executable,
+        eval_device_list=eval_device_list,
+        eval_worker_device_list=eval_worker_device_list,
+    )
+    return {
+        "schema": "cosmos_mixed_step_policy_plan_v1",
+        "policy": policy,
+        "root": root,
+        "output_dir": output_dir,
+        "protocol_source_root": protocol_source_root,
+        "protocol_dir": protocol_dir,
+        "dataset_path": _as_path(dataset_path),
+        "source_checkpoint": stage1_checkpoint,
+        "resume_from_path": train_resume_path,
+        "current_step": current_step,
+        "target_step": target_step,
+        "max_train_steps": max_train_steps,
+        "save_interval": save_interval,
+        "stop_after_step": effective_stop_after,
+        "checkpoint_dir": checkpoint_dir,
+        "selection_proxy_path": output_dir
+        / "metrics"
+        / "selection"
+        / f"step_{target_step}"
+        / "selection_proxy.json",
+        "train_seed": int(train_seed),
+        "device_list": list(devices),
+        "world_size": world_size,
+        "master_port": _validate_master_port(master_port),
+        "forced_sequence": forced_sequence_for_env,
+        "forced_indices": list(forced_indices),
+        "objective_settings": objective_settings,
+        "train_env": train_env,
+        "train_argv": train_argv,
+        "eval_plans": eval_plans,
+    }
+
+
+def build_policy_manifest_payload(
+    plan: Mapping[str, Any],
+    *,
+    git_hash: str,
+    dirty_diff_hash: str,
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    """Build the immutable, JSON-safe provenance payload written before launch."""
+    timestamp = timestamp or _datetime.datetime.now(
+        tz=_datetime.timezone.utc
+    ).isoformat()
+    visible_devices = [
+        int(device) if str(device).isdecimal() else str(device)
+        for device in plan["device_list"]
+    ]
+    return {
+        "schema": "cosmos_mixed_step_policy_manifest_v1",
+        "created_at": timestamp,
+        "git_hash": str(git_hash),
+        "dirty_diff_hash": str(dirty_diff_hash),
+        "root": str(plan["root"]),
+        "policy": _json_ready(plan["policy"]),
+        "seed": int(plan["train_seed"]),
+        "source_checkpoint": str(plan["source_checkpoint"]),
+        "resume_from_path": str(plan["resume_from_path"]),
+        "protocol_source_root": str(plan["protocol_source_root"]),
+        "protocol_dir": str(plan["protocol_dir"]),
+        "dataset_path": str(plan["dataset_path"]),
+        "visible_devices": visible_devices,
+        "world_size": int(plan["world_size"]),
+        "master_port": int(plan["master_port"]),
+        "current_step": int(plan["current_step"]),
+        "target_step": int(plan["target_step"]),
+        "max_train_steps": int(plan["max_train_steps"]),
+        "save_interval": int(plan["save_interval"]),
+        "stop_after_step": int(plan["stop_after_step"]),
+        "forced_sequence": str(plan["forced_sequence"]),
+        "forced_indices": list(plan["forced_indices"]),
+        "objective_settings": _json_ready(plan["objective_settings"]),
+        "train_environment": _json_ready(plan["train_env"]),
+        "train_command": list(plan["train_argv"]),
+        "evaluation_plans": _json_ready(plan["eval_plans"]),
+        "selection_proxy_path": str(plan["selection_proxy_path"]),
+        "note": "Fixed-cache proxy evaluation only; this manifest does not claim rollout success.",
+    }
+
+
+def _git_hash() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def _dirty_diff_hash() -> str:
+    """Hash tracked diff plus untracked filenames, without adding/staging anything."""
+    try:
+        diff = subprocess.check_output(
+            ["git", "diff", "--binary", "HEAD"], cwd=REPO_ROOT
+        )
+        status = subprocess.check_output(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=REPO_ROOT,
+        )
+    except Exception:
+        return "unknown"
+    return hashlib.sha256(diff + b"\0" + status).hexdigest()
+
+
+def _write_json(path: str | Path, payload: Mapping[str, Any]) -> Path:
+    path = _as_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(path.name + ".tmp")
+    temporary_path.write_text(
+        json.dumps(_json_ready(payload), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
+    return path
+
+
+def write_policy_manifest(plan: Mapping[str, Any]) -> Path:
+    """Write provenance before a launch; never stage, push, or start a job."""
+    root = _as_path(plan["root"])
+    path = root / "policy_manifest.json"
+    payload = build_policy_manifest_payload(
+        plan,
+        git_hash=_git_hash(),
+        dirty_diff_hash=_dirty_diff_hash(),
+    )
+    if path.exists():
+        # A resumed job gets a timestamped record without silently replacing the
+        # first-run provenance.  Fresh launch collision checks prevent this path.
+        step = int(plan["current_step"])
+        path = root / "protocol" / f"policy_manifest_resume_step_{step}.json"
+    return _write_json(path, payload)
+
+
+def copy_immutable_protocol_metadata(plan: Mapping[str, Any]) -> list[Path]:
+    """Copy only JSON protocol metadata; deliberately never copy teacher caches."""
+    source_root = _as_path(plan["protocol_source_root"])
+    destination_root = _as_path(plan["protocol_dir"])
+    copied: list[Path] = []
+    for filename in _METADATA_FILENAMES:
+        source = source_root / filename
+        if not source.is_file():
+            raise FileNotFoundError(f"Missing immutable protocol metadata: {source}")
+        destination = destination_root / filename
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            if destination.read_bytes() != source.read_bytes():
+                raise RuntimeError(
+                    "Refusing to replace differing protocol metadata at "
+                    f"{destination}"
+                )
+        else:
+            shutil.copy2(source, destination)
+            destination.chmod(destination.stat().st_mode & ~0o222)
+        copied.append(destination)
+    return copied
+
+
+def _validate_checkpoint_transformer(checkpoint_dir: str | Path, *, role: str) -> None:
+    config_path = _checkpoint_transformer_dir(checkpoint_dir) / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Missing {role} online student transformer: {config_path}")
+
+
+def validate_eval_caches(eval_plans: Sequence[Mapping[str, Any]]) -> None:
+    """Verify each planned cache has every fixed selection record/pair payload."""
+    for plan in eval_plans:
+        manifest_path = _as_path(plan["argv"][plan["argv"].index("--manifest") + 1])
+        pairs_path = _as_path(plan["argv"][plan["argv"].index("--pairs") + 1])
+        cache_dir = _as_path(plan["cache_dir"])
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            pairs = json.loads(pairs_path.read_text(encoding="utf-8")).get("pairs", [])
+        except FileNotFoundError:
+            raise
+        if not pairs:
+            raise ValueError(f"Evaluation pairs are empty: {pairs_path}")
+        missing: list[str] = []
+        for record in manifest.get("records", []):
+            for pair in pairs:
+                filename = f"sample_{int(record['index']):06d}__{pair['pair_id']}.pt"
+                if not (cache_dir / filename).is_file():
+                    missing.append(str(cache_dir / filename))
+                    if len(missing) >= 5:
+                        break
+            if len(missing) >= 5:
+                break
+        if missing:
+            raise FileNotFoundError(
+                "Fixed evaluation cache is incomplete for "
+                f"{plan['budget']}: " + ", ".join(missing)
+            )
+
+
+def _write_selection_proxy(plan: Mapping[str, Any]) -> Path:
+    results: dict[str, Any] = {}
+    for eval_plan in plan["eval_plans"]:
+        output_json = _as_path(eval_plan["output_json"])
+        if not output_json.is_file():
+            raise RuntimeError(
+                f"Evaluator did not write expected {eval_plan['budget']} result: {output_json}"
+            )
+        results[str(eval_plan["budget"])] = {
+            "student_steps": int(eval_plan["student_steps"]),
+            "teacher_steps": int(eval_plan["teacher_steps"]),
+            "cache_dir": str(eval_plan["cache_dir"]),
+            "output_json": str(output_json),
+            "metrics": json.loads(output_json.read_text(encoding="utf-8")),
+        }
+    return _write_json(
+        plan["selection_proxy_path"],
+        {
+            "schema": "cosmos_mixed_step_selection_proxy_v1",
+            "checkpoint_dir": str(plan["checkpoint_dir"]),
+            "budgets": results,
+            "note": "Fixed-cache offline proxy only; not an execution-success claim.",
+        },
+    )
+
+
+def execute_policy_plan(plan: Mapping[str, Any]) -> None:
+    """Execute a plan only after an explicit ``--run`` CLI opt-in.
+
+    This path has intentionally strict validation and does not build missing
+    data/caches, overwrite checkpoints, delete outputs, or start a tmux session.
+    """
+    is_resume = int(plan["current_step"]) > 0
+    validate_policy_root(plan["root"], resume=is_resume)
+    _validate_checkpoint_transformer(plan["resume_from_path"], role="resume")
+    copy_immutable_protocol_metadata(plan)
+    validate_eval_caches(plan["eval_plans"])
+    manifest_path = write_policy_manifest(plan)
+    print(f"Wrote policy manifest: {manifest_path}", flush=True)
+    train_env = {**os.environ, **dict(plan["train_env"])}
+    subprocess.run(list(plan["train_argv"]), cwd=REPO_ROOT, env=train_env, check=True)
+    _validate_checkpoint_transformer(plan["checkpoint_dir"], role="trained")
+    for eval_plan in plan["eval_plans"]:
+        eval_env = {**os.environ, **dict(eval_plan["env"])}
+        subprocess.run(list(eval_plan["argv"]), cwd=REPO_ROOT, env=eval_env, check=True)
+    selection_proxy_path = _write_selection_proxy(plan)
+    print(f"Wrote selection proxy: {selection_proxy_path}", flush=True)
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate or explicitly run one isolated eight-GPU Cosmos mixed-step policy."
+    )
+    parser.add_argument("--policy", choices=mixed_step_policy_names(), required=True)
+    parser.add_argument(
+        "--root",
+        type=Path,
+        required=True,
+        help="New policy-specific root; no default is provided by design.",
+    )
+    parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET)
+    parser.add_argument(
+        "--protocol-source-root",
+        type=Path,
+        required=True,
+        help="Read-only source holding protocol JSON and t4/t8 teacher caches.",
+    )
+    parser.add_argument("--stage1-checkpoint", type=Path, default=DEFAULT_STAGE1_CHECKPOINT)
+    parser.add_argument("--resume-from-path", type=Path, default=None)
+    parser.add_argument("--current-step", type=int, default=0)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=0,
+        help="Optional bounded chunk; zero means full run unless stop-after-step is set.",
+    )
+    parser.add_argument("--max-train-steps", type=int, default=DEFAULT_MAX_TRAIN_STEPS)
+    parser.add_argument("--save-interval", type=int, default=DEFAULT_SAVE_INTERVAL)
+    parser.add_argument("--stop-after-step", type=int, default=0)
+    parser.add_argument("--master-port", type=int, default=DEFAULT_MASTER_PORT)
+    parser.add_argument("--train-seed", type=int, default=DEFAULT_TRAIN_SEED)
+    parser.add_argument("--torchrun", type=Path, default=DEFAULT_TORCHRUN)
+    parser.add_argument("--teacher-model-path", type=Path, default=DEFAULT_TEACHER_MODEL)
+    parser.add_argument("--device-list", default=DEFAULT_DEVICE_LIST)
+    parser.add_argument("--world-size", type=int, default=DEFAULT_WORLD_SIZE)
+    parser.add_argument(
+        "--force-sequence",
+        default="",
+        help="Optional deterministic selector labels/indices, e.g. s1,s2,s4 for a preflight.",
+    )
+    parser.add_argument("--eval-device-list", default="0")
+    parser.add_argument("--eval-worker-device-list", default="0")
+    parser.add_argument(
+        "--run",
+        action="store_true",
+        help="Execute after printing the plan. Without this flag nothing is launched or written.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    plan = build_policy_train_plan(
+        policy_name=args.policy,
+        root=args.root,
+        dataset_path=args.dataset_path,
+        protocol_source_root=args.protocol_source_root,
+        stage1_checkpoint=args.stage1_checkpoint,
+        current_step=args.current_step,
+        chunk_size=args.chunk_size,
+        max_train_steps=args.max_train_steps,
+        save_interval=args.save_interval,
+        stop_after_step=args.stop_after_step,
+        master_port=args.master_port,
+        train_seed=args.train_seed,
+        torchrun=args.torchrun,
+        teacher_model_path=args.teacher_model_path,
+        device_list=args.device_list,
+        world_size=args.world_size,
+        force_sequence=args.force_sequence,
+        resume_from_path=args.resume_from_path,
+        eval_device_list=args.eval_device_list,
+        eval_worker_device_list=args.eval_worker_device_list,
+    )
+    print(json.dumps(_json_ready(plan), indent=2, sort_keys=True))
+    if args.run:
+        execute_policy_plan(plan)
+
+
+if __name__ == "__main__":
+    main()

@@ -68,7 +68,9 @@ directions: it may not equal, contain, or be contained by the protocol source,
 dataset, teacher model, or Stage-1 checkpoint. Evaluation does not consume a
 Stage-1 checkpoint, but it still validates the explicit `--stage1-checkpoint`
 or the launcher default as immutable to prevent an eval root from ever writing
-into that source tree.
+into that source tree. The eval launcher also canonicalizes the selected
+`ROOT_BASE/<policy>` directory and repeats this check before it creates a log
+or worker, so a policy-path symlink into an immutable source is rejected.
 
 ## Future preflight command
 
@@ -164,6 +166,7 @@ bash distillation_flowmap/launch_cosmos_mixed_step_8gpu.sh eval universe \
   --protocol-source-root "$PROTOCOL_SOURCE_ROOT" \
   --dataset-path "$DATASET_PATH" \
   --teacher-model-path "$TEACHER_MODEL_PATH" \
+  --stage1-checkpoint "$STAGE1_CHECKPOINT" \
   --python "$PYTHON_BIN" \
   --eval-device-list 0 \
   --eval-worker-device-list 0
@@ -175,7 +178,10 @@ uses the reviewed distinct t4/t8 fixed caches and writes a combined selection
 proxy only after all three S1/S2/S4 evaluator JSONs exist.  These metrics are
 an offline fixed-cache proxy, not a claim of real robot rollout success.
 
-Before an eval subprocess can run, the public executor revalidates the exact
-approved S1/S2/S4 plan, including the t4/t4/t8 cache mapping, expected output
-paths, fixed proxy environment, and evaluator-only argv. A malformed in-memory
-plan therefore fails before it can accidentally invoke a training command.
+The eval launcher forwards the canonical Stage-1 path to the eval-only runner
+for provenance and revalidation; it is not a training resume input. Before an
+eval subprocess can run, the public executor verifies that path, the exact
+approved S1/S2/S4 plan, the t4/t4/t8 cache mapping, the owned
+`selection_proxy.json` destination, and the resolved Python executable that
+generated the evaluator argv. A malformed in-memory plan therefore fails
+before it can redirect output or invoke a different command.

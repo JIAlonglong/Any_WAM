@@ -462,6 +462,8 @@ def validate_policy_eval_execution_contract(
         protocol_root = _resolve_path(plan["protocol_source_root"])
         dataset_path = _resolve_path(plan["dataset_path"])
         teacher_model_path = _resolve_path(plan["teacher_model_path"])
+        python_executable = _resolve_path(plan["python_executable"])
+        selection_proxy_path = _resolve_path(plan["selection_proxy_path"])
         eval_plans = plan["eval_plans"]
     except (KeyError, TypeError, ValueError) as exc:
         _raise_invalid_eval_execution_plan(f"missing or invalid plan metadata: {exc}")
@@ -473,6 +475,11 @@ def validate_policy_eval_execution_contract(
         )
     checkpoint_dir = _resolve_path(checkpoint_dir)
     metrics_dir = root / "metrics" / "selection" / checkpoint_dir.name
+    expected_selection_proxy_path = metrics_dir / "selection_proxy.json"
+    if selection_proxy_path != _resolve_path(expected_selection_proxy_path):
+        _raise_invalid_eval_execution_plan(
+            "selection_proxy_path is not the owned checkpoint selection proxy"
+        )
     for eval_plan, (budget, teacher_steps, student_steps, cache_name) in zip(
         eval_plans, _BUDGET_SPECS
     ):
@@ -525,8 +532,10 @@ def validate_policy_eval_execution_contract(
         if isinstance(argv, (str, bytes)) or not isinstance(argv, Sequence):
             _raise_invalid_eval_execution_plan(f"{budget} argv is not a sequence")
         argv = list(argv)
-        if not argv or not isinstance(argv[0], str) or not argv[0]:
-            _raise_invalid_eval_execution_plan(f"{budget} argv has no executable")
+        if not argv or not isinstance(argv[0], str) or argv[0] != str(python_executable):
+            _raise_invalid_eval_execution_plan(
+                f"{budget} argv does not use the plan's intended Python executable"
+            )
         expected_argv_tail = [
             "distillation_flowmap/eval_cosmos_progressive_stage2.py",
             "--checkpoint-transformer",
@@ -595,6 +604,7 @@ def build_policy_eval_plan(
     checkpoint_dir: str | Path,
     dataset_path: str | Path,
     protocol_source_root: str | Path,
+    stage1_checkpoint: str | Path = DEFAULT_STAGE1_CHECKPOINT,
     teacher_model_path: str | Path = DEFAULT_TEACHER_MODEL,
     legacy_root: str | Path = LEGACY_PROGRESSIVE_ROOT,
     eval_device_list: str = "0",
@@ -612,13 +622,13 @@ def build_policy_eval_plan(
     root = validate_policy_root(root, legacy_root=legacy_root, resume=True)
     protocol_source_root = _resolve_path(protocol_source_root)
     dataset_path = _resolve_path(dataset_path)
+    stage1_checkpoint = _resolve_path(stage1_checkpoint)
     teacher_model_path = _resolve_path(teacher_model_path)
+    python_executable = _resolve_path(python_executable or sys.executable)
     validate_policy_source_isolation(
         root,
         protocol_source_root=protocol_source_root,
-        # The Stage-1 source is irrelevant to an eval-only plan; there is no
-        # training/resume operation in this branch.
-        stage1_checkpoint=None,
+        stage1_checkpoint=stage1_checkpoint,
         teacher_model_path=teacher_model_path,
         dataset_path=dataset_path,
     )
@@ -648,7 +658,9 @@ def build_policy_eval_plan(
         "output_dir": root,
         "protocol_source_root": protocol_source_root,
         "dataset_path": dataset_path,
+        "stage1_checkpoint": stage1_checkpoint,
         "teacher_model_path": teacher_model_path,
+        "python_executable": python_executable,
         "checkpoint_dir": checkpoint_dir,
         "selection_proxy_path": root
         / "metrics"
@@ -1108,7 +1120,7 @@ def execute_policy_eval_plan(plan: Mapping[str, Any]) -> None:
     validate_policy_source_isolation(
         plan["root"],
         protocol_source_root=plan["protocol_source_root"],
-        stage1_checkpoint=None,
+        stage1_checkpoint=plan["stage1_checkpoint"],
         teacher_model_path=plan["teacher_model_path"],
         dataset_path=plan["dataset_path"],
     )
@@ -1195,6 +1207,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             checkpoint_dir=args.eval_checkpoint,
             dataset_path=args.dataset_path,
             protocol_source_root=args.protocol_source_root,
+            stage1_checkpoint=args.stage1_checkpoint,
             teacher_model_path=args.teacher_model_path,
             eval_device_list=args.eval_device_list,
             eval_worker_device_list=args.eval_worker_device_list,

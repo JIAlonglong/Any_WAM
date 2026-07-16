@@ -33,6 +33,7 @@ def _eval_plan(tmp_path: Path, **overrides):
         "dataset_path": tmp_path / "dataset",
         "protocol_source_root": tmp_path / "shared_protocol",
         "teacher_model_path": tmp_path / "teacher",
+        "stage1_checkpoint": tmp_path / "stage1",
         "python_executable": "/tmp/python",
         "eval_device_list": "6",
         "eval_worker_device_list": "7",
@@ -60,6 +61,8 @@ def test_eval_only_plan_owns_its_checkpoint_and_contains_only_three_budget_evalu
     assert plan["schema"] == "cosmos_mixed_step_policy_eval_plan_v1"
     assert plan["policy"]["name"] == "universe"
     assert plan["checkpoint_dir"] == tmp_path / "universe" / "checkpoints" / "step_5000"
+    assert plan["stage1_checkpoint"] == tmp_path / "stage1"
+    assert plan["python_executable"] == Path("/tmp/python")
     assert "train_argv" not in plan
     assert [item["budget"] for item in plan["eval_plans"]] == ["s1", "s2", "s4"]
     assert [item["cache_dir"].name for item in plan["eval_plans"]] == ["t4", "t4", "t8"]
@@ -69,6 +72,22 @@ def test_eval_only_plan_owns_its_checkpoint_and_contains_only_three_budget_evalu
 def test_eval_only_plan_rejects_checkpoint_outside_the_owned_policy_root(tmp_path):
     with pytest.raises(ValueError, match="owned checkpoints"):
         _eval_plan(tmp_path, checkpoint_dir=tmp_path / "other" / "step_5000")
+
+
+def test_eval_plan_rejects_a_canonical_policy_symlink_to_the_stage1_source(tmp_path):
+    stage1 = tmp_path / "stage1"
+    stage1.mkdir()
+    root_base = tmp_path / "output_base"
+    root_base.mkdir()
+    policy_root_link = root_base / "universe"
+    policy_root_link.symlink_to(stage1, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="Stage-1"):
+        _eval_plan(
+            tmp_path,
+            root=policy_root_link,
+            stage1_checkpoint=stage1,
+        )
 
 
 @pytest.mark.parametrize("checkpoint_name", ["5000", "step_+1", "step_-1", "step_1.0", "step_"])
@@ -153,6 +172,10 @@ def test_eval_only_executor_invokes_only_evaluator_argvs_with_no_real_subprocess
         lambda plan: plan["eval_plans"][2].__setitem__(
             "cache_dir", plan["protocol_source_root"] / "teacher_cache" / "selection" / "t4"
         ),
+        lambda plan: plan["eval_plans"][0]["argv"].__setitem__(0, "/tmp/other-python"),
+        lambda plan: plan.__setitem__(
+            "selection_proxy_path", plan["root"] / "metrics" / "other" / "selection_proxy.json"
+        ),
     ],
 )
 def test_eval_only_executor_rejects_programmatic_nonapproved_plans_before_subprocess(
@@ -168,6 +191,22 @@ def test_eval_only_executor_rejects_programmatic_nonapproved_plans_before_subpro
     )
 
     with pytest.raises(ValueError, match="approved evaluator-only contract"):
+        execute_policy_eval_plan(plan)
+
+    assert calls == []
+
+
+def test_eval_only_executor_revalidates_stage1_source_before_subprocess(tmp_path, monkeypatch):
+    plan = _eval_plan(tmp_path)
+    plan["stage1_checkpoint"] = plan["root"]
+    calls = []
+    monkeypatch.setattr(
+        mixed_runner.subprocess,
+        "run",
+        lambda argv, **kwargs: calls.append((list(argv), kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="Stage-1"):
         execute_policy_eval_plan(plan)
 
     assert calls == []
@@ -279,3 +318,17 @@ def test_launcher_rejects_bidirectional_input_overlap_before_artifact_creation()
     ):
         validation_call = "validate_eval_inputs" if body.startswith("\nstart_eval") else "validate_training_inputs"
         assert body.index(validation_call) < body.index("prepare_artifact_paths")
+
+
+def test_launcher_eval_rechecks_canonical_policy_root_and_forwards_stage1_source():
+    source = _launcher_source()
+    evaluation = _function_body(source, "start_eval", "main")
+
+    assert 'policy_root="$(canonical_directory "$root_base/$policy")"' in evaluation
+    assert 'assert_root_base_input_isolation \\' in evaluation
+    assert '"$policy_root" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH"' in evaluation
+    assert '"$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT"' in evaluation
+    assert '"--stage1-checkpoint" "$STAGE1_CHECKPOINT"' in evaluation
+    assert evaluation.index('policy_root="$(canonical_directory') < evaluation.index(
+        "assert_root_base_input_isolation"
+    ) < evaluation.index("prepare_artifact_paths")

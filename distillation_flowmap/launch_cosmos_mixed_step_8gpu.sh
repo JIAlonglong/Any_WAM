@@ -611,6 +611,9 @@ start_eval() {
     local root_base="$ROOT_BASE"
     local policy_root
     policy_root="$(canonical_directory "$root_base/$policy")"
+    assert_root_base_input_isolation \
+        "$policy_root" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
+        "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT"
     checkpoint="$(canonical_directory "$checkpoint")"
     [[ "$(dirname "$checkpoint")" == "$policy_root/checkpoints" ]] || die \
         "Evaluation checkpoint must be directly under $policy_root/checkpoints"
@@ -642,6 +645,7 @@ start_eval() {
         "--root" "$policy_root"
         "--dataset-path" "$DATASET_PATH"
         "--protocol-source-root" "$PROTOCOL_SOURCE_ROOT"
+        "--stage1-checkpoint" "$STAGE1_CHECKPOINT"
         "--teacher-model-path" "$TEACHER_MODEL_PATH"
         "--eval-device-list" "$EVAL_DEVICE_LIST"
         "--eval-worker-device-list" "$EVAL_WORKER_DEVICE_LIST"

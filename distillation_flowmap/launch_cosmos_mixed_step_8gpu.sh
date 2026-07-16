@@ -220,6 +220,38 @@ assert_root_base_input_isolation() {
 }
 
 
+resolve_path_maybe_missing() {
+    realpath -m -- "$1"
+}
+
+
+assert_eval_artifact_paths_isolated() {
+    local policy_root="$1"
+    local protocol_source_root="$2"
+    local dataset_path="$3"
+    local teacher_model_path="$4"
+    local stage1_checkpoint="$5"
+    shift 5
+    local canonical_policy_root
+    canonical_policy_root="$(resolve_path_maybe_missing "$policy_root")"
+    protocol_source_root="$(resolve_path_maybe_missing "$protocol_source_root")"
+    dataset_path="$(resolve_path_maybe_missing "$dataset_path")"
+    teacher_model_path="$(resolve_path_maybe_missing "$teacher_model_path")"
+    stage1_checkpoint="$(resolve_path_maybe_missing "$stage1_checkpoint")"
+    local artifact_path=""
+    local resolved_artifact=""
+    for artifact_path in "$@"; do
+        resolved_artifact="$(resolve_path_maybe_missing "$artifact_path")"
+        if [[ "$resolved_artifact" != "$canonical_policy_root" && "$resolved_artifact" != "$canonical_policy_root"/* ]]; then
+            die "Evaluation artifact must resolve under policy root: artifact=$resolved_artifact root=$canonical_policy_root"
+        fi
+        assert_root_base_input_isolation \
+            "$resolved_artifact" "$protocol_source_root" "$dataset_path" \
+            "$teacher_model_path" "$stage1_checkpoint"
+    done
+}
+
+
 validate_training_inputs() {
     validate_root_base
     PROTOCOL_SOURCE_ROOT="$(canonical_directory "$PROTOCOL_SOURCE_ROOT")"
@@ -251,6 +283,7 @@ validate_eval_inputs() {
         "$ROOT_BASE" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
         "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT"
     require_program "$PYTHON_BIN"
+    require_program realpath
     [[ -f "$RUNNER_PATH" ]] || die "Missing mixed-step runner: $RUNNER_PATH"
     [[ -n "$EVAL_DEVICE_LIST" && -n "$EVAL_WORKER_DEVICE_LIST" ]] || die \
         "Evaluation device lists must be non-empty"
@@ -625,8 +658,16 @@ start_eval() {
     checkpoint_label="$(basename "$checkpoint")"
     local metrics_dir="$policy_root/metrics/selection/$checkpoint_label"
     local selection_proxy="$metrics_dir/selection_proxy.json"
-    ensure_marker_absent "$metrics_dir/EVAL_COMPLETE"
-    ensure_marker_absent "$metrics_dir/EVAL_FAILED"
+    local eval_complete_marker="$metrics_dir/EVAL_COMPLETE"
+    local eval_failed_marker="$metrics_dir/EVAL_FAILED"
+    assert_eval_artifact_paths_isolated \
+        "$policy_root" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
+        "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT" \
+        "$metrics_dir" "$selection_proxy" \
+        "$metrics_dir/s1.json" "$metrics_dir/s2.json" "$metrics_dir/s4.json" \
+        "$eval_complete_marker" "$eval_failed_marker"
+    ensure_marker_absent "$eval_complete_marker"
+    ensure_marker_absent "$eval_failed_marker"
     [[ ! -e "$selection_proxy" && ! -L "$selection_proxy" ]] || die \
         "Refusing to overwrite existing selection proxy: $selection_proxy"
     local budget=""
@@ -634,7 +675,7 @@ start_eval() {
         [[ ! -e "$metrics_dir/${budget}.json" && ! -L "$metrics_dir/${budget}.json" ]] || die \
             "Refusing to overwrite existing fixed-cache proxy result: $metrics_dir/${budget}.json"
     done
-    reserve_operation "$root_base" "eval-${policy}-${checkpoint_label}" "$metrics_dir/EVAL_FAILED"
+    reserve_operation "$root_base" "eval-${policy}-${checkpoint_label}" "$eval_failed_marker"
     local run_tag
     run_tag="$(new_run_tag)"
     local session_name="cosmos-mixed-eval-${policy}-${checkpoint_label}-${run_tag}"
@@ -653,7 +694,7 @@ start_eval() {
         "--run"
     )
     write_worker_script "$WORKER_SCRIPT" "$LOG_FILE" \
-        "$metrics_dir/EVAL_COMPLETE" "$metrics_dir/EVAL_FAILED" \
+        "$eval_complete_marker" "$eval_failed_marker" \
         "$ACTIVE_RESERVATION_DIR" "${policy}-offline-proxy-${checkpoint_label}" \
         "$checkpoint" "$selection_proxy" \
         "${runner_argv[@]}"

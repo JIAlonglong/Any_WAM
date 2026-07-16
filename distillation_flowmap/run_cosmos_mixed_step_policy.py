@@ -207,6 +207,63 @@ def validate_policy_source_isolation(
             )
 
 
+def validate_policy_eval_artifact_isolation(
+    *,
+    root: str | Path,
+    checkpoint_dir: str | Path,
+    protocol_source_root: str | Path,
+    dataset_path: str | Path,
+    teacher_model_path: str | Path,
+    stage1_checkpoint: str | Path,
+    selection_proxy_path: str | Path | None = None,
+) -> dict[str, Path]:
+    """Resolve every eval write target before allowing an eval plan to proceed.
+
+    The policy root can be valid while a nested ``metrics`` entry (or an
+    individual result/marker) is a symlink into one of the immutable inputs.
+    Validate every concrete artifact path independently so plan construction
+    and plan execution use the same no-write-into-source boundary.
+    """
+    root = _resolve_path(root)
+    checkpoint_dir = _resolve_path(checkpoint_dir)
+    metrics_dir = root / "metrics" / "selection" / checkpoint_dir.name
+    expected_selection_proxy = metrics_dir / "selection_proxy.json"
+    artifacts: list[tuple[str, str | Path]] = [
+        ("metrics directory", metrics_dir),
+        ("S1 output JSON", metrics_dir / "s1.json"),
+        ("S2 output JSON", metrics_dir / "s2.json"),
+        ("S4 output JSON", metrics_dir / "s4.json"),
+        ("selection proxy", expected_selection_proxy),
+        ("evaluation completion marker", metrics_dir / "EVAL_COMPLETE"),
+        ("evaluation failure marker", metrics_dir / "EVAL_FAILED"),
+    ]
+    if selection_proxy_path is not None:
+        artifacts.append(("declared selection proxy", selection_proxy_path))
+    sources = (
+        ("protocol source root", _resolve_path(protocol_source_root)),
+        ("dataset path", _resolve_path(dataset_path)),
+        ("teacher model path", _resolve_path(teacher_model_path)),
+        ("Stage-1 source checkpoint", _resolve_path(stage1_checkpoint)),
+    )
+    resolved_artifacts: dict[str, Path] = {}
+    for label, artifact in artifacts:
+        resolved_artifact = _resolve_path(artifact)
+        if not _is_within(resolved_artifact, root):
+            raise ValueError(
+                "Cosmos mixed-step evaluation artifact must resolve under policy root: "
+                f"artifact={label}, path={resolved_artifact}, root={root}"
+            )
+        for source_label, source in sources:
+            if _paths_overlap(resolved_artifact, source):
+                raise ValueError(
+                    "Cosmos mixed-step evaluation artifact must not overlap immutable "
+                    f"{source_label}: artifact={label}, path={resolved_artifact}, "
+                    f"source={source}"
+                )
+        resolved_artifacts[label] = resolved_artifact
+    return resolved_artifacts
+
+
 def validate_resume_policy_ownership(root: str | Path, policy_name: str) -> Path:
     """Require a root-level manifest that proves a resume owns this policy."""
     root = _resolve_path(root)
@@ -462,7 +519,7 @@ def validate_policy_eval_execution_contract(
         protocol_root = _resolve_path(plan["protocol_source_root"])
         dataset_path = _resolve_path(plan["dataset_path"])
         teacher_model_path = _resolve_path(plan["teacher_model_path"])
-        python_executable = _resolve_path(plan["python_executable"])
+        stage1_checkpoint = _resolve_path(plan["stage1_checkpoint"])
         selection_proxy_path = _resolve_path(plan["selection_proxy_path"])
         eval_plans = plan["eval_plans"]
     except (KeyError, TypeError, ValueError) as exc:
@@ -474,12 +531,25 @@ def validate_policy_eval_execution_contract(
             f"expected exactly {len(_BUDGET_SPECS)} eval plans, got {len(eval_plans)}"
         )
     checkpoint_dir = _resolve_path(checkpoint_dir)
+    try:
+        artifact_paths = validate_policy_eval_artifact_isolation(
+            root=root,
+            checkpoint_dir=checkpoint_dir,
+            protocol_source_root=protocol_root,
+            dataset_path=dataset_path,
+            teacher_model_path=teacher_model_path,
+            stage1_checkpoint=stage1_checkpoint,
+            selection_proxy_path=selection_proxy_path,
+        )
+    except ValueError as exc:
+        _raise_invalid_eval_execution_plan(str(exc))
     metrics_dir = root / "metrics" / "selection" / checkpoint_dir.name
-    expected_selection_proxy_path = metrics_dir / "selection_proxy.json"
-    if selection_proxy_path != _resolve_path(expected_selection_proxy_path):
+    expected_selection_proxy_path = artifact_paths["selection proxy"]
+    if selection_proxy_path != expected_selection_proxy_path:
         _raise_invalid_eval_execution_plan(
             "selection_proxy_path is not the owned checkpoint selection proxy"
         )
+    trusted_python_executable = _resolve_path(sys.executable)
     for eval_plan, (budget, teacher_steps, student_steps, cache_name) in zip(
         eval_plans, _BUDGET_SPECS
     ):
@@ -532,9 +602,13 @@ def validate_policy_eval_execution_contract(
         if isinstance(argv, (str, bytes)) or not isinstance(argv, Sequence):
             _raise_invalid_eval_execution_plan(f"{budget} argv is not a sequence")
         argv = list(argv)
-        if not argv or not isinstance(argv[0], str) or argv[0] != str(python_executable):
+        if (
+            not argv
+            or not isinstance(argv[0], str)
+            or argv[0] != str(trusted_python_executable)
+        ):
             _raise_invalid_eval_execution_plan(
-                f"{budget} argv does not use the plan's intended Python executable"
+                f"{budget} argv does not use the trusted intended Python executable"
             )
         expected_argv_tail = [
             "distillation_flowmap/eval_cosmos_progressive_stage2.py",
@@ -636,6 +710,14 @@ def build_policy_eval_plan(
     checkpoint_dir = validate_owned_policy_checkpoint(
         root=root, checkpoint_dir=checkpoint_dir
     )
+    artifact_paths = validate_policy_eval_artifact_isolation(
+        root=root,
+        checkpoint_dir=checkpoint_dir,
+        protocol_source_root=protocol_source_root,
+        dataset_path=dataset_path,
+        teacher_model_path=teacher_model_path,
+        stage1_checkpoint=stage1_checkpoint,
+    )
     selection_manifest = protocol_source_root / "selection_manifest.json"
     eval_pairs = protocol_source_root / "eval_pairs.json"
     eval_plans = build_multibudget_eval_plans(
@@ -662,11 +744,7 @@ def build_policy_eval_plan(
         "teacher_model_path": teacher_model_path,
         "python_executable": python_executable,
         "checkpoint_dir": checkpoint_dir,
-        "selection_proxy_path": root
-        / "metrics"
-        / "selection"
-        / checkpoint_dir.name
-        / "selection_proxy.json",
+        "selection_proxy_path": artifact_paths["selection proxy"],
         "eval_plans": eval_plans,
     }
 

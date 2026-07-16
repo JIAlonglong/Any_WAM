@@ -70,7 +70,12 @@ Stage-1 checkpoint, but it still validates the explicit `--stage1-checkpoint`
 or the launcher default as immutable to prevent an eval root from ever writing
 into that source tree. The eval launcher also canonicalizes the selected
 `ROOT_BASE/<policy>` directory and repeats this check before it creates a log
-or worker, so a policy-path symlink into an immutable source is rejected.
+or worker, so a policy-path symlink into an immutable source is rejected. It
+also resolves the eval metrics directory, all S1/S2/S4 JSONs, selection proxy,
+and both terminal markers before a reservation, log, or worker is created;
+each must remain under that policy root and disjoint from all immutable inputs.
+Thus a nested `metrics` or leaf-artifact symlink cannot redirect an eval write
+into Stage-1, protocol, dataset, or teacher files.
 
 ## Future preflight command
 
@@ -182,6 +187,8 @@ The eval launcher forwards the canonical Stage-1 path to the eval-only runner
 for provenance and revalidation; it is not a training resume input. Before an
 eval subprocess can run, the public executor verifies that path, the exact
 approved S1/S2/S4 plan, the t4/t4/t8 cache mapping, the owned
-`selection_proxy.json` destination, and the resolved Python executable that
-generated the evaluator argv. A malformed in-memory plan therefore fails
-before it can redirect output or invoke a different command.
+`selection_proxy.json` destination, and every resolved eval artifact/terminal
+marker. It binds evaluator `argv[0]` to the trusted Python executable of the
+current runner process rather than mutable in-memory plan metadata. A malformed
+plan therefore fails before it can redirect output or invoke a different
+command.

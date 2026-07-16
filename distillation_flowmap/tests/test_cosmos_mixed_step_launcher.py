@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -34,12 +35,27 @@ def _eval_plan(tmp_path: Path, **overrides):
         "protocol_source_root": tmp_path / "shared_protocol",
         "teacher_model_path": tmp_path / "teacher",
         "stage1_checkpoint": tmp_path / "stage1",
-        "python_executable": "/tmp/python",
+        "python_executable": sys.executable,
         "eval_device_list": "6",
         "eval_worker_device_list": "7",
     }
     defaults.update(overrides)
     return build_policy_eval_plan(**defaults)
+
+
+def _materialize_eval_execution_inputs(plan) -> None:
+    checkpoint = Path(plan["checkpoint_dir"])
+    transformer = checkpoint / "online_student" / "transformer"
+    transformer.mkdir(parents=True, exist_ok=True)
+    (transformer / "config.json").write_text("{}", encoding="utf-8")
+    protocol = Path(plan["protocol_source_root"])
+    protocol.mkdir(parents=True, exist_ok=True)
+    (protocol / "selection_manifest.json").write_text(
+        json.dumps({"records": []}), encoding="utf-8"
+    )
+    (protocol / "eval_pairs.json").write_text(
+        json.dumps({"pairs": [{"pair_id": "pair0"}]}), encoding="utf-8"
+    )
 
 
 def _launcher_source() -> str:
@@ -62,7 +78,7 @@ def test_eval_only_plan_owns_its_checkpoint_and_contains_only_three_budget_evalu
     assert plan["policy"]["name"] == "universe"
     assert plan["checkpoint_dir"] == tmp_path / "universe" / "checkpoints" / "step_5000"
     assert plan["stage1_checkpoint"] == tmp_path / "stage1"
-    assert plan["python_executable"] == Path("/tmp/python")
+    assert plan["python_executable"] == Path(sys.executable).resolve()
     assert "train_argv" not in plan
     assert [item["budget"] for item in plan["eval_plans"]] == ["s1", "s2", "s4"]
     assert [item["cache_dir"].name for item in plan["eval_plans"]] == ["t4", "t4", "t8"]
@@ -88,6 +104,17 @@ def test_eval_plan_rejects_a_canonical_policy_symlink_to_the_stage1_source(tmp_p
             root=policy_root_link,
             stage1_checkpoint=stage1,
         )
+
+
+def test_eval_plan_rejects_a_nested_metrics_symlink_to_the_stage1_source(tmp_path):
+    root = tmp_path / "universe"
+    _write_policy_manifest(root)
+    stage1 = tmp_path / "stage1"
+    stage1.mkdir()
+    (root / "metrics").symlink_to(stage1, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="must resolve under policy root"):
+        _eval_plan(tmp_path, root=root, stage1_checkpoint=stage1)
 
 
 @pytest.mark.parametrize("checkpoint_name", ["5000", "step_+1", "step_-1", "step_1.0", "step_"])
@@ -176,12 +203,20 @@ def test_eval_only_executor_invokes_only_evaluator_argvs_with_no_real_subprocess
         lambda plan: plan.__setitem__(
             "selection_proxy_path", plan["root"] / "metrics" / "other" / "selection_proxy.json"
         ),
+        lambda plan: (
+            plan.__setitem__("python_executable", Path("/tmp/fake-python")),
+            [
+                eval_plan["argv"].__setitem__(0, "/tmp/fake-python")
+                for eval_plan in plan["eval_plans"]
+            ],
+        ),
     ],
 )
 def test_eval_only_executor_rejects_programmatic_nonapproved_plans_before_subprocess(
     tmp_path, monkeypatch, mutate_plan
 ):
     plan = _eval_plan(tmp_path)
+    _materialize_eval_execution_inputs(plan)
     mutate_plan(plan)
     calls = []
     monkeypatch.setattr(
@@ -189,8 +224,35 @@ def test_eval_only_executor_rejects_programmatic_nonapproved_plans_before_subpro
         "run",
         lambda argv, **kwargs: calls.append((list(argv), kwargs)),
     )
+    monkeypatch.setattr(
+        mixed_runner,
+        "_write_selection_proxy",
+        lambda passed_plan: passed_plan["selection_proxy_path"],
+    )
 
     with pytest.raises(ValueError, match="approved evaluator-only contract"):
+        execute_policy_eval_plan(plan)
+
+    assert calls == []
+
+
+def test_custom_python_eval_plan_can_be_printed_but_never_executes(tmp_path, monkeypatch):
+    plan = _eval_plan(tmp_path, python_executable="/tmp/print-only-python")
+    assert plan["python_executable"] == Path("/tmp/print-only-python")
+    _materialize_eval_execution_inputs(plan)
+    calls = []
+    monkeypatch.setattr(
+        mixed_runner.subprocess,
+        "run",
+        lambda argv, **kwargs: calls.append((list(argv), kwargs)),
+    )
+    monkeypatch.setattr(
+        mixed_runner,
+        "_write_selection_proxy",
+        lambda passed_plan: passed_plan["selection_proxy_path"],
+    )
+
+    with pytest.raises(ValueError, match="intended Python executable"):
         execute_policy_eval_plan(plan)
 
     assert calls == []
@@ -207,6 +269,32 @@ def test_eval_only_executor_revalidates_stage1_source_before_subprocess(tmp_path
     )
 
     with pytest.raises(ValueError, match="Stage-1"):
+        execute_policy_eval_plan(plan)
+
+    assert calls == []
+
+
+def test_eval_only_executor_revalidates_nested_metrics_symlink_before_subprocess(
+    tmp_path, monkeypatch
+):
+    plan = _eval_plan(tmp_path)
+    _materialize_eval_execution_inputs(plan)
+    stage1 = Path(plan["stage1_checkpoint"])
+    stage1.mkdir()
+    (Path(plan["root"]) / "metrics").symlink_to(stage1, target_is_directory=True)
+    calls = []
+    monkeypatch.setattr(
+        mixed_runner.subprocess,
+        "run",
+        lambda argv, **kwargs: calls.append((list(argv), kwargs)),
+    )
+    monkeypatch.setattr(
+        mixed_runner,
+        "_write_selection_proxy",
+        lambda passed_plan: passed_plan["selection_proxy_path"],
+    )
+
+    with pytest.raises(ValueError, match="must resolve under policy root"):
         execute_policy_eval_plan(plan)
 
     assert calls == []
@@ -331,4 +419,16 @@ def test_launcher_eval_rechecks_canonical_policy_root_and_forwards_stage1_source
     assert '"--stage1-checkpoint" "$STAGE1_CHECKPOINT"' in evaluation
     assert evaluation.index('policy_root="$(canonical_directory') < evaluation.index(
         "assert_root_base_input_isolation"
+    ) < evaluation.index("prepare_artifact_paths")
+
+
+def test_launcher_eval_guards_nested_metrics_outputs_and_terminal_markers_before_writes():
+    source = _launcher_source()
+    evaluation = _function_body(source, "start_eval", "main")
+
+    assert "assert_eval_artifact_paths_isolated" in source
+    assert '"$metrics_dir" "$selection_proxy"' in evaluation
+    assert '"$eval_complete_marker" "$eval_failed_marker"' in evaluation
+    assert evaluation.index("assert_eval_artifact_paths_isolated") < evaluation.index(
+        "ensure_marker_absent"
     ) < evaluation.index("prepare_artifact_paths")

@@ -696,6 +696,10 @@ start_eval() {
     local root_base="$ROOT_BASE"
     local policy_root
     policy_root="$(canonical_directory "$root_base/$policy")"
+    assert_launcher_owned_write_paths_isolated \
+        "$root_base" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
+        "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT" \
+        "$policy_root"
     assert_root_base_input_isolation \
         "$policy_root" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
         "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT"

@@ -460,6 +460,67 @@ def test_launcher_eval_rechecks_canonical_policy_root_and_forwards_stage1_source
     ) < evaluation.index("prepare_artifact_paths")
 
 
+def test_launcher_eval_rejects_external_policy_root_symlink_before_reservation_or_artifacts(
+    tmp_path,
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    immutable_sources = {
+        "protocol": tmp_path / "protocol",
+        "dataset": tmp_path / "dataset",
+        "teacher": tmp_path / "teacher",
+        "stage1": tmp_path / "stage1",
+    }
+    for source in immutable_sources.values():
+        source.mkdir()
+    external_policy_root = tmp_path / "external-output" / "universe"
+    checkpoint = external_policy_root / "checkpoints" / "step_5000"
+    checkpoint.mkdir(parents=True)
+    _write_policy_manifest(external_policy_root)
+    (root / "universe").symlink_to(external_policy_root, target_is_directory=True)
+    (tmp_path / "run_cosmos_mixed_step_policy.py").write_text(
+        "# pure shell-harness runner stub\n", encoding="utf-8"
+    )
+
+    result = _run_pure_launcher_write_helper(
+        tmp_path,
+        root=root,
+        protocol=immutable_sources["protocol"],
+        dataset=immutable_sources["dataset"],
+        teacher=immutable_sources["teacher"],
+        stage1=immutable_sources["stage1"],
+        invocation=(
+            f"PYTHON_BIN={shlex.quote(sys.executable)}\n"
+            "reserve_operation() { printf 'reservation reached\\n' >&2; exit 99; }\n"
+            "prepare_artifact_paths() { printf 'artifact setup reached\\n' >&2; exit 99; }\n"
+            "write_worker_script() { printf 'worker write reached\\n' >&2; exit 99; }\n"
+            'start_eval "universe" "$ROOT_BASE/universe/checkpoints/step_5000"'
+        ),
+    )
+
+    assert result.returncode == 2
+    assert "Launcher write destination must resolve under ROOT_BASE" in result.stderr
+    assert "reservation reached" not in result.stderr
+    assert "artifact setup reached" not in result.stderr
+    assert "worker write reached" not in result.stderr
+    assert not (root / ".cosmos_mixed_step_reservations").exists()
+    assert not (root / "logs").exists()
+
+
+def test_launcher_eval_checks_resolved_policy_root_ownership_before_checkpoint_work():
+    source = _launcher_source()
+    evaluation = _function_body(source, "start_eval", "main")
+
+    policy_root_index = evaluation.index('policy_root="$(canonical_directory')
+    assert "assert_launcher_owned_write_paths_isolated" in evaluation
+    ownership_guard_index = evaluation.index(
+        "assert_launcher_owned_write_paths_isolated", policy_root_index
+    )
+    checkpoint_index = evaluation.index('checkpoint="$(canonical_directory')
+    assert '"$policy_root"' in evaluation[ownership_guard_index:checkpoint_index]
+    assert policy_root_index < ownership_guard_index < checkpoint_index
+
+
 def test_launcher_eval_guards_nested_metrics_outputs_and_terminal_markers_before_writes():
     source = _launcher_source()
     evaluation = _function_body(source, "start_eval", "main")

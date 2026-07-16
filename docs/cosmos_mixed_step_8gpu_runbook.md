@@ -77,6 +77,11 @@ each must remain under that policy root and disjoint from all immutable inputs.
 Thus a nested `metrics` or leaf-artifact symlink cannot redirect an eval write
 into Stage-1, protocol, dataset, or teacher files.
 
+The canonicalized `ROOT_BASE/<policy>` itself must also remain beneath canonical
+`ROOT_BASE`; an external policy-directory symlink is rejected before checkpoint,
+marker, reservation, log, or worker processing, even when its target is not an
+immutable input.
+
 The same resolved-path boundary applies to launcher-owned setup artifacts for
 preflight, full policy runs, and eval-only runs. Before any reservation `mkdir`,
 log-directory `mkdir`, generated worker-script redirection, or log-file

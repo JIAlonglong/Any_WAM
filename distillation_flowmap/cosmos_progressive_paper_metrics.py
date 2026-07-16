@@ -99,10 +99,11 @@ def merge_task_records(records: Iterable[Mapping[str, Any]]):
     for record in records:
         if not isinstance(record, Mapping):
             raise ValueError("records must be mappings")
-        task_value = _identity_value(record, "task")
-        task = str(task_value)
+        task = _identity_value(record, "task")
+        if not isinstance(task, str):
+            raise ValueError("record task identity must be a non-empty string")
         identity = (
-            task_value,
+            task,
             _identity_value(record, "record_index"),
             _identity_value(record, "pair_id"),
         )

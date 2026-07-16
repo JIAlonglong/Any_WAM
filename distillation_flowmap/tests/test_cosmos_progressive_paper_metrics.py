@@ -100,6 +100,20 @@ def test_merge_task_records_macro_averages_task_means_and_preserves_leaf_names()
     }
 
 
+def test_merge_task_records_rejects_non_string_task_before_key_coercion():
+    numeric_task_record = {
+        "task": 1,
+        "record_index": 0,
+        "pair_id": "pair-a",
+        "metrics": {"g_anchor/node_750": 1.0},
+    }
+    string_task_record = dict(numeric_task_record)
+    string_task_record["task"] = "1"
+
+    with pytest.raises(ValueError, match="task.*non-empty string"):
+        merge_task_records([numeric_task_record, string_task_record])
+
+
 @pytest.mark.parametrize("identity_field", ("task", "record_index", "pair_id"))
 def test_merge_task_records_rejects_missing_identity(identity_field):
     record = {

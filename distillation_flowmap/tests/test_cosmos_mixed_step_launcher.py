@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import shlex
+import subprocess
 import sys
 
 import pytest
@@ -61,6 +63,42 @@ def _materialize_eval_execution_inputs(plan) -> None:
 def _launcher_source() -> str:
     assert LAUNCHER_PATH.is_file(), "Task 3 launcher has not been created"
     return LAUNCHER_PATH.read_text(encoding="utf-8")
+
+
+def _run_pure_launcher_write_helper(
+    tmp_path: Path,
+    *,
+    root: Path,
+    protocol: Path,
+    dataset: Path,
+    teacher: Path,
+    stage1: Path,
+    invocation: str,
+) -> subprocess.CompletedProcess[str]:
+    """Exercise only a copied shell helper, never the launcher's main entrypoint."""
+    footer = '\ntrap launcher_exit_cleanup EXIT\nmain "$@"\n'
+    source = _launcher_source()
+    assert source.endswith(footer)
+    harness = tmp_path / "pure_launcher_write_guard.sh"
+    harness.write_text(
+        source.removesuffix(footer)
+        + "\n"
+        + f"ROOT_BASE={shlex.quote(str(root))}\n"
+        + f"PROTOCOL_SOURCE_ROOT={shlex.quote(str(protocol))}\n"
+        + f"DATASET_PATH={shlex.quote(str(dataset))}\n"
+        + f"TEACHER_MODEL_PATH={shlex.quote(str(teacher))}\n"
+        + f"STAGE1_CHECKPOINT={shlex.quote(str(stage1))}\n"
+        + "mkdir() { printf 'mkdir reached\\n' >&2; exit 99; }\n"
+        + invocation
+        + "\n",
+        encoding="utf-8",
+    )
+    return subprocess.run(
+        ["bash", str(harness)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def _function_body(source: str, name: str, next_name: str) -> str:
@@ -432,3 +470,76 @@ def test_launcher_eval_guards_nested_metrics_outputs_and_terminal_markers_before
     assert evaluation.index("assert_eval_artifact_paths_isolated") < evaluation.index(
         "ensure_marker_absent"
     ) < evaluation.index("prepare_artifact_paths")
+
+
+@pytest.mark.parametrize(
+    ("symlink_name", "target_name", "invocation"),
+    [
+        (
+            "logs",
+            "stage1",
+            'prepare_artifact_paths "$ROOT_BASE" "guard-session"',
+        ),
+        (
+            ".cosmos_mixed_step_reservations",
+            "protocol",
+            'reserve_operation "$ROOT_BASE" "preflight" "$ROOT_BASE/PREFLIGHT_FAILED"',
+        ),
+    ],
+)
+def test_launcher_rejects_symlinked_owned_write_roots_before_any_mkdir(
+    tmp_path, symlink_name, target_name, invocation
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    immutable_sources = {
+        "protocol": tmp_path / "protocol",
+        "dataset": tmp_path / "dataset",
+        "teacher": tmp_path / "teacher",
+        "stage1": tmp_path / "stage1",
+    }
+    for source in immutable_sources.values():
+        source.mkdir()
+    target = immutable_sources[target_name]
+    (root / symlink_name).symlink_to(target, target_is_directory=True)
+
+    result = _run_pure_launcher_write_helper(
+        tmp_path,
+        root=root,
+        protocol=immutable_sources["protocol"],
+        dataset=immutable_sources["dataset"],
+        teacher=immutable_sources["teacher"],
+        stage1=immutable_sources["stage1"],
+        invocation=invocation,
+    )
+
+    assert result.returncode == 2
+    assert "Launcher write destination must resolve under ROOT_BASE" in result.stderr
+    assert "mkdir reached" not in result.stderr
+    assert not any(target.iterdir())
+
+
+def test_launcher_rechecks_all_owned_write_destinations_before_any_mkdir_or_redirection():
+    source = _launcher_source()
+    training_validation = _function_body(source, "validate_training_inputs", "validate_eval_inputs")
+    eval_validation = _function_body(source, "validate_eval_inputs", "write_marker_once")
+    reservation = _function_body(source, "reserve_operation", "transfer_active_reservation_to_worker")
+    artifacts = _function_body(source, "prepare_artifact_paths", "write_worker_script")
+    worker = _function_body(source, "write_worker_script", "launch_tmux_session")
+
+    assert "assert_launcher_owned_write_paths_isolated" in source
+    for validation in (training_validation, eval_validation):
+        assert validation.index("assert_launcher_owned_write_paths_isolated") < validation.index(
+            'require_program "$PYTHON_BIN"'
+        )
+    assert '"$reservation_root"' in reservation
+    assert '"$log_dir" "$LOG_FILE" "$WORKER_SCRIPT"' in artifacts
+    assert reservation.index("assert_launcher_owned_write_paths_isolated") < reservation.index(
+        'mkdir -p "$reservation_root"'
+    )
+    assert artifacts.index("assert_launcher_owned_write_paths_isolated") < artifacts.index(
+        'mkdir -p "$log_dir"'
+    )
+    assert worker.index("assert_launcher_owned_write_paths_isolated") < worker.index(
+        ': > "$log_file"'
+    ) < worker.index('} > "$worker_script"')

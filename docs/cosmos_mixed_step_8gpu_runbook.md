@@ -77,6 +77,14 @@ each must remain under that policy root and disjoint from all immutable inputs.
 Thus a nested `metrics` or leaf-artifact symlink cannot redirect an eval write
 into Stage-1, protocol, dataset, or teacher files.
 
+The same resolved-path boundary applies to launcher-owned setup artifacts for
+preflight, full policy runs, and eval-only runs. Before any reservation `mkdir`,
+log-directory `mkdir`, generated worker-script redirection, or log-file
+redirection, the launcher validates its reservation root, `logs` directory,
+exact log file, and exact worker script beneath canonical `ROOT_BASE` and
+against the immutable inputs. Existing `logs` or reservation-root symlinks into
+an input tree are rejected before any launcher write is reached.
+
 ## Future preflight command
 
 After the above paths are confirmed, the following is the intended form.  It

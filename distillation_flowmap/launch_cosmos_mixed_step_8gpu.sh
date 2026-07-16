@@ -225,6 +225,33 @@ resolve_path_maybe_missing() {
 }
 
 
+assert_launcher_owned_write_paths_isolated() {
+    local root_base="$1"
+    local protocol_source_root="$2"
+    local dataset_path="$3"
+    local teacher_model_path="$4"
+    local stage1_checkpoint="$5"
+    shift 5
+    local canonical_root_base
+    canonical_root_base="$(resolve_path_maybe_missing "$root_base")"
+    protocol_source_root="$(resolve_path_maybe_missing "$protocol_source_root")"
+    dataset_path="$(resolve_path_maybe_missing "$dataset_path")"
+    teacher_model_path="$(resolve_path_maybe_missing "$teacher_model_path")"
+    stage1_checkpoint="$(resolve_path_maybe_missing "$stage1_checkpoint")"
+    local destination=""
+    local resolved_destination=""
+    for destination in "$@"; do
+        resolved_destination="$(resolve_path_maybe_missing "$destination")"
+        if [[ "$resolved_destination" != "$canonical_root_base" && "$resolved_destination" != "$canonical_root_base"/* ]]; then
+            die "Launcher write destination must resolve under ROOT_BASE: destination=$resolved_destination root=$canonical_root_base"
+        fi
+        assert_root_base_input_isolation \
+            "$resolved_destination" "$protocol_source_root" "$dataset_path" \
+            "$teacher_model_path" "$stage1_checkpoint"
+    done
+}
+
+
 assert_eval_artifact_paths_isolated() {
     local policy_root="$1"
     local protocol_source_root="$2"
@@ -261,6 +288,11 @@ validate_training_inputs() {
     assert_root_base_input_isolation \
         "$ROOT_BASE" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
         "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT"
+    require_program realpath
+    assert_launcher_owned_write_paths_isolated \
+        "$ROOT_BASE" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
+        "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT" \
+        "$ROOT_BASE/$RESERVATION_ROOT_NAME" "$ROOT_BASE/logs"
     require_program "$PYTHON_BIN"
     require_program "$TORCHRUN_BIN"
     [[ -f "$RUNNER_PATH" ]] || die "Missing mixed-step runner: $RUNNER_PATH"
@@ -282,8 +314,12 @@ validate_eval_inputs() {
     assert_root_base_input_isolation \
         "$ROOT_BASE" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
         "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT"
-    require_program "$PYTHON_BIN"
     require_program realpath
+    assert_launcher_owned_write_paths_isolated \
+        "$ROOT_BASE" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
+        "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT" \
+        "$ROOT_BASE/$RESERVATION_ROOT_NAME" "$ROOT_BASE/logs"
+    require_program "$PYTHON_BIN"
     [[ -f "$RUNNER_PATH" ]] || die "Missing mixed-step runner: $RUNNER_PATH"
     [[ -n "$EVAL_DEVICE_LIST" && -n "$EVAL_WORKER_DEVICE_LIST" ]] || die \
         "Evaluation device lists must be non-empty"
@@ -341,6 +377,10 @@ reserve_operation() {
     [[ "$operation_id" =~ ^[a-z0-9_-]+$ ]] || die "Invalid reservation operation identity: $operation_id"
     local reservation_root="$root_base/$RESERVATION_ROOT_NAME"
     local reservation_dir="$reservation_root/$operation_id"
+    assert_launcher_owned_write_paths_isolated \
+        "$root_base" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
+        "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT" \
+        "$reservation_root"
     mkdir -p "$reservation_root"
     if ! mkdir "$reservation_dir"; then
         die "Operation already has an in-flight reservation: $operation_id ($reservation_dir)"
@@ -369,6 +409,11 @@ prepare_artifact_paths() {
     local log_dir="$root_base/logs"
     LOG_FILE="$log_dir/${session_name}.log"
     WORKER_SCRIPT="$log_dir/${session_name}.worker.sh"
+    assert_launcher_owned_write_paths_isolated \
+        "$root_base" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
+        "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT" \
+        "$root_base/$RESERVATION_ROOT_NAME" \
+        "$log_dir" "$LOG_FILE" "$WORKER_SCRIPT"
     [[ ! -e "$LOG_FILE" && ! -L "$LOG_FILE" ]] || die "Refusing to overwrite log: $LOG_FILE"
     [[ ! -e "$WORKER_SCRIPT" && ! -L "$WORKER_SCRIPT" ]] || die \
         "Refusing to overwrite worker script: $WORKER_SCRIPT"
@@ -387,6 +432,13 @@ write_worker_script() {
     local selection_proxy="$8"
     shift 8
     local -a runner_argv=("$@")
+    local log_dir
+    log_dir="$(dirname "$log_file")"
+    assert_launcher_owned_write_paths_isolated \
+        "$ROOT_BASE" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
+        "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT" \
+        "$ROOT_BASE/$RESERVATION_ROOT_NAME" \
+        "$log_dir" "$log_file" "$worker_script"
 
     ensure_marker_absent "$success_marker"
     ensure_marker_absent "$failure_marker"

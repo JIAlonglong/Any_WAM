@@ -32,3 +32,22 @@ def test_video_eval_does_not_eager_load_vae_before_student_rollout():
     student_rollout = source.index("trainer._student_euler_integrate(")
 
     assert first_load_vae > student_rollout
+
+
+def test_video_eval_teacher_action_metrics_are_opt_in_and_use_teacher_endpoint():
+    source = _video_eval_source()
+
+    flag_index = source.index('"--emit-teacher-action-gt"')
+    next_arg = source.index("args = parser.parse_args()", flag_index)
+    flag_block = source[flag_index:next_arg]
+    teacher_rollout = source.index("trainer._teacher_integrate_to_r(")
+    teacher_action_query = source.index("trainer._teacher_forward_at_student_state(")
+
+    assert 'action="store_true"' in flag_block
+    assert teacher_action_query > teacher_rollout
+    assert "teacher_x_r," in source[teacher_action_query:teacher_action_query + 240]
+    assert 'action_input_dict=student_input["action_dict"]' in source
+    assert "action_frames=action_frames" in source
+    assert "if args.emit_teacher_action_gt:" in source
+    assert "for name, value in teacher_action_metrics.items()" in source
+    assert "action_teacher_gt_xr_mse" in source

@@ -165,6 +165,50 @@ def masked_mse_l1(diff, mask):
             (diff.float().abs() * mask).sum() / denom)
 
 
+def apply_rollout_student_choice(cfg, choice: str) -> str:
+    if choice == "online":
+        cfg.resume_online_from_target = False
+    elif choice == "target":
+        cfg.resume_online_from_target = True
+    elif choice != "config":
+        raise ValueError(f"unsupported rollout student: {choice}")
+    return "target" if cfg.resume_online_from_target else "online"
+
+
+def validate_teacher_action_cache_compatibility(
+    emit_teacher_action_gt: bool, teacher_cache_path: Path | None
+) -> None:
+    if emit_teacher_action_gt and teacher_cache_path is not None:
+        raise ValueError(
+            "teacher action ground-truth metrics require a live teacher and cannot "
+            "be used with --teacher-cache-path"
+        )
+
+
+def compute_teacher_action_gt_metrics(
+    teacher_action_v,
+    action_noisy_t,
+    action_noisy_r,
+    action_v_target,
+    sigma_t,
+    sigma_r,
+    action_mask,
+):
+    teacher_xr = action_noisy_t + teacher_action_v * (sigma_r - sigma_t)
+    teacher_xr_mse, teacher_xr_l1 = masked_mse_l1(
+        teacher_xr - action_noisy_r, action_mask
+    )
+    teacher_v_mse, teacher_v_l1 = masked_mse_l1(
+        teacher_action_v - action_v_target, action_mask
+    )
+    return {
+        "action_teacher_gt_xr_mse": teacher_xr_mse,
+        "action_teacher_gt_xr_l1": teacher_xr_l1,
+        "action_teacher_gt_v_mse": teacher_v_mse,
+        "action_teacher_gt_v_l1": teacher_v_l1,
+    }
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
@@ -184,6 +228,15 @@ def main():
     parser.add_argument("--split-name", default=None)
     parser.add_argument("--student-steps", nargs="+", type=int, default=[1, 2, 4])
     parser.add_argument("--teacher-steps", nargs="+", type=int, default=[4])
+    parser.add_argument(
+        "--rollout-student",
+        choices=("config", "online", "target"),
+        default="config",
+        help=(
+            "Checkpoint weights loaded into the rollout student. config preserves "
+            "the config's resume_online_from_target setting."
+        ),
+    )
     parser.add_argument(
         "--load-target-student",
         action="store_true",
@@ -231,6 +284,14 @@ def main():
         help="Path to a CPU teacher-target cache. If it exists, teacher loading is skipped.",
     )
     parser.add_argument(
+        "--emit-teacher-action-gt",
+        action="store_true",
+        help=(
+            "Report teacher-action-to-ground-truth metrics at the teacher video "
+            "endpoint. Requires a live teacher, not --teacher-cache-path."
+        ),
+    )
+    parser.add_argument(
         "--teacher-cache-only",
         action="store_true",
         help="Only compute and save teacher rollout targets, then exit before student eval.",
@@ -263,6 +324,10 @@ def main():
         help="Query the teacher at each student terminal state for a true local velocity error.",
     )
     args = parser.parse_args()
+    teacher_cache_path = Path(args.teacher_cache_path) if args.teacher_cache_path else None
+    validate_teacher_action_cache_compatibility(
+        args.emit_teacher_action_gt, teacher_cache_path
+    )
     teacher_steps = normalize_rollout_steps(args.teacher_steps)
     student_steps = normalize_rollout_steps(args.student_steps)
     trajectory_teacher_steps = normalize_rollout_steps(args.trajectory_teacher_steps)
@@ -283,7 +348,6 @@ def main():
     world_size = int(os.getenv("WORLD_SIZE", 1))
     init_distributed(world_size, local_rank, rank)
 
-    teacher_cache_path = Path(args.teacher_cache_path) if args.teacher_cache_path else None
     teacher_cache_payload = None
     teacher_cache_compatible = False
     if (
@@ -358,6 +422,7 @@ def main():
     teacher_cache_to_write = {}
 
     cfg = importlib.import_module(args.config).cfg
+    rollout_source_resolved = apply_rollout_student_choice(cfg, args.rollout_student)
     cfg.rank = rank
     cfg.local_rank = local_rank
     cfg.world_size = world_size
@@ -773,6 +838,52 @@ def main():
                         teacher_step, teacher_x_r, teacher_v_r, teacher_trajectory
                     )
 
+                teacher_action_metrics = None
+                if args.emit_teacher_action_gt:
+                    action_frames = batch["actions"].shape[2] // action_ds
+                    action_noisy_t_ds = action_noisy_t[:, :, ::action_ds]
+                    action_noisy_r_ds = action_noisy_r[:, :, ::action_ds]
+                    action_v_target_ds = action_v_target_t[:, :, ::action_ds]
+                    action_sigma_t = (
+                        action_t[:, None, ::action_ds, None, None]
+                        / trainer.config.num_train_timesteps
+                    )
+                    action_sigma_r = (
+                        action_r[:, None, ::action_ds, None, None]
+                        / trainer.config.num_train_timesteps
+                    )
+                    mask = batch.get("actions_mask")
+                    mask_ds = mask[:, :, ::action_ds] if mask is not None else None
+                    _, _, teacher_action_v = trainer._teacher_forward_at_student_state(
+                        teacher_x_r,
+                        video_r,
+                        input_dict,
+                        empty_emb,
+                        args.cfg_scale,
+                        ref_shape,
+                        B,
+                        action_input_dict=student_input["action_dict"],
+                        action_frames=action_frames,
+                    )
+                    teacher_action_metrics = compute_teacher_action_gt_metrics(
+                        teacher_action_v,
+                        action_noisy_t_ds,
+                        action_noisy_r_ds,
+                        action_v_target_ds,
+                        action_sigma_t.to(teacher_action_v),
+                        action_sigma_r.to(teacher_action_v),
+                        mask_ds,
+                    )
+                    del (
+                        teacher_action_v,
+                        action_noisy_t_ds,
+                        action_noisy_r_ds,
+                        action_v_target_ds,
+                        action_sigma_t,
+                        action_sigma_r,
+                        mask_ds,
+                    )
+
                 for k_steps, student_result in student_rollouts.items():
                     prefix = f"rollout_eval/{pair_name}/s{k_steps}_t{teacher_step}"
                     mse, l1 = masked_video_mse_l1(
@@ -808,9 +919,12 @@ def main():
                         )
                         add(prefix + "/video_rollout_drift_mse", drift["mse"])
                         add(prefix + "/video_rollout_drift_l1", drift["l1"])
+                    if teacher_action_metrics is not None:
+                        for name, value in teacher_action_metrics.items():
+                            add(prefix + "/" + name, value)
                     for name, value in student_result["metrics"].items():
                         add(prefix + name, value)
-                del teacher_x_r, teacher_v_r, teacher_x_path
+                del teacher_x_r, teacher_v_r, teacher_x_path, teacher_action_metrics
 
             if args.eval_empty_cache:
                 teacher_x_r = teacher_v_r = None
@@ -852,7 +966,10 @@ def main():
     if args.teacher_cache_only:
         return
 
-    out = {}
+    out = {
+        "rollout_source_requested": args.rollout_student,
+        "rollout_source_resolved": rollout_source_resolved,
+    }
     for name, total in metrics.items():
         avg = total / max(1, counts[name])
         if dist.is_initialized():

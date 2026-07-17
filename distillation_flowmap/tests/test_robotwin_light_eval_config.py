@@ -39,3 +39,16 @@ def test_robotwin_stage2_exposes_grad_branch_diagnostics_env(monkeypatch):
     module = importlib.import_module("distillation_flowmap.config_robotwin_fullfinetune_stage2_anyflow")
 
     assert module.cfg.enable_grad_branch_diagnostics is True
+
+
+def test_robotwin_stage2_exposes_online_target_selection_env(monkeypatch):
+    for value, expected in (("0", False), ("1", True)):
+        monkeypatch.setenv("RESUME_ONLINE_FROM_TARGET", value)
+        sys.modules.pop("distillation_flowmap.config_robotwin_fullfinetune_stage1_warmup", None)
+        sys.modules.pop("distillation_flowmap.config_robotwin_fullfinetune_stage2_anyflow", None)
+
+        module = importlib.import_module(
+            "distillation_flowmap.config_robotwin_fullfinetune_stage2_anyflow"
+        )
+
+        assert module.cfg.resume_online_from_target is expected

@@ -550,6 +550,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    # A durable closed-loop result is keyed by a shared rollout seed.  Require
+    # it before constructing the student or raw Cosmos worker; stdio serving
+    # is intentionally seedless because it owns no environment trials.
+    if not args.serve_stdio and args.env_seed is None:
+        raise ValueError(
+            "--env-seed is required for live LIBERO rollout so every record has seed provenance"
+        )
+
     service, teacher = build_live_service(args)
     try:
         if args.serve_stdio:

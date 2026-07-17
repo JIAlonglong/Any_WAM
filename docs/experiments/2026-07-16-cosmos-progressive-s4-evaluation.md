@@ -5,20 +5,20 @@ Status: orchestration only. This document does not claim a completed live Cosmos
 
 ## Fixed artifact and no-overwrite policy
 
-Use only the published 9.515-GiB ModelScope transformer subtree:
+Use only the published 9.515-GiB ModelScope transformer subtree from
+`JIAlonglong/any-wam-cosmos-checkpoints` at revision
+`74a41530ca8966f9caf112f37b96efdb01297ce0`:
 
 ~~~text
 progressive_stage2_full/s4/step_5000/online_student/transformer
 ~~~
 
-The worktree does not pin a ModelScope model ID or revision. Obtain those two
-values from the approved release record; do not substitute a similarly named
-checkpoint or download a broad snapshot. Download only the subtree above into a
-new cache root, then set:
+Do not substitute a similarly named checkpoint or download a broad snapshot.
+Download only the subtree above into a new cache root, then set:
 
 ~~~bash
-export MODELSCOPE_S4_MODEL="<approved published ModelScope model ID>"
-export MODELSCOPE_S4_REVISION="<approved published revision>"
+export MODELSCOPE_S4_MODEL="JIAlonglong/any-wam-cosmos-checkpoints"
+export MODELSCOPE_S4_REVISION="74a41530ca8966f9caf112f37b96efdb01297ce0"
 export MODELSCOPE_S4_CACHE="<new empty local cache directory>"
 
 # Use the approved ModelScope client/API with an allow-pattern restricted to:

@@ -406,6 +406,25 @@ def test_live_runtime_preflight_rejects_non_cu128_cosmos_python(tmp_path, monkey
         )
 
 
+def test_live_cli_requires_seed_before_constructing_service(monkeypatch):
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    def unexpected_service_construction(_args):
+        raise AssertionError("live service construction must not run without --env-seed")
+
+    monkeypatch.setattr(rollout, "build_live_service", unexpected_service_construction)
+
+    with pytest.raises(ValueError, match="--env-seed is required"):
+        rollout.main(
+            [
+                "--checkpoint-transformer",
+                "/tmp/s4-transformer",
+                "--prompt-table",
+                "/tmp/training-prompt-table.pt",
+            ]
+        )
+
+
 def test_s4_action_encoder_preserves_sixteen_decodable_actions_after_downsample():
     from evaluation.libero.rollout_cosmos_progressive_s4 import FlowMapActionAnchorEncoder
 

@@ -19,7 +19,8 @@ def test_video_eval_defaults_to_cpu_video_decode():
 def test_video_eval_forces_checkpoint_safe_rollout_path():
     source = _video_eval_source()
 
-    assert "cfg.offline_eval_force_gradient_checkpointing = True" in source
+    assert "cfg.offline_eval_force_gradient_checkpointing = not args.disable_eval_gradient_checkpointing" in source
+    assert "--disable-eval-gradient-checkpointing" in source
     assert "torch.enable_grad()" in source
     assert "student_action_v = student_action_v.detach()" in source
 

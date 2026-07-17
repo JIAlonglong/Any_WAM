@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import distillation_flowmap.run_cosmos_mixed_step_policy as mixed_runner
 from distillation_flowmap.run_cosmos_mixed_step_policy import (
     DEFAULT_STAGE1_CHECKPOINT,
     LEGACY_PROGRESSIVE_ROOT,
@@ -10,9 +11,12 @@ from distillation_flowmap.run_cosmos_mixed_step_policy import (
     build_policy_manifest_payload,
     build_policy_train_plan,
     build_torchrun_command,
+    copy_immutable_protocol_metadata,
     execute_policy_plan,
     parse_args,
     parse_device_list,
+    validate_preflight_selection_evidence,
+    validate_policy_eval_execution_contract,
     validate_policy_root,
 )
 
@@ -27,7 +31,7 @@ def _plan(tmp_path, **overrides):
         "root": root,
         "dataset_path": Path("/tmp/libero"),
         "protocol_source_root": tmp_path / "shared_protocol",
-        "stage1_checkpoint": Path("/tmp/stage1_step5000"),
+        "stage1_checkpoint": DEFAULT_STAGE1_CHECKPOINT,
         "current_step": 0,
         "chunk_size": 250,
         "max_train_steps": 5000,
@@ -41,6 +45,15 @@ def _plan(tmp_path, **overrides):
     }
     defaults.update(overrides)
     return build_policy_train_plan(**defaults)
+
+
+def _resume_manifest(policy_name: str = "universe", **overrides) -> dict:
+    payload = {
+        "policy": {"name": policy_name},
+        "source_checkpoint": str(DEFAULT_STAGE1_CHECKPOINT),
+    }
+    payload.update(overrides)
+    return payload
 
 
 @pytest.mark.parametrize(
@@ -62,10 +75,10 @@ def test_initial_independent_policy_plans_start_from_common_online_student(
     assert plan["policy"]["weights"] == pytest.approx(expected_weights)
     assert plan["output_dir"] == root
     assert plan["checkpoint_dir"] == root / "checkpoints" / "step_250"
-    assert plan["source_checkpoint"] == Path("/tmp/stage1_step5000")
+    assert plan["source_checkpoint"] == DEFAULT_STAGE1_CHECKPOINT
     assert plan["max_train_steps"] == 5000
     assert plan["save_interval"] == 250
-    assert plan["train_env"]["RESUME_FROM_PATH"] == "/tmp/stage1_step5000"
+    assert plan["train_env"]["RESUME_FROM_PATH"] == str(DEFAULT_STAGE1_CHECKPOINT)
     assert plan["train_env"]["RESUME_ONLINE_FROM_TARGET"] == "0"
     assert plan["train_env"]["RESET_RESUME_STEP"] == "1"
     assert plan["train_env"]["RESUME_OPTIMIZER_STATE"] == "0"
@@ -78,7 +91,7 @@ def test_initial_independent_policy_plans_start_from_common_online_student(
     assert plan["train_env"]["COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES"] == DEVICES
     assert "--nproc_per_node=8" in plan["train_argv"]
     assert "--master_port=29761" in plan["train_argv"]
-    assert plan["train_argv"][plan["train_argv"].index("--resume-from-path") + 1] == "/tmp/stage1_step5000"
+    assert plan["train_argv"][plan["train_argv"].index("--resume-from-path") + 1] == str(DEFAULT_STAGE1_CHECKPOINT)
     assert plan["train_argv"][plan["train_argv"].index("--gradient-accumulation-steps") + 1] == "1"
     assert all(eval_plan["env"]["COSMOS_PROGRESSIVE_STAGE"] == "s4" for eval_plan in plan["eval_plans"])
     assert all(eval_plan["env"]["COSMOS_MIXED_STEP_POLICY"] == policy_name for eval_plan in plan["eval_plans"])
@@ -91,11 +104,138 @@ def test_default_stage1_source_is_the_agreed_common_online_student_checkpoint():
     )
 
 
+def test_resume_manifest_must_retain_the_common_stage1_provenance(tmp_path):
+    root = tmp_path / "universe"
+    root.mkdir()
+    (root / "policy_manifest.json").write_text(
+        json.dumps(
+            _resume_manifest(source_checkpoint=str(tmp_path / "alternate_stage1"))
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="common Stage-1 source provenance"):
+        _plan(tmp_path, root=root, current_step=250, chunk_size=250)
+
+
+@pytest.mark.parametrize("nested_child", ["protocol", "metrics"])
+def test_train_plan_rejects_nested_owned_artifact_symlink_before_any_write(
+    tmp_path, nested_child
+):
+    root = tmp_path / "policy"
+    protocol_source = tmp_path / "shared_protocol"
+    root.mkdir()
+    protocol_source.mkdir()
+    (root / nested_child).symlink_to(protocol_source, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        _plan(tmp_path, root=root, protocol_source_root=protocol_source)
+
+
+def test_train_plan_rejects_existing_target_selection_proxy_without_overwrite(tmp_path):
+    root = tmp_path / "policy"
+    proxy = root / "metrics" / "selection" / "step_250" / "selection_proxy.json"
+    proxy.parent.mkdir(parents=True)
+    proxy.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="selection proxy"):
+        _plan(tmp_path, root=root)
+
+
+def test_protocol_copy_rechecks_nested_symlink_before_mkdir_or_copy(tmp_path):
+    plan = _plan(tmp_path)
+    source_root = Path(plan["protocol_source_root"])
+    source_root.mkdir()
+    for filename in mixed_runner._METADATA_FILENAMES:
+        (source_root / filename).write_text("{}", encoding="utf-8")
+    root = Path(plan["root"])
+    root.mkdir()
+    (root / "protocol").symlink_to(source_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        copy_immutable_protocol_metadata(plan)
+
+
+def test_train_eval_contract_allows_only_its_canonical_copied_protocol_metadata(tmp_path):
+    plan = _plan(tmp_path)
+
+    validate_policy_eval_execution_contract(
+        plan,
+        checkpoint_dir=plan["checkpoint_dir"],
+        protocol_metadata_root=plan["root"] / "protocol",
+    )
+    with pytest.raises(ValueError, match="canonical root/protocol"):
+        validate_policy_eval_execution_contract(
+            plan,
+            checkpoint_dir=plan["checkpoint_dir"],
+            protocol_metadata_root=plan["protocol_source_root"],
+        )
+    with pytest.raises(ValueError, match="canonical root/protocol"):
+        validate_policy_eval_execution_contract(
+            plan,
+            checkpoint_dir=plan["checkpoint_dir"],
+            protocol_metadata_root=tmp_path / "arbitrary_protocol",
+        )
+
+
+def _preflight_record(label: str) -> dict:
+    index, teacher_steps, student_steps = {
+        "s1": (0, 4, 1),
+        "s2": (1, 4, 2),
+        "s4": (2, 8, 4),
+    }[label]
+    return {
+        "policy_name": "universe",
+        "forced": True,
+        "pair_label": label,
+        "pair_index": index,
+        "teacher_steps": teacher_steps,
+        "student_steps": student_steps,
+    }
+
+
+def test_preflight_plan_sets_only_reviewed_auxiliary_overrides_and_forced_schedule(tmp_path):
+    plan = _plan(
+        tmp_path,
+        max_train_steps=9,
+        save_interval=9,
+        stop_after_step=9,
+        chunk_size=9,
+        force_sequence="s1,s2,s4,s1,s2,s4,s1,s2,s4",
+        preflight_evidence=True,
+        opd_aux_warmup_steps=0,
+        opd_aux_interval=1,
+    )
+
+    assert plan["preflight_evidence"] is True
+    assert plan["forced_indices"] == [0, 1, 2, 0, 1, 2, 0, 1, 2]
+    assert plan["train_env"]["OPD_AUX_WARMUP_STEPS"] == "0"
+    assert plan["train_env"]["OPD_AUX_INTERVAL"] == "1"
+    assert "OPD_AUX_WARMUP_STEPS" not in _plan(tmp_path / "full")["train_env"]
+    assert "OPD_AUX_INTERVAL" not in _plan(tmp_path / "full")["train_env"]
+
+
+def test_preflight_selection_evidence_requires_three_forced_rank_zero_records_per_mode(tmp_path):
+    path = tmp_path / "cosmos_mixed_step_opd.jsonl"
+    records = [_preflight_record(label) for _ in range(3) for label in ("s1", "s2", "s4")]
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+    assert validate_preflight_selection_evidence(path) == {"s1": 3, "s2": 3, "s4": 3}
+
+    path.write_text(json.dumps(_preflight_record("s1")) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="incomplete"):
+        validate_preflight_selection_evidence(path)
+
+    path.write_text("not-json\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Malformed"):
+        validate_preflight_selection_evidence(path)
+
+
 def test_resume_plan_uses_only_its_own_online_checkpoint_and_optimizer_state(tmp_path):
     root = tmp_path / "universe"
     (root / "policy_manifest.json").parent.mkdir(parents=True)
     (root / "policy_manifest.json").write_text(
-        json.dumps({"policy": {"name": "universe"}}), encoding="utf-8"
+        json.dumps(_resume_manifest()), encoding="utf-8"
     )
     plan = _plan(tmp_path, root=root, current_step=250, chunk_size=250)
 
@@ -127,7 +267,7 @@ def test_root_guard_rejects_an_ancestor_that_contains_the_legacy_root(tmp_path):
         validate_policy_root(legacy_root.parent, legacy_root=legacy_root)
 
 
-def test_policy_plan_rejects_output_overlap_with_protocol_and_stage1_sources(tmp_path):
+def test_policy_plan_rejects_output_overlap_with_protocol_source_and_alternate_stage1(tmp_path):
     protocol_source_root = tmp_path / "shared_protocol"
     with pytest.raises(ValueError, match="protocol source"):
         _plan(
@@ -137,7 +277,7 @@ def test_policy_plan_rejects_output_overlap_with_protocol_and_stage1_sources(tmp
         )
 
     stage1_checkpoint = tmp_path / "stage1" / "checkpoints" / "step_5000"
-    with pytest.raises(ValueError, match="Stage-1"):
+    with pytest.raises(ValueError, match="approved common Stage-1"):
         _plan(
             tmp_path,
             root=stage1_checkpoint.parents[1],
@@ -197,7 +337,7 @@ def test_resume_requires_a_matching_policy_manifest(tmp_path):
         _plan(tmp_path, **resume_kwargs)
 
     (root / "policy_manifest.json").write_text(
-        json.dumps({"policy": {"name": "universe"}}), encoding="utf-8"
+        json.dumps(_resume_manifest()), encoding="utf-8"
     )
     assert _plan(tmp_path, **resume_kwargs)["policy"]["name"] == "universe"
 
@@ -207,7 +347,7 @@ def test_execute_revalidates_resume_manifest_before_any_subprocess(tmp_path):
     root.mkdir(parents=True)
     manifest_path = root / "policy_manifest.json"
     manifest_path.write_text(
-        json.dumps({"policy": {"name": "universe"}}), encoding="utf-8"
+        json.dumps(_resume_manifest()), encoding="utf-8"
     )
     plan = _plan(tmp_path, root=root, current_step=250, chunk_size=250)
     manifest_path.write_text(
@@ -231,7 +371,7 @@ def test_execute_revalidates_teacher_and_dataset_isolation_before_any_subprocess
     root = tmp_path / "universe"
     root.mkdir(parents=True)
     (root / "policy_manifest.json").write_text(
-        json.dumps({"policy": {"name": "universe"}}), encoding="utf-8"
+        json.dumps(_resume_manifest()), encoding="utf-8"
     )
     plan = _plan(tmp_path, root=root, current_step=250, chunk_size=250)
     plan[input_key] = root / "read_only" / suffix
@@ -334,7 +474,7 @@ def test_manifest_payload_records_reproducibility_and_objective_contract(tmp_pat
     assert payload["schema"] == "cosmos_mixed_step_policy_manifest_v1"
     assert payload["git_hash"] == "abc123"
     assert payload["dirty_diff_hash"] == "def456"
-    assert payload["source_checkpoint"] == "/tmp/stage1_step5000"
+    assert payload["source_checkpoint"] == str(DEFAULT_STAGE1_CHECKPOINT)
     assert payload["policy"]["name"] == "universe"
     assert payload["seed"] == 20260716
     assert payload["visible_devices"] == list(range(8))

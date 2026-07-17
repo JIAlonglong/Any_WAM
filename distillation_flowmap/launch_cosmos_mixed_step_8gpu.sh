@@ -12,6 +12,7 @@ readonly REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 readonly RUNNER_PATH="$SCRIPT_DIR/run_cosmos_mixed_step_policy.py"
 readonly PREFLIGHT_PORT=29860
 readonly PREFLIGHT_FORCE_SEQUENCE="s1,s2,s4,s1,s2,s4,s1,s2,s4"
+readonly PREFLIGHT_MINIMUM_PER_LABEL=3
 readonly TRAIN_STEPS=5000
 readonly TRAIN_SAVE_INTERVAL=250
 readonly RESERVATION_ROOT_NAME=".cosmos_mixed_step_reservations"
@@ -50,7 +51,8 @@ Required training/preflight inputs (all paths must already exist):
   --protocol-source-root PATH   Read-only protocol JSON plus t4/t8 fixed caches.
   --dataset-path PATH           Read-only LIBERO dataset path.
   --teacher-model-path PATH     Read-only Cosmos Policy model directory.
-  --stage1-checkpoint PATH      Common Stage-1 online-student checkpoint.
+  --stage1-checkpoint PATH      Must resolve to the approved common Stage-1
+                                online-student checkpoint for preflight/start.
 
 Required evaluation inputs:
   --root-base PATH --protocol-source-root PATH --dataset-path PATH
@@ -67,10 +69,11 @@ Optional explicit execution settings:
   --train-seed INTEGER          Default: 20260716.
 
 `preflight` writes ROOT_BASE/PREFLIGHT_COMPLETE only after the 9-step Universe
-run, target-free online checkpoint check, and all three fixed-cache proxy
-evaluations have completed.  `start` schedules exactly one fresh policy; it
-does not queue S4 or any later policy.  `eval` only invokes the runner's
-eval-only S1/S2/S4 proxy path and never supplies a training command.
+run, rank-zero selection JSONL proof of three forced S1/S2/S4 samples each,
+target-free online checkpoint check, and all three fixed-cache proxy evaluations
+have completed.  `start` schedules exactly one fresh policy; it does not queue
+S4 or any later policy.  `eval` only invokes the runner's eval-only S1/S2/S4
+proxy path and never supplies a training command.
 USAGE
 }
 
@@ -285,6 +288,10 @@ validate_training_inputs() {
     DATASET_PATH="$(canonical_directory "$DATASET_PATH")"
     TEACHER_MODEL_PATH="$(canonical_directory "$TEACHER_MODEL_PATH")"
     STAGE1_CHECKPOINT="$(canonical_directory "$STAGE1_CHECKPOINT")"
+    local approved_stage1_checkpoint
+    approved_stage1_checkpoint="$(canonical_directory "$DEFAULT_STAGE1_CHECKPOINT")"
+    [[ "$STAGE1_CHECKPOINT" == "$approved_stage1_checkpoint" ]] || die \
+        "Preflight and fresh mixed-policy training require the approved common Stage-1 checkpoint: $approved_stage1_checkpoint"
     assert_root_base_input_isolation \
         "$ROOT_BASE" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
         "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT"
@@ -430,7 +437,9 @@ write_worker_script() {
     local operation="$6"
     local checkpoint_dir="$7"
     local selection_proxy="$8"
-    shift 8
+    local preflight_selection_log="$9"
+    local preflight_minimum_per_label="${10}"
+    shift 10
     local -a runner_argv=("$@")
     local log_dir
     log_dir="$(dirname "$log_file")"
@@ -439,6 +448,14 @@ write_worker_script() {
         "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT" \
         "$ROOT_BASE/$RESERVATION_ROOT_NAME" \
         "$log_dir" "$log_file" "$worker_script"
+    if [[ -n "$preflight_selection_log" ]]; then
+        [[ "$preflight_minimum_per_label" =~ ^[1-9][0-9]*$ ]] || die \
+            "Preflight minimum per endpoint must be a positive integer"
+        assert_launcher_owned_write_paths_isolated \
+            "$ROOT_BASE" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
+            "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT" \
+            "$preflight_selection_log"
+    fi
 
     ensure_marker_absent "$success_marker"
     ensure_marker_absent "$failure_marker"
@@ -461,6 +478,9 @@ write_worker_script() {
         printf 'OPERATION=%q\n' "$operation"
         printf 'CHECKPOINT_DIR=%q\n' "$checkpoint_dir"
         printf 'SELECTION_PROXY=%q\n' "$selection_proxy"
+        printf 'PYTHON_BIN=%q\n' "$PYTHON_BIN"
+        printf 'PREFLIGHT_SELECTION_LOG=%q\n' "$preflight_selection_log"
+        printf 'PREFLIGHT_MINIMUM_PER_LABEL=%q\n' "$preflight_minimum_per_label"
         cat <<'WORKER_HEADER'
 write_failure_marker() {
     if [[ ! -e "$FAILURE_MARKER" && ! -L "$FAILURE_MARKER" ]]; then
@@ -512,6 +532,16 @@ for budget in s1 s2 s4; do
         exit 1
     fi
 done
+if [[ -n "$PREFLIGHT_SELECTION_LOG" ]]; then
+    "$PYTHON_BIN" -c '
+from pathlib import Path
+import sys
+from distillation_flowmap.run_cosmos_mixed_step_policy import validate_preflight_selection_evidence
+validate_preflight_selection_evidence(
+    Path(sys.argv[1]), minimum_per_label=int(sys.argv[2])
+)
+' "$PREFLIGHT_SELECTION_LOG" "$PREFLIGHT_MINIMUM_PER_LABEL"
+fi
 if [[ -e "$SUCCESS_MARKER" || -L "$SUCCESS_MARKER" ]]; then
     printf 'refusing to overwrite success marker: %s\n' "$SUCCESS_MARKER" >&2
     exit 1
@@ -601,6 +631,7 @@ start_preflight() {
     prepare_artifact_paths "$ROOT_BASE" "$session_name"
     local checkpoint_dir="$preflight_root/checkpoints/step_9"
     local selection_proxy="$preflight_root/metrics/selection/step_9/selection_proxy.json"
+    local preflight_selection_log="$preflight_root/metrics/cosmos_mixed_step_opd.jsonl"
     local -a runner_argv=(
         "$PYTHON_BIN" "$RUNNER_PATH"
         "--policy" "universe"
@@ -620,6 +651,9 @@ start_preflight() {
         "--device-list" "$DEVICE_LIST"
         "--world-size" "8"
         "--force-sequence" "$PREFLIGHT_FORCE_SEQUENCE"
+        "--preflight-evidence"
+        "--opd-aux-warmup-steps" "0"
+        "--opd-aux-interval" "1"
         "--eval-device-list" "$EVAL_DEVICE_LIST"
         "--eval-worker-device-list" "$EVAL_WORKER_DEVICE_LIST"
         "--run"
@@ -627,6 +661,7 @@ start_preflight() {
     write_worker_script "$WORKER_SCRIPT" "$LOG_FILE" \
         "$ROOT_BASE/PREFLIGHT_COMPLETE" "$ROOT_BASE/PREFLIGHT_FAILED" \
         "$ACTIVE_RESERVATION_DIR" "universe-preflight" "$checkpoint_dir" "$selection_proxy" \
+        "$preflight_selection_log" "$PREFLIGHT_MINIMUM_PER_LABEL" \
         "${runner_argv[@]}"
     launch_tmux_session "$session_name" "$WORKER_SCRIPT"
     transfer_active_reservation_to_worker
@@ -682,6 +717,7 @@ start_policy() {
     write_worker_script "$WORKER_SCRIPT" "$LOG_FILE" \
         "$policy_root/TRAINING_COMPLETE" "$policy_root/TRAINING_FAILED" \
         "$ACTIVE_RESERVATION_DIR" "${policy}-full-5000" "$checkpoint_dir" "$selection_proxy" \
+        "" "0" \
         "${runner_argv[@]}"
     launch_tmux_session "$session_name" "$WORKER_SCRIPT"
     transfer_active_reservation_to_worker
@@ -753,6 +789,7 @@ start_eval() {
         "$eval_complete_marker" "$eval_failed_marker" \
         "$ACTIVE_RESERVATION_DIR" "${policy}-offline-proxy-${checkpoint_label}" \
         "$checkpoint" "$selection_proxy" \
+        "" "0" \
         "${runner_argv[@]}"
     launch_tmux_session "$session_name" "$WORKER_SCRIPT"
     transfer_active_reservation_to_worker

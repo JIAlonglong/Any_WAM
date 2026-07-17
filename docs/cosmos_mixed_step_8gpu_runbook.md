@@ -18,6 +18,12 @@ runs for 5,000 steps, saves every 250 steps, and owns all eight explicitly
 provided CUDA devices.  It never queues or retrains the already-completed S4
 policy.
 
+For preflight and every fresh policy, that source is pinned to the canonical
+`output_libero_cosmos_policy_stage1_cosmos_latent_cdiff_8gpu_20260706_cosmos_latent_s1s2_8gpu/checkpoints/step_5000`
+checkpoint. An alternate compatible checkpoint is intentionally rejected;
+resume uses only the policy's own prior checkpoint while retaining this source
+in its root manifest provenance.
+
 The serial gates are fixed:
 
 ```text
@@ -56,7 +62,8 @@ output/protocol/dataset automatically:
   `teacher_cache/selection/t4` and `teacher_cache/selection/t8`.
 - `DATASET_PATH` and `TEACHER_MODEL_PATH`: existing read-only inputs.
 - `STAGE1_CHECKPOINT`: the agreed common Stage-1 online-student checkpoint
-  with `online_student/transformer/config.json`.
+  with `online_student/transformer/config.json`. For `preflight` and `start`,
+  it must canonicalize exactly to the pinned path above.
 - Eight unique GPU IDs via `--device-list`; the script rejects any other count.
 
 For a full run, use a root base that has no old `PREFLIGHT_*` marker and no
@@ -90,6 +97,15 @@ exact log file, and exact worker script beneath canonical `ROOT_BASE` and
 against the immutable inputs. Existing `logs` or reservation-root symlinks into
 an input tree are rejected before any launcher write is reached.
 
+The Python runner repeats this containment at plan build and immediately before
+execution for every destination it owns: the copied protocol metadata, policy
+manifest, rank-zero selection JSONL, target checkpoint/transformer,
+S1/S2/S4 proxy JSONs, and combined selection proxy. These destinations must be
+direct canonical children of the policy root, never nested symlinks into a
+source tree, and future output files must not already exist. The only allowed
+prior artifacts are byte-identical regular immutable protocol JSON files from
+the reviewed protocol source; the runner does not overwrite them.
+
 ## Future preflight command
 
 After the above paths are confirmed, the following is the intended form.  It
@@ -119,6 +135,13 @@ Its immutable runtime contract is:
 - training: exactly 9 steps, save at step 9
 - forced selector sequence:
   `s1,s2,s4,s1,s2,s4,s1,s2,s4`
+- controlled auxiliary schedule only for this preflight:
+  `OPD_AUX_WARMUP_STEPS=0`, `OPD_AUX_INTERVAL=1`
+- evidence: rank-zero JSONL at
+  `preflight-universe-.../metrics/cosmos_mixed_step_opd.jsonl` must parse
+  strictly and contain at least three forced `universe` records for each of
+  `s1`, `s2`, and `s4`; malformed, missing, or incomplete evidence fails the
+  worker and leaves `PREFLIGHT_COMPLETE` absent.
 - completion checks: online student only, no target student, and all three
   `s1.json`, `s2.json`, `s4.json` fixed-cache proxy outputs.
 

@@ -357,9 +357,13 @@ def test_launcher_preflight_is_unique_eight_gpu_and_forces_all_modes_three_times
 
     assert 'PREFLIGHT_PORT=29860' in source
     assert 'PREFLIGHT_FORCE_SEQUENCE="s1,s2,s4,s1,s2,s4,s1,s2,s4"' in source
+    assert 'PREFLIGHT_MINIMUM_PER_LABEL=3' in source
     assert '"--max-train-steps" "9"' in source
     assert '"--save-interval" "9"' in source
     assert '"--stop-after-step" "9"' in source
+    assert '"--preflight-evidence"' in source
+    assert '"--opd-aux-warmup-steps" "0"' in source
+    assert '"--opd-aux-interval" "1"' in source
     assert 'preflight-universe-${run_tag}' in source
     assert 'cosmos-mixed-preflight-universe-${run_tag}' in source
     assert 'PREFLIGHT_COMPLETE' in source
@@ -367,6 +371,33 @@ def test_launcher_preflight_is_unique_eight_gpu_and_forces_all_modes_three_times
     assert 'online_student/transformer/config.json' in source
     assert 'target_student' in source
     assert 'selection_proxy.json' in source
+    assert 'metrics/cosmos_mixed_step_opd.jsonl' in source
+
+
+def test_launcher_preflight_gate_validates_rank_zero_jsonl_before_completion_marker():
+    source = _launcher_source()
+    worker = _function_body(source, "write_worker_script", "launch_tmux_session")
+
+    assert 'PREFLIGHT_SELECTION_LOG=%q' in worker
+    assert 'PREFLIGHT_MINIMUM_PER_LABEL=%q' in worker
+    assert "validate_preflight_selection_evidence" in worker
+    assert '"$PREFLIGHT_SELECTION_LOG" "$PREFLIGHT_MINIMUM_PER_LABEL"' in worker
+    assert worker.index("validate_preflight_selection_evidence") < worker.index(
+        'if [[ -e "$SUCCESS_MARKER"'
+    )
+    assert 'write_failure_marker' in worker
+
+
+def test_launcher_training_input_validation_pins_the_common_stage1_before_artifacts():
+    source = _launcher_source()
+    training_validation = _function_body(source, "validate_training_inputs", "validate_eval_inputs")
+
+    assert 'canonical_directory "$DEFAULT_STAGE1_CHECKPOINT"' in training_validation
+    assert '"$STAGE1_CHECKPOINT" == "$approved_stage1_checkpoint"' in training_validation
+    assert "approved common Stage-1 checkpoint" in training_validation
+    assert training_validation.index("approved_stage1_checkpoint") < training_validation.index(
+        "assert_root_base_input_isolation"
+    ) < training_validation.index("require_program")
 
 
 def test_launcher_has_serial_gates_named_sessions_and_no_s4_training_policy():

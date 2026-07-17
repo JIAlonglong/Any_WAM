@@ -271,6 +271,8 @@ def test_progressive_config_isolates_mixed_endpoint_pairs_from_generic_opd(monke
     monkeypatch.setenv("COSMOS_MIXED_STEP_FORCE_SEQUENCE", "s1,s2,s4")
     monkeypatch.setenv("COSMOS_MIXED_STEP_SELECTOR_SEED", "31")
     monkeypatch.setenv("COSMOS_PROGRESSIVE_STAGE", "s4")
+    monkeypatch.setenv("OPD_AUX_WARMUP_STEPS", "0")
+    monkeypatch.setenv("OPD_AUX_INTERVAL", "1")
     module = importlib.import_module(
         "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive"
     )
@@ -290,3 +292,5 @@ def test_progressive_config_isolates_mixed_endpoint_pairs_from_generic_opd(monke
     )
     assert module.cfg.opd_rollout_step_forced_indices == (0, 1, 2)
     assert module.cfg.opd_rollout_selection_seed == 31
+    assert module.cfg.opd_aux_warmup_steps == 0
+    assert module.cfg.opd_aux_interval == 1

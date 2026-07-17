@@ -301,11 +301,20 @@ def validate_policy_eval_artifact_isolation(
     artifacts: list[tuple[str, str | Path]] = [
         ("metrics directory", metrics_dir),
         ("S1 output JSON", metrics_dir / "s1.json"),
+        ("S1 output JSON temporary file", metrics_dir / "s1.json.tmp"),
         ("S2 output JSON", metrics_dir / "s2.json"),
+        ("S2 output JSON temporary file", metrics_dir / "s2.json.tmp"),
         ("S4 output JSON", metrics_dir / "s4.json"),
+        ("S4 output JSON temporary file", metrics_dir / "s4.json.tmp"),
         ("selection proxy", expected_selection_proxy),
+        (
+            "selection proxy temporary file",
+            expected_selection_proxy.with_name(expected_selection_proxy.name + ".tmp"),
+        ),
         ("evaluation completion marker", metrics_dir / "EVAL_COMPLETE"),
+        ("evaluation completion marker temporary file", metrics_dir / "EVAL_COMPLETE.tmp"),
         ("evaluation failure marker", metrics_dir / "EVAL_FAILED"),
+        ("evaluation failure marker temporary file", metrics_dir / "EVAL_FAILED.tmp"),
     ]
     if selection_proxy_path is not None:
         artifacts.append(("declared selection proxy", selection_proxy_path))
@@ -332,6 +341,105 @@ def validate_policy_eval_artifact_isolation(
                 )
         resolved_artifacts[label] = resolved_artifact
     return resolved_artifacts
+
+
+def _reject_existing_eval_output(path: str | Path, *, label: str) -> None:
+    path = _as_path(path)
+    if path.exists() or path.is_symlink():
+        raise FileExistsError(
+            "Refusing to overwrite existing Cosmos mixed-step evaluation output: "
+            f"artifact={label}, path={path}"
+        )
+
+
+def validate_policy_eval_write_availability(
+    plan: Mapping[str, Any],
+    *,
+    checkpoint_dir: str | Path,
+    completed_budgets: Sequence[str] = (),
+) -> None:
+    """Reserve direct-eval outputs before every evaluator subprocess.
+
+    The evaluator writes JSON directly, so a post-evaluation proxy check is too
+    late to prevent overwrites.  ``completed_budgets`` is the small set that a
+    prior evaluator in this same invocation may have legitimately produced;
+    those paths are still checked for symlink traversal but are not treated as
+    collisions before the next budget runs.
+    """
+    try:
+        root = _resolve_path(plan["root"])
+        protocol_source_root = _resolve_path(plan["protocol_source_root"])
+        dataset_path = _resolve_path(plan["dataset_path"])
+        teacher_model_path = _resolve_path(plan["teacher_model_path"])
+        stage1_checkpoint = _resolve_path(plan["stage1_checkpoint"])
+        declared_selection_proxy = _resolve_path(plan["selection_proxy_path"])
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        _raise_invalid_eval_execution_plan(
+            f"missing or invalid eval write metadata: {exc}"
+        )
+    completed = {str(budget) for budget in completed_budgets}
+    expected_budgets = {budget for budget, *_unused in _BUDGET_SPECS}
+    if not completed.issubset(expected_budgets):
+        _raise_invalid_eval_execution_plan(
+            f"unknown completed evaluation budget(s): {sorted(completed - expected_budgets)}"
+        )
+    checkpoint_dir = _resolve_path(checkpoint_dir)
+    artifact_paths = validate_policy_eval_artifact_isolation(
+        root=root,
+        checkpoint_dir=checkpoint_dir,
+        protocol_source_root=protocol_source_root,
+        dataset_path=dataset_path,
+        teacher_model_path=teacher_model_path,
+        stage1_checkpoint=stage1_checkpoint,
+        selection_proxy_path=declared_selection_proxy,
+    )
+    metrics_dir = root / "metrics" / "selection" / checkpoint_dir.name
+    selection_proxy = metrics_dir / "selection_proxy.json"
+    if declared_selection_proxy != artifact_paths["selection proxy"]:
+        _raise_invalid_eval_execution_plan(
+            "selection_proxy_path is not the owned checkpoint selection proxy"
+        )
+    owned_paths: list[tuple[str, Path]] = [
+        ("metrics directory", metrics_dir),
+        ("selection proxy", selection_proxy),
+        ("selection proxy temporary file", selection_proxy.with_name(selection_proxy.name + ".tmp")),
+        ("evaluation completion marker", metrics_dir / "EVAL_COMPLETE"),
+        ("evaluation completion marker temporary file", metrics_dir / "EVAL_COMPLETE.tmp"),
+        ("evaluation failure marker", metrics_dir / "EVAL_FAILED"),
+        ("evaluation failure marker temporary file", metrics_dir / "EVAL_FAILED.tmp"),
+    ]
+    for budget, *_unused in _BUDGET_SPECS:
+        output_json = metrics_dir / f"{budget}.json"
+        owned_paths.extend(
+            (
+                (f"{budget} evaluation JSON", output_json),
+                (f"{budget} evaluation JSON temporary file", output_json.with_name(output_json.name + ".tmp")),
+            )
+        )
+    for label, path in owned_paths:
+        _reject_symlinked_owned_artifact_path(root, path, label=f"evaluation {label}")
+    _require_existing_directory_or_missing(metrics_dir, label="evaluation metrics directory")
+
+    _reject_existing_eval_output(selection_proxy, label="selection proxy")
+    _reject_existing_eval_output(
+        selection_proxy.with_name(selection_proxy.name + ".tmp"),
+        label="selection proxy temporary file",
+    )
+    for marker in ("EVAL_COMPLETE", "EVAL_COMPLETE.tmp", "EVAL_FAILED", "EVAL_FAILED.tmp"):
+        _reject_existing_eval_output(metrics_dir / marker, label=f"evaluation marker {marker}")
+    for budget, *_unused in _BUDGET_SPECS:
+        output_json = metrics_dir / f"{budget}.json"
+        _reject_existing_eval_output(
+            output_json.with_name(output_json.name + ".tmp"),
+            label=f"{budget} evaluation JSON temporary file",
+        )
+        if budget not in completed:
+            _reject_existing_eval_output(output_json, label=f"{budget} evaluation JSON")
+        elif output_json.exists() and not output_json.is_file():
+            raise FileExistsError(
+                "Completed Cosmos mixed-step evaluation output is not a regular file: "
+                f"artifact={budget} evaluation JSON, path={output_json}"
+            )
 
 
 def validate_resume_policy_ownership(
@@ -406,6 +514,11 @@ def validate_preflight_selection_evidence(
     minimum_per_label = _validate_positive_int(
         minimum_per_label, name="minimum_per_label"
     )
+    if minimum_per_label != _PREFLIGHT_MINIMUM_PER_LABEL:
+        raise ValueError(
+            "Preflight evidence requires exactly three records for each fixed "
+            "S1/S2/S4 endpoint"
+        )
     path = _as_path(path)
     if path.is_symlink() or not path.is_file():
         raise FileNotFoundError(
@@ -417,12 +530,14 @@ def validate_preflight_selection_evidence(
         "s2": (1, 4, 2),
         "s4": (2, 8, 4),
     }
-    counts = {label: 0 for label in _PREFLIGHT_LABELS}
-    nonempty_records = 0
+    expected_labels = _PREFLIGHT_LABELS * _PREFLIGHT_MINIMUM_PER_LABEL
+    records: list[Mapping[str, Any]] = []
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
-            continue
-        nonempty_records += 1
+            raise ValueError(
+                f"Preflight rank-zero selection JSONL contains a blank line at "
+                f"{path}:{line_number}"
+            )
         try:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
@@ -433,6 +548,18 @@ def validate_preflight_selection_evidence(
             raise ValueError(
                 f"Preflight selection record is not an object at {path}:{line_number}"
             )
+        records.append(record)
+    if len(records) != len(expected_labels):
+        raise ValueError(
+            "Preflight rank-zero selection JSONL must contain exactly nine "
+            f"forced records, got {len(records)}: {path}"
+        )
+
+    counts = {label: 0 for label in _PREFLIGHT_LABELS}
+    for selection_ordinal, (record, expected_label) in enumerate(
+        zip(records, expected_labels)
+    ):
+        line_number = selection_ordinal + 1
         if record.get("policy_name") != "universe":
             raise ValueError(
                 f"Preflight selection record is not Universe at {path}:{line_number}"
@@ -446,6 +573,25 @@ def validate_preflight_selection_evidence(
             raise ValueError(
                 f"Preflight selection record has an unsupported endpoint at "
                 f"{path}:{line_number}: {label!r}"
+            )
+        if label != expected_label:
+            raise ValueError(
+                "Preflight rank-zero selection JSONL violates the fixed forced "
+                f"endpoint sequence at {path}:{line_number}: expected={expected_label}, "
+                f"got={label}"
+            )
+        try:
+            actual_ordinal = int(record["selection_ordinal"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Preflight selection record has malformed selection ordinal at "
+                f"{path}:{line_number}"
+            ) from exc
+        if actual_ordinal != selection_ordinal:
+            raise ValueError(
+                "Preflight rank-zero selection JSONL violates the fixed forced "
+                f"selection ordinal sequence at {path}:{line_number}: "
+                f"expected={selection_ordinal}, got={actual_ordinal}"
             )
         expected_index, expected_teacher, expected_student = expected_pairs[label]
         try:
@@ -467,16 +613,10 @@ def validate_preflight_selection_evidence(
                 f"{path}:{line_number}"
             )
         counts[label] += 1
-    if not nonempty_records:
-        raise ValueError(f"Preflight rank-zero selection JSONL is empty: {path}")
-    missing = [
-        f"{label}={counts[label]}/{minimum_per_label}"
-        for label in _PREFLIGHT_LABELS
-        if counts[label] < minimum_per_label
-    ]
-    if missing:
+    if any(count != minimum_per_label for count in counts.values()):
         raise ValueError(
-            "Preflight rank-zero selection JSONL is incomplete: " + ", ".join(missing)
+            "Preflight rank-zero selection JSONL violates the fixed forced "
+            f"endpoint counts: {counts}"
         )
     return counts
 
@@ -582,6 +722,28 @@ def _plan_target_step(
         return target_step, target_step
     # Zero means the normal full-run semantics understood by train.py.
     return max_train_steps, 0
+
+
+def _future_training_checkpoint_steps(
+    *, current_step: int, target_step: int, save_interval: int
+) -> tuple[int, ...]:
+    """Return every checkpoint the trainer can write in this invocation.
+
+    ``flowmap_trainer`` saves after each positive periodic boundary and always
+    writes the requested final step.  A resume therefore has more write
+    destinations than just its final checkpoint; reserve all of them before
+    permitting the train subprocess to start.
+    """
+    current_step = _validate_positive_int(
+        current_step, name="current_step", allow_zero=True
+    )
+    target_step = _validate_positive_int(target_step, name="target_step")
+    save_interval = _validate_positive_int(save_interval, name="save_interval")
+    if target_step <= current_step:
+        raise ValueError("target_step must be greater than current_step")
+    first_periodic_step = ((current_step // save_interval) + 1) * save_interval
+    periodic_steps = range(first_periodic_step, target_step + 1, save_interval)
+    return tuple(sorted({*periodic_steps, target_step}))
 
 
 def build_multibudget_eval_plans(
@@ -955,6 +1117,9 @@ def validate_policy_train_execution_contract(plan: Mapping[str, Any]) -> dict[st
         stage1_checkpoint = _resolve_path(plan["stage1_checkpoint"])
         current_step = int(plan["current_step"])
         target_step = int(plan["target_step"])
+        save_interval = _validate_positive_int(
+            plan["save_interval"], name="save_interval"
+        )
         protocol_dir = _as_path(plan["protocol_dir"])
         checkpoint_dir = _as_path(plan["checkpoint_dir"])
         selection_proxy_path = _as_path(plan["selection_proxy_path"])
@@ -967,6 +1132,11 @@ def validate_policy_train_execution_contract(plan: Mapping[str, Any]) -> dict[st
             f"invalid current/target steps: current={current_step}, target={target_step}"
         )
     is_resume = current_step > 0
+    future_checkpoint_steps = _future_training_checkpoint_steps(
+        current_step=current_step,
+        target_step=target_step,
+        save_interval=save_interval,
+    )
     if output_dir != root:
         _raise_invalid_train_execution_plan("output_dir is not the canonical policy root")
     if stage1_checkpoint != source_checkpoint:
@@ -986,7 +1156,6 @@ def validate_policy_train_execution_contract(plan: Mapping[str, Any]) -> dict[st
     expected_metrics_dir = root / "metrics"
     expected_metrics_jsonl = expected_metrics_dir / "cosmos_mixed_step_opd.jsonl"
     expected_checkpoint_dir = root / "checkpoints" / f"step_{target_step}"
-    expected_transformer_dir = _checkpoint_transformer_dir(expected_checkpoint_dir)
     expected_selection_dir = (
         root / "metrics" / "selection" / f"step_{target_step}"
     )
@@ -1014,6 +1183,17 @@ def validate_policy_train_execution_contract(plan: Mapping[str, Any]) -> dict[st
         _raise_invalid_train_execution_plan(
             "selection_proxy_path is not the canonical target selection proxy"
         )
+    if is_resume:
+        _reject_symlinked_owned_artifact_path(
+            root, expected_resume_path, label="resume checkpoint"
+        )
+        owned_resume_path = validate_owned_policy_checkpoint(
+            root=root, checkpoint_dir=expected_resume_path
+        )
+        if owned_resume_path != expected_resume_path:
+            _raise_invalid_train_execution_plan(
+                "resume checkpoint is not the expected historical policy checkpoint"
+            )
 
     sources = (
         ("protocol source root", protocol_source_root),
@@ -1030,8 +1210,17 @@ def validate_policy_train_execution_contract(plan: Mapping[str, Any]) -> dict[st
         ],
         ("metrics directory", expected_metrics_dir),
         ("rank-zero selection JSONL", expected_metrics_jsonl),
-        ("checkpoint destination", expected_checkpoint_dir),
-        ("checkpoint transformer destination", expected_transformer_dir),
+        *[
+            (f"future checkpoint step_{step}", root / "checkpoints" / f"step_{step}")
+            for step in future_checkpoint_steps
+        ],
+        *[
+            (
+                f"future checkpoint step_{step} transformer",
+                _checkpoint_transformer_dir(root / "checkpoints" / f"step_{step}"),
+            )
+            for step in future_checkpoint_steps
+        ],
         ("selection metrics directory", expected_selection_dir),
         ("selection proxy", expected_selection_proxy),
         ("policy manifest", expected_manifest),
@@ -1068,10 +1257,15 @@ def validate_policy_train_execution_contract(plan: Mapping[str, Any]) -> dict[st
                 f"{destination}"
             )
 
-    _reject_existing_output_artifact(expected_checkpoint_dir, label="checkpoint destination")
-    _reject_existing_output_artifact(
-        expected_transformer_dir, label="checkpoint transformer destination"
-    )
+    for step in future_checkpoint_steps:
+        future_checkpoint_dir = root / "checkpoints" / f"step_{step}"
+        _reject_existing_output_artifact(
+            future_checkpoint_dir, label=f"future checkpoint step_{step}"
+        )
+        _reject_existing_output_artifact(
+            _checkpoint_transformer_dir(future_checkpoint_dir),
+            label=f"future checkpoint step_{step} transformer",
+        )
     _reject_existing_output_artifact(expected_selection_proxy, label="selection proxy")
     _reject_existing_output_artifact(
         expected_selection_proxy.with_name(expected_selection_proxy.name + ".tmp"),
@@ -1089,6 +1283,11 @@ def validate_policy_train_execution_contract(plan: Mapping[str, Any]) -> dict[st
             policy_name,
             expected_source_checkpoint=source_checkpoint,
         )
+        if expected_metrics_jsonl.exists() and not expected_metrics_jsonl.is_file():
+            raise FileExistsError(
+                "Resume Cosmos mixed-step metrics JSONL is not a regular append-only "
+                f"file: {expected_metrics_jsonl}"
+            )
     else:
         _reject_existing_output_artifact(
             expected_metrics_jsonl, label="rank-zero selection JSONL"
@@ -1113,6 +1312,7 @@ def validate_policy_train_execution_contract(plan: Mapping[str, Any]) -> dict[st
         "RESUME_FROM_PATH": str(expected_resume_path),
         "RESUME_ONLINE_FROM_TARGET": "0",
         "SKIP_TARGET_STUDENT_FOR_COSMOS_LATENT": "1",
+        "SAVE_INTERVAL": str(save_interval),
     }
     if any(str(train_env.get(key, "")) != value for key, value in required_env.items()):
         _raise_invalid_train_execution_plan(
@@ -1626,6 +1826,45 @@ def write_policy_manifest(plan: Mapping[str, Any]) -> Path:
     return _write_json(path, payload)
 
 
+def claim_fresh_policy_root(plan: Mapping[str, Any]) -> Path:
+    """Atomically claim the empty root of a fresh policy execution.
+
+    Plan generation intentionally has no side effects.  At the explicit run
+    boundary, however, a fresh policy must own a previously absent directory;
+    this prevents a launcher race from turning an empty-looking child into a
+    reused policy root between validation and metadata writes.
+    """
+    try:
+        current_step = int(plan["current_step"])
+        root = _as_path(plan["root"])
+    except (KeyError, TypeError, ValueError) as exc:
+        _raise_invalid_train_execution_plan(
+            f"missing fresh policy root metadata: {exc}"
+        )
+    if current_step != 0:
+        _raise_invalid_train_execution_plan(
+            "only a fresh policy execution may claim a new policy root"
+        )
+    root = validate_policy_root(root, resume=False)
+    try:
+        root.mkdir()
+    except FileExistsError as exc:
+        raise FileExistsError(
+            "Refusing to reuse an existing fresh policy root; it must be absent "
+            f"at execution start: {root}"
+        ) from exc
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "Fresh policy root parent is missing; the launcher must provide an "
+            f"existing ROOT_BASE: {root.parent}"
+        ) from exc
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError(
+            f"Unable to claim a regular fresh policy root: {root}"
+        )
+    return root
+
+
 def copy_immutable_protocol_metadata(plan: Mapping[str, Any]) -> list[Path]:
     """Copy only JSON protocol metadata; deliberately never copy teacher caches."""
     # Do this before the first mkdir/copy.  In particular a pre-created
@@ -1791,8 +2030,10 @@ def execute_policy_plan(plan: Mapping[str, Any]) -> None:
         )
     validate_policy_train_execution_contract(plan)
     _validate_checkpoint_transformer(plan["resume_from_path"], role="resume")
-    copy_immutable_protocol_metadata(plan)
     validate_eval_caches(plan["eval_plans"])
+    if not is_resume:
+        claim_fresh_policy_root(plan)
+    copy_immutable_protocol_metadata(plan)
     manifest_path = write_policy_manifest(plan)
     print(f"Wrote policy manifest: {manifest_path}", flush=True)
     train_env = {**os.environ, **dict(plan["train_env"])}
@@ -1827,9 +2068,16 @@ def execute_policy_eval_plan(plan: Mapping[str, Any]) -> None:
     validate_policy_eval_execution_contract(plan, checkpoint_dir=checkpoint_dir)
     validate_target_free_online_student(checkpoint_dir, role="evaluation")
     validate_eval_caches(plan["eval_plans"])
+    completed_budgets: tuple[str, ...] = ()
     for eval_plan in plan["eval_plans"]:
+        validate_policy_eval_write_availability(
+            plan,
+            checkpoint_dir=checkpoint_dir,
+            completed_budgets=completed_budgets,
+        )
         eval_env = {**os.environ, **dict(eval_plan["env"])}
         subprocess.run(list(eval_plan["argv"]), cwd=REPO_ROOT, env=eval_env, check=True)
+        completed_budgets = (*completed_budgets, str(eval_plan["budget"]))
     selection_proxy_path = _write_selection_proxy(plan)
     print(f"Wrote selection proxy: {selection_proxy_path}", flush=True)
 

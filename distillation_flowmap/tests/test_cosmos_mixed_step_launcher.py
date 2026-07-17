@@ -338,6 +338,99 @@ def test_eval_only_executor_revalidates_nested_metrics_symlink_before_subprocess
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "artifact_name",
+    [
+        "s1.json",
+        "s4.json.tmp",
+        "selection_proxy.json",
+        "selection_proxy.json.tmp",
+        "EVAL_COMPLETE",
+        "EVAL_COMPLETE.tmp",
+        "EVAL_FAILED",
+        "EVAL_FAILED.tmp",
+    ],
+)
+def test_direct_eval_rejects_existing_owned_outputs_before_any_subprocess(
+    tmp_path, monkeypatch, artifact_name
+):
+    plan = _eval_plan(tmp_path)
+    _materialize_eval_execution_inputs(plan)
+    metrics_dir = Path(plan["root"]) / "metrics" / "selection" / "step_5000"
+    metrics_dir.mkdir(parents=True)
+    (metrics_dir / artifact_name).write_text("reserved", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(
+        mixed_runner.subprocess,
+        "run",
+        lambda argv, **kwargs: calls.append((list(argv), kwargs)),
+    )
+    monkeypatch.setattr(
+        mixed_runner,
+        "_write_selection_proxy",
+        lambda passed_plan: passed_plan["selection_proxy_path"],
+    )
+
+    with pytest.raises(FileExistsError, match="evaluation output"):
+        execute_policy_eval_plan(plan)
+
+    assert calls == []
+
+
+def test_direct_eval_rechecks_each_next_output_for_internal_symlink(tmp_path, monkeypatch):
+    plan = _eval_plan(tmp_path)
+    _materialize_eval_execution_inputs(plan)
+    root = Path(plan["root"])
+    metrics_dir = root / "metrics" / "selection" / "step_5000"
+    calls = []
+
+    def fake_eval(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        if len(calls) == 1:
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            (metrics_dir / "s1.json").write_text("{}", encoding="utf-8")
+            (metrics_dir / "s2.json").symlink_to(root / "policy_manifest.json")
+
+    monkeypatch.setattr(mixed_runner.subprocess, "run", fake_eval)
+    monkeypatch.setattr(
+        mixed_runner,
+        "_write_selection_proxy",
+        lambda passed_plan: passed_plan["selection_proxy_path"],
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        execute_policy_eval_plan(plan)
+
+    assert len(calls) == 1
+
+
+def test_direct_eval_rejects_root_internal_metrics_symlink_before_subprocess(
+    tmp_path, monkeypatch
+):
+    plan = _eval_plan(tmp_path)
+    _materialize_eval_execution_inputs(plan)
+    root = Path(plan["root"])
+    internal_metrics = root / "internal_metrics"
+    internal_metrics.mkdir()
+    (root / "metrics").symlink_to(internal_metrics, target_is_directory=True)
+    calls = []
+    monkeypatch.setattr(
+        mixed_runner.subprocess,
+        "run",
+        lambda argv, **kwargs: calls.append((list(argv), kwargs)),
+    )
+    monkeypatch.setattr(
+        mixed_runner,
+        "_write_selection_proxy",
+        lambda passed_plan: passed_plan["selection_proxy_path"],
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        execute_policy_eval_plan(plan)
+
+    assert calls == []
+
+
 def test_launcher_declares_static_safe_shell_contract_and_never_runs_in_this_test():
     source = _launcher_source()
 
@@ -398,6 +491,53 @@ def test_launcher_training_input_validation_pins_the_common_stage1_before_artifa
     assert training_validation.index("approved_stage1_checkpoint") < training_validation.index(
         "assert_root_base_input_isolation"
     ) < training_validation.index("require_program")
+
+
+def test_launcher_requires_fresh_canonical_children_before_reservation_or_logs():
+    source = _launcher_source()
+    preflight = _function_body(source, "start_preflight", "start_policy")
+    policy = _function_body(source, "start_policy", "start_eval")
+
+    assert "assert_fresh_launcher_child_root" in source
+    assert 'assert_fresh_launcher_child_root "$ROOT_BASE" "$preflight_root"' in preflight
+    assert 'assert_fresh_launcher_child_root "$root_base" "$policy_root"' in policy
+    assert preflight.index("assert_fresh_launcher_child_root") < preflight.index(
+        "reserve_operation"
+    )
+    assert policy.index("assert_fresh_launcher_child_root") < policy.index(
+        "reserve_operation"
+    )
+
+
+def test_launcher_child_root_guard_rejects_symlink_before_any_mkdir(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    immutable_sources = {
+        "protocol": tmp_path / "protocol",
+        "dataset": tmp_path / "dataset",
+        "teacher": tmp_path / "teacher",
+        "stage1": tmp_path / "stage1",
+    }
+    for source in immutable_sources.values():
+        source.mkdir()
+    external = tmp_path / "external-child"
+    external.mkdir()
+    (root / "universe").symlink_to(external, target_is_directory=True)
+
+    result = _run_pure_launcher_write_helper(
+        tmp_path,
+        root=root,
+        protocol=immutable_sources["protocol"],
+        dataset=immutable_sources["dataset"],
+        teacher=immutable_sources["teacher"],
+        stage1=immutable_sources["stage1"],
+        invocation='assert_fresh_launcher_child_root "$ROOT_BASE" "$ROOT_BASE/universe"',
+    )
+
+    assert result.returncode == 2
+    assert "fresh child root" in result.stderr
+    assert "mkdir reached" not in result.stderr
+    assert not any(external.iterdir())
 
 
 def test_launcher_has_serial_gates_named_sessions_and_no_s4_training_policy():
@@ -475,6 +615,50 @@ def test_launcher_rejects_bidirectional_input_overlap_before_artifact_creation()
     ):
         validation_call = "validate_eval_inputs" if body.startswith("\nstart_eval") else "validate_training_inputs"
         assert body.index(validation_call) < body.index("prepare_artifact_paths")
+
+
+@pytest.mark.parametrize("overlap", ["same", "child", "parent"])
+def test_launcher_rejects_legacy_root_base_before_any_owned_artifact(tmp_path, overlap):
+    # The copied shell harness defines REPO_ROOT as tmp_path.parent, matching
+    # the launcher's own SCRIPT_DIR/.. calculation.
+    legacy_root = (
+        tmp_path.parent
+        / "distillation_flowmap"
+        / "output_libero_cosmos_policy_stage2_progressive_20260714_full"
+    )
+    legacy_root.mkdir(parents=True, exist_ok=True)
+    root = {
+        "same": legacy_root,
+        "child": legacy_root / "child",
+        "parent": legacy_root.parent,
+    }[overlap]
+    root.mkdir(parents=True, exist_ok=True)
+    immutable_sources = {
+        "protocol": tmp_path / "protocol",
+        "dataset": tmp_path / "dataset",
+        "teacher": tmp_path / "teacher",
+        "stage1": tmp_path / "stage1",
+    }
+    for source in immutable_sources.values():
+        source.mkdir()
+
+    result = _run_pure_launcher_write_helper(
+        tmp_path,
+        root=root,
+        protocol=immutable_sources["protocol"],
+        dataset=immutable_sources["dataset"],
+        teacher=immutable_sources["teacher"],
+        stage1=immutable_sources["stage1"],
+        invocation=(
+            'STAGE1_CHECKPOINT="$DEFAULT_STAGE1_CHECKPOINT"\n'
+            "start_preflight"
+        ),
+    )
+
+    assert result.returncode == 2
+    assert "legacy progressive S4 root" in result.stderr
+    assert not (root / ".cosmos_mixed_step_reservations").exists()
+    assert not (root / "logs").exists()
 
 
 def test_launcher_eval_rechecks_canonical_policy_root_and_forwards_stage1_source():

@@ -178,7 +178,7 @@ def test_train_eval_contract_allows_only_its_canonical_copied_protocol_metadata(
         )
 
 
-def _preflight_record(label: str) -> dict:
+def _preflight_record(label: str, selection_ordinal: int) -> dict:
     index, teacher_steps, student_steps = {
         "s1": (0, 4, 1),
         "s2": (1, 4, 2),
@@ -191,6 +191,7 @@ def _preflight_record(label: str) -> dict:
         "pair_index": index,
         "teacher_steps": teacher_steps,
         "student_steps": student_steps,
+        "selection_ordinal": selection_ordinal,
     }
 
 
@@ -215,20 +216,96 @@ def test_preflight_plan_sets_only_reviewed_auxiliary_overrides_and_forced_schedu
     assert "OPD_AUX_INTERVAL" not in _plan(tmp_path / "full")["train_env"]
 
 
-def test_preflight_selection_evidence_requires_three_forced_rank_zero_records_per_mode(tmp_path):
+def test_preflight_selection_evidence_requires_exact_forced_rank_zero_sequence(tmp_path):
     path = tmp_path / "cosmos_mixed_step_opd.jsonl"
-    records = [_preflight_record(label) for _ in range(3) for label in ("s1", "s2", "s4")]
+    labels = ["s1", "s2", "s4"] * 3
+    records = [
+        _preflight_record(label, selection_ordinal)
+        for selection_ordinal, label in enumerate(labels)
+    ]
     path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
 
     assert validate_preflight_selection_evidence(path) == {"s1": 3, "s2": 3, "s4": 3}
 
-    path.write_text(json.dumps(_preflight_record("s1")) + "\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="incomplete"):
+    path.write_text(
+        "\n".join(json.dumps(record) for record in records[:8]) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="exactly nine"):
         validate_preflight_selection_evidence(path)
 
     path.write_text("not-json\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Malformed"):
         validate_preflight_selection_evidence(path)
+
+
+@pytest.mark.parametrize(
+    ("mutate_lines", "match"),
+    [
+        (lambda lines: lines.insert(3, ""), "blank"),
+        (lambda lines: lines.__setitem__(1, lines[2]), "sequence"),
+        (
+            lambda lines: lines.append(
+                json.dumps(_preflight_record("s1", 9), sort_keys=True)
+            ),
+            "exactly nine",
+        ),
+    ],
+)
+def test_preflight_selection_evidence_rejects_blank_repeated_or_extra_records(
+    tmp_path, mutate_lines, match
+):
+    labels = ["s1", "s2", "s4"] * 3
+    lines = [
+        json.dumps(_preflight_record(label, ordinal), sort_keys=True)
+        for ordinal, label in enumerate(labels)
+    ]
+    mutate_lines(lines)
+    path = tmp_path / "cosmos_mixed_step_opd.jsonl"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=match):
+        validate_preflight_selection_evidence(path)
+
+
+@pytest.mark.parametrize(
+    ("existing_step", "transformer_only"),
+    [(500, False), (750, True), (1000, False)],
+)
+def test_resume_plan_rejects_every_future_scheduled_checkpoint_destination(
+    tmp_path, existing_step, transformer_only
+):
+    root = tmp_path / "universe"
+    root.mkdir()
+    (root / "policy_manifest.json").write_text(
+        json.dumps(_resume_manifest()), encoding="utf-8"
+    )
+    existing = root / "checkpoints" / f"step_{existing_step}"
+    if transformer_only:
+        (existing / "online_student" / "transformer").mkdir(parents=True)
+    else:
+        existing.mkdir(parents=True)
+
+    with pytest.raises(FileExistsError, match=f"step_{existing_step}"):
+        _plan(
+            tmp_path,
+            root=root,
+            current_step=250,
+            chunk_size=750,
+            max_train_steps=1000,
+            save_interval=250,
+        )
+
+
+def test_fresh_policy_root_is_claimed_atomically_only_at_execution_boundary(tmp_path):
+    plan = _plan(tmp_path)
+    root = Path(plan["root"])
+
+    assert not root.exists()
+    assert mixed_runner.claim_fresh_policy_root(plan) == root
+    assert root.is_dir()
+    with pytest.raises(FileExistsError, match="fresh policy root"):
+        mixed_runner.claim_fresh_policy_root(plan)
 
 
 def test_resume_plan_uses_only_its_own_online_checkpoint_and_optimizer_state(tmp_path):

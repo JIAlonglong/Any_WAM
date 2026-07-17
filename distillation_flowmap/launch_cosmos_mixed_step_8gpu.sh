@@ -17,6 +17,7 @@ readonly TRAIN_STEPS=5000
 readonly TRAIN_SAVE_INTERVAL=250
 readonly RESERVATION_ROOT_NAME=".cosmos_mixed_step_reservations"
 readonly DEFAULT_STAGE1_CHECKPOINT="/root/nas/junjie/jj/Any_WAM/distillation_flowmap/output_libero_cosmos_policy_stage1_cosmos_latent_cdiff_8gpu_20260706_cosmos_latent_s1s2_8gpu/checkpoints/step_5000"
+readonly LEGACY_PROGRESSIVE_ROOT="$REPO_ROOT/distillation_flowmap/output_libero_cosmos_policy_stage2_progressive_20260714_full"
 readonly -a SUPPORTED_POLICIES=("universe" "s2" "s1")
 declare -Ar POLICY_PORTS=( ["universe"]=29861 ["s2"]=29862 ["s1"]=29863 )
 
@@ -208,6 +209,12 @@ parse_options() {
 
 validate_root_base() {
     ROOT_BASE="$(canonical_directory "$ROOT_BASE")"
+    require_program realpath
+    local legacy_root
+    legacy_root="$(realpath -m -- "$LEGACY_PROGRESSIVE_ROOT")"
+    if [[ "$ROOT_BASE" == "$legacy_root" || "$ROOT_BASE" == "$legacy_root"/* || "$legacy_root" == "$ROOT_BASE"/* ]]; then
+        die "Output root base must not overlap legacy progressive S4 root: root=$ROOT_BASE legacy=$legacy_root"
+    fi
 }
 
 
@@ -225,6 +232,21 @@ assert_root_base_input_isolation() {
 
 resolve_path_maybe_missing() {
     realpath -m -- "$1"
+}
+
+
+assert_fresh_launcher_child_root() {
+    local root_base="$1"
+    local child_root="$2"
+    local canonical_root_base
+    local canonical_child_root
+    canonical_root_base="$(resolve_path_maybe_missing "$root_base")"
+    canonical_child_root="$(resolve_path_maybe_missing "$child_root")"
+    if [[ "$canonical_child_root" == "$canonical_root_base" || "$canonical_child_root" != "$canonical_root_base"/* ]]; then
+        die "Refusing fresh child root outside ROOT_BASE: child=$canonical_child_root root=$canonical_root_base"
+    fi
+    [[ ! -e "$child_root" && ! -L "$child_root" ]] || die \
+        "Refusing fresh child root that already exists or is a symlink: $child_root"
 }
 
 
@@ -625,6 +647,7 @@ start_preflight() {
     run_tag="$(new_run_tag)"
     local preflight_root="$ROOT_BASE/preflight-universe-${run_tag}"
     local session_name="cosmos-mixed-preflight-universe-${run_tag}"
+    assert_fresh_launcher_child_root "$ROOT_BASE" "$preflight_root"
     [[ ! -e "$preflight_root" && ! -L "$preflight_root" ]] || die \
         "Refusing to reuse preflight root: $preflight_root"
     reserve_operation "$ROOT_BASE" "preflight" "$ROOT_BASE/PREFLIGHT_FAILED"
@@ -685,6 +708,7 @@ start_policy() {
             ;;
     esac
     local policy_root="$root_base/$policy"
+    assert_fresh_launcher_child_root "$root_base" "$policy_root"
     [[ ! -e "$policy_root" && ! -L "$policy_root" ]] || die \
         "Refusing fresh $policy start because policy root already exists: $policy_root"
     reserve_operation "$root_base" "policy-${policy}" "$policy_root/TRAINING_FAILED"

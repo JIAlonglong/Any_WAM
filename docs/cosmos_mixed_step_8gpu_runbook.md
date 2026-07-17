@@ -56,7 +56,9 @@ The launcher deliberately requires explicit paths rather than selecting an
 output/protocol/dataset automatically:
 
 - `ROOT_BASE`: an existing dedicated parent directory for only these new
-  policies and their logs.  It must not be the legacy progressive S4 root.
+  policies and their logs.  It must not equal, contain, or be contained by the
+  legacy progressive S4 root
+  `distillation_flowmap/output_libero_cosmos_policy_stage2_progressive_20260714_full`.
 - `PROTOCOL_SOURCE_ROOT`: the read-only protocol JSON source containing
   `selection_manifest.json`, `eval_pairs.json`, and complete fixed caches under
   `teacher_cache/selection/t4` and `teacher_cache/selection/t8`.
@@ -68,7 +70,11 @@ output/protocol/dataset automatically:
 
 For a full run, use a root base that has no old `PREFLIGHT_*` marker and no
 pre-existing `universe`, `s2`, or `s1` output.  The launcher never removes old
-markers, logs, worker scripts, checkpoints, or caches to make this true.
+markers, logs, worker scripts, checkpoints, or caches to make this true.  Its
+fresh preflight/policy child must canonically be a direct descendant of
+`ROOT_BASE`, must be absent, and must not be a symlink.  The runner then claims
+that child once with a non-recursive `mkdir` immediately before its first
+metadata write; it will not reuse an empty-looking root.
 
 `ROOT_BASE` must be completely disjoint from every immutable input in both
 directions: it may not equal, contain, or be contained by the protocol source,
@@ -100,11 +106,14 @@ an input tree are rejected before any launcher write is reached.
 The Python runner repeats this containment at plan build and immediately before
 execution for every destination it owns: the copied protocol metadata, policy
 manifest, rank-zero selection JSONL, target checkpoint/transformer,
+every periodic checkpoint/transformer that a resume can save before its target,
 S1/S2/S4 proxy JSONs, and combined selection proxy. These destinations must be
 direct canonical children of the policy root, never nested symlinks into a
 source tree, and future output files must not already exist. The only allowed
 prior artifacts are byte-identical regular immutable protocol JSON files from
-the reviewed protocol source; the runner does not overwrite them.
+the reviewed protocol source and, on a verified resume, the policy's own
+historical checkpoint plus regular append-only metrics JSONL; the runner does
+not overwrite them.
 
 ## Future preflight command
 
@@ -139,9 +148,9 @@ Its immutable runtime contract is:
   `OPD_AUX_WARMUP_STEPS=0`, `OPD_AUX_INTERVAL=1`
 - evidence: rank-zero JSONL at
   `preflight-universe-.../metrics/cosmos_mixed_step_opd.jsonl` must parse
-  strictly and contain at least three forced `universe` records for each of
-  `s1`, `s2`, and `s4`; malformed, missing, or incomplete evidence fails the
-  worker and leaves `PREFLIGHT_COMPLETE` absent.
+  strictly as exactly nine forced `universe` records in ordinal order
+  `s1,s2,s4,s1,s2,s4,s1,s2,s4`; blank, malformed, repeated, missing, or extra
+  records fail the worker and leave `PREFLIGHT_COMPLETE` absent.
 - completion checks: online student only, no target student, and all three
   `s1.json`, `s2.json`, `s4.json` fixed-cache proxy outputs.
 
@@ -224,7 +233,10 @@ for provenance and revalidation; it is not a training resume input. Before an
 eval subprocess can run, the public executor verifies that path, the exact
 approved S1/S2/S4 plan, the t4/t4/t8 cache mapping, the owned
 `selection_proxy.json` destination, and every resolved eval artifact/terminal
-marker. It binds evaluator `argv[0]` to the trusted Python executable of the
-current runner process rather than mutable in-memory plan metadata. A malformed
-plan therefore fails before it can redirect output or invoke a different
-command.
+marker. Immediately before each evaluator subprocess it also rejects existing
+S1/S2/S4 JSONs, proxy/marker temporary paths, and every symlinked component of
+the owned metrics path; an earlier budget JSON created by that same invocation
+is the sole permitted intermediate. It binds evaluator `argv[0]` to the trusted
+Python executable of the current runner process rather than mutable in-memory
+plan metadata. A malformed plan therefore fails before it can redirect output
+or invoke a different command.

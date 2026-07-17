@@ -535,6 +535,7 @@ exec >>"$LOG_FILE" 2>&1
 printf 'starting %s at %s\n' "$OPERATION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 WORKER_HEADER
         printf 'cd %q\n' "$REPO_ROOT"
+        printf 'export PYTHONPATH=%q\n' "$REPO_ROOT"
         printf '%q ' "${runner_argv[@]}"
         printf '\n'
         cat <<'WORKER_VALIDATION'

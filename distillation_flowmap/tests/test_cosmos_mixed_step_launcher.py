@@ -486,6 +486,15 @@ def test_launcher_preflight_gate_validates_rank_zero_jsonl_before_completion_mar
     assert 'write_failure_marker' in worker
 
 
+def test_launcher_worker_exports_repo_pythonpath_before_direct_runner_script():
+    source = _launcher_source()
+    worker = _function_body(source, "write_worker_script", "launch_tmux_session")
+
+    export_line = "printf 'export PYTHONPATH=%q\\n' \"$REPO_ROOT\""
+    assert export_line in worker
+    assert worker.index(export_line) < worker.index("printf '%q ' \"${runner_argv[@]}\"")
+
+
 def test_launcher_training_input_validation_pins_the_common_stage1_before_artifacts():
     source = _launcher_source()
     training_validation = _function_body(source, "validate_training_inputs", "validate_eval_inputs")

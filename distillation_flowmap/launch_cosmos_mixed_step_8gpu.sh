@@ -16,6 +16,7 @@ readonly PREFLIGHT_MINIMUM_PER_LABEL=3
 readonly TRAIN_STEPS=5000
 readonly TRAIN_SAVE_INTERVAL=250
 readonly RESERVATION_ROOT_NAME=".cosmos_mixed_step_reservations"
+readonly FAILURE_ROOT_NAME=".cosmos_mixed_step_failures"
 readonly DEFAULT_STAGE1_CHECKPOINT="/root/nas/junjie/jj/Any_WAM/distillation_flowmap/output_libero_cosmos_policy_stage1_cosmos_latent_cdiff_8gpu_20260706_cosmos_latent_s1s2_8gpu/checkpoints/step_5000"
 readonly LEGACY_PROGRESSIVE_ROOT="$REPO_ROOT/distillation_flowmap/output_libero_cosmos_policy_stage2_progressive_20260714_full"
 readonly -a SUPPORTED_POLICIES=("universe" "s2" "s1")
@@ -409,7 +410,7 @@ reserve_operation() {
     assert_launcher_owned_write_paths_isolated \
         "$root_base" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
         "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT" \
-        "$reservation_root"
+        "$reservation_root" "$failure_marker"
     mkdir -p "$reservation_root"
     if ! mkdir "$reservation_dir"; then
         die "Operation already has an in-flight reservation: $operation_id ($reservation_dir)"
@@ -469,7 +470,8 @@ write_worker_script() {
         "$ROOT_BASE" "$PROTOCOL_SOURCE_ROOT" "$DATASET_PATH" \
         "$TEACHER_MODEL_PATH" "$STAGE1_CHECKPOINT" \
         "$ROOT_BASE/$RESERVATION_ROOT_NAME" \
-        "$log_dir" "$log_file" "$worker_script"
+        "$log_dir" "$log_file" "$worker_script" \
+        "$success_marker" "$failure_marker"
     if [[ -n "$preflight_selection_log" ]]; then
         [[ "$preflight_minimum_per_label" =~ ^[1-9][0-9]*$ ]] || die \
             "Preflight minimum per endpoint must be a positive integer"
@@ -611,6 +613,15 @@ show_status() {
             printf 'marker: %s\n' "$marker"
         fi
     done
+    local controlled_failure_marker=""
+    local failure_root="$root_base/$FAILURE_ROOT_NAME"
+    if [[ -d "$failure_root" ]]; then
+        shopt -s nullglob
+        for controlled_failure_marker in "$failure_root"/*.failed; do
+            printf 'failure marker: %s\n' "$controlled_failure_marker"
+        done
+        shopt -u nullglob
+    fi
     local reservation=""
     local reservation_root="$root_base/$RESERVATION_ROOT_NAME"
     if [[ -d "$reservation_root" ]]; then
@@ -711,9 +722,10 @@ start_policy() {
     assert_fresh_launcher_child_root "$root_base" "$policy_root"
     [[ ! -e "$policy_root" && ! -L "$policy_root" ]] || die \
         "Refusing fresh $policy start because policy root already exists: $policy_root"
-    reserve_operation "$root_base" "policy-${policy}" "$policy_root/TRAINING_FAILED"
     local run_tag
     run_tag="$(new_run_tag)"
+    local failure_marker="$root_base/$FAILURE_ROOT_NAME/${policy}-${run_tag}.failed"
+    reserve_operation "$root_base" "policy-${policy}" "$failure_marker"
     local session_name="cosmos-mixed-${policy}-${run_tag}"
     prepare_artifact_paths "$root_base" "$session_name"
     local checkpoint_dir="$policy_root/checkpoints/step_${TRAIN_STEPS}"
@@ -739,7 +751,7 @@ start_policy() {
         "--run"
     )
     write_worker_script "$WORKER_SCRIPT" "$LOG_FILE" \
-        "$policy_root/TRAINING_COMPLETE" "$policy_root/TRAINING_FAILED" \
+        "$policy_root/TRAINING_COMPLETE" "$failure_marker" \
         "$ACTIVE_RESERVATION_DIR" "${policy}-full-5000" "$checkpoint_dir" "$selection_proxy" \
         "" "0" \
         "${runner_argv[@]}"

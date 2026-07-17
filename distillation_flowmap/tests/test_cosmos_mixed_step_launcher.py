@@ -74,6 +74,7 @@ def _run_pure_launcher_write_helper(
     teacher: Path,
     stage1: Path,
     invocation: str,
+    intercept_mkdir: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     """Exercise only a copied shell helper, never the launcher's main entrypoint."""
     footer = '\ntrap launcher_exit_cleanup EXIT\nmain "$@"\n'
@@ -88,7 +89,11 @@ def _run_pure_launcher_write_helper(
         + f"DATASET_PATH={shlex.quote(str(dataset))}\n"
         + f"TEACHER_MODEL_PATH={shlex.quote(str(teacher))}\n"
         + f"STAGE1_CHECKPOINT={shlex.quote(str(stage1))}\n"
-        + "mkdir() { printf 'mkdir reached\\n' >&2; exit 99; }\n"
+        + (
+            "mkdir() { printf 'mkdir reached\\n' >&2; exit 99; }\n"
+            if intercept_mkdir
+            else ""
+        )
         + invocation
         + "\n",
         encoding="utf-8",
@@ -538,6 +543,59 @@ def test_launcher_child_root_guard_rejects_symlink_before_any_mkdir(tmp_path):
     assert "fresh child root" in result.stderr
     assert "mkdir reached" not in result.stderr
     assert not any(external.iterdir())
+
+
+def test_launcher_policy_claim_failure_marker_never_writes_through_policy_child(
+    tmp_path,
+):
+    """Exercise copied shell functions only; no launcher, worker, or tmux runs."""
+    root = tmp_path / "root"
+    root.mkdir()
+    immutable_sources = {
+        "protocol": tmp_path / "protocol",
+        "dataset": tmp_path / "dataset",
+        "teacher": tmp_path / "teacher",
+        "stage1": tmp_path / "stage1",
+    }
+    for source in immutable_sources.values():
+        source.mkdir()
+
+    result = _run_pure_launcher_write_helper(
+        tmp_path,
+        root=root,
+        protocol=immutable_sources["protocol"],
+        dataset=immutable_sources["dataset"],
+        teacher=immutable_sources["teacher"],
+        stage1=immutable_sources["stage1"],
+        intercept_mkdir=False,
+        invocation=(
+            "validate_training_inputs() { :; }\n"
+            "require_marker() { :; }\n"
+            "assert_fresh_launcher_child_root() { :; }\n"
+            'reserve_operation() { ACTIVE_RESERVATION_DIR="$ROOT_BASE/.reservation"; '
+            'ACTIVE_RESERVATION_FAILURE_MARKER="$3"; ACTIVE_RESERVATION_OPERATION="$2"; }\n'
+            'prepare_artifact_paths() { LOG_FILE="$ROOT_BASE/logs/mock.log"; '
+            'WORKER_SCRIPT="$ROOT_BASE/logs/mock.worker.sh"; }\n'
+            "write_worker_script() {\n"
+            '  local failure_marker="$4"\n'
+            '  local external_root="$ROOT_BASE/claim-failure-symlink-target"\n'
+            '  mkdir -p "$external_root"\n'
+            '  ln -s "$external_root" "$ROOT_BASE/universe"\n'
+            '  mkdir -p "$(dirname "$failure_marker")"\n'
+            "  printf 'runner_claim_failed\\n' > \"$failure_marker\"\n"
+            "}\n"
+            "launch_tmux_session() { :; }\n"
+            "start_policy universe"
+        ),
+    )
+
+    controlled_failures = list(
+        (root / ".cosmos_mixed_step_failures").glob("universe-*.failed")
+    )
+    assert result.returncode == 0, result.stderr
+    assert (root / "universe").is_symlink()
+    assert controlled_failures and controlled_failures[0].is_file()
+    assert not any((root / "claim-failure-symlink-target").iterdir())
 
 
 def test_launcher_has_serial_gates_named_sessions_and_no_s4_training_policy():

@@ -35,8 +35,9 @@ s2 ──TRAINING_COMPLETE──> s1
 `TRAINING_COMPLETE` is written only after the runner exits successfully, the
 step-5000 online-student transformer exists, no `target_student` directory is
 present, and all S1/S2/S4 fixed-cache proxy JSONs plus the combined proxy are
-present.  A failed worker writes a separate `*_FAILED` marker; the launcher
-will not overwrite it or delete any output.
+present. A failed fresh-policy worker writes a unique marker below
+`ROOT_BASE/.cosmos_mixed_step_failures/`, never through an unclaimed policy
+child; the launcher will not overwrite it or delete any output.
 
 Before it creates a log, worker script, or tmux session, the launcher takes an
 atomic directory reservation below
@@ -46,9 +47,9 @@ and `eval-<policy>-<step_N>`. A second invocation of the same operation fails
 while that reservation exists, so it cannot race the same output or port. The
 worker writes its terminal marker and then releases the reservation on both
 success and failure. If setup or tmux creation fails first, the caller writes a
-`*_FAILED` marker and releases the empty reservation; if release itself fails,
-the reservation remains deliberately visible for manual inspection instead of
-being deleted unsafely.
+controlled failure marker and releases the empty reservation; if release itself
+fails, the reservation remains deliberately visible for manual inspection
+instead of being deleted unsafely.
 
 ## Inputs to confirm before any future launch
 
@@ -74,7 +75,9 @@ markers, logs, worker scripts, checkpoints, or caches to make this true.  Its
 fresh preflight/policy child must canonically be a direct descendant of
 `ROOT_BASE`, must be absent, and must not be a symlink.  The runner then claims
 that child once with a non-recursive `mkdir` immediately before its first
-metadata write; it will not reuse an empty-looking root.
+metadata write; `--run` rejects an existing empty or metadata-only child rather
+than reusing it. Plan-only generation remains side-effect-free and may inspect
+such a path without claiming it.
 
 `ROOT_BASE` must be completely disjoint from every immutable input in both
 directions: it may not equal, contain, or be contained by the protocol source,
@@ -113,7 +116,11 @@ source tree, and future output files must not already exist. The only allowed
 prior artifacts are byte-identical regular immutable protocol JSON files from
 the reviewed protocol source and, on a verified resume, the policy's own
 historical checkpoint plus regular append-only metrics JSONL; the runner does
-not overwrite them.
+not overwrite them. For a fresh run it records the claimed root's
+`(st_dev, st_ino)` identity and rechecks the same non-symlink directory at the
+copy, manifest, training, evaluator, and proxy phase boundaries. This is a
+phase-boundary guard; same-UID mutation during a long child process is outside
+its scope and is not treated as an FD/openat sandbox.
 
 ## Future preflight command
 
@@ -191,13 +198,15 @@ The full-run tmux names are `cosmos-mixed-{universe|s2|s1}-<UTC timestamp>-<pid>
 Their log and generated, shell-quoted worker script are stored below
 `ROOT_BASE/logs/`.  The worker, rather than the interactive caller, writes the
 success/failure marker so an interrupted shell cannot make a false completion
-claim.
+claim. Fresh-policy failures are instead recorded as unique
+`ROOT_BASE/.cosmos_mixed_step_failures/<policy>-<run-tag>.failed` files, so a
+failed root claim cannot write through `ROOT_BASE/<policy>`.
 
 ## Status and offline proxy evaluation
 
 Status is read-only: it lists existing markers, in-flight atomic reservations,
-available tmux sessions, and the last 20 lines of each launcher log. It creates
-no output.
+controlled fresh-policy failure markers, available tmux sessions, and the last
+20 lines of each launcher log. It creates no output.
 
 ```bash
 bash distillation_flowmap/launch_cosmos_mixed_step_8gpu.sh status \
@@ -239,4 +248,7 @@ the owned metrics path; an earlier budget JSON created by that same invocation
 is the sole permitted intermediate. It binds evaluator `argv[0]` to the trusted
 Python executable of the current runner process rather than mutable in-memory
 plan metadata. A malformed plan therefore fails before it can redirect output
-or invoke a different command.
+or invoke a different command. The full-policy executor applies the same
+before-each-evaluator guard, allowing only earlier S1/S2/S4 JSONs produced by
+that same invocation while rejecting all later outputs, proxy/marker paths, and
+symlink traversal.

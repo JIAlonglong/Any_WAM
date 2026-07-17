@@ -56,6 +56,40 @@ def _resume_manifest(policy_name: str = "universe", **overrides) -> dict:
     return payload
 
 
+def _patch_fresh_execute_dependencies(monkeypatch, *, copies, subprocess_calls):
+    """Keep full-run executor tests at Python/mock boundaries only."""
+    monkeypatch.setattr(
+        mixed_runner,
+        "_validate_checkpoint_transformer",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        mixed_runner,
+        "validate_eval_caches",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        mixed_runner,
+        "copy_immutable_protocol_metadata",
+        lambda *args, **kwargs: copies.append("copy"),
+    )
+    monkeypatch.setattr(
+        mixed_runner,
+        "write_policy_manifest",
+        lambda plan: Path(plan["root"]) / "policy_manifest.json",
+    )
+    monkeypatch.setattr(
+        mixed_runner,
+        "validate_target_free_online_student",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        mixed_runner,
+        "_write_selection_proxy",
+        lambda plan: Path(plan["selection_proxy_path"]),
+    )
+
+
 @pytest.mark.parametrize(
     ("policy_name", "expected_weights"),
     [
@@ -306,6 +340,217 @@ def test_fresh_policy_root_is_claimed_atomically_only_at_execution_boundary(tmp_
     assert root.is_dir()
     with pytest.raises(FileExistsError, match="fresh policy root"):
         mixed_runner.claim_fresh_policy_root(plan)
+
+
+@pytest.mark.parametrize("metadata_only", [False, True])
+def test_fresh_plan_is_side_effect_free_but_run_claim_rejects_existing_root(
+    tmp_path, metadata_only
+):
+    root = tmp_path / "policy"
+    root.mkdir()
+    if metadata_only:
+        metadata = root / "protocol" / "selection_manifest.json"
+        metadata.parent.mkdir()
+        metadata.write_text("{}\n", encoding="utf-8")
+    before = {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+    plan = _plan(tmp_path, root=root)
+
+    assert {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    } == before
+    with pytest.raises(FileExistsError, match="fresh policy root"):
+        mixed_runner.claim_fresh_policy_root(plan)
+
+
+def test_claimed_fresh_root_identity_rejects_directory_replacement(tmp_path):
+    plan = _plan(tmp_path)
+    root = mixed_runner.claim_fresh_policy_root(plan)
+    identity = mixed_runner._capture_fresh_policy_root_identity(root)
+
+    root.rename(tmp_path / "original-claimed-root")
+    root.mkdir()
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        mixed_runner._validate_fresh_policy_root_identity(
+            identity, phase="protocol copy"
+        )
+
+
+def test_full_train_rechecks_later_eval_output_before_next_subprocess(
+    tmp_path, monkeypatch
+):
+    plan = _plan(tmp_path)
+    root = Path(plan["root"])
+    copies: list[str] = []
+    subprocess_calls: list[list[str]] = []
+    _patch_fresh_execute_dependencies(
+        monkeypatch, copies=copies, subprocess_calls=subprocess_calls
+    )
+    availability_calls: list[tuple[str, ...]] = []
+    original_availability = mixed_runner.validate_policy_eval_write_availability
+
+    def record_availability(*args, completed_budgets=(), **kwargs):
+        availability_calls.append(tuple(completed_budgets))
+        return original_availability(
+            *args, completed_budgets=completed_budgets, **kwargs
+        )
+
+    def fake_subprocess(argv, **kwargs):
+        argv = list(argv)
+        subprocess_calls.append(argv)
+        if "distillation_flowmap/train.py" not in argv:
+            eval_calls = [
+                call
+                for call in subprocess_calls
+                if "distillation_flowmap/eval_cosmos_progressive_stage2.py" in call
+            ]
+            if len(eval_calls) == 1:
+                metrics_dir = root / "metrics" / "selection" / "step_250"
+                metrics_dir.mkdir(parents=True, exist_ok=True)
+                (metrics_dir / "s1.json").write_text("{}", encoding="utf-8")
+                (metrics_dir / "s2.json").symlink_to(root / "policy_manifest.json")
+
+    monkeypatch.setattr(
+        mixed_runner,
+        "validate_policy_eval_write_availability",
+        record_availability,
+    )
+    monkeypatch.setattr(mixed_runner.subprocess, "run", fake_subprocess)
+
+    with pytest.raises(ValueError, match="symlink"):
+        execute_policy_plan(plan)
+
+    assert copies == ["copy"]
+    assert len(subprocess_calls) == 2  # train + S1 only; S2 never starts.
+    assert availability_calls == [(), ("s1",)]
+
+
+@pytest.mark.parametrize("replacement_scope", ["in_root", "external"])
+def test_fresh_execute_rejects_symlinked_root_before_copy_or_subprocess(
+    tmp_path, monkeypatch, replacement_scope
+):
+    plan = _plan(tmp_path)
+    root = Path(plan["root"])
+    target = (
+        root.parent / "replacement-inside-root-base"
+        if replacement_scope == "in_root"
+        else tmp_path.parent / f"{tmp_path.name}-replacement-external"
+    )
+    target.mkdir()
+    copies: list[str] = []
+    subprocess_calls: list[list[str]] = []
+    _patch_fresh_execute_dependencies(
+        monkeypatch, copies=copies, subprocess_calls=subprocess_calls
+    )
+    original_claim = mixed_runner.claim_fresh_policy_root
+
+    def claim_then_replace(passed_plan):
+        claimed_root = original_claim(passed_plan)
+        claimed_root.rmdir()
+        claimed_root.symlink_to(target, target_is_directory=True)
+        return claimed_root
+
+    monkeypatch.setattr(mixed_runner, "claim_fresh_policy_root", claim_then_replace)
+    monkeypatch.setattr(
+        mixed_runner.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess_calls.append(list(argv)),
+    )
+
+    with pytest.raises(RuntimeError, match="fresh policy root"):
+        execute_policy_plan(plan)
+
+    assert copies == []
+    assert subprocess_calls == []
+
+
+@pytest.mark.parametrize(
+    ("replace_after", "expected_eval_calls"),
+    [
+        (None, 3),
+        ("copy", 0),
+        ("manifest", 0),
+        ("train", 0),
+        ("s1", 1),
+        ("s2", 2),
+        ("s4", 3),
+    ],
+)
+def test_fresh_execute_revalidates_root_identity_at_every_write_phase(
+    tmp_path, monkeypatch, replace_after, expected_eval_calls
+):
+    plan = _plan(tmp_path)
+    root = Path(plan["root"])
+    external_root = tmp_path / "external-replacement"
+    external_root.mkdir()
+    phase_events: list[str] = []
+    subprocess_calls: list[list[str]] = []
+    _patch_fresh_execute_dependencies(
+        monkeypatch, copies=[], subprocess_calls=subprocess_calls
+    )
+
+    def replace_claimed_root():
+        displaced_root = tmp_path / f"displaced-after-{replace_after}"
+        root.rename(displaced_root)
+        root.symlink_to(external_root, target_is_directory=True)
+
+    def fake_copy(_plan):
+        phase_events.append("copy")
+        if replace_after == "copy":
+            replace_claimed_root()
+
+    def fake_manifest(_plan):
+        phase_events.append("manifest")
+        if replace_after == "manifest":
+            replace_claimed_root()
+        return root / "policy_manifest.json"
+
+    def fake_subprocess(argv, **kwargs):
+        argv = list(argv)
+        subprocess_calls.append(argv)
+        if "distillation_flowmap/train.py" in argv:
+            phase_events.append("train")
+            if replace_after == "train":
+                replace_claimed_root()
+            return
+        output_json = Path(argv[argv.index("--output-json") + 1])
+        budget = output_json.stem
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_json.write_text("{}", encoding="utf-8")
+        phase_events.append(budget)
+        if replace_after == budget:
+            replace_claimed_root()
+
+    def fake_proxy(_plan):
+        phase_events.append("proxy")
+        return root / "metrics" / "selection" / "step_250" / "selection_proxy.json"
+
+    monkeypatch.setattr(mixed_runner, "copy_immutable_protocol_metadata", fake_copy)
+    monkeypatch.setattr(mixed_runner, "write_policy_manifest", fake_manifest)
+    monkeypatch.setattr(mixed_runner.subprocess, "run", fake_subprocess)
+    monkeypatch.setattr(mixed_runner, "_write_selection_proxy", fake_proxy)
+
+    if replace_after is None:
+        execute_policy_plan(plan)
+        assert phase_events == ["copy", "manifest", "train", "s1", "s2", "s4", "proxy"]
+    else:
+        with pytest.raises(RuntimeError, match="identity changed"):
+            execute_policy_plan(plan)
+        assert "proxy" not in phase_events
+
+    eval_calls = [
+        call
+        for call in subprocess_calls
+        if "distillation_flowmap/eval_cosmos_progressive_stage2.py" in call
+    ]
+    assert len(eval_calls) == expected_eval_calls
 
 
 def test_resume_plan_uses_only_its_own_online_checkpoint_and_optimizer_state(tmp_path):

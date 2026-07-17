@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as _datetime
+from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import stat as _stat
 import subprocess
 import sys
 from typing import Any, Mapping, Sequence
@@ -77,6 +79,15 @@ _PREFLIGHT_FORCE_INDICES = (0, 1, 2, 0, 1, 2, 0, 1, 2)
 _PREFLIGHT_MINIMUM_PER_LABEL = 3
 
 
+@dataclass(frozen=True)
+class _FreshPolicyRootIdentity:
+    """Directory identity recorded immediately after a fresh-root claim."""
+
+    root: Path
+    st_dev: int
+    st_ino: int
+
+
 def _as_path(value: str | Path) -> Path:
     return Path(value).expanduser()
 
@@ -107,6 +118,54 @@ def _is_within(path: Path, parent: Path) -> bool:
 def _paths_overlap(left: Path, right: Path) -> bool:
     """Return whether either resolved path is contained by the other."""
     return _is_within(left, right) or _is_within(right, left)
+
+
+def _capture_fresh_policy_root_identity(root: str | Path) -> _FreshPolicyRootIdentity:
+    """Record a newly claimed root without following a replacement symlink."""
+    root = _as_path(root)
+    try:
+        metadata = root.lstat()
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot capture fresh policy root identity: {root}"
+        ) from exc
+    if _stat.S_ISLNK(metadata.st_mode) or not _stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(
+            "Cannot capture fresh policy root identity because it is not a "
+            f"non-symlink directory: {root}"
+        )
+    return _FreshPolicyRootIdentity(
+        root=root,
+        st_dev=int(metadata.st_dev),
+        st_ino=int(metadata.st_ino),
+    )
+
+
+def _validate_fresh_policy_root_identity(
+    identity: _FreshPolicyRootIdentity, *, phase: str
+) -> Path:
+    """Reject an identity/symlink change at a runner-owned phase boundary."""
+    root = identity.root
+    try:
+        metadata = root.lstat()
+    except OSError as exc:
+        raise RuntimeError(
+            f"Fresh policy root identity changed before {phase}: root is missing: {root}"
+        ) from exc
+    if _stat.S_ISLNK(metadata.st_mode) or not _stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(
+            "Fresh policy root identity changed before "
+            f"{phase}: root is no longer a non-symlink directory: {root}"
+        )
+    if (int(metadata.st_dev), int(metadata.st_ino)) != (
+        identity.st_dev,
+        identity.st_ino,
+    ):
+        raise RuntimeError(
+            "Fresh policy root identity changed before "
+            f"{phase}: root={root}"
+        )
+    return root
 
 
 def _reject_symlinked_owned_artifact_path(
@@ -222,10 +281,11 @@ def validate_policy_root(
 ) -> Path:
     """Reject unsafe roots without deleting or modifying any existing output.
 
-    A fresh policy may reuse a root containing immutable protocol metadata, but
-    it may not reuse a root carrying another policy's manifest or checkpoints.
-    Resuming is an explicit mode and is validated separately against its own
-    checkpoint and manifest ownership.
+    Plan construction remains side-effect-free and may inspect an existing
+    root, but an explicit fresh ``--run`` claims it atomically and therefore
+    rejects an existing empty or metadata-only root.  Resuming is an explicit
+    mode and is validated separately against its own checkpoint and manifest
+    ownership.
     """
     resolved_root = _resolve_path(root)
     resolved_legacy = _resolve_path(legacy_root)
@@ -358,7 +418,7 @@ def validate_policy_eval_write_availability(
     checkpoint_dir: str | Path,
     completed_budgets: Sequence[str] = (),
 ) -> None:
-    """Reserve direct-eval outputs before every evaluator subprocess.
+    """Reserve outputs before every evaluator subprocess.
 
     The evaluator writes JSON directly, so a post-evaluation proxy check is too
     late to prevent overwrites.  ``completed_budgets`` is the small set that a
@@ -2031,17 +2091,50 @@ def execute_policy_plan(plan: Mapping[str, Any]) -> None:
     validate_policy_train_execution_contract(plan)
     _validate_checkpoint_transformer(plan["resume_from_path"], role="resume")
     validate_eval_caches(plan["eval_plans"])
+    fresh_root_identity: _FreshPolicyRootIdentity | None = None
     if not is_resume:
-        claim_fresh_policy_root(plan)
+        claimed_root = claim_fresh_policy_root(plan)
+        fresh_root_identity = _capture_fresh_policy_root_identity(claimed_root)
+    if fresh_root_identity is not None:
+        _validate_fresh_policy_root_identity(
+            fresh_root_identity, phase="protocol copy"
+        )
     copy_immutable_protocol_metadata(plan)
+    if fresh_root_identity is not None:
+        _validate_fresh_policy_root_identity(
+            fresh_root_identity, phase="policy manifest"
+        )
     manifest_path = write_policy_manifest(plan)
     print(f"Wrote policy manifest: {manifest_path}", flush=True)
     train_env = {**os.environ, **dict(plan["train_env"])}
+    if fresh_root_identity is not None:
+        _validate_fresh_policy_root_identity(
+            fresh_root_identity, phase="training subprocess"
+        )
     subprocess.run(list(plan["train_argv"]), cwd=REPO_ROOT, env=train_env, check=True)
+    if fresh_root_identity is not None:
+        _validate_fresh_policy_root_identity(
+            fresh_root_identity, phase="post-training validation"
+        )
     validate_target_free_online_student(plan["checkpoint_dir"], role="trained")
+    completed_budgets: tuple[str, ...] = ()
     for eval_plan in plan["eval_plans"]:
+        if fresh_root_identity is not None:
+            _validate_fresh_policy_root_identity(
+                fresh_root_identity, phase=f"{eval_plan['budget']} evaluator"
+            )
+        validate_policy_eval_write_availability(
+            plan,
+            checkpoint_dir=plan["checkpoint_dir"],
+            completed_budgets=completed_budgets,
+        )
         eval_env = {**os.environ, **dict(eval_plan["env"])}
         subprocess.run(list(eval_plan["argv"]), cwd=REPO_ROOT, env=eval_env, check=True)
+        completed_budgets = (*completed_budgets, str(eval_plan["budget"]))
+    if fresh_root_identity is not None:
+        _validate_fresh_policy_root_identity(
+            fresh_root_identity, phase="selection proxy"
+        )
     selection_proxy_path = _write_selection_proxy(plan)
     print(f"Wrote selection proxy: {selection_proxy_path}", flush=True)
 

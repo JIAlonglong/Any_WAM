@@ -17,6 +17,7 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
         "OPD_ENDPOINT_FOCUS_PROB",
         "OPD_DANCEOPD_VELOCITY_WEIGHT",
         "OPD_DANCEOPD_ENDPOINT_WEIGHT",
+        "OPD_DANCEOPD_ROLLOUT_STEPS",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -28,7 +29,7 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
     assert module.cfg.opd_teacher_target_mode == "cosmos_latent_full"
     assert module.cfg.opd_rollout_step_pairs == [[8, 4]]
     assert module.cfg.opd_endpoint_focus_prob > 0
-    assert module.cfg.opd_danceopd_rollout_steps == 16
+    assert module.cfg.opd_danceopd_rollout_steps == 4
     assert module.cfg.opd_danceopd_endpoint_weight > 0
     assert module.cfg.opd_danceopd_velocity_weight > 0
     assert module.cfg.opd_serial_student_cfg is True
@@ -40,8 +41,9 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
     assert module.cfg.opd_danceopd_action_endpoint_weight > 0
 
 
-def test_progressive_k1_uses_four_step_teacher_not_two(monkeypatch):
+def test_progressive_k1_keeps_a_dense_danceopd_query_grid(monkeypatch):
     monkeypatch.setenv("COSMOS_PROGRESSIVE_STAGE", "s1")
+    monkeypatch.delenv("OPD_DANCEOPD_ROLLOUT_STEPS", raising=False)
     module = importlib.import_module(
         "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive"
     )
@@ -49,6 +51,19 @@ def test_progressive_k1_uses_four_step_teacher_not_two(monkeypatch):
 
     assert module.cfg.opd_rollout_step_pairs == [[4, 1]]
     assert module.cfg.opd_endpoint_focus_prob > 0
+    assert module.cfg.opd_danceopd_rollout_steps == 16
+
+
+def test_progressive_k2_keeps_a_dense_danceopd_query_grid(monkeypatch):
+    monkeypatch.setenv("COSMOS_PROGRESSIVE_STAGE", "s2")
+    monkeypatch.delenv("OPD_DANCEOPD_ROLLOUT_STEPS", raising=False)
+    module = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive"
+    )
+    module = importlib.reload(module)
+
+    assert module.cfg.opd_rollout_step_pairs == [[4, 2]]
+    assert module.cfg.opd_danceopd_rollout_steps == 16
 
 
 def test_progressive_exposes_chunk_stop_and_training_manifest(monkeypatch):

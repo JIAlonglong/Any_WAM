@@ -5,11 +5,28 @@ import torch
 from wan_va.utils.scheduler import FlowMatchScheduler
 
 from distillation_flowmap.danceopd_query import (
+    append_post_update_trajectory_state,
     denoised_endpoint_mse,
     direct_velocity_mse,
     sample_low_noise_query_indices,
     select_per_sample_trajectory_state,
 )
+
+
+def test_appending_post_update_state_preserves_a_time_zero_terminal_query():
+    states = [torch.full((1,), 10.0)]
+    timesteps = [torch.full((1,), 1000.0)]
+    endpoint = torch.tensor([0.0], requires_grad=True)
+    zero_t = torch.zeros(1)
+
+    append_post_update_trajectory_state(
+        states, timesteps, state=endpoint, timestep=zero_t
+    )
+
+    assert len(states) == len(timesteps) == 2
+    assert torch.equal(states[-1], torch.tensor([0.0]))
+    assert not states[-1].requires_grad
+    assert torch.equal(timesteps[-1], zero_t)
 
 
 class DanceOPDQueryTest(unittest.TestCase):

@@ -23,6 +23,7 @@ from distillation_flowmap.cosmos_mixed_step_policy import (
     CosmosMixedStepPolicySpec,
     append_selection_jsonl,
     build_selection_record,
+    get_mixed_danceopd_schedule,
     get_mixed_step_policy_spec,
     record_selection,
     select_rank_synchronized_pair,
@@ -48,6 +49,20 @@ def test_mixed_policy_specs_have_the_agreed_pair_order_and_weights(name, expecte
     assert spec.rollout_step_pairs == ((4, 1), (4, 2), (8, 4))
     assert spec.weights == pytest.approx(expected_weights)
     assert math.fsum(spec.weights) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "forced_index, expected", [(0, (1, 0.25)), (1, (2, 0.50)), (2, (4, 1.00))]
+)
+def test_mixed_dance_schedule_matches_the_selected_endpoint_pair(forced_index, expected):
+    selection = select_rank_synchronized_pair(
+        get_mixed_step_policy_spec("universe"), forced_indices=(forced_index,)
+    )
+
+    schedule = get_mixed_danceopd_schedule(selection)
+
+    assert (schedule.rollout_steps, schedule.velocity_weight) == pytest.approx(expected)
+    assert schedule.rollout_steps == selection.student_steps
 
 
 def test_policy_spec_normalizes_positive_finite_weights():

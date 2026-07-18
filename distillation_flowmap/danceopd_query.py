@@ -8,6 +8,19 @@ import torch
 import torch.nn.functional as F
 
 
+def append_post_update_trajectory_state(
+    states: list[torch.Tensor],
+    timesteps: list[torch.Tensor],
+    *,
+    state: torch.Tensor,
+    timestep: torch.Tensor,
+) -> None:
+    if len(states) != len(timesteps):
+        raise ValueError("trajectory states and timesteps must have the same length")
+    states.append(state.detach().clone())
+    timesteps.append(timestep.detach().clone())
+
+
 def sample_low_noise_query_indices(
     *,
     n_states: int,

@@ -187,6 +187,29 @@ class MixedStepSelection:
         return self.rollout_step_pair[1]
 
 
+@dataclass(frozen=True)
+class CosmosMixedDanceSchedule:
+    rollout_steps: int
+    velocity_weight: float
+
+
+_MIXED_DANCEOPD_SCHEDULES = {
+    (4, 1): CosmosMixedDanceSchedule(rollout_steps=1, velocity_weight=0.25),
+    (4, 2): CosmosMixedDanceSchedule(rollout_steps=2, velocity_weight=0.50),
+    (8, 4): CosmosMixedDanceSchedule(rollout_steps=4, velocity_weight=1.00),
+}
+
+
+def get_mixed_danceopd_schedule(selection: MixedStepSelection) -> CosmosMixedDanceSchedule:
+    try:
+        return _MIXED_DANCEOPD_SCHEDULES[selection.rollout_step_pair]
+    except KeyError as exc:
+        raise ValueError(
+            "Unsupported Cosmos mixed DanceOPD pair "
+            f"{selection.rollout_step_pair!r}"
+        ) from exc
+
+
 def _forced_index(
     forced_indices: Sequence[int] | None,
     *,

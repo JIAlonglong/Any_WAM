@@ -102,6 +102,7 @@ from distillation_flowmap.opd_rollout_grad import (
     rollout_step_requires_grad,
 )
 from distillation_flowmap.danceopd_query import (
+    append_post_update_trajectory_state,
     denoised_endpoint_mse,
     direct_velocity_mse,
     sample_low_noise_query_indices,
@@ -116,6 +117,7 @@ from distillation_flowmap.cosmos_progressive_opd import (
 from distillation_flowmap.cosmos_mixed_step_policy import (
     append_selection_jsonl,
     build_selection_record,
+    get_mixed_danceopd_schedule,
     get_mixed_step_policy_spec,
     record_selection,
     select_rank_synchronized_pair,
@@ -4003,11 +4005,19 @@ class FlowMapStepMixin:
         )
 
     def _cosmos_danceopd_velocity_loss(
-        self, batch, teacher, input_dict, *, cfg_scale, teacher_crop_context=None
+        self,
+        batch,
+        teacher,
+        input_dict,
+        *,
+        cfg_scale,
+        teacher_crop_context=None,
+        rollout_steps=None,
+        append_post_update_terminal=False,
     ):
         """Return DanceOPD's local video-field loss for a raw Cosmos teacher.
 
-        The 16-step trajectory jointly evolves the student video and action
+        The rollout trajectory jointly evolves the student video and action
         states, but the official Cosmos API only exposes a video latent field.
         Thus the local loss supervises the video field at a state conditioned
         on the on-policy action state instead of fabricating an action field.
@@ -4021,9 +4031,13 @@ class FlowMapStepMixin:
         if action_frames <= 0:
             raise ValueError("Cosmos DanceOPD requires action frames after downsampling")
 
-        rollout_steps = int(getattr(self.config, 'opd_danceopd_rollout_steps', 16))
-        if rollout_steps <= 0:
-            raise ValueError("opd_danceopd_rollout_steps must be positive")
+        effective_rollout_steps = (
+            int(rollout_steps)
+            if rollout_steps is not None
+            else int(getattr(self.config, 'opd_danceopd_rollout_steps', 16))
+        )
+        if effective_rollout_steps <= 0:
+            raise ValueError("Cosmos DanceOPD rollout steps must be positive")
         query_alpha = float(getattr(self.config, 'opd_danceopd_query_alpha', 5.0))
         query_beta = float(getattr(self.config, 'opd_danceopd_query_beta', 2.0))
 
@@ -4074,10 +4088,10 @@ class FlowMapStepMixin:
             )
 
         video_path = self._build_timestep_path(
-            terminal_video_t, zero_video_t, rollout_steps
+            terminal_video_t, zero_video_t, effective_rollout_steps
         )
         action_path = self._build_timestep_path(
-            terminal_action_t, zero_action_t, rollout_steps
+            terminal_action_t, zero_action_t, effective_rollout_steps
         )
         action_base = input_dict['action_dict']
         action_grid_id = _downsample_action_grid_id(
@@ -4160,7 +4174,7 @@ class FlowMapStepMixin:
         video_timesteps = []
         action_timesteps = []
         with torch.no_grad():
-            for step_index in range(rollout_steps):
+            for step_index in range(effective_rollout_steps):
                 video_t = video_path[step_index]
                 video_r = video_path[step_index + 1]
                 action_t = action_path[step_index]
@@ -4195,8 +4209,22 @@ class FlowMapStepMixin:
                     action_sigma_next.to(action_velocity) - action_sigma.to(action_velocity)
                 )
 
+        if append_post_update_terminal:
+            append_post_update_trajectory_state(
+                video_states,
+                video_timesteps,
+                state=current_video,
+                timestep=zero_video_t,
+            )
+            append_post_update_trajectory_state(
+                action_states,
+                action_timesteps,
+                state=current_action,
+                timestep=zero_action_t,
+            )
+
         query_indices = sample_low_noise_query_indices(
-            n_states=rollout_steps,
+            n_states=len(video_states),
             batch_size=B,
             alpha=query_alpha,
             beta=query_beta,
@@ -4256,6 +4284,8 @@ class FlowMapStepMixin:
                 query_video_t.float() / self.config.num_train_timesteps
             ).mean().detach(),
             'terminal_prior_max_error': terminal_prior_error.detach(),
+            'rollout_steps': effective_rollout_steps,
+            'state_count': len(video_states),
         }
         return velocity_loss, diagnostics
 
@@ -4565,16 +4595,25 @@ class FlowMapStepMixin:
             action_denom = (action_mask.sum() * student_action_x0.shape[1]).clamp(min=1.0)
             action_endpoint_loss = action_diff.square().sum() / action_denom
         endpoint_loss = video_endpoint_loss + action_endpoint_weight * action_endpoint_loss
+        dance_schedule = (
+            get_mixed_danceopd_schedule(mixed_step_selection)
+            if mixed_step_selection is not None else None
+        )
         velocity_loss, dance_diagnostics = self._cosmos_danceopd_velocity_loss(
             batch,
             teacher,
             self._prepare_base_dict(batch),
             cfg_scale=cfg_scale,
             teacher_crop_context=teacher_crop_context,
+            rollout_steps=(dance_schedule.rollout_steps if dance_schedule else None),
+            append_post_update_terminal=(dance_schedule is not None),
         )
 
         endpoint_weight = float(getattr(self.config, 'opd_danceopd_endpoint_weight', 1.0))
-        velocity_weight = float(getattr(self.config, 'opd_danceopd_velocity_weight', 1.0))
+        velocity_weight = (
+            dance_schedule.velocity_weight if dance_schedule is not None
+            else float(getattr(self.config, 'opd_danceopd_velocity_weight', 1.0))
+        )
         if (
             not math.isfinite(endpoint_weight)
             or endpoint_weight < 0
@@ -4620,6 +4659,9 @@ class FlowMapStepMixin:
             'danceopd_query_index_mean': dance_diagnostics['query_index_mean'],
             'danceopd_query_sigma_mean': dance_diagnostics['query_sigma_mean'],
             'danceopd_terminal_prior_max_error': dance_diagnostics['terminal_prior_max_error'],
+            'danceopd_velocity_rollout_steps': dance_diagnostics['rollout_steps'],
+            'danceopd_velocity_state_count': dance_diagnostics['state_count'],
+            'danceopd_velocity_weight': velocity_weight,
             'cosmos_opd_endpoint_focus_ratio': focused_mask.float().mean().detach(),
             'danceopd_endpoint_teacher_steps': teacher_steps,
             'danceopd_endpoint_student_steps': student_steps,

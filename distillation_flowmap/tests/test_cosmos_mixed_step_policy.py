@@ -126,9 +126,9 @@ class _EndpointLatentScheduler:
 class _EndpointWireProbe(FlowMapStepMixin):
     """Minimal CPU-only probe that executes the real full-OPD endpoint method."""
 
-    def __init__(self, metrics_path):
+    def __init__(self, metrics_path, *, cosmos_mixed_step_policy="universe"):
         self.config = SimpleNamespace(
-            cosmos_mixed_step_policy="universe",
+            cosmos_mixed_step_policy=cosmos_mixed_step_policy,
             # Generic OPD paths remain at the legacy S4 singleton pair.
             opd_rollout_step_pairs=[[8, 4]],
             rollout_step_pairs=[[8, 4]],
@@ -167,6 +167,7 @@ class _EndpointWireProbe(FlowMapStepMixin):
         self.action_aware = False
         self.empty_emb = torch.zeros(1, 1, 1)
         self.student_k_steps = []
+        self.dance_calls = []
 
     @staticmethod
     def convert_input_format(batch):
@@ -192,12 +193,23 @@ class _EndpointWireProbe(FlowMapStepMixin):
         velocity = torch.zeros_like(state, requires_grad=True)
         return state, velocity
 
-    def _cosmos_danceopd_velocity_loss(self, *_args, **_kwargs):
+    def _cosmos_danceopd_velocity_loss(self, *_args, **kwargs):
+        self.dance_calls.append({
+            "rollout_steps": kwargs.get("rollout_steps"),
+            "append_post_update_terminal": kwargs.get("append_post_update_terminal"),
+        })
         zero = torch.zeros((), device=self.device, requires_grad=True)
+        effective_rollout_steps = kwargs.get("rollout_steps")
+        if effective_rollout_steps is None:
+            effective_rollout_steps = self.config.opd_danceopd_rollout_steps
         return zero, {
             "query_index_mean": zero.detach(),
             "query_sigma_mean": zero.detach(),
             "terminal_prior_max_error": zero.detach(),
+            "rollout_steps": effective_rollout_steps,
+            "state_count": effective_rollout_steps + int(
+                bool(kwargs.get("append_post_update_terminal"))
+            ),
         }
 
 
@@ -246,6 +258,58 @@ def test_real_full_opd_endpoint_wiring_uses_mixed_pair_without_touching_generic_
     assert probe.config.rollout_step_pairs == [[8, 4]]
     assert probe.config.opd_danceopd_rollout_steps == 16
     assert probe.config.opd_selected_rollout_pair_context["pair_label"] == "s2"
+    assert probe.dance_calls == [
+        {"rollout_steps": 2, "append_post_update_terminal": True}
+    ]
+    assert result["danceopd_velocity_rollout_steps"] == 2
+    assert result["danceopd_velocity_state_count"] == 3
+    assert result["danceopd_velocity_weight"] == pytest.approx(0.50)
+
+
+def test_real_full_opd_endpoint_wiring_retains_legacy_dance_behavior(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        flowmap_step,
+        "apply_full_endpoint_focus",
+        lambda video_t, video_r, **_kwargs: (
+            video_t,
+            video_r,
+            torch.zeros_like(video_t, dtype=torch.bool),
+        ),
+    )
+    monkeypatch.setattr(
+        flowmap_step,
+        "center_spatial_crop_slices",
+        lambda height, width, **_kwargs: (slice(0, height), slice(0, width)),
+    )
+    monkeypatch.setattr(
+        flowmap_step,
+        "rollout_velocity_field",
+        lambda initial_state, *_args, **_kwargs: (
+            torch.zeros_like(initial_state),
+            torch.zeros_like(initial_state),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        flowmap_step,
+        "denoised_endpoint_mse",
+        lambda student_x, *_args: student_x.sum(),
+    )
+
+    probe = _EndpointWireProbe(
+        tmp_path / "legacy_endpoint.jsonl", cosmos_mixed_step_policy=""
+    )
+    result = probe._cosmos_latent_full_opd_aux_transition_step(
+        {"actions": torch.zeros(1, 1, 1, 1, 1)},
+        batch_idx=0,
+    )
+
+    assert probe.dance_calls == [
+        {"rollout_steps": None, "append_post_update_terminal": False}
+    ]
+    assert result["danceopd_velocity_rollout_steps"] == 16
+    assert result["danceopd_velocity_state_count"] == 16
+    assert result["danceopd_velocity_weight"] == pytest.approx(1.0)
 
 
 def test_selection_record_updates_pair_label_histogram_and_persists_provenance(tmp_path):

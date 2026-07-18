@@ -36,20 +36,20 @@ _stage_specs = {
         "teacher_steps": 4,
         "student_steps": 2,
         "focus_prob": 0.85,
-        "velocity_weight": 0.50,
+        "velocity_weight": 1.0,
         "grad_mode": "last_step",
         "grad_steps": 1,
-        "danceopd_rollout_steps": 16,
+        "danceopd_rollout_steps": 2,
     },
     "s1": {
         "max_steps": 3000,
         "teacher_steps": 4,
         "student_steps": 1,
         "focus_prob": 0.90,
-        "velocity_weight": 0.25,
+        "velocity_weight": 0.0,
         "grad_mode": "last_step",
         "grad_steps": 1,
-        "danceopd_rollout_steps": 16,
+        "danceopd_rollout_steps": 1,
     },
 }
 if _stage not in _stage_specs:
@@ -143,10 +143,9 @@ cfg.opd_endpoint_focus_prob = float(
     os.environ.get("OPD_ENDPOINT_FOCUS_PROB", _spec["focus_prob"])
 )
 
-# S4 queries the deployed four-step trajectory.  The current sampler only
-# records pre-step states, so S2/S1 retain a dense grid until terminal-state
-# queries receive a dedicated implementation.  The environment override keeps
-# density/distribution ablations explicit.
+# DanceOPD rollout lengths follow the deployed student trajectory.  S1 is
+# endpoint-only because it has no interior trajectory field; S2/S4 query
+# post-update semantic states from their 2/4-step rollouts.
 cfg.opd_danceopd_rollout_steps = int(
     os.environ.get("OPD_DANCEOPD_ROLLOUT_STEPS", _spec["danceopd_rollout_steps"])
 )

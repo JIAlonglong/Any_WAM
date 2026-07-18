@@ -104,7 +104,7 @@ from distillation_flowmap.opd_rollout_grad import (
 from distillation_flowmap.danceopd_query import (
     denoised_endpoint_mse,
     direct_velocity_mse,
-    sample_low_noise_query_indices,
+    sample_semantic_query_indices,
     select_per_sample_trajectory_state,
 )
 from distillation_flowmap.cosmos_progressive_opd import (
@@ -3925,7 +3925,7 @@ class FlowMapStepMixin:
     ):
         """Return DanceOPD's local video-field loss for a raw Cosmos teacher.
 
-        The 16-step trajectory jointly evolves the student video and action
+        The configured trajectory jointly evolves the student video and action
         states, but the official Cosmos API only exposes a video latent field.
         Thus the local loss supervises the video field at a state conditioned
         on the on-policy action state instead of fabricating an action field.
@@ -3939,7 +3939,7 @@ class FlowMapStepMixin:
         if action_frames <= 0:
             raise ValueError("Cosmos DanceOPD requires action frames after downsampling")
 
-        rollout_steps = int(getattr(self.config, 'opd_danceopd_rollout_steps', 16))
+        rollout_steps = int(getattr(self.config, 'opd_danceopd_rollout_steps', 4))
         if rollout_steps <= 0:
             raise ValueError("opd_danceopd_rollout_steps must be positive")
         query_alpha = float(getattr(self.config, 'opd_danceopd_query_alpha', 5.0))
@@ -4113,8 +4113,15 @@ class FlowMapStepMixin:
                     action_sigma_next.to(action_velocity) - action_sigma.to(action_velocity)
                 )
 
-        query_indices = sample_low_noise_query_indices(
-            n_states=rollout_steps,
+            # Keep the post-update terminal state and exclude initial pure
+            # noise from query selection, matching the LingBotVA policy.
+            video_states.append(current_video.detach().clone())
+            action_states.append(current_action.detach().clone())
+            video_timesteps.append(video_path[-1].detach().clone())
+            action_timesteps.append(action_path[-1].detach().clone())
+
+        query_indices = sample_semantic_query_indices(
+            rollout_steps=rollout_steps,
             batch_size=B,
             alpha=query_alpha,
             beta=query_beta,
@@ -4421,14 +4428,6 @@ class FlowMapStepMixin:
             action_denom = (action_mask.sum() * student_action_x0.shape[1]).clamp(min=1.0)
             action_endpoint_loss = action_diff.square().sum() / action_denom
         endpoint_loss = video_endpoint_loss + action_endpoint_weight * action_endpoint_loss
-        velocity_loss, dance_diagnostics = self._cosmos_danceopd_velocity_loss(
-            batch,
-            teacher,
-            self._prepare_base_dict(batch),
-            cfg_scale=cfg_scale,
-            teacher_crop_context=teacher_crop_context,
-        )
-
         endpoint_weight = float(getattr(self.config, 'opd_danceopd_endpoint_weight', 1.0))
         velocity_weight = float(getattr(self.config, 'opd_danceopd_velocity_weight', 1.0))
         if (
@@ -4438,6 +4437,25 @@ class FlowMapStepMixin:
             or velocity_weight < 0
         ):
             raise ValueError('Cosmos OPD endpoint and velocity weights must be finite and non-negative')
+        if endpoint_weight == 0.0 and velocity_weight == 0.0:
+            raise ValueError('Cosmos OPD requires a non-zero endpoint or velocity weight')
+        if velocity_weight > 0:
+            velocity_loss, dance_diagnostics = self._cosmos_danceopd_velocity_loss(
+                batch,
+                teacher,
+                self._prepare_base_dict(batch),
+                cfg_scale=cfg_scale,
+                teacher_crop_context=teacher_crop_context,
+            )
+        else:
+            velocity_loss = torch.zeros(
+                (), device=self.device, dtype=endpoint_loss.dtype
+            )
+            dance_diagnostics = {
+                'query_index_mean': velocity_loss,
+                'query_sigma_mean': velocity_loss,
+                'terminal_prior_max_error': velocity_loss,
+            }
         aux_weight = float(getattr(self.config, 'opd_aux_weight', 1.0))
         endpoint_contrib = endpoint_weight * endpoint_loss * aux_weight
         velocity_contrib = velocity_weight * velocity_loss * aux_weight

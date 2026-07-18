@@ -39,6 +39,28 @@ def sample_low_noise_query_indices(
     return (normalized_indices * n_states).to(torch.long).clamp_(0, n_states - 1)
 
 
+def sample_semantic_query_indices(
+    *,
+    rollout_steps: int,
+    batch_size: int,
+    alpha: float,
+    beta: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sample only post-update states from a terminal-to-clean rollout.
+
+    Index zero is the initial pure-noise state.  Excluding it makes a one-step
+    rollout query its denoised endpoint, rather than querying pure noise.
+    """
+    return sample_low_noise_query_indices(
+        n_states=rollout_steps,
+        batch_size=batch_size,
+        alpha=alpha,
+        beta=beta,
+        device=device,
+    ) + 1
+
+
 def select_per_sample_trajectory_state(
     trajectory: torch.Tensor,
     indices: torch.Tensor,

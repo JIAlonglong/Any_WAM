@@ -8,6 +8,7 @@ from distillation_flowmap.danceopd_query import (
     denoised_endpoint_mse,
     direct_velocity_mse,
     sample_low_noise_query_indices,
+    sample_semantic_query_indices,
     select_per_sample_trajectory_state,
 )
 
@@ -28,6 +29,29 @@ class DanceOPDQueryTest(unittest.TestCase):
         self.assertGreaterEqual(int(indices.min()), 0)
         self.assertLess(int(indices.max()), 16)
         self.assertGreater(float(indices.float().mean()), 9.0)
+
+    def test_semantic_query_excludes_initial_noise_and_keeps_one_step_terminal(self):
+        torch.manual_seed(23)
+
+        one_step = sample_semantic_query_indices(
+            rollout_steps=1,
+            batch_size=128,
+            alpha=5.0,
+            beta=2.0,
+            device=torch.device("cpu"),
+        )
+        four_step = sample_semantic_query_indices(
+            rollout_steps=4,
+            batch_size=4096,
+            alpha=5.0,
+            beta=2.0,
+            device=torch.device("cpu"),
+        )
+
+        self.assertTrue(torch.equal(one_step, torch.ones_like(one_step)))
+        self.assertGreaterEqual(int(four_step.min()), 1)
+        self.assertLessEqual(int(four_step.max()), 4)
+        self.assertGreater(float(four_step.float().mean()), 2.5)
 
     def test_selects_one_trajectory_state_for_each_sample(self):
         trajectory = torch.stack(

@@ -90,6 +90,34 @@ def _patch_fresh_execute_dependencies(monkeypatch, *, copies, subprocess_calls):
     )
 
 
+def test_fresh_execute_validates_caches_from_immutable_source_before_claiming_root(
+    tmp_path, monkeypatch
+):
+    plan = _plan(tmp_path)
+    copies: list[str] = []
+    subprocess_calls: list[list[str]] = []
+    _patch_fresh_execute_dependencies(
+        monkeypatch, copies=copies, subprocess_calls=subprocess_calls
+    )
+    observed_metadata_roots: list[Path] = []
+
+    def record_cache_validation(_eval_plans, *, protocol_metadata_root):
+        observed_metadata_roots.append(Path(protocol_metadata_root))
+        assert not Path(plan["root"]).exists()
+
+    monkeypatch.setattr(mixed_runner, "validate_eval_caches", record_cache_validation)
+    monkeypatch.setattr(
+        mixed_runner.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess_calls.append(list(argv)),
+    )
+
+    execute_policy_plan(plan)
+
+    assert observed_metadata_roots == [Path(plan["protocol_source_root"])]
+    assert copies == ["copy"]
+
+
 @pytest.mark.parametrize(
     ("policy_name", "expected_weights"),
     [

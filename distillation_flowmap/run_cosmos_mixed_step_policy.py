@@ -1968,11 +1968,32 @@ def validate_target_free_online_student(checkpoint_dir: str | Path, *, role: str
         )
 
 
-def validate_eval_caches(eval_plans: Sequence[Mapping[str, Any]]) -> None:
-    """Verify each planned cache has every fixed selection record/pair payload."""
+def validate_eval_caches(
+    eval_plans: Sequence[Mapping[str, Any]],
+    *,
+    protocol_metadata_root: str | Path | None = None,
+) -> None:
+    """Verify each planned cache has every fixed selection record/pair payload.
+
+    Fresh training plans validate caches before they claim and populate their
+    owned ``root/protocol`` copy, so they must read manifest metadata from the
+    immutable source.  Eval-only and resumed paths keep validating the copied
+    metadata referenced by their evaluator argv.
+    """
+    metadata_root = (
+        _resolve_path(protocol_metadata_root)
+        if protocol_metadata_root is not None
+        else None
+    )
     for plan in eval_plans:
-        manifest_path = _as_path(plan["argv"][plan["argv"].index("--manifest") + 1])
-        pairs_path = _as_path(plan["argv"][plan["argv"].index("--pairs") + 1])
+        if metadata_root is None:
+            manifest_path = _as_path(
+                plan["argv"][plan["argv"].index("--manifest") + 1]
+            )
+            pairs_path = _as_path(plan["argv"][plan["argv"].index("--pairs") + 1])
+        else:
+            manifest_path = metadata_root / "selection_manifest.json"
+            pairs_path = metadata_root / "eval_pairs.json"
         cache_dir = _as_path(plan["cache_dir"])
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -2090,7 +2111,9 @@ def execute_policy_plan(plan: Mapping[str, Any]) -> None:
         )
     validate_policy_train_execution_contract(plan)
     _validate_checkpoint_transformer(plan["resume_from_path"], role="resume")
-    validate_eval_caches(plan["eval_plans"])
+    validate_eval_caches(
+        plan["eval_plans"], protocol_metadata_root=plan["protocol_source_root"]
+    )
     fresh_root_identity: _FreshPolicyRootIdentity | None = None
     if not is_resume:
         claimed_root = claim_fresh_policy_root(plan)

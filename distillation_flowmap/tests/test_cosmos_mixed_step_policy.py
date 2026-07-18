@@ -205,6 +205,10 @@ class _EndpointWireProbe(FlowMapStepMixin):
         return zero, {
             "query_index_mean": zero.detach(),
             "query_sigma_mean": zero.detach(),
+            "terminal_query_sigma": zero.detach(),
+            "terminal_query_timestep": zero.detach(),
+            "query_t_min": zero.detach(),
+            "query_t_max": zero.detach(),
             "terminal_prior_max_error": zero.detach(),
             "rollout_steps": effective_rollout_steps,
             "state_count": effective_rollout_steps + int(
@@ -264,6 +268,7 @@ def test_real_full_opd_endpoint_wiring_uses_mixed_pair_without_touching_generic_
     assert result["danceopd_velocity_rollout_steps"] == 2
     assert result["danceopd_velocity_state_count"] == 3
     assert result["danceopd_velocity_weight"] == pytest.approx(0.50)
+    assert "danceopd_terminal_query_sigma" in result
 
 
 def test_real_full_opd_endpoint_wiring_retains_legacy_dance_behavior(monkeypatch, tmp_path):
@@ -310,6 +315,7 @@ def test_real_full_opd_endpoint_wiring_retains_legacy_dance_behavior(monkeypatch
     assert result["danceopd_velocity_rollout_steps"] == 16
     assert result["danceopd_velocity_state_count"] == 16
     assert result["danceopd_velocity_weight"] == pytest.approx(1.0)
+    assert "danceopd_terminal_query_sigma" not in result
 
 
 def test_selection_record_updates_pair_label_histogram_and_persists_provenance(tmp_path):

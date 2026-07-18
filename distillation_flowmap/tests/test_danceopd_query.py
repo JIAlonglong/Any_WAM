@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 
+import pytest
 import torch
 from wan_va.utils.scheduler import FlowMatchScheduler
 
@@ -8,25 +9,83 @@ from distillation_flowmap.danceopd_query import (
     append_post_update_trajectory_state,
     denoised_endpoint_mse,
     direct_velocity_mse,
+    interpolate_raw_flow_segment,
+    legacy_danceopd_query_floor,
+    require_query_timestep_floor,
     sample_low_noise_query_indices,
     select_per_sample_trajectory_state,
 )
 
 
-def test_appending_post_update_state_preserves_a_time_zero_terminal_query():
+def test_appending_post_update_state_preserves_explicit_terminal_metadata():
     states = [torch.full((1,), 10.0)]
     timesteps = [torch.full((1,), 1000.0)]
-    endpoint = torch.tensor([0.0], requires_grad=True)
-    zero_t = torch.zeros(1)
+    endpoint = torch.tensor([0.5], requires_grad=True)
+    safe_t = torch.full((1,), 62.5)
 
     append_post_update_trajectory_state(
-        states, timesteps, state=endpoint, timestep=zero_t
+        states, timesteps, state=endpoint, timestep=safe_t
     )
 
     assert len(states) == len(timesteps) == 2
-    assert torch.equal(states[-1], torch.tensor([0.0]))
+    assert torch.equal(states[-1], torch.tensor([0.5]))
     assert not states[-1].requires_grad
-    assert torch.equal(timesteps[-1], zero_t)
+    assert torch.equal(timesteps[-1], safe_t)
+
+
+def test_mixed_dance_terminal_floor_matches_the_legacy_16_step_minimum():
+    floor = legacy_danceopd_query_floor(num_train_timesteps=1000)
+
+    assert floor == 62.5
+    assert 0.0 < floor < 1000.0
+
+
+def test_positive_terminal_query_stays_on_the_final_raw_euler_segment():
+    segment_start = torch.tensor([[[[[2.0]], [[4.0]]]]])
+    velocity = torch.tensor([[[[[8.0]], [[16.0]]]]])
+    start_timestep = torch.tensor([[1000.0, 1000.0]])
+    target_timestep = torch.tensor([[62.5, 125.0]])
+
+    query_state = interpolate_raw_flow_segment(
+        segment_start,
+        velocity,
+        start_timestep,
+        target_timestep,
+        num_train_timesteps=1000,
+        t_dim=2,
+    )
+
+    expected = torch.tensor([[[[[-5.5]], [[-10.0]]]]])
+    assert torch.allclose(query_state, expected)
+
+
+def test_query_floor_guard_rejects_an_exact_zero_teacher_timestamp():
+    safe_floor = legacy_danceopd_query_floor(num_train_timesteps=1000)
+
+    require_query_timestep_floor(
+        torch.tensor([[safe_floor, 1000.0]]), safe_floor=safe_floor
+    )
+    with pytest.raises(RuntimeError, match="below the safe floor"):
+        require_query_timestep_floor(
+            torch.tensor([[0.0, safe_floor]]), safe_floor=safe_floor
+        )
+
+
+def test_mixed_cosmos_danceopd_never_appends_an_exact_zero_teacher_query():
+    source = (
+        Path(__file__).resolve().parents[1] / "flowmap_step.py"
+    ).read_text(encoding="utf-8")
+    velocity_loss_block = source.split(
+        "def _cosmos_danceopd_velocity_loss("
+    )[1].split("def _cosmos_latent_full_opd_aux_transition_step(")[0]
+    post_update_block = velocity_loss_block.split(
+        "if append_post_update_terminal:"
+    )[1].split("query_indices =")[0]
+
+    assert "legacy_danceopd_query_floor" in post_update_block
+    assert "interpolate_raw_flow_segment" in post_update_block
+    assert "timestep=terminal_query_video_t" in post_update_block
+    assert "timestep=zero_video_t" not in post_update_block
 
 
 class DanceOPDQueryTest(unittest.TestCase):

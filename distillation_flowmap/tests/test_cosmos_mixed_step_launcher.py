@@ -479,6 +479,7 @@ def test_launcher_preflight_gate_validates_rank_zero_jsonl_before_completion_mar
     assert 'PREFLIGHT_SELECTION_LOG=%q' in worker
     assert 'PREFLIGHT_MINIMUM_PER_LABEL=%q' in worker
     assert "validate_preflight_selection_evidence" in worker
+    assert "require_dance_query_evidence=True" in worker
     assert '"$PREFLIGHT_SELECTION_LOG" "$PREFLIGHT_MINIMUM_PER_LABEL"' in worker
     assert worker.index("validate_preflight_selection_evidence") < worker.index(
         'if [[ -e "$SUCCESS_MARKER"'

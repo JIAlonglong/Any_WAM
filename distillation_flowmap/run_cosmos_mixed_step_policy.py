@@ -20,6 +20,7 @@ import datetime as _datetime
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -562,6 +563,7 @@ def validate_preflight_selection_evidence(
     path: str | Path,
     *,
     minimum_per_label: int = _PREFLIGHT_MINIMUM_PER_LABEL,
+    require_dance_query_evidence: bool = False,
 ) -> dict[str, int]:
     """Strictly prove that the short preflight sampled every forced endpoint.
 
@@ -677,6 +679,123 @@ def validate_preflight_selection_evidence(
         raise ValueError(
             "Preflight rank-zero selection JSONL violates the fixed forced "
             f"endpoint counts: {counts}"
+        )
+    if require_dance_query_evidence:
+        validate_preflight_dance_query_evidence(
+            path.with_name("cosmos_mixed_step_dance_query.jsonl"),
+            minimum_per_label=minimum_per_label,
+        )
+    return counts
+
+
+def validate_preflight_dance_query_evidence(
+    path: str | Path,
+    *,
+    minimum_per_label: int = _PREFLIGHT_MINIMUM_PER_LABEL,
+) -> dict[str, int]:
+    """Prove every preflight rank kept raw-Cosmos queries above ``t=0``."""
+    minimum_per_label = _validate_positive_int(
+        minimum_per_label, name="minimum_per_label"
+    )
+    if minimum_per_label != _PREFLIGHT_MINIMUM_PER_LABEL:
+        raise ValueError(
+            "Preflight query evidence requires exactly three records for each "
+            "fixed S1/S2/S4 endpoint"
+        )
+    path = _as_path(path)
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError(
+            "Preflight rank-zero DanceOPD query JSONL is missing or not a regular file: "
+            f"{path}"
+        )
+    expected_pairs = {
+        "s1": (0, 4, 1),
+        "s2": (1, 4, 2),
+        "s4": (2, 8, 4),
+    }
+    expected_labels = _PREFLIGHT_LABELS * _PREFLIGHT_MINIMUM_PER_LABEL
+    safe_floor = 1000.0 / 16.0
+    records: list[Mapping[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            raise ValueError(
+                f"Preflight DanceOPD query JSONL contains a blank line at {path}:{line_number}"
+            )
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Malformed preflight DanceOPD query JSONL at {path}:{line_number}"
+            ) from exc
+        if not isinstance(record, Mapping):
+            raise ValueError(
+                f"Preflight DanceOPD query record is not an object at {path}:{line_number}"
+            )
+        records.append(record)
+    if len(records) != len(expected_labels):
+        raise ValueError(
+            "Preflight rank-zero DanceOPD query JSONL must contain exactly nine "
+            f"records, got {len(records)}: {path}"
+        )
+
+    counts = {label: 0 for label in _PREFLIGHT_LABELS}
+    for selection_ordinal, (record, expected_label) in enumerate(
+        zip(records, expected_labels)
+    ):
+        line_number = selection_ordinal + 1
+        if record.get("record_type") != "danceopd_query":
+            raise ValueError(
+                f"Preflight DanceOPD query record has wrong type at {path}:{line_number}"
+            )
+        if record.get("policy_name") != "universe" or record.get("forced") is not True:
+            raise ValueError(
+                f"Preflight DanceOPD query record is not a forced Universe update at {path}:{line_number}"
+            )
+        if record.get("pair_label") != expected_label:
+            raise ValueError(
+                f"Preflight DanceOPD query record violates the forced endpoint sequence at {path}:{line_number}"
+            )
+        try:
+            actual_ordinal = int(record["selection_ordinal"])
+            pair_index = int(record["pair_index"])
+            teacher_steps = int(record["teacher_steps"])
+            student_steps = int(record["student_steps"])
+            rollout_steps = int(record["rollout_steps"])
+            terminal_t = float(record["terminal_query_timestep"])
+            query_t_min = float(record["query_t_min"])
+            query_t_max = float(record["query_t_max"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Preflight DanceOPD query record has malformed metadata at {path}:{line_number}"
+            ) from exc
+        expected_index, expected_teacher, expected_student = expected_pairs[expected_label]
+        if actual_ordinal != selection_ordinal or (
+            pair_index, teacher_steps, student_steps, rollout_steps
+        ) != (expected_index, expected_teacher, expected_student, expected_student):
+            raise ValueError(
+                f"Preflight DanceOPD query record has mismatched endpoint metadata at {path}:{line_number}"
+            )
+        if not all(math.isfinite(value) for value in (terminal_t, query_t_min, query_t_max)):
+            raise ValueError(
+                f"Preflight DanceOPD query record has non-finite timestamps at {path}:{line_number}"
+            )
+        if abs(terminal_t - safe_floor) > 1e-4:
+            raise ValueError(
+                f"Preflight DanceOPD query record has wrong terminal floor at {path}:{line_number}"
+            )
+        if query_t_min < safe_floor - 1e-4:
+            raise ValueError(
+                f"Preflight DanceOPD query record fell below the safe floor at {path}:{line_number}"
+            )
+        if query_t_max < query_t_min:
+            raise ValueError(
+                f"Preflight DanceOPD query record has inverted query bounds at {path}:{line_number}"
+            )
+        counts[expected_label] += 1
+    if any(count != minimum_per_label for count in counts.values()):
+        raise ValueError(
+            "Preflight DanceOPD query JSONL violates fixed endpoint counts: "
+            f"{counts}"
         )
     return counts
 
@@ -1691,6 +1810,9 @@ def build_policy_train_plan(
             "COSMOS_MIXED_STEP_METRICS_PATH": output_dir
             / "metrics"
             / "cosmos_mixed_step_opd.jsonl",
+            "COSMOS_MIXED_STEP_DANCE_QUERY_METRICS_PATH": output_dir
+            / "metrics"
+            / "cosmos_mixed_step_dance_query.jsonl",
             "CUDA_VISIBLE_DEVICES": ",".join(devices),
             "COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES": ",".join(devices),
             "CACHE_DATASET_IN_MEMORY": "0",

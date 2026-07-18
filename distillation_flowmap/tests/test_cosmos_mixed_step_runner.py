@@ -257,6 +257,33 @@ def _preflight_record(label: str, selection_ordinal: int) -> dict:
     }
 
 
+def _preflight_dance_query_record(
+    label: str,
+    selection_ordinal: int,
+    *,
+    query_t_min: float = 62.5,
+) -> dict:
+    index, teacher_steps, student_steps = {
+        "s1": (0, 4, 1),
+        "s2": (1, 4, 2),
+        "s4": (2, 8, 4),
+    }[label]
+    return {
+        "record_type": "danceopd_query",
+        "policy_name": "universe",
+        "forced": True,
+        "pair_label": label,
+        "pair_index": index,
+        "teacher_steps": teacher_steps,
+        "student_steps": student_steps,
+        "selection_ordinal": selection_ordinal,
+        "rollout_steps": student_steps,
+        "terminal_query_timestep": 62.5,
+        "query_t_min": query_t_min,
+        "query_t_max": 1000.0,
+    }
+
+
 def test_preflight_plan_sets_only_reviewed_auxiliary_overrides_and_forced_schedule(tmp_path):
     plan = _plan(
         tmp_path,
@@ -274,6 +301,9 @@ def test_preflight_plan_sets_only_reviewed_auxiliary_overrides_and_forced_schedu
     assert plan["forced_indices"] == [0, 1, 2, 0, 1, 2, 0, 1, 2]
     assert plan["train_env"]["OPD_AUX_WARMUP_STEPS"] == "0"
     assert plan["train_env"]["OPD_AUX_INTERVAL"] == "1"
+    assert plan["train_env"]["COSMOS_MIXED_STEP_DANCE_QUERY_METRICS_PATH"].endswith(
+        "metrics/cosmos_mixed_step_dance_query.jsonl"
+    )
     assert "OPD_AUX_WARMUP_STEPS" not in _plan(tmp_path / "full")["train_env"]
     assert "OPD_AUX_INTERVAL" not in _plan(tmp_path / "full")["train_env"]
 
@@ -299,6 +329,44 @@ def test_preflight_selection_evidence_requires_exact_forced_rank_zero_sequence(t
     path.write_text("not-json\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Malformed"):
         validate_preflight_selection_evidence(path)
+
+
+def test_preflight_query_evidence_proves_no_rank_queried_below_the_safe_floor(tmp_path):
+    labels = ["s1", "s2", "s4"] * 3
+    selection_path = tmp_path / "cosmos_mixed_step_opd.jsonl"
+    selection_path.write_text(
+        "\n".join(
+            json.dumps(_preflight_record(label, ordinal))
+            for ordinal, label in enumerate(labels)
+        ) + "\n",
+        encoding="utf-8",
+    )
+    query_path = tmp_path / "cosmos_mixed_step_dance_query.jsonl"
+    query_path.write_text(
+        "\n".join(
+            json.dumps(_preflight_dance_query_record(label, ordinal))
+            for ordinal, label in enumerate(labels)
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    assert validate_preflight_selection_evidence(
+        selection_path, require_dance_query_evidence=True
+    ) == {"s1": 3, "s2": 3, "s4": 3}
+
+    bad_records = [
+        _preflight_dance_query_record(label, ordinal, query_t_min=0.0)
+        if ordinal == 0 else _preflight_dance_query_record(label, ordinal)
+        for ordinal, label in enumerate(labels)
+    ]
+    query_path.write_text(
+        "\n".join(json.dumps(record) for record in bad_records) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="below the safe floor"):
+        validate_preflight_selection_evidence(
+            selection_path, require_dance_query_evidence=True
+        )
 
 
 @pytest.mark.parametrize(

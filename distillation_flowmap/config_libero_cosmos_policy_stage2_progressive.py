@@ -163,6 +163,10 @@ if _mixed_policy_name:
         "COSMOS_MIXED_STEP_METRICS_PATH",
         os.path.join(cfg.output_dir, "cosmos_mixed_step_opd.jsonl"),
     )
+    cfg.opd_danceopd_query_metrics_path = os.environ.get(
+        "COSMOS_MIXED_STEP_DANCE_QUERY_METRICS_PATH",
+        os.path.join(cfg.output_dir, "cosmos_mixed_step_dance_query.jsonl"),
+    )
 else:
     if _forced_mixed_sequence:
         raise ValueError(
@@ -176,6 +180,7 @@ else:
         os.environ.get("COSMOS_MIXED_STEP_SELECTOR_SEED", os.environ.get("TRAIN_SEED", "0"))
     )
     cfg.opd_rollout_selection_metrics_path = None
+    cfg.opd_danceopd_query_metrics_path = None
 cfg.opd_selected_rollout_pair_context = None
 cfg.rollout_step_pairs = copy.deepcopy(cfg.opd_rollout_step_pairs)
 cfg.opd_rollout_grad_mode = os.environ.get(

@@ -563,7 +563,9 @@ from pathlib import Path
 import sys
 from distillation_flowmap.run_cosmos_mixed_step_policy import validate_preflight_selection_evidence
 validate_preflight_selection_evidence(
-    Path(sys.argv[1]), minimum_per_label=int(sys.argv[2])
+    Path(sys.argv[1]),
+    minimum_per_label=int(sys.argv[2]),
+    require_dance_query_evidence=True,
 )
 ' "$PREFLIGHT_SELECTION_LOG" "$PREFLIGHT_MINIMUM_PER_LABEL"
 fi

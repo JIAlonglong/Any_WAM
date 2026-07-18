@@ -105,6 +105,9 @@ from distillation_flowmap.danceopd_query import (
     append_post_update_trajectory_state,
     denoised_endpoint_mse,
     direct_velocity_mse,
+    interpolate_raw_flow_segment,
+    legacy_danceopd_query_floor,
+    require_query_timestep_floor,
     sample_low_noise_query_indices,
     select_per_sample_trajectory_state,
 )
@@ -4173,6 +4176,12 @@ class FlowMapStepMixin:
         action_states = []
         video_timesteps = []
         action_timesteps = []
+        last_video_state = None
+        last_action_state = None
+        last_video_t = None
+        last_action_t = None
+        last_video_velocity = None
+        last_action_velocity = None
         with torch.no_grad():
             for step_index in range(effective_rollout_steps):
                 video_t = video_path[step_index]
@@ -4198,6 +4207,13 @@ class FlowMapStepMixin:
                 action_velocity = self._extract_action_v(
                     action_velocity_seq, action_frames
                 )
+                if step_index == effective_rollout_steps - 1:
+                    last_video_state = current_video
+                    last_action_state = current_action
+                    last_video_t = video_t
+                    last_action_t = action_t
+                    last_video_velocity = video_velocity
+                    last_action_velocity = action_velocity
                 video_sigma = self._timestep_to_sigma_5d(video_t)
                 video_sigma_next = self._timestep_to_sigma_5d(video_r)
                 action_sigma = action_t[:, None, :, None, None] / self.config.num_train_timesteps
@@ -4210,17 +4226,51 @@ class FlowMapStepMixin:
                 )
 
         if append_post_update_terminal:
+            if any(item is None for item in (
+                last_video_state,
+                last_action_state,
+                last_video_t,
+                last_action_t,
+                last_video_velocity,
+                last_action_velocity,
+            )):
+                raise RuntimeError("Cosmos DanceOPD did not retain its final Euler segment")
+            terminal_query_timestep = legacy_danceopd_query_floor(
+                num_train_timesteps=self.config.num_train_timesteps
+            )
+            terminal_query_video_t = torch.full_like(
+                terminal_video_t, terminal_query_timestep
+            )
+            terminal_query_action_t = torch.full_like(
+                terminal_action_t, terminal_query_timestep
+            )
+            terminal_query_video = interpolate_raw_flow_segment(
+                last_video_state,
+                last_video_velocity,
+                last_video_t,
+                terminal_query_video_t,
+                num_train_timesteps=self.config.num_train_timesteps,
+                t_dim=2,
+            )
+            terminal_query_action = interpolate_raw_flow_segment(
+                last_action_state,
+                last_action_velocity,
+                last_action_t,
+                terminal_query_action_t,
+                num_train_timesteps=self.config.num_train_timesteps,
+                t_dim=2,
+            )
             append_post_update_trajectory_state(
                 video_states,
                 video_timesteps,
-                state=current_video,
-                timestep=zero_video_t,
+                state=terminal_query_video,
+                timestep=terminal_query_video_t,
             )
             append_post_update_trajectory_state(
                 action_states,
                 action_timesteps,
-                state=current_action,
-                timestep=zero_action_t,
+                state=terminal_query_action,
+                timestep=terminal_query_action_t,
             )
 
         query_indices = sample_low_noise_query_indices(
@@ -4242,6 +4292,17 @@ class FlowMapStepMixin:
         query_action_t = select_per_sample_trajectory_state(
             torch.stack(action_timesteps, dim=0), query_indices
         ).detach()
+        query_t_min = None
+        query_t_max = None
+        if append_post_update_terminal:
+            require_query_timestep_floor(
+                query_video_t, safe_floor=terminal_query_timestep
+            )
+            query_t_min = query_video_t.float().amin().detach()
+            query_t_max = query_video_t.float().amax().detach()
+            if dist.is_initialized():
+                dist.all_reduce(query_t_min, op=dist.ReduceOp.MIN)
+                dist.all_reduce(query_t_max, op=dist.ReduceOp.MAX)
         query_input = _build_joint_input(
             query_video, query_video_t, query_action, query_action_t
         )
@@ -4287,6 +4348,19 @@ class FlowMapStepMixin:
             'rollout_steps': effective_rollout_steps,
             'state_count': len(video_states),
         }
+        if append_post_update_terminal:
+            diagnostics['terminal_query_sigma'] = torch.tensor(
+                terminal_query_timestep / self.config.num_train_timesteps,
+                device=current_video.device,
+                dtype=torch.float32,
+            )
+            diagnostics['terminal_query_timestep'] = torch.tensor(
+                terminal_query_timestep,
+                device=current_video.device,
+                dtype=torch.float32,
+            )
+            diagnostics['query_t_min'] = query_t_min
+            diagnostics['query_t_max'] = query_t_max
         return velocity_loss, diagnostics
 
     def _cosmos_latent_full_opd_aux_transition_step(self, batch, batch_idx, kto_paopd=False):
@@ -4608,6 +4682,40 @@ class FlowMapStepMixin:
             rollout_steps=(dance_schedule.rollout_steps if dance_schedule else None),
             append_post_update_terminal=(dance_schedule is not None),
         )
+        if mixed_step_selection is not None:
+            query_metrics_path = getattr(
+                self.config, 'opd_danceopd_query_metrics_path', None
+            )
+            rank_is_zero = (
+                dist.get_rank() == 0 if dist.is_initialized()
+                else int(getattr(self.config, 'rank', 0)) == 0
+            )
+            if rank_is_zero and query_metrics_path:
+                query_record = {
+                    'record_type': 'danceopd_query',
+                    'policy_name': mixed_step_selection.policy_name,
+                    'forced': bool(mixed_step_selection.forced),
+                    'pair_label': mixed_step_selection.label,
+                    'pair_index': int(mixed_step_selection.index),
+                    'teacher_steps': int(mixed_step_selection.teacher_steps),
+                    'student_steps': int(mixed_step_selection.student_steps),
+                    'global_step': int(self.step),
+                    'selection_ordinal': int(selection_ordinal),
+                    'rollout_steps': int(dance_diagnostics['rollout_steps']),
+                    'terminal_query_timestep': float(
+                        dance_diagnostics['terminal_query_timestep'].item()
+                    ),
+                    'query_t_min': float(dance_diagnostics['query_t_min'].item()),
+                    'query_t_max': float(dance_diagnostics['query_t_max'].item()),
+                }
+                try:
+                    append_selection_jsonl(query_metrics_path, query_record)
+                except OSError as exc:
+                    logger.warning(
+                        '[step %s] failed to append Cosmos DanceOPD query evidence: %s',
+                        self.step,
+                        exc,
+                    )
 
         endpoint_weight = float(getattr(self.config, 'opd_danceopd_endpoint_weight', 1.0))
         velocity_weight = (
@@ -4676,6 +4784,9 @@ class FlowMapStepMixin:
             # These scalar fields make the selected endpoint mode visible to
             # callers without changing the trainer's existing loss plumbing.
             result.update({
+                'danceopd_terminal_query_sigma': dance_diagnostics['terminal_query_sigma'],
+                'danceopd_query_t_min': dance_diagnostics['query_t_min'],
+                'danceopd_query_t_max': dance_diagnostics['query_t_max'],
                 'cosmos_mixed_step_policy': mixed_step_selection.policy_name,
                 'cosmos_mixed_step_pair_index': mixed_step_selection.index,
                 'cosmos_mixed_step_pair_label': mixed_step_selection.label,

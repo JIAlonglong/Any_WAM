@@ -205,8 +205,12 @@ cfg.opd_danceopd_query_beta = float(
 cfg.opd_danceopd_verify_terminal_prior = _env_bool(
     "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR", True
 )
+# LIBERO's FP32 action scheduler uses shift=0.05.  Its nominal terminal
+# sigma is 0.99999976 rather than bitwise one, which leaves a ~1.43e-6
+# clean-action residual for normal-scale actions.  Keep the invariant check
+# enabled while allowing that deterministic scheduler roundoff.
 cfg.opd_danceopd_terminal_prior_tolerance = float(
-    os.environ.get("OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE", 1e-6)
+    os.environ.get("OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE", 1e-5)
 )
 cfg.opd_danceopd_endpoint_weight = float(
     os.environ.get("OPD_DANCEOPD_ENDPOINT_WEIGHT", 1.0)

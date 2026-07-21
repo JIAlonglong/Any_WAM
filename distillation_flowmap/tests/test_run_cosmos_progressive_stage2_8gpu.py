@@ -70,34 +70,24 @@ def _run(*args: str, env: dict[str, str]):
 
 
 @pytest.mark.parametrize(
-    ("stage", "steps", "port", "resume_target"),
+    ("stage", "steps", "port"),
     [
-        ("s4", "5000", "29661", "1"),
-        ("s2", "3000", "29662", "0"),
-        ("s1", "3000", "29663", "0"),
+        ("s1", "3000", "29663"),
+        ("s2", "3000", "29662"),
+        ("s4", "5000", "29661"),
+        ("universal", "5000", "29664"),
     ],
 )
-def test_dry_run_prints_stage_contract_without_creating_output(
-    tmp_path, stage, steps, port, resume_target
+def test_dry_run_prints_independent_stage_contract_without_creating_output(
+    tmp_path, stage, steps, port
 ):
     env, output = _env(tmp_path)
-    if stage == "s2":
-        _transformer(
-            output / "s4" / "checkpoints" / "step_5000" / "online_student" / "transformer"
-        )
-    if stage == "s1":
-        _transformer(
-            output / "s2" / "checkpoints" / "step_3000" / "online_student" / "transformer"
-        )
-
     result = _run(stage, "--dry-run", env=env)
 
     assert result.returncode == 0, result.stderr
-    assert f"COSMOS_PROGRESSIVE_STAGE={stage}" in result.stdout
     assert f"MAX_TRAIN_STEPS={steps}" in result.stdout
-    assert f"RESUME_ONLINE_FROM_TARGET={resume_target}" in result.stdout
-    assert "SAVE_INTERVAL=1000" in result.stdout
-    assert "--nproc_per_node=8" in result.stdout
+    assert "RESUME_FROM_PATH=" + env["COSMOS_STAGE1_ROOT"] in result.stdout
+    assert "RESUME_ONLINE_FROM_TARGET=1" in result.stdout
     assert f"--master_port={port}" in result.stdout
     assert not (output / stage).exists()
 
@@ -150,15 +140,6 @@ def test_dry_run_rejects_existing_fresh_checkpoint_root(tmp_path):
 
     assert result.returncode != 0
     assert "Refusing fresh run" in result.stderr
-
-
-def test_s2_dry_run_rejects_missing_s4_predecessor(tmp_path):
-    env, _ = _env(tmp_path)
-
-    result = _run("s2", "--dry-run", env=env)
-
-    assert result.returncode != 0
-    assert "predecessor online_student/transformer" in result.stderr
 
 
 def test_dry_run_rejects_invalid_port_and_unknown_stage(tmp_path):

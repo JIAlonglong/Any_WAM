@@ -67,7 +67,7 @@ print_assignment() {
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 STAGE1_ROOT="${COSMOS_STAGE1_ROOT:-/kpfs-intern/jialongliu/models/modelscope/JIAlonglong/any-wam-cosmos-checkpoints/raw_stage1_5000}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_cosmos_progressive_dance_aligned_8gpu_20260720}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_cosmos_independent_dance_4way_8gpu_20260721}"
 DATASET_PATH="${DATASET_PATH:-/kpfs-intern/jialongliu/projects/Flash-WAM/training_data/libero-long-lerobot}"
 COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B}"
 COSMOS_WORKER_ENV_ROOT="${COSMOS_WORKER_ENV_ROOT:-/kpfs-intern/jialongliu/envs/cosmos-predict2-cu128-py310}"
@@ -110,27 +110,16 @@ while (( $# > 0 )); do
 done
 
 case "$stage" in
-    s4)
-        max_steps=5000
-        default_port=29661
-        predecessor="$STAGE1_ROOT"
-        fresh_target=1
-        ;;
-    s2)
-        max_steps=3000
-        default_port=29662
-        predecessor="$OUTPUT_ROOT/s4/checkpoints/step_5000"
-        fresh_target=0
-        ;;
     s1)
-        max_steps=3000
-        default_port=29663
-        predecessor="$OUTPUT_ROOT/s2/checkpoints/step_3000"
-        fresh_target=0
-        ;;
+        max_steps=3000; default_port=29663 ;;
+    s2)
+        max_steps=3000; default_port=29662 ;;
+    s4)
+        max_steps=5000; default_port=29661 ;;
+    universal)
+        max_steps=5000; default_port=29664 ;;
     *)
-        die "stage must be one of: s4, s2, s1"
-        ;;
+        die "stage must be one of: s1, s2, s4, universal" ;;
 esac
 
 master_port="${master_port:-$default_port}"
@@ -164,16 +153,14 @@ if [[ -n "$resume_step" ]]; then
 else
     [[ ! -e "$output_dir/checkpoints" ]] || die \
         "Refusing fresh run with existing checkpoints: $output_dir/checkpoints"
-    resume_from_path="$predecessor"
-    resume_online_from_target="$fresh_target"
+    resume_from_path="$STAGE1_ROOT"
+    resume_online_from_target=1
     reset_resume_step=1
     resume_optimizer_state=0
-    require_transformer "predecessor online_student/transformer" \
+    require_transformer "Stage-1 online_student/transformer" \
         "$resume_from_path/online_student/transformer"
-    if (( fresh_target )); then
-        require_transformer "Stage-1 target_student/transformer" \
-            "$resume_from_path/target_student/transformer"
-    fi
+    require_transformer "Stage-1 target_student/transformer" \
+        "$resume_from_path/target_student/transformer"
 fi
 
 COSMOS_POLICY_EXTRA_PYTHONPATH="${COSMOS_POLICY_EXTRA_PYTHONPATH:-$COSMOS_PREDICT2_REPO/packages/cosmos-cuda:$COSMOS_PREDICT2_REPO/packages/cosmos-oss}"

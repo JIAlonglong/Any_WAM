@@ -14,7 +14,7 @@
 - Keep DanceOPD semantics exactly: S1=`1`/velocity `0`; S2=`2`/velocity `1`; S4=`4`/velocity `1`; universal=`2,4`/velocity `1`.
 - Universal endpoint pairs are exactly `8,1;8,2;8,4`; its DanceOPD choice is independent, not pair-coupled.
 - Steps are S1=3000, S2=3000, S4=5000, universal=5000; save interval is 1000.
-- Fresh outputs are below `output_libero_cosmos_independent_dance_4way_8gpu_20260721/<mode>` and must never be overwritten.
+- Fresh outputs are below `output_libero_cosmos_independent_dance_4way_8gpu_20260721/s1`, with matching `s2`, `s4`, and `universal` directories, and must never be overwritten.
 - Every launch requires exactly eight matching visible GPU ordinals and does not start a GPU job during `--dry-run`.
 
 ---

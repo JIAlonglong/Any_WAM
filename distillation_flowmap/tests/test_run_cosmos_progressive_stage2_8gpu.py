@@ -88,6 +88,8 @@ def test_dry_run_prints_independent_stage_contract_without_creating_output(
     assert f"MAX_TRAIN_STEPS={steps}" in result.stdout
     assert "RESUME_FROM_PATH=" + env["COSMOS_STAGE1_ROOT"] in result.stdout
     assert "RESUME_ONLINE_FROM_TARGET=1" in result.stdout
+    assert "RESET_RESUME_STEP=1" in result.stdout
+    assert "RESUME_OPTIMIZER_STATE=0" in result.stdout
     assert f"--master_port={port}" in result.stdout
     assert not (output / stage).exists()
 

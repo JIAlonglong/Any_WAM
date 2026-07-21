@@ -71,6 +71,18 @@ def test_progressive_k2_uses_a_two_step_danceopd_query_grid(monkeypatch):
     assert module.cfg.opd_danceopd_velocity_weight == 1.0
 
 
+def test_progressive_universal_retains_original_lingbotva_definition(monkeypatch):
+    monkeypatch.setenv("COSMOS_PROGRESSIVE_STAGE", "universal")
+    monkeypatch.delenv("OPD_DANCEOPD_ROLLOUT_STEPS", raising=False)
+    module = importlib.reload(importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive"
+    ))
+    assert module.cfg.opd_rollout_step_pairs == [[8, 1], [8, 2], [8, 4]]
+    assert module.cfg.opd_danceopd_rollout_step_choices == (2, 4)
+    assert module.cfg.opd_danceopd_rollout_steps == 2
+    assert module.cfg.opd_danceopd_velocity_weight == 1.0
+
+
 def test_cosmos_danceopd_uses_terminal_semantic_states_and_skips_s1_velocity():
     source = (
         Path(__file__).resolve().parents[1] / "flowmap_step.py"

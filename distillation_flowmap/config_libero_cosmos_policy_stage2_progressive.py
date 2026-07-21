@@ -19,37 +19,58 @@ def _env_bool(name, default):
     return value.lower() in ("1", "true", "yes", "on")
 
 
+def _parse_positive_step_choices(text, *, env_name):
+    parts = [part.strip() for part in text.split(",")]
+    if not parts or any(not part for part in parts):
+        raise ValueError(f"{env_name} must be a comma-separated list of positive integers")
+    try:
+        choices = tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise ValueError(
+            f"{env_name} must be a comma-separated list of positive integers"
+        ) from exc
+    if any(choice <= 0 for choice in choices) or len(set(choices)) != len(choices):
+        raise ValueError(f"{env_name} must contain unique positive integers")
+    return choices
+
+
 _stage = os.environ.get("COSMOS_PROGRESSIVE_STAGE", "s4").strip().lower()
 _stage_specs = {
     "s4": {
         "max_steps": 5000,
-        "teacher_steps": 8,
-        "student_steps": 4,
+        "rollout_step_pairs": [[8, 4]],
         "focus_prob": 0.80,
         "velocity_weight": 1.0,
         "grad_mode": "suffix",
         "grad_steps": 2,
-        "danceopd_rollout_steps": 4,
+        "danceopd_rollout_steps": "4",
     },
     "s2": {
         "max_steps": 3000,
-        "teacher_steps": 4,
-        "student_steps": 2,
+        "rollout_step_pairs": [[4, 2]],
         "focus_prob": 0.85,
         "velocity_weight": 1.0,
         "grad_mode": "last_step",
         "grad_steps": 1,
-        "danceopd_rollout_steps": 2,
+        "danceopd_rollout_steps": "2",
     },
     "s1": {
         "max_steps": 3000,
-        "teacher_steps": 4,
-        "student_steps": 1,
+        "rollout_step_pairs": [[4, 1]],
         "focus_prob": 0.90,
         "velocity_weight": 0.0,
         "grad_mode": "last_step",
         "grad_steps": 1,
-        "danceopd_rollout_steps": 1,
+        "danceopd_rollout_steps": "1",
+    },
+    "universal": {
+        "max_steps": 5000,
+        "rollout_step_pairs": [[8, 1], [8, 2], [8, 4]],
+        "focus_prob": 0.85,
+        "velocity_weight": 1.0,
+        "grad_mode": "last_step",
+        "grad_steps": 1,
+        "danceopd_rollout_steps": "2,4",
     },
 }
 if _stage not in _stage_specs:
@@ -131,7 +152,7 @@ cfg.opd_cosmos_spatial_crop_size = int(
     os.environ.get("OPD_COSMOS_SPATIAL_CROP_SIZE", 28)
 )
 
-cfg.opd_rollout_step_pairs = [[_spec["teacher_steps"], _spec["student_steps"]]]
+cfg.opd_rollout_step_pairs = copy.deepcopy(_spec["rollout_step_pairs"])
 cfg.rollout_step_pairs = copy.deepcopy(cfg.opd_rollout_step_pairs)
 cfg.opd_rollout_grad_mode = os.environ.get(
     "OPD_ROLLOUT_GRAD_MODE", _spec["grad_mode"]
@@ -143,12 +164,13 @@ cfg.opd_endpoint_focus_prob = float(
     os.environ.get("OPD_ENDPOINT_FOCUS_PROB", _spec["focus_prob"])
 )
 
-# DanceOPD rollout lengths follow the deployed student trajectory.  S1 is
-# endpoint-only because it has no interior trajectory field; S2/S4 query
-# post-update semantic states from their 2/4-step rollouts.
-cfg.opd_danceopd_rollout_steps = int(
-    os.environ.get("OPD_DANCEOPD_ROLLOUT_STEPS", _spec["danceopd_rollout_steps"])
+# DanceOPD samples its configured semantic-query rollout choices independently
+# of the endpoint pair sampled by the main progressive OPD objective.
+cfg.opd_danceopd_rollout_step_choices = _parse_positive_step_choices(
+    os.environ.get("OPD_DANCEOPD_ROLLOUT_STEPS", _spec["danceopd_rollout_steps"]),
+    env_name="OPD_DANCEOPD_ROLLOUT_STEPS",
 )
+cfg.opd_danceopd_rollout_steps = cfg.opd_danceopd_rollout_step_choices[0]
 cfg.opd_danceopd_query_alpha = float(
     os.environ.get("OPD_DANCEOPD_QUERY_ALPHA", 5.0)
 )

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -5,6 +7,7 @@ from distillation_flowmap.cosmos_progressive_opd import (
     apply_full_endpoint_focus,
     broadcast_joint_action_timesteps,
     center_spatial_crop_slices,
+    compose_cosmos_endpoint_loss,
     rollout_velocity_field,
     should_stop_training_at_step,
     should_run_standalone_opd,
@@ -110,3 +113,32 @@ def test_joint_action_timesteps_reject_per_frame_video_pairs_without_a_mapping_r
 
     with pytest.raises(ValueError, match="constant across video frames"):
         broadcast_joint_action_timesteps(video_t, video_r, action_frames=4)
+
+
+def test_zero_weight_action_endpoint_cannot_poison_video_only_loss():
+    video_loss = torch.tensor(1.25, requires_grad=True)
+    action_loss = torch.tensor(float("nan"), requires_grad=True)
+
+    loss = compose_cosmos_endpoint_loss(
+        video_loss,
+        action_loss,
+        action_endpoint_weight=0.0,
+    )
+
+    assert torch.isfinite(loss)
+    assert loss.item() == pytest.approx(1.25)
+    loss.backward()
+    assert video_loss.grad.item() == pytest.approx(1.0)
+    assert action_loss.grad is None
+
+
+def test_video_only_cosmos_opd_skips_action_endpoint_loss_graph():
+    source = (
+        Path(__file__).resolve().parents[1] / "flowmap_step.py"
+    ).read_text(encoding="utf-8")
+    cosmos_full_block = source.split(
+        "def _cosmos_latent_full_opd_aux_transition_step("
+    )[1].split("def _cosmos_latent_opd_aux_transition_step(")[0]
+
+    assert "if joint_action_rollout and action_endpoint_weight > 0.0:" in cosmos_full_block
+    assert "endpoint_loss = compose_cosmos_endpoint_loss(" in cosmos_full_block

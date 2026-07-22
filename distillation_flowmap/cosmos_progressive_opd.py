@@ -44,6 +44,30 @@ def broadcast_joint_action_timesteps(video_t, video_r, *, action_frames):
     return video_t[:, :1].expand(shape), video_r[:, :1].expand(shape)
 
 
+def compose_cosmos_endpoint_loss(
+    video_endpoint_loss,
+    action_endpoint_loss,
+    *,
+    action_endpoint_weight,
+):
+    """Add the action endpoint term only when that objective is enabled.
+
+    In particular, avoid ``0 * NaN`` turning a video-only loss non-finite and
+    keep the disabled action branch out of the autograd graph.
+    """
+    action_endpoint_weight = float(action_endpoint_weight)
+    if (
+        not math.isfinite(action_endpoint_weight)
+        or action_endpoint_weight < 0.0
+    ):
+        raise ValueError(
+            "Cosmos OPD action endpoint weight must be finite and non-negative"
+        )
+    if action_endpoint_weight == 0.0:
+        return video_endpoint_loss
+    return video_endpoint_loss + action_endpoint_weight * action_endpoint_loss
+
+
 @torch.no_grad()
 def rollout_velocity_field(x_t, timesteps, target_timesteps, *, num_steps, velocity_field):
     """Euler-integrate a frozen normalized-time vector field from `t` to `r`.

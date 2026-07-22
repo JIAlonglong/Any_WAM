@@ -111,6 +111,7 @@ from distillation_flowmap.cosmos_progressive_opd import (
     apply_full_endpoint_focus,
     broadcast_joint_action_timesteps,
     center_spatial_crop_slices,
+    compose_cosmos_endpoint_loss,
     rollout_velocity_field,
 )
 
@@ -4426,13 +4427,20 @@ class FlowMapStepMixin:
         video_endpoint_loss = denoised_endpoint_mse(
             student_x_r, student_v_r, teacher_x_r, teacher_v_r, sigma_r
         )
-        action_endpoint_loss = torch.zeros((), device=self.device, dtype=video_endpoint_loss.dtype)
         action_endpoint_weight = float(getattr(
             self.config, 'opd_danceopd_action_endpoint_weight', 0.0
         ))
-        if not math.isfinite(action_endpoint_weight) or action_endpoint_weight < 0:
-            raise ValueError('Cosmos OPD action endpoint weight must be finite and non-negative')
-        if joint_action_rollout:
+        if (
+            not math.isfinite(action_endpoint_weight)
+            or action_endpoint_weight < 0.0
+        ):
+            raise ValueError(
+                'Cosmos OPD action endpoint weight must be finite and non-negative'
+            )
+        action_endpoint_loss = torch.zeros(
+            (), device=self.device, dtype=video_endpoint_loss.dtype
+        )
+        if joint_action_rollout and action_endpoint_weight > 0.0:
             action_downsample = int(getattr(self.config, 'action_downsample_factor', 4))
             student_action_v = self._extract_action_v(
                 student_action_seq, student_action_x_r.shape[2]
@@ -4451,7 +4459,11 @@ class FlowMapStepMixin:
             action_diff = (student_action_x0.float() - action_target_x0.detach().float()) * action_mask
             action_denom = (action_mask.sum() * student_action_x0.shape[1]).clamp(min=1.0)
             action_endpoint_loss = action_diff.square().sum() / action_denom
-        endpoint_loss = video_endpoint_loss + action_endpoint_weight * action_endpoint_loss
+        endpoint_loss = compose_cosmos_endpoint_loss(
+            video_endpoint_loss,
+            action_endpoint_loss,
+            action_endpoint_weight=action_endpoint_weight,
+        )
         endpoint_weight = float(getattr(self.config, 'opd_danceopd_endpoint_weight', 1.0))
         velocity_weight = float(getattr(self.config, 'opd_danceopd_velocity_weight', 1.0))
         if (

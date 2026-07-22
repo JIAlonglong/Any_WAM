@@ -38,11 +38,6 @@ class FlowMatchScheduler():
         dynamic_shift_len=None):
         if shift is not None:
             self.shift = shift
-        if (
-            not self.exponential_shift
-            and (not math.isfinite(self.shift) or self.shift <= 0)
-        ):
-            raise ValueError("shift must be finite and positive")
         sigma_start = self.sigma_min + (self.sigma_max -
                                         self.sigma_min) * denoising_strength
         if self.extra_one_step:
@@ -59,8 +54,22 @@ class FlowMatchScheduler():
             ) if dynamic_shift_len is not None else self.exponential_shift_mu
             self.sigmas = math.exp(mu) / (math.exp(mu) + (1 / self.sigmas - 1))
         else:
-            self.sigmas = self.shift * self.sigmas / (
-                1 + (self.shift - 1) * self.sigmas)
+            try:
+                shift_value = float(self.shift)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("shift must be finite and positive") from exc
+            effective_shift = torch.as_tensor(
+                shift_value, dtype=self.sigmas.dtype, device=self.sigmas.device
+            )
+            if (
+                not math.isfinite(shift_value)
+                or shift_value <= 0
+                or not bool(torch.isfinite(effective_shift))
+                or not bool(effective_shift > 0)
+            ):
+                raise ValueError("shift must be finite and positive")
+            self.sigmas = shift_value * self.sigmas / (
+                1 + (shift_value - 1) * self.sigmas)
         if self.shift_terminal is not None:
             one_minus_z = 1 - self.sigmas
             scale_factor = one_minus_z[-1] / (1 - self.shift_terminal)
@@ -79,6 +88,8 @@ class FlowMatchScheduler():
             and denoising_strength == 1.0
         )
         if full_forward_noise_endpoint:
+            if not bool(torch.isfinite(self.sigmas[0])):
+                raise ValueError("full-forward scheduler endpoint is non-finite")
             self.sigmas[0] = 1.0
         self.timesteps = self.sigmas * self.num_train_timesteps
         if training:

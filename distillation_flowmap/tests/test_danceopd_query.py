@@ -162,6 +162,45 @@ class DanceOPDQueryTest(unittest.TestCase):
                 extra_one_step=True,
             )
 
+    def test_flowmatch_rejects_invalid_linear_shift_override(self):
+        scheduler = FlowMatchScheduler(
+            num_inference_steps=1000,
+            num_train_timesteps=1000,
+            shift=0.05,
+            sigma_min=0.0,
+            extra_one_step=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "shift must be finite and positive"):
+            scheduler.set_timesteps(1000, shift=0.0)
+
+    def test_flowmatch_rejects_unrepresentable_linear_shift(self):
+        for shift in (1e-46, 1e100):
+            with self.subTest(shift=shift):
+                with self.assertRaisesRegex(
+                    ValueError, "shift must be finite and positive"
+                ):
+                    FlowMatchScheduler(
+                        num_inference_steps=1000,
+                        num_train_timesteps=1000,
+                        shift=shift,
+                        sigma_min=0.0,
+                        extra_one_step=True,
+                    )
+
+    def test_flowmatch_rejects_nonfinite_full_forward_endpoint(self):
+        with self.assertRaisesRegex(
+            ValueError, "full-forward scheduler endpoint is non-finite"
+        ):
+            FlowMatchScheduler(
+                num_inference_steps=1000,
+                num_train_timesteps=1000,
+                exponential_shift=True,
+                exponential_shift_mu=float("inf"),
+                sigma_min=0.0,
+                extra_one_step=True,
+            )
+
     def test_flowmatch_partial_schedule_is_not_snapped_to_pure_noise(self):
         scheduler = FlowMatchScheduler(
             num_inference_steps=1000,

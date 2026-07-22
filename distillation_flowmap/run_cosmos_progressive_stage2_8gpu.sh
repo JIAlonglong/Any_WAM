@@ -158,8 +158,16 @@ if [[ -n "$resume_step" ]]; then
     reset_resume_step=0
     resume_optimizer_state=1
 else
-    [[ ! -e "$output_dir/checkpoints" ]] || die \
-        "Refusing fresh run with existing checkpoints: $output_dir/checkpoints"
+    if [[ -e "$output_dir/checkpoints" ]]; then
+        [[ -d "$output_dir/checkpoints" ]] || die \
+            "fresh checkpoint path is not a directory: $output_dir/checkpoints"
+        # A failed run can create this directory before its first checkpoint.
+        # Preserve its logs and allow a safe fresh restart only while it is empty.
+        checkpoint_entry="$(find "$output_dir/checkpoints" -mindepth 1 -maxdepth 1 -print -quit)" || die \
+            "cannot inspect fresh checkpoint path: $output_dir/checkpoints"
+        [[ -z "$checkpoint_entry" ]] || die \
+            "Refusing fresh run with existing checkpoints: $output_dir/checkpoints"
+    fi
     resume_from_path="$STAGE1_ROOT"
     resume_online_from_target=1
     reset_resume_step=1

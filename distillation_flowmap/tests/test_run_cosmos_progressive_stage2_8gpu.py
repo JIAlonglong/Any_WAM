@@ -138,9 +138,20 @@ def test_dry_run_rejects_invalid_or_mismatched_worker_gpu_layout(
     assert message in result.stderr
 
 
-def test_dry_run_rejects_existing_fresh_checkpoint_root(tmp_path):
+def test_dry_run_allows_empty_fresh_checkpoint_root(tmp_path):
     env, output = _env(tmp_path)
     (output / "s4" / "checkpoints").mkdir(parents=True)
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_dry_run_rejects_nonempty_fresh_checkpoint_root(tmp_path):
+    env, output = _env(tmp_path)
+    checkpoints = output / "s4" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    (checkpoints / "step_1000").mkdir()
 
     result = _run("s4", "--dry-run", env=env)
 

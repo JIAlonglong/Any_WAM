@@ -63,22 +63,17 @@ class FlowMatchScheduler():
         if self.reverse_sigmas:
             self.sigmas = 1 - self.sigmas
         # A full-strength, forward diffusion schedule starts at pure noise.
-        # Finite-precision shifted-sigma arithmetic can turn the mathematical
-        # endpoint sigma=1 into (for example) 0.99999976, which leaves a small
-        # data-dependent clean-state residual in ``add_noise``.  Preserve the
-        # exact endpoint contract without changing partial/inverse schedules.
+        # Finite-precision shifted-sigma arithmetic can move the mathematical
+        # endpoint sigma=1 above or below one, which leaves a data-dependent
+        # clean-state residual in ``add_noise``. Preserve the exact endpoint
+        # contract without changing partial/inverse schedules.
         full_forward_noise_endpoint = (
             not self.inverse_timesteps
             and not self.reverse_sigmas
             and self.sigma_max == 1.0
             and denoising_strength == 1.0
         )
-        endpoint_roundoff = 4 * torch.finfo(self.sigmas.dtype).eps
-        if (
-            full_forward_noise_endpoint
-            and torch.isfinite(self.sigmas[0])
-            and (self.sigmas[0] - 1.0).abs() <= endpoint_roundoff
-        ):
+        if full_forward_noise_endpoint:
             self.sigmas[0] = 1.0
         self.timesteps = self.sigmas * self.num_train_timesteps
         if training:

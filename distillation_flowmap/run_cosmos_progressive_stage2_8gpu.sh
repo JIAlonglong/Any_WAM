@@ -67,6 +67,7 @@ print_assignment() {
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 STAGE1_ROOT="${COSMOS_STAGE1_ROOT:-/kpfs-intern/jialongliu/models/modelscope/JIAlonglong/any-wam-cosmos-checkpoints/raw_stage1_5000}"
+STUDENT_BASE_MODEL_PATH="${STUDENT_BASE_MODEL_PATH:-${STAGE1_ROOT}/target_student}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_cosmos_independent_dance_4way_8gpu_20260721}"
 DATASET_PATH="${DATASET_PATH:-/kpfs-intern/jialongliu/projects/Flash-WAM/training_data/libero-long-lerobot}"
 COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B}"
@@ -139,6 +140,12 @@ require_dir COSMOS_PREDICT2_REPO "$COSMOS_PREDICT2_REPO"
 require_dir COSMOS_PREDICT25_LOCAL_MODEL_DIR "$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
 [[ -x "$COSMOS_POLICY_PYTHON" ]] || die \
     "COSMOS_POLICY_PYTHON is not executable: $COSMOS_POLICY_PYTHON"
+if [[ "$(basename "$STUDENT_BASE_MODEL_PATH")" == "transformer" ]]; then
+    require_transformer STUDENT_BASE_MODEL_PATH "$STUDENT_BASE_MODEL_PATH"
+else
+    require_transformer STUDENT_BASE_MODEL_PATH \
+        "$STUDENT_BASE_MODEL_PATH/transformer"
+fi
 
 if [[ -n "$resume_step" ]]; then
     [[ "$resume_step" =~ ^[1-9][0-9]*$ ]] && (( resume_step < max_steps )) || die \
@@ -194,6 +201,7 @@ export HF_HUB_OFFLINE=1
 export CUDA_VISIBLE_DEVICES
 export COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES
 export COSMOS_POLICY_PATH
+export STUDENT_BASE_MODEL_PATH
 export COSMOS_POLICY_PYTHON
 export COSMOS_PREDICT2_REPO
 export COSMOS_PREDICT25_LOCAL_MODEL_DIR
@@ -221,6 +229,7 @@ for key in \
     RESET_RESUME_STEP \
     RESUME_OPTIMIZER_STATE \
     SAVE_INTERVAL \
+    STUDENT_BASE_MODEL_PATH \
     CUDA_VISIBLE_DEVICES \
     COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES; do
     print_assignment "$key" "${!key}"

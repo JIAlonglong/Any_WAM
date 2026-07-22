@@ -87,6 +87,10 @@ def test_dry_run_prints_independent_stage_contract_without_creating_output(
     assert result.returncode == 0, result.stderr
     assert f"MAX_TRAIN_STEPS={steps}" in result.stdout
     assert "RESUME_FROM_PATH=" + env["COSMOS_STAGE1_ROOT"] in result.stdout
+    assert (
+        "STUDENT_BASE_MODEL_PATH="
+        + str(Path(env["COSMOS_STAGE1_ROOT"]) / "target_student")
+    ) in result.stdout
     assert "RESUME_ONLINE_FROM_TARGET=1" in result.stdout
     assert "RESET_RESUME_STEP=1" in result.stdout
     assert "RESUME_OPTIMIZER_STATE=0" in result.stdout

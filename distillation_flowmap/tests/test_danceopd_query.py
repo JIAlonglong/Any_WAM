@@ -152,6 +152,16 @@ class DanceOPDQueryTest(unittest.TestCase):
                 self.assertTrue(torch.equal(scheduler.sigmas[0], torch.tensor(1.0)))
                 self.assertTrue(torch.equal(terminal_state, noise))
 
+    def test_flowmatch_rejects_nonpositive_linear_shift(self):
+        with self.assertRaisesRegex(ValueError, "shift must be finite and positive"):
+            FlowMatchScheduler(
+                num_inference_steps=1000,
+                num_train_timesteps=1000,
+                shift=0.0,
+                sigma_min=0.0,
+                extra_one_step=True,
+            )
+
     def test_flowmatch_partial_schedule_is_not_snapped_to_pure_noise(self):
         scheduler = FlowMatchScheduler(
             num_inference_steps=1000,

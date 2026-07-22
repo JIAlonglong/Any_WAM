@@ -35,9 +35,14 @@ class FlowMatchScheduler():
                       denoising_strength=1.0,
                       training=False,
                       shift=None,
-                      dynamic_shift_len=None):
+        dynamic_shift_len=None):
         if shift is not None:
             self.shift = shift
+        if (
+            not self.exponential_shift
+            and (not math.isfinite(self.shift) or self.shift <= 0)
+        ):
+            raise ValueError("shift must be finite and positive")
         sigma_start = self.sigma_min + (self.sigma_max -
                                         self.sigma_min) * denoising_strength
         if self.extra_one_step:

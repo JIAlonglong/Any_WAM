@@ -69,6 +69,16 @@ def _run(*args: str, env: dict[str, str]):
     )
 
 
+def _assignments(stdout: str) -> dict[str, str]:
+    return {
+        key: value
+        for line in stdout.splitlines()
+        if "=" in line
+        for key, value in [line.split("=", 1)]
+        if key.isupper()
+    }
+
+
 @pytest.mark.parametrize(
     ("stage", "steps", "port"),
     [
@@ -96,6 +106,48 @@ def test_dry_run_prints_independent_stage_contract_without_creating_output(
     assert "RESUME_OPTIMIZER_STATE=0" in result.stdout
     assert f"--master_port={port}" in result.stdout
     assert not (output / stage).exists()
+
+
+def test_dual_universal_video_modes_are_a_paired_cosmos_loss_ablation(tmp_path):
+    env, output = _env(tmp_path)
+    resolved = {}
+    for mode in ("universal-video", "universal-video-action"):
+        result = _run(mode, "--dry-run", env=env)
+
+        assert result.returncode == 0, result.stderr
+        resolved[mode] = _assignments(result.stdout)
+
+    video = resolved["universal-video"]
+    video_action = resolved["universal-video-action"]
+    assert video["COSMOS_PROGRESSIVE_STAGE"] == "universal"
+    assert video_action["COSMOS_PROGRESSIVE_STAGE"] == "universal"
+    assert video["MAX_TRAIN_STEPS"] == video_action["MAX_TRAIN_STEPS"] == "5000"
+    assert video["OUTPUT_DIR"] == str(output / "universal-video")
+    assert video_action["OUTPUT_DIR"] == str(output / "universal-video-action")
+    assert video["MASTER_PORT"] == "29665"
+    assert video_action["MASTER_PORT"] == "29666"
+    assert video["OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT"] == "0.0"
+    assert video_action["OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT"] == "1.0"
+    assert video["OPD_AUX_ACTION"] == video_action["OPD_AUX_ACTION"] == "0"
+    assert (
+        video["COSMOS_USE_TEACHER_ACTION_ANCHOR"]
+        == video_action["COSMOS_USE_TEACHER_ACTION_ANCHOR"]
+        == "1"
+    )
+    assert (
+        video["OPD_JOINT_ACTION_ROLLOUT"]
+        == video_action["OPD_JOINT_ACTION_ROLLOUT"]
+        == "1"
+    )
+
+    paired_keys = set(video) | set(video_action)
+    paired_keys -= {
+        "OUTPUT_DIR",
+        "MASTER_PORT",
+        "OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT",
+    }
+    for key in paired_keys:
+        assert video[key] == video_action[key]
 
 
 def test_s4_dry_run_rejects_missing_target_to_online_compatibility_link(tmp_path):

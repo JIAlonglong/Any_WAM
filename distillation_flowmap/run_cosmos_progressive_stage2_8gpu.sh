@@ -112,19 +112,54 @@ done
 
 case "$stage" in
     s1)
-        max_steps=3000; default_port=29663 ;;
+        progressive_stage=s1
+        max_steps=3000; default_port=29663
+        action_endpoint_weight="${OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT:-1.0}"
+        opd_aux_action="${OPD_AUX_ACTION:-0}"
+        cosmos_use_teacher_action_anchor="${COSMOS_USE_TEACHER_ACTION_ANCHOR:-1}"
+        opd_joint_action_rollout="${OPD_JOINT_ACTION_ROLLOUT:-1}" ;;
     s2)
-        max_steps=3000; default_port=29662 ;;
+        progressive_stage=s2
+        max_steps=3000; default_port=29662
+        action_endpoint_weight="${OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT:-1.0}"
+        opd_aux_action="${OPD_AUX_ACTION:-0}"
+        cosmos_use_teacher_action_anchor="${COSMOS_USE_TEACHER_ACTION_ANCHOR:-1}"
+        opd_joint_action_rollout="${OPD_JOINT_ACTION_ROLLOUT:-1}" ;;
     s4)
-        max_steps=5000; default_port=29661 ;;
+        progressive_stage=s4
+        max_steps=5000; default_port=29661
+        action_endpoint_weight="${OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT:-1.0}"
+        opd_aux_action="${OPD_AUX_ACTION:-0}"
+        cosmos_use_teacher_action_anchor="${COSMOS_USE_TEACHER_ACTION_ANCHOR:-1}"
+        opd_joint_action_rollout="${OPD_JOINT_ACTION_ROLLOUT:-1}" ;;
     universal)
-        max_steps=5000; default_port=29664 ;;
+        progressive_stage=universal
+        max_steps=5000; default_port=29664
+        action_endpoint_weight="${OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT:-1.0}"
+        opd_aux_action="${OPD_AUX_ACTION:-0}"
+        cosmos_use_teacher_action_anchor="${COSMOS_USE_TEACHER_ACTION_ANCHOR:-1}"
+        opd_joint_action_rollout="${OPD_JOINT_ACTION_ROLLOUT:-1}" ;;
+    universal-video)
+        progressive_stage=universal
+        max_steps=5000; default_port=29665
+        action_endpoint_weight=0.0
+        opd_aux_action=0
+        cosmos_use_teacher_action_anchor=1
+        opd_joint_action_rollout=1 ;;
+    universal-video-action)
+        progressive_stage=universal
+        max_steps=5000; default_port=29666
+        action_endpoint_weight=1.0
+        opd_aux_action=0
+        cosmos_use_teacher_action_anchor=1
+        opd_joint_action_rollout=1 ;;
     *)
-        die "stage must be one of: s1, s2, s4, universal" ;;
+        die "stage must be one of: s1, s2, s4, universal, universal-video, universal-video-action" ;;
 esac
 
 master_port="${master_port:-$default_port}"
 validate_port "$master_port"
+MASTER_PORT="$master_port"
 output_dir="$OUTPUT_ROOT/$stage"
 
 validate_devices CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES"
@@ -182,7 +217,7 @@ COSMOS_POLICY_EXTRA_PYTHONPATH="${COSMOS_POLICY_EXTRA_PYTHONPATH:-$COSMOS_PREDIC
 COSMOS_WORKER_CUDA_LIBRARY_PATH="${COSMOS_WORKER_CUDA_LIBRARY_PATH:-${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cublas/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_cupti/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_nvrtc/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_runtime/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cudnn/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cufft/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cufile/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/curand/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusolver/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusparse/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusparselt/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/nccl/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/nvjitlink/lib}"
 
 export CONFIG_FILE=distillation_flowmap.config_libero_cosmos_policy_stage2_progressive
-export COSMOS_PROGRESSIVE_STAGE="$stage"
+export COSMOS_PROGRESSIVE_STAGE="$progressive_stage"
 export COSMOS_PROGRESSIVE_OUTPUT_ROOT="$OUTPUT_ROOT"
 export OUTPUT_DIR="$output_dir"
 export MAX_TRAIN_STEPS="$max_steps"
@@ -197,6 +232,10 @@ export OPD_AUX_GRADIENT_CHECKPOINTING=1
 export OPD_SERIAL_STUDENT_CFG=1
 export OPD_AUX_STANDALONE_STEP=1
 export OPD_COSMOS_SPATIAL_CROP_SIZE=28
+export OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT="$action_endpoint_weight"
+export OPD_AUX_ACTION="$opd_aux_action"
+export COSMOS_USE_TEACHER_ACTION_ANCHOR="$cosmos_use_teacher_action_anchor"
+export OPD_JOINT_ACTION_ROLLOUT="$opd_joint_action_rollout"
 export ENABLE_WANDB=0
 export WANDB_MODE=offline
 export ATTN_MODE="${ATTN_MODE:-flex}"
@@ -231,12 +270,18 @@ train_cmd=(
 
 for key in \
     COSMOS_PROGRESSIVE_STAGE \
+    MASTER_PORT \
+    OUTPUT_DIR \
     MAX_TRAIN_STEPS \
     RESUME_FROM_PATH \
     RESUME_ONLINE_FROM_TARGET \
     RESET_RESUME_STEP \
     RESUME_OPTIMIZER_STATE \
     SAVE_INTERVAL \
+    OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT \
+    OPD_AUX_ACTION \
+    COSMOS_USE_TEACHER_ACTION_ANCHOR \
+    OPD_JOINT_ACTION_ROLLOUT \
     STUDENT_BASE_MODEL_PATH \
     CUDA_VISIBLE_DEVICES \
     COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES; do

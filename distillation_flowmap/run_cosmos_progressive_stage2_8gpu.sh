@@ -110,6 +110,7 @@ while (( $# > 0 )); do
     esac
 done
 
+train_seed=""
 case "$stage" in
     s1)
         progressive_stage=s1
@@ -145,14 +146,16 @@ case "$stage" in
         action_endpoint_weight=0.0
         opd_aux_action=0
         cosmos_use_teacher_action_anchor=1
-        opd_joint_action_rollout=1 ;;
+        opd_joint_action_rollout=1
+        train_seed=42 ;;
     universal-video-action)
         progressive_stage=universal
         max_steps=5000; default_port=29666
         action_endpoint_weight=1.0
         opd_aux_action=0
         cosmos_use_teacher_action_anchor=1
-        opd_joint_action_rollout=1 ;;
+        opd_joint_action_rollout=1
+        train_seed=42 ;;
     *)
         die "stage must be one of: s1, s2, s4, universal, universal-video, universal-video-action" ;;
 esac
@@ -236,6 +239,9 @@ export OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT="$action_endpoint_weight"
 export OPD_AUX_ACTION="$opd_aux_action"
 export COSMOS_USE_TEACHER_ACTION_ANCHOR="$cosmos_use_teacher_action_anchor"
 export OPD_JOINT_ACTION_ROLLOUT="$opd_joint_action_rollout"
+if [[ -n "$train_seed" ]]; then
+    export TRAIN_SEED="$train_seed"
+fi
 export ENABLE_WANDB=0
 export WANDB_MODE=offline
 export ATTN_MODE="${ATTN_MODE:-flex}"
@@ -287,6 +293,9 @@ for key in \
     COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES; do
     print_assignment "$key" "${!key}"
 done
+if [[ -n "$train_seed" ]]; then
+    print_assignment TRAIN_SEED "$TRAIN_SEED"
+fi
 printf 'command='
 printf '%q ' "${train_cmd[@]}"
 printf '\n'

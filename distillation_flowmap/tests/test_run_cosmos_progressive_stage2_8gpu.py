@@ -122,6 +122,7 @@ def test_dual_universal_video_modes_are_a_paired_cosmos_loss_ablation(tmp_path):
     assert video["COSMOS_PROGRESSIVE_STAGE"] == "universal"
     assert video_action["COSMOS_PROGRESSIVE_STAGE"] == "universal"
     assert video["MAX_TRAIN_STEPS"] == video_action["MAX_TRAIN_STEPS"] == "5000"
+    assert video["TRAIN_SEED"] == video_action["TRAIN_SEED"] == "42"
     assert video["OUTPUT_DIR"] == str(output / "universal-video")
     assert video_action["OUTPUT_DIR"] == str(output / "universal-video-action")
     assert video["MASTER_PORT"] == "29665"
@@ -139,6 +140,8 @@ def test_dual_universal_video_modes_are_a_paired_cosmos_loss_ablation(tmp_path):
         == video_action["OPD_JOINT_ACTION_ROLLOUT"]
         == "1"
     )
+    assert not (output / "universal-video").exists()
+    assert not (output / "universal-video-action").exists()
 
     paired_keys = set(video) | set(video_action)
     paired_keys -= {

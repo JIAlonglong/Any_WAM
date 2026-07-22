@@ -3939,9 +3939,25 @@ class FlowMapStepMixin:
         if action_frames <= 0:
             raise ValueError("Cosmos DanceOPD requires action frames after downsampling")
 
-        rollout_steps = int(getattr(self.config, 'opd_danceopd_rollout_steps', 4))
-        if rollout_steps <= 0:
-            raise ValueError("opd_danceopd_rollout_steps must be positive")
+        rollout_step_choices = tuple(
+            int(value)
+            for value in getattr(
+                self.config,
+                'opd_danceopd_rollout_step_choices',
+                (getattr(self.config, 'opd_danceopd_rollout_steps', 4),),
+            )
+        )
+        if not rollout_step_choices or any(value <= 0 for value in rollout_step_choices):
+            raise ValueError('opd_danceopd_rollout_step_choices must be positive')
+        if len(rollout_step_choices) == 1:
+            rollout_steps = rollout_step_choices[0]
+        else:
+            choice_index = torch.randint(
+                len(rollout_step_choices), (1,), device=self.device
+            )
+            if dist.is_initialized():
+                dist.broadcast(choice_index, src=0)
+            rollout_steps = rollout_step_choices[choice_index.item()]
         query_alpha = float(getattr(self.config, 'opd_danceopd_query_alpha', 5.0))
         query_beta = float(getattr(self.config, 'opd_danceopd_query_beta', 2.0))
 
@@ -4139,6 +4155,14 @@ class FlowMapStepMixin:
         query_action_t = select_per_sample_trajectory_state(
             torch.stack(action_timesteps, dim=0), query_indices
         ).detach()
+        # Only the selected query state is needed by the trainable forwards
+        # below. Release the no-grad rollout trajectory before building those
+        # graphs, which keeps the Cosmos joint rollout's peak memory bounded.
+        del video_states, action_states, video_timesteps, action_timesteps
+        del current_video, current_action, joint_input
+        del video_velocity, action_velocity_seq, action_velocity
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         query_input = _build_joint_input(
             query_video, query_video_t, query_action, query_action_t
         )

@@ -111,6 +111,76 @@ class DanceOPDQueryTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(terminal_state, noise))
 
+    def test_flowmatch_shifted_action_terminal_is_exactly_pure_noise(self):
+        scheduler = FlowMatchScheduler(
+            num_inference_steps=1000,
+            num_train_timesteps=1000,
+            shift=0.05,
+            sigma_min=0.0,
+            extra_one_step=True,
+        )
+        scheduler.set_timesteps(1000, training=True)
+        clean = torch.full((2, 30, 64, 1, 1), 10.0)
+        noise = torch.randn_like(clean)
+        terminal_t = torch.full((2, 64), 1000.0)
+
+        terminal_state = scheduler.add_noise(clean, noise, terminal_t, t_dim=2)
+
+        self.assertTrue(torch.equal(scheduler.sigmas[0], torch.tensor(1.0)))
+        self.assertTrue(torch.equal(terminal_state, noise))
+
+    def test_flowmatch_partial_schedule_is_not_snapped_to_pure_noise(self):
+        scheduler = FlowMatchScheduler(
+            num_inference_steps=1000,
+            num_train_timesteps=1000,
+            shift=0.05,
+            sigma_min=0.0,
+            extra_one_step=True,
+        )
+        scheduler.set_timesteps(
+            1000, denoising_strength=0.9, training=True
+        )
+        clean = torch.full((2, 30, 64, 1, 1), 10.0)
+        noise = torch.randn_like(clean)
+        terminal_t = torch.full((2, 64), 1000.0)
+
+        terminal_state = scheduler.add_noise(clean, noise, terminal_t, t_dim=2)
+
+        self.assertLess(float(scheduler.sigmas[0]), 1.0)
+        self.assertFalse(torch.equal(terminal_state, noise))
+
+    def test_cosmos_danceopd_syncs_configured_rollout_choices(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "flowmap_step.py"
+        ).read_text(encoding="utf-8")
+        cosmos_block = source.split(
+            "def _cosmos_danceopd_velocity_loss("
+        )[1].split("def _cosmos_latent_full_opd_aux_transition_step(")[0]
+
+        self.assertIn("opd_danceopd_rollout_step_choices", cosmos_block)
+        self.assertIn("choice_index = torch.randint(", cosmos_block)
+        self.assertIn("dist.broadcast(choice_index, src=0)", cosmos_block)
+        self.assertIn(
+            "rollout_steps = rollout_step_choices[choice_index.item()]",
+            cosmos_block,
+        )
+
+    def test_cosmos_danceopd_releases_rollout_trajectory_before_query(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "flowmap_step.py"
+        ).read_text(encoding="utf-8")
+        cosmos_block = source.split(
+            "def _cosmos_danceopd_velocity_loss("
+        )[1].split("def _cosmos_latent_full_opd_aux_transition_step(")[0]
+
+        release_position = cosmos_block.index(
+            "del video_states, action_states, video_timesteps, action_timesteps"
+        )
+        query_position = cosmos_block.index("student_velocity = _student_joint_forward(")
+
+        self.assertLess(release_position, query_position)
+        self.assertIn("torch.cuda.empty_cache()", cosmos_block)
+
     def test_flowmap_step_has_an_opt_in_danceopd_aux_dispatch(self):
         source = (
             Path(__file__).resolve().parents[1] / "flowmap_step.py"

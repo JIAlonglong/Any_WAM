@@ -148,6 +148,26 @@ def test_dry_run_rejects_existing_fresh_checkpoint_root(tmp_path):
     assert "Refusing fresh run" in result.stderr
 
 
+def test_fresh_run_exports_student_base_to_torchrun(tmp_path):
+    env, _ = _env(tmp_path)
+    capture = tmp_path / "student-base.txt"
+    fake_torchrun = tmp_path / "fake-torchrun"
+    fake_torchrun.write_text(
+        "#!/usr/bin/env bash\nprintf '%s' \"$STUDENT_BASE_MODEL_PATH\" > \"$STUDENT_BASE_CAPTURE\"\n",
+        encoding="utf-8",
+    )
+    fake_torchrun.chmod(fake_torchrun.stat().st_mode | stat.S_IXUSR)
+    env["TORCHRUN_BIN"] = str(fake_torchrun)
+    env["STUDENT_BASE_CAPTURE"] = str(capture)
+
+    result = _run("s2", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text(encoding="utf-8") == str(
+        Path(env["COSMOS_STAGE1_ROOT"]) / "target_student"
+    )
+
+
 def test_dry_run_rejects_invalid_port_and_unknown_stage(tmp_path):
     env, _ = _env(tmp_path)
 

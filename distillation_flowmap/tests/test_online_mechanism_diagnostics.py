@@ -191,6 +191,7 @@ def _load_trainer_harness():
     wanted = {
         "_get_mechanism_diagnostic_batches",
         "_sync_mechanism_diagnostic_preflight",
+        "_finalize_mechanism_diagnostic_contexts",
         "_abort_mechanism_diagnostic_forward_failure",
         "_run_mechanism_diagnostics",
         "_maybe_run_mechanism_diagnostics",
@@ -397,6 +398,64 @@ def test_preflight_one_rank_failure_stops_every_rank_before_first_forward(
     assert len(reductions) == 1
     assert reductions[0][0].numel() == 1
     assert reductions[0][1] == torch.distributed.ReduceOp.MIN
+    host._compute_mechanism_diagnostic_stats.assert_not_called()
+
+
+def test_peer_preflight_failure_happens_before_nofsdp_full_tensor_sync(tmp_path):
+    mixin = _load_mixin()
+    host = _trainer_host(tmp_path)
+    host._mechanism_diagnostic_batches = [_batch()]
+    host.config.action_downsample_factor = 1
+    host.config.cfg_min = 2.0
+    host.config.cfg_max = 4.0
+    host.student = torch.nn.Linear(1, 1)
+    host._student_nofsdp = torch.nn.Linear(1, 1)
+    host._student_nofsdp.eval()
+    host._nofsdp_synced = False
+    host.empty_emb = torch.zeros(1, 1, 1)
+    host._prepare_base_dict = lambda batch: {
+        "latent_dict": {
+            "latent": batch["latents"],
+            "text_emb": torch.zeros(batch["latents"].shape[0], 1, 1),
+        },
+        "action_dict": {
+            "latent": batch["actions"],
+            "cond_timesteps": torch.zeros(
+                batch["actions"].shape[0], batch["actions"].shape[2]
+            ),
+            "text_emb": torch.zeros(batch["actions"].shape[0], 1, 1),
+            "grid_id": None,
+            "actions_mask": batch["action_mask"],
+        },
+        "chunk_size": 1,
+        "window_size": 1,
+    }
+    host._prepare_mechanism_diagnostic_context = types.MethodType(
+        mixin._prepare_mechanism_diagnostic_context, host
+    )
+    trace = []
+    host._sync_student_nofsdp = lambda: trace.append("full_tensor")
+    host._compute_mechanism_diagnostic_stats = mock.Mock()
+
+    def fake_all_reduce(packed, op):
+        assert packed.numel() == 1
+        assert op == torch.distributed.ReduceOp.MIN
+        trace.append("MIN")
+        # This rank prepared successfully, but a peer rank did not.
+        packed.zero_()
+
+    with (
+        mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+        mock.patch.object(torch.distributed, "all_reduce", side_effect=fake_all_reduce),
+        pytest.raises(
+            RuntimeError,
+            match="Mechanism diagnostic preflight failed on at least one rank",
+        ),
+    ):
+        host._run_mechanism_diagnostics()
+
+    assert trace == ["MIN"]
+    assert not host._nofsdp_synced
     host._compute_mechanism_diagnostic_stats.assert_not_called()
 
 

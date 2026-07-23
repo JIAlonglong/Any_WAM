@@ -1424,6 +1424,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 "Mechanism diagnostic preflight failed on at least one rank"
             ) from local_error
 
+    def _finalize_mechanism_diagnostic_contexts(self, prepared_batches):
+        """Synchronize the no-FSDP model only after every rank passed preflight."""
+        use_nofsdp = any(
+            batch["_mechanism_diagnostic_context"].get("use_nofsdp", False)
+            for batch in prepared_batches
+        )
+        if use_nofsdp and not getattr(self, "_nofsdp_synced", False):
+            self._sync_student_nofsdp()
+            self._nofsdp_synced = True
+
     def _abort_mechanism_diagnostic_forward_failure(self, local_error):
         """Fail the whole distributed job instead of risking divergent collectives."""
         if dist.is_initialized():
@@ -1484,6 +1494,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             except Exception as error:
                 preflight_error = error
             self._sync_mechanism_diagnostic_preflight(preflight_error)
+            try:
+                self._finalize_mechanism_diagnostic_contexts(prepared_batches)
+            except Exception as error:
+                self._abort_mechanism_diagnostic_forward_failure(error)
 
             for device_batch in prepared_batches:
                 try:

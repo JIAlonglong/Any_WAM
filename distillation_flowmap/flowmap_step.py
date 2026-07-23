@@ -5232,9 +5232,6 @@ class FlowMapStepMixin:
         action_cond_t = action_base['cond_timesteps'][:, ::action_downsample]
         action_text = action_base['text_emb']
         if use_nofsdp:
-            if not getattr(self, '_nofsdp_synced', False):
-                self._sync_student_nofsdp()
-                self._nofsdp_synced = True
             video_base = {
                 key: _to_regular_tensor(value)
                 if isinstance(value, torch.Tensor) else value
@@ -5255,6 +5252,7 @@ class FlowMapStepMixin:
             'action_clean': action_clean,
             'action_frames': action_frames,
             'action_mask': action_mask,
+            'use_nofsdp': use_nofsdp,
             'student_model': student_model,
             'video_base': video_base,
             'action_latent': action_latent,

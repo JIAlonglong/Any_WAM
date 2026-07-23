@@ -5443,7 +5443,9 @@ class FlowMapStepMixin:
         self, batch, *, diagnostic_index
     ):
         """Run deterministic joint routes and return detached additive statistics."""
-        context = self._prepare_mechanism_diagnostic_context(batch)
+        context = batch.get("_mechanism_diagnostic_context")
+        if context is None:
+            context = self._prepare_mechanism_diagnostic_context(batch)
         prepared_batch = context.get('batch', batch)
         video_clean = prepared_batch['latents']
         action_clean = context.get('action_clean', prepared_batch['actions'])

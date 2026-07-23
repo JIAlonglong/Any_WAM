@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import torch
+import pytest
 
 from distillation_flowmap.mechanism_diagnostics import (
     diagnostic_due,
@@ -189,6 +190,8 @@ def _load_trainer_harness():
     )
     wanted = {
         "_get_mechanism_diagnostic_batches",
+        "_sync_mechanism_diagnostic_preflight",
+        "_abort_mechanism_diagnostic_forward_failure",
         "_run_mechanism_diagnostics",
         "_maybe_run_mechanism_diagnostics",
     }
@@ -246,6 +249,7 @@ def _trainer_host(tmp_path, *, rank=0, enabled=True):
     host._mechanism_pending = False
     host._last_mechanism_diagnostic_step = None
     host._mechanism_diagnostic_batches = None
+    host._prepare_mechanism_diagnostic_context = lambda batch: {}
     host.tb_writer = None
     return host
 
@@ -322,7 +326,9 @@ def test_skipped_boundary_remains_pending_until_next_success(tmp_path):
     assert not host._mechanism_pending
 
 
-def test_runner_uses_one_packed_sum_reduction_and_global_counts(tmp_path):
+def test_runner_uses_preflight_then_one_packed_sum_reduction_and_global_counts(
+    tmp_path,
+):
     host = _trainer_host(tmp_path)
     host._mechanism_diagnostic_batches = [{"latents": torch.zeros(1)}]
     host._compute_mechanism_diagnostic_stats = lambda batch, diagnostic_index: {
@@ -334,6 +340,9 @@ def test_runner_uses_one_packed_sum_reduction_and_global_counts(tmp_path):
 
     def fake_all_reduce(packed, op):
         reduce_calls.append((packed.clone(), op))
+        if packed.numel() == 1:
+            assert op == torch.distributed.ReduceOp.MIN
+            return
         # Rank 1 has mean 10 from three samples, and one invalid diagnostic.
         packed.add_(torch.tensor([0.0, 3.0, 30.0]))
 
@@ -344,14 +353,83 @@ def test_runner_uses_one_packed_sum_reduction_and_global_counts(tmp_path):
     ):
         result = host._run_mechanism_diagnostics()
 
-    assert len(reduce_calls) == 1
-    assert reduce_calls[0][1] == torch.distributed.ReduceOp.SUM
+    assert len(reduce_calls) == 2
+    assert reduce_calls[0][1] == torch.distributed.ReduceOp.MIN
+    assert reduce_calls[1][1] == torch.distributed.ReduceOp.SUM
     assert result["mechanism/g_anchor"] == 8.0
     record = json.loads(
         (tmp_path / "diagnostics" / "mechanism_metrics.jsonl").read_text()
     )
     assert record["valid_count"] == 1.0
     assert record["diagnostic_valid"] is False
+
+
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_preflight_one_rank_failure_stops_every_rank_before_first_forward(
+    tmp_path, local_failure
+):
+    host = _trainer_host(tmp_path)
+    host._mechanism_diagnostic_batches = [{"latents": torch.zeros(1)}]
+    if local_failure:
+        host._prepare_mechanism_diagnostic_context = mock.Mock(
+            side_effect=ValueError("rank-local malformed batch")
+        )
+    else:
+        host._prepare_mechanism_diagnostic_context = mock.Mock(return_value={})
+    host._compute_mechanism_diagnostic_stats = mock.Mock()
+    reductions = []
+
+    def fake_all_reduce(packed, op):
+        reductions.append((packed.clone(), op))
+        # Model the globally agreed preflight status after another rank failed.
+        packed.zero_()
+
+    with (
+        mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+        mock.patch.object(torch.distributed, "all_reduce", side_effect=fake_all_reduce),
+        pytest.raises(
+            RuntimeError,
+            match="Mechanism diagnostic preflight failed on at least one rank",
+        ),
+    ):
+        host._run_mechanism_diagnostics()
+
+    assert len(reductions) == 1
+    assert reductions[0][0].numel() == 1
+    assert reductions[0][1] == torch.distributed.ReduceOp.MIN
+    host._compute_mechanism_diagnostic_stats.assert_not_called()
+
+
+def test_forward_failure_aborts_process_group_before_metric_reduction(tmp_path):
+    host = _trainer_host(tmp_path)
+    host._mechanism_diagnostic_batches = [{"latents": torch.zeros(1)}]
+    host._prepare_mechanism_diagnostic_context = mock.Mock(return_value={})
+    host._compute_mechanism_diagnostic_stats = mock.Mock(
+        side_effect=RuntimeError("rank-local FSDP forward failure")
+    )
+    reductions = []
+
+    def fake_all_reduce(packed, op):
+        reductions.append((packed.clone(), op))
+
+    with (
+        mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+        mock.patch.object(torch.distributed, "all_reduce", side_effect=fake_all_reduce),
+        mock.patch.object(
+            torch.distributed, "destroy_process_group"
+        ) as destroy_process_group,
+        pytest.raises(
+            RuntimeError,
+            match="Mechanism diagnostic model forward failed; "
+            "the distributed process group was aborted",
+        ),
+    ):
+        host._run_mechanism_diagnostics()
+
+    assert len(reductions) == 1
+    assert reductions[0][0].numel() == 1
+    assert reductions[0][1] == torch.distributed.ReduceOp.MIN
+    destroy_process_group.assert_called_once_with()
 
 
 def test_rank_zero_logs_jsonl_wandb_tensorboard_and_preserves_state(tmp_path):
@@ -567,7 +645,10 @@ def test_real_compute_pack_excludes_inf_and_ranks_keep_identical_order(tmp_path)
         trace = []
 
         def fake_all_reduce(packed, op):
-            trace.append((tuple(stat_keys), packed.numel(), op))
+            trace.append((packed.numel(), op))
+            if packed.numel() == 1:
+                assert op == torch.distributed.ReduceOp.MIN
+                return
             packed.copy_(global_packed)
 
         with (
@@ -581,7 +662,9 @@ def test_real_compute_pack_excludes_inf_and_ranks_keep_identical_order(tmp_path)
         collective_traces.append(trace)
 
     assert collective_traces[0] == collective_traces[1]
-    assert len(collective_traces[0]) == 1
+    assert len(collective_traces[0]) == 2
+    assert collective_traces[0][0][1] == torch.distributed.ReduceOp.MIN
+    assert collective_traces[0][1][1] == torch.distributed.ReduceOp.SUM
     expected_anchor = (
         global_packed[stat_keys.index("mechanism/g_anchor_sum")]
         / global_packed[stat_keys.index("mechanism/g_anchor_count")]

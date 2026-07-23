@@ -1411,6 +1411,31 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self._mechanism_diagnostic_batches = batches
         return batches
 
+    def _sync_mechanism_diagnostic_preflight(self, local_error):
+        """Agree that every rank is ready before any diagnostic model forward."""
+        status = torch.tensor(
+            [0.0 if local_error is not None else 1.0],
+            device=self.device,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(status, op=dist.ReduceOp.MIN)
+        if status.item() != 1.0:
+            raise RuntimeError(
+                "Mechanism diagnostic preflight failed on at least one rank"
+            ) from local_error
+
+    def _abort_mechanism_diagnostic_forward_failure(self, local_error):
+        """Fail the whole distributed job instead of risking divergent collectives."""
+        if dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+        raise RuntimeError(
+            "Mechanism diagnostic model forward failed; "
+            "the distributed process group was aborted"
+        ) from local_error
+
     @torch.no_grad()
     def _run_mechanism_diagnostics(self):
         started_at = time.perf_counter()
@@ -1442,16 +1467,31 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         local_stats = {}
         local_batch_count = 0
         try:
-            for batch in self._get_mechanism_diagnostic_batches():
-                device_batch = {
-                    key: value.to(self.device, non_blocking=True)
-                    if isinstance(value, torch.Tensor)
-                    else value
-                    for key, value in batch.items()
-                }
-                stats = self._compute_mechanism_diagnostic_stats(
-                    device_batch, diagnostic_index=diagnostic_index
-                )
+            prepared_batches = []
+            preflight_error = None
+            try:
+                for batch in self._get_mechanism_diagnostic_batches():
+                    device_batch = {
+                        key: value.to(self.device, non_blocking=True)
+                        if isinstance(value, torch.Tensor)
+                        else value
+                        for key, value in batch.items()
+                    }
+                    device_batch["_mechanism_diagnostic_context"] = (
+                        self._prepare_mechanism_diagnostic_context(device_batch)
+                    )
+                    prepared_batches.append(device_batch)
+            except Exception as error:
+                preflight_error = error
+            self._sync_mechanism_diagnostic_preflight(preflight_error)
+
+            for device_batch in prepared_batches:
+                try:
+                    stats = self._compute_mechanism_diagnostic_stats(
+                        device_batch, diagnostic_index=diagnostic_index
+                    )
+                except Exception as error:
+                    self._abort_mechanism_diagnostic_forward_failure(error)
                 local_batch_count += 1
                 for key, value in stats.items():
                     value = value.detach().float()

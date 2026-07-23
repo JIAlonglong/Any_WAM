@@ -116,6 +116,11 @@ from distillation_flowmap.cosmos_progressive_opd import (
     constrain_cosmos_teacher_timestep_pair,
     rollout_velocity_field,
 )
+from distillation_flowmap.mechanism_diagnostics import (
+    compute_mechanism_metric_samples,
+    diagnostic_seed,
+    pack_finite_metric_stats,
+)
 
 
 class FlowMapStepMixin:
@@ -5065,6 +5070,573 @@ class FlowMapStepMixin:
         }
         return endpoint_loss, diagnostics
 
+    def _build_joint_input(
+        self,
+        video_x,
+        video_t,
+        action_x,
+        action_t,
+        *,
+        video_base,
+        action_latent,
+        action_cond_t,
+        action_text,
+        action_grid,
+        action_valid_mask,
+        chunk_size,
+        window_size,
+    ):
+        """Build the shared video-action model input for a joint state."""
+        action_dict = {
+            'noisy_latents': action_x,
+            'latent': action_latent,
+            'timesteps': action_t,
+            'cond_timesteps': action_cond_t,
+            'text_emb': action_text,
+        }
+        if action_grid is not None:
+            action_dict['grid_id'] = action_grid
+        if action_valid_mask is not None:
+            action_dict['actions_mask'] = action_valid_mask
+        return {
+            'latent_dict': {
+                **video_base,
+                'noisy_latents': video_x,
+                'timesteps': video_t,
+            },
+            'action_dict': action_dict,
+            'chunk_size': chunk_size,
+            'window_size': window_size,
+        }
+
+    def _init_joint_mask(self, joint_input):
+        """Initialize the packed attention mask for a joint video-action input."""
+        from modules.model import FlexAttnFunc
+
+        latent_dict = joint_input['latent_dict']
+        action_dict = joint_input['action_dict']
+        total_length = FlexAttnFunc._packed_sequence_length(
+            latent_dict['noisy_latents'].shape,
+            action_dict['noisy_latents'].shape,
+            self.patch_size,
+        )
+        padded_length = FlexAttnFunc.resolve_padded_length(
+            total_length,
+            attn_mode=getattr(self.config, "attn_mode", None),
+        )
+        FlexAttnFunc.init_mask(
+            latent_dict['noisy_latents'].shape,
+            action_dict['noisy_latents'].shape,
+            padded_length,
+            joint_input['chunk_size'],
+            window_size=joint_input['window_size'],
+            patch_size=self.patch_size,
+            device=self.device,
+        )
+
+    def _student_joint_forward(
+        self,
+        model,
+        joint_input,
+        model_empty_emb,
+        video_r_t,
+        action_r_t,
+        *,
+        cfg_scale,
+        batch_size,
+        ref_shape,
+        require_action,
+    ):
+        """Run a student joint query while safely bypassing compiled blocks."""
+        saved_blocks = None
+        if model is self.student and getattr(self, '_student_blocks_compiled', False):
+            saved_blocks = list(self.student.blocks)
+            for block_index, block in enumerate(saved_blocks):
+                if hasattr(block, '_orig_mod'):
+                    self.student.blocks[block_index] = block._orig_mod
+        try:
+            return self._student_cfg_forward(
+                model,
+                joint_input,
+                model_empty_emb,
+                cfg_scale,
+                batch_size,
+                ref_shape,
+                video_r_t,
+                action_r_t,
+                force_cfg=True,
+                return_action=require_action,
+            )
+        finally:
+            if saved_blocks is not None:
+                for block_index, block in enumerate(saved_blocks):
+                    self.student.blocks[block_index] = block
+
+    def _joint_euler_update(
+        self,
+        video_x,
+        action_x,
+        video_velocity,
+        action_velocity,
+        video_t,
+        video_r,
+        action_t,
+        action_r,
+    ):
+        """Advance video and action together along their scheduler sigmas."""
+        video_sigma = self._timestep_to_sigma_5d(video_t)
+        video_sigma_next = self._timestep_to_sigma_5d(video_r)
+        action_sigma = (
+            action_t[:, None, :, None, None] / self.config.num_train_timesteps
+        )
+        action_sigma_next = (
+            action_r[:, None, :, None, None] / self.config.num_train_timesteps
+        )
+        next_video = video_x + video_velocity * (
+            video_sigma_next.to(video_velocity) - video_sigma.to(video_velocity)
+        )
+        next_action = action_x + action_velocity * (
+            action_sigma_next.to(action_velocity) - action_sigma.to(action_velocity)
+        )
+        return next_video, next_action
+
+    def _prepare_mechanism_diagnostic_context(self, batch):
+        """Prepare reusable, detached model inputs for one diagnostic batch."""
+        if hasattr(self, 'convert_input_format'):
+            batch = self.convert_input_format(batch)
+        batch_size = batch['latents'].shape[0]
+        ref_shape = batch['latents'].shape
+        action_downsample = int(getattr(self.config, 'action_downsample_factor', 4))
+        action_clean = batch['actions'][:, :, ::action_downsample]
+        action_frames = action_clean.shape[2]
+        if action_frames <= 0:
+            raise ValueError(
+                "Mechanism diagnostics require at least one action frame "
+                "after downsampling"
+            )
+
+        input_dict = self._prepare_base_dict(batch)
+        action_base = input_dict['action_dict']
+        empty_emb = self.empty_emb.expand(batch_size, -1, -1)
+        action_grid = _downsample_action_grid_id(
+            action_base.get('grid_id'), action_base['latent'], action_downsample
+        )
+        action_mask = action_base.get('actions_mask')
+        if action_mask is not None:
+            action_mask = action_mask[:, :, ::action_downsample]
+
+        use_nofsdp = getattr(self, '_student_nofsdp', None) is not None
+        student_model = self._student_nofsdp if use_nofsdp else self.student
+        video_base = input_dict['latent_dict']
+        action_latent = action_base['latent'][:, :, ::action_downsample]
+        action_cond_t = action_base['cond_timesteps'][:, ::action_downsample]
+        action_text = action_base['text_emb']
+        if use_nofsdp:
+            if not getattr(self, '_nofsdp_synced', False):
+                self._sync_student_nofsdp()
+                self._nofsdp_synced = True
+            student_model.train()
+            video_base = {
+                key: _to_regular_tensor(value)
+                if isinstance(value, torch.Tensor) else value
+                for key, value in video_base.items()
+            }
+            action_latent = _to_regular_tensor(action_latent)
+            action_cond_t = _to_regular_tensor(action_cond_t)
+            action_text = _to_regular_tensor(action_text)
+            action_grid = _to_regular_tensor(action_grid)
+            action_mask = _to_regular_tensor(action_mask)
+            empty_emb = _to_regular_tensor(empty_emb)
+
+        return {
+            'batch': batch,
+            'input_dict': input_dict,
+            'batch_size': batch_size,
+            'ref_shape': ref_shape,
+            'action_clean': action_clean,
+            'action_frames': action_frames,
+            'action_mask': action_mask,
+            'student_model': student_model,
+            'video_base': video_base,
+            'action_latent': action_latent,
+            'action_cond_t': action_cond_t,
+            'action_text': action_text,
+            'action_grid': action_grid,
+            'empty_emb': empty_emb,
+            'cfg_scale': (
+                float(getattr(self.config, 'cfg_min', 1.0))
+                + float(getattr(self.config, 'cfg_max', 1.0))
+            ) / 2.0,
+        }
+
+    def _mechanism_joint_input(self, video_x, action_x, video_t, action_t, context):
+        return self._build_joint_input(
+            video_x,
+            video_t,
+            action_x,
+            action_t,
+            video_base=context['video_base'],
+            action_latent=context['action_latent'],
+            action_cond_t=context['action_cond_t'],
+            action_text=context['action_text'],
+            action_grid=context['action_grid'],
+            action_valid_mask=context['action_mask'],
+            chunk_size=context['input_dict']['chunk_size'],
+            window_size=context['input_dict']['window_size'],
+        )
+
+    def _diagnostic_student_joint_map(
+        self,
+        video_x,
+        action_x,
+        video_t,
+        action_t,
+        video_r,
+        action_r,
+        *,
+        context,
+    ):
+        """Apply one finite student joint map from ``t`` directly to ``r``."""
+        joint_input = self._mechanism_joint_input(
+            video_x, action_x, video_t, action_t, context
+        )
+        self._init_joint_mask(joint_input)
+        video_velocity, action_velocity_seq = self._student_joint_forward(
+            context['student_model'],
+            joint_input,
+            context['empty_emb'],
+            video_r,
+            action_r,
+            cfg_scale=context['cfg_scale'],
+            batch_size=context['batch_size'],
+            ref_shape=context['ref_shape'],
+            require_action=True,
+        )
+        if action_velocity_seq is None:
+            raise RuntimeError(
+                "Mechanism diagnostic joint map requires a student action output"
+            )
+        action_velocity = self._extract_action_v(
+            action_velocity_seq, context['action_frames']
+        )
+        next_video, next_action = self._joint_euler_update(
+            video_x,
+            action_x,
+            video_velocity,
+            action_velocity,
+            video_t,
+            video_r,
+            action_t,
+            action_r,
+        )
+        return next_video, next_action, video_velocity, action_velocity
+
+    def _diagnostic_teacher_joint_rollout(
+        self,
+        video_x,
+        action_x,
+        video_t,
+        action_t,
+        video_r,
+        action_r,
+        *,
+        num_steps,
+        context,
+    ):
+        """Integrate the frozen teacher joint field over one reference segment."""
+        video_path = self._build_timestep_path(video_t, video_r, num_steps)
+        action_path = self._build_timestep_path(action_t, action_r, num_steps)
+        current_video = video_x
+        current_action = action_x
+        for step_index in range(num_steps):
+            current_video_t = video_path[step_index]
+            next_video_t = video_path[step_index + 1]
+            current_action_t = action_path[step_index]
+            next_action_t = action_path[step_index + 1]
+            joint_input = self._mechanism_joint_input(
+                current_video,
+                current_action,
+                current_video_t,
+                current_action_t,
+                context,
+            )
+            self._init_joint_mask(joint_input)
+            teacher_cond, teacher_uncond, action_velocity_seq = (
+                self._batched_cfg_forward(joint_input, context['empty_emb'])
+            )
+            video_velocity = self._extract_video_v(
+                teacher_uncond
+                + context['cfg_scale'] * (teacher_cond - teacher_uncond),
+                context['ref_shape'],
+                context['batch_size'],
+            )
+            if action_velocity_seq is None:
+                raise RuntimeError(
+                    "Mechanism diagnostic teacher rollout requires an action output"
+                )
+            action_velocity = self._extract_action_v(
+                action_velocity_seq, context['action_frames']
+            )
+            current_video, current_action = self._joint_euler_update(
+                current_video,
+                current_action,
+                video_velocity,
+                action_velocity,
+                current_video_t,
+                next_video_t,
+                current_action_t,
+                next_action_t,
+            )
+            del joint_input, teacher_cond, teacher_uncond
+            del action_velocity_seq, video_velocity, action_velocity
+        return current_video, current_action
+
+    def _diagnostic_joint_fields(
+        self, video_x, action_x, video_t, action_t, *, context
+    ):
+        """Query student and teacher video fields at the identical joint state."""
+        joint_input = self._mechanism_joint_input(
+            video_x, action_x, video_t, action_t, context
+        )
+        self._init_joint_mask(joint_input)
+        student_video = self._student_joint_forward(
+            context['student_model'],
+            joint_input,
+            context['empty_emb'],
+            video_t,
+            action_t,
+            cfg_scale=context['cfg_scale'],
+            batch_size=context['batch_size'],
+            ref_shape=context['ref_shape'],
+            require_action=False,
+        )
+        teacher_cond, teacher_uncond, _ = self._batched_cfg_forward(
+            joint_input, context['empty_emb']
+        )
+        teacher_video = self._extract_video_v(
+            teacher_uncond
+            + context['cfg_scale'] * (teacher_cond - teacher_uncond),
+            context['ref_shape'],
+            context['batch_size'],
+        )
+        return student_video, teacher_video
+
+    @torch.no_grad()
+    def _compute_mechanism_diagnostic_stats(self, batch, *, diagnostic_index):
+        """Run diagnostics without advancing CPU or device-global RNG streams."""
+        cpu_rng_state = torch.random.get_rng_state()
+        rng_device = torch.device(getattr(
+            self, 'device', batch['latents'].device
+        ))
+        cuda_rng_state = None
+        if torch.cuda.is_available() and rng_device.type == 'cuda':
+            cuda_rng_state = torch.cuda.get_rng_state(rng_device)
+        try:
+            return self._compute_mechanism_diagnostic_stats_impl(
+                batch, diagnostic_index=diagnostic_index
+            )
+        finally:
+            torch.random.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, rng_device)
+
+    def _compute_mechanism_diagnostic_stats_impl(
+        self, batch, *, diagnostic_index
+    ):
+        """Run deterministic joint routes and return detached additive statistics."""
+        context = self._prepare_mechanism_diagnostic_context(batch)
+        prepared_batch = context.get('batch', batch)
+        video_clean = prepared_batch['latents']
+        action_clean = context.get('action_clean', prepared_batch['actions'])
+        batch_size = video_clean.shape[0]
+        video_frames = video_clean.shape[2]
+        action_frames = action_clean.shape[2]
+        device = video_clean.device
+        batch_index = int(prepared_batch.get(
+            '_mechanism_diagnostic_batch_index', 0
+        ))
+        generator = torch.Generator(device=device)
+        generator.manual_seed(diagnostic_seed(
+            int(self.config.mechanism_diagnostic_seed),
+            int(diagnostic_index),
+            batch_index,
+            int(getattr(self.config, 'rank', 0)),
+        ))
+        video_noise = torch.randn(
+            video_clean.shape,
+            device=device,
+            dtype=video_clean.dtype,
+            generator=generator,
+        )
+        action_noise = torch.randn(
+            action_clean.shape,
+            device=action_clean.device,
+            dtype=action_clean.dtype,
+            generator=generator,
+        )
+
+        terminal = float(self.config.num_train_timesteps)
+        r_value = float(self.config.mechanism_diagnostic_r)
+        s_value = float(self.config.mechanism_diagnostic_s)
+        video_terminal_t = torch.full(
+            (batch_size, video_frames), terminal, device=device
+        )
+        action_terminal_t = torch.full(
+            (batch_size, action_frames), terminal, device=action_clean.device
+        )
+        video_r_t = torch.full_like(video_terminal_t, r_value)
+        action_r_t = torch.full_like(action_terminal_t, r_value)
+        video_s_t = torch.full_like(video_terminal_t, s_value)
+        action_s_t = torch.full_like(action_terminal_t, s_value)
+        video_zero_t = torch.zeros_like(video_terminal_t)
+        action_zero_t = torch.zeros_like(action_terminal_t)
+        prior_video = self.train_scheduler_latent.add_noise(
+            video_clean, video_noise, video_terminal_t, t_dim=2
+        )
+        prior_action = self.train_scheduler_action.add_noise(
+            action_clean, action_noise, action_terminal_t, t_dim=2
+        )
+        teacher_steps = int(self.config.mechanism_diagnostic_teacher_steps)
+
+        z_r_video, z_r_action, _, _ = self._diagnostic_student_joint_map(
+            prior_video,
+            prior_action,
+            video_terminal_t,
+            action_terminal_t,
+            video_r_t,
+            action_r_t,
+            context=context,
+        )
+
+        y_r_video, y_r_action = self._diagnostic_teacher_joint_rollout(
+            prior_video,
+            prior_action,
+            video_terminal_t,
+            action_terminal_t,
+            video_r_t,
+            action_r_t,
+            num_steps=teacher_steps,
+            context=context,
+        )
+        y_0_video, y_0_action = self._diagnostic_teacher_joint_rollout(
+            y_r_video,
+            y_r_action,
+            video_r_t,
+            action_r_t,
+            video_zero_t,
+            action_zero_t,
+            num_steps=teacher_steps,
+            context=context,
+        )
+        del prior_video, prior_action, video_noise, action_noise
+
+        teacher_cont_video, teacher_cont_action = (
+            self._diagnostic_teacher_joint_rollout(
+                z_r_video,
+                z_r_action,
+                video_r_t,
+                action_r_t,
+                video_zero_t,
+                action_zero_t,
+                num_steps=teacher_steps,
+                context=context,
+            )
+        )
+        del teacher_cont_action
+
+        student_direct_video, student_direct_action, _, _ = (
+            self._diagnostic_student_joint_map(
+                z_r_video,
+                z_r_action,
+                video_r_t,
+                action_r_t,
+                video_zero_t,
+                action_zero_t,
+                context=context,
+            )
+        )
+        composed_mid_video, composed_mid_action, _, _ = (
+            self._diagnostic_student_joint_map(
+                z_r_video,
+                z_r_action,
+                video_r_t,
+                action_r_t,
+                video_s_t,
+                action_s_t,
+                context=context,
+            )
+        )
+        student_composed_video, student_composed_action, _, _ = (
+            self._diagnostic_student_joint_map(
+                composed_mid_video,
+                composed_mid_action,
+                video_s_t,
+                action_s_t,
+                video_zero_t,
+                action_zero_t,
+                context=context,
+            )
+        )
+        del student_direct_action, student_composed_action
+        del composed_mid_video, composed_mid_action
+
+        _, action_student_context, _, _ = self._diagnostic_student_joint_map(
+            z_r_video,
+            z_r_action,
+            video_r_t,
+            action_r_t,
+            video_zero_t,
+            action_zero_t,
+            context=context,
+        )
+        _, action_teacher_video_context, _, _ = (
+            self._diagnostic_student_joint_map(
+                y_r_video,
+                z_r_action,
+                video_r_t,
+                action_r_t,
+                video_zero_t,
+                action_zero_t,
+                context=context,
+            )
+        )
+        _, action_teacher_joint_context, _, _ = (
+            self._diagnostic_student_joint_map(
+                y_r_video,
+                y_r_action,
+                video_r_t,
+                action_r_t,
+                video_zero_t,
+                action_zero_t,
+                context=context,
+            )
+        )
+
+        student_field_video, teacher_field_video = self._diagnostic_joint_fields(
+            z_r_video,
+            z_r_action,
+            video_r_t,
+            action_r_t,
+            context=context,
+        )
+        samples = compute_mechanism_metric_samples(
+            teacher_cont_video=teacher_cont_video,
+            teacher_endpoint_video=y_0_video,
+            student_direct_video=student_direct_video,
+            student_composed_video=student_composed_video,
+            student_field_video=student_field_video,
+            teacher_field_video=teacher_field_video,
+            teacher_endpoint_action=y_0_action,
+            action_student_context=action_student_context,
+            action_teacher_video_context=action_teacher_video_context,
+            action_teacher_joint_context=action_teacher_joint_context,
+            action_mask=context.get('action_mask'),
+        )
+        return {
+            name: value.detach()
+            for name, value in pack_finite_metric_stats(samples).items()
+        }
+
     def _danceopd_aux_transition_step(self, batch, batch_idx, kto_paopd=False):
         """Run one DanceOPD-style local video field-matching update.
 
@@ -5196,77 +5768,6 @@ class FlowMapStepMixin:
             video_path = _to_regular_tensor(video_path)
             action_path = _to_regular_tensor(action_path)
 
-        def _build_joint_input(video_x, video_t, action_x, action_t, *, video_base,
-                               action_latent, action_cond_t, action_text,
-                               action_grid, action_valid_mask):
-            action_dict = {
-                'noisy_latents': action_x,
-                'latent': action_latent,
-                'timesteps': action_t,
-                'cond_timesteps': action_cond_t,
-                'text_emb': action_text,
-            }
-            if action_grid is not None:
-                action_dict['grid_id'] = action_grid
-            if action_valid_mask is not None:
-                action_dict['actions_mask'] = action_valid_mask
-            return {
-                'latent_dict': {
-                    **video_base,
-                    'noisy_latents': video_x,
-                    'timesteps': video_t,
-                },
-                'action_dict': action_dict,
-                'chunk_size': input_dict['chunk_size'],
-                'window_size': input_dict['window_size'],
-            }
-
-        def _init_joint_mask(joint_input):
-            from modules.model import FlexAttnFunc
-
-            latent_dict = joint_input['latent_dict']
-            action_dict = joint_input['action_dict']
-            total_length = (
-                latent_dict['noisy_latents'].flatten(0, 1).shape[0] * 2
-                + action_dict['noisy_latents'].flatten(0, 1).shape[0] * 2
-            )
-            padded_length = (128 - total_length % 128) % 128
-            FlexAttnFunc.init_mask(
-                latent_dict['noisy_latents'].shape,
-                action_dict['noisy_latents'].shape,
-                padded_length,
-                joint_input['chunk_size'],
-                window_size=joint_input['window_size'],
-                patch_size=self.patch_size,
-                device=self.device,
-            )
-
-        def _student_joint_forward(model, joint_input, model_empty_emb,
-                                   video_r_t, action_r_t, *, require_action):
-            saved_blocks = None
-            if model is self.student and getattr(self, '_student_blocks_compiled', False):
-                saved_blocks = list(self.student.blocks)
-                for block_index, block in enumerate(saved_blocks):
-                    if hasattr(block, '_orig_mod'):
-                        self.student.blocks[block_index] = block._orig_mod
-            try:
-                return self._student_cfg_forward(
-                    model,
-                    joint_input,
-                    model_empty_emb,
-                    cfg_scale,
-                    B,
-                    ref_shape,
-                    video_r_t,
-                    action_r_t,
-                    force_cfg=True,
-                    return_action=require_action,
-                )
-            finally:
-                if saved_blocks is not None:
-                    for block_index, block in enumerate(saved_blocks):
-                        self.student.blocks[block_index] = block
-
         video_states = []
         action_states = []
         video_timesteps = []
@@ -5282,7 +5783,7 @@ class FlowMapStepMixin:
                 video_timesteps.append(video_t.detach().clone())
                 action_timesteps.append(action_t.detach().clone())
 
-                rollout_input = _build_joint_input(
+                rollout_input = self._build_joint_input(
                     current_video, video_t, current_action, action_t,
                     video_base=rollout_video_base,
                     action_latent=rollout_action_latent,
@@ -5290,28 +5791,33 @@ class FlowMapStepMixin:
                     action_text=rollout_action_text,
                     action_grid=action_grid_id,
                     action_valid_mask=action_mask,
+                    chunk_size=input_dict['chunk_size'],
+                    window_size=input_dict['window_size'],
                 )
-                _init_joint_mask(rollout_input)
-                video_velocity, action_velocity_seq = _student_joint_forward(
+                self._init_joint_mask(rollout_input)
+                video_velocity, action_velocity_seq = self._student_joint_forward(
                     rollout_model,
                     rollout_input,
                     rollout_empty_emb,
                     video_r,
                     action_r,
+                    cfg_scale=cfg_scale,
+                    batch_size=B,
+                    ref_shape=ref_shape,
                     require_action=True,
                 )
                 if action_velocity_seq is None:
                     raise RuntimeError("DanceOPD joint rollout requires a student action output")
                 action_velocity = self._extract_action_v(action_velocity_seq, action_frames)
-                video_sigma = self._timestep_to_sigma_5d(video_t)
-                video_sigma_next = self._timestep_to_sigma_5d(video_r)
-                action_sigma = action_t[:, None, :, None, None] / self.config.num_train_timesteps
-                action_sigma_next = action_r[:, None, :, None, None] / self.config.num_train_timesteps
-                current_video = current_video + video_velocity * (
-                    video_sigma_next.to(video_velocity) - video_sigma.to(video_velocity)
-                )
-                current_action = current_action + action_velocity * (
-                    action_sigma_next.to(action_velocity) - action_sigma.to(action_velocity)
+                current_video, current_action = self._joint_euler_update(
+                    current_video,
+                    current_action,
+                    video_velocity,
+                    action_velocity,
+                    video_t,
+                    video_r,
+                    action_t,
+                    action_r,
                 )
 
         query_indices = sample_low_noise_query_indices(
@@ -5353,7 +5859,7 @@ class FlowMapStepMixin:
                 danceopd_terminal_prior_max_error.detach().item(),
             )
 
-        student_query_input = _build_joint_input(
+        student_query_input = self._build_joint_input(
             query_video, query_video_t, query_action, query_action_t,
             video_base=input_dict['latent_dict'],
             action_latent=action_base['latent'][:, :, ::action_downsample],
@@ -5366,14 +5872,19 @@ class FlowMapStepMixin:
                 action_base['actions_mask'][:, :, ::action_downsample]
                 if action_base.get('actions_mask') is not None else None
             ),
+            chunk_size=input_dict['chunk_size'],
+            window_size=input_dict['window_size'],
         )
-        _init_joint_mask(student_query_input)
-        student_video_velocity = _student_joint_forward(
+        self._init_joint_mask(student_query_input)
+        student_video_velocity = self._student_joint_forward(
             self.student,
             student_query_input,
             empty_emb,
             query_video_t,
             query_action_t,
+            cfg_scale=cfg_scale,
+            batch_size=B,
+            ref_shape=ref_shape,
             require_action=False,
         )
         with torch.no_grad():

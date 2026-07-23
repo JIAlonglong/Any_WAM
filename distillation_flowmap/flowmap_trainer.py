@@ -21,6 +21,7 @@ FlowMapDistiller：Flow Map 蒸馏训练主类。
 import gc
 import json
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -50,6 +51,10 @@ from distillation_flowmap.cosmos_teacher_roles import resolve_teacher_roles
 from distillation_flowmap.ablation.robotwin_diagnostics import (
     classify_parameter_branch,
     opd_diagnostic_aliases,
+)
+from distillation_flowmap.mechanism_diagnostics import (
+    diagnostic_due,
+    means_from_reduced_stats,
 )
 
 try:
@@ -1186,6 +1191,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.train_loader_iter = None  # 数据迭代器（懒加载）
         self._light_eval_batches = None
         self._stage1_start_eval_batches = None
+        self._mechanism_diagnostic_batches = None
+        self._mechanism_pending = False
+        self._last_mechanism_diagnostic_step = None
 
         # ==============================================================
         # DMD 判别器 checkpoint 恢复（如果从 checkpoint 恢复）
@@ -1381,6 +1389,145 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             batches.append(default_collate([dataset[idx]]))
         self._stage1_start_eval_batches = batches
         return batches
+
+    def _get_mechanism_diagnostic_batches(self):
+        if self._mechanism_diagnostic_batches is not None:
+            return self._mechanism_diagnostic_batches
+
+        from torch.utils.data._utils.collate import default_collate
+
+        dataset = self.train_loader.dataset
+        num_batches = max(
+            1, int(getattr(self.config, "mechanism_diagnostic_num_batches", 1))
+        )
+        seed = int(self.config.mechanism_diagnostic_seed)
+        rank = int(getattr(self.config, "rank", 0))
+        batches = []
+        for batch_index in range(num_batches):
+            dataset_index = (seed + rank + batch_index) % len(dataset)
+            batch = default_collate([dataset[dataset_index]])
+            batch["_mechanism_diagnostic_batch_index"] = batch_index
+            batches.append(batch)
+        self._mechanism_diagnostic_batches = batches
+        return batches
+
+    @torch.no_grad()
+    def _run_mechanism_diagnostics(self):
+        started_at = time.perf_counter()
+        interval = int(self.config.mechanism_diagnostic_interval)
+        diagnostic_index = self.step // interval
+        cpu_rng_state = torch.random.get_rng_state()
+        rng_device = torch.device(self.device)
+        cuda_rng_state = None
+        if torch.cuda.is_available() and rng_device.type == "cuda":
+            cuda_rng_state = torch.cuda.get_rng_state(rng_device)
+
+        models = []
+        seen_models = set()
+        for name in (
+            "student",
+            "teacher",
+            "video_teacher",
+            "_teacher_nofsdp",
+            "_video_teacher_nofsdp",
+            "target_student",
+        ):
+            model = getattr(self, name, None)
+            if model is not None and id(model) not in seen_models:
+                seen_models.add(id(model))
+                models.append((model, bool(model.training)))
+                model.eval()
+
+        local_stats = {}
+        local_batch_count = 0
+        try:
+            for batch in self._get_mechanism_diagnostic_batches():
+                device_batch = {
+                    key: value.to(self.device, non_blocking=True)
+                    if isinstance(value, torch.Tensor)
+                    else value
+                    for key, value in batch.items()
+                }
+                stats = self._compute_mechanism_diagnostic_stats(
+                    device_batch, diagnostic_index=diagnostic_index
+                )
+                local_batch_count += 1
+                for key, value in stats.items():
+                    value = value.detach().float()
+                    local_stats[key] = local_stats.get(
+                        key, torch.zeros((), device=self.device)
+                    ) + value
+        finally:
+            for model, was_training in models:
+                model.train(was_training)
+            torch.random.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, rng_device)
+
+        stat_keys = sorted(local_stats)
+        packed = torch.stack([local_stats[key] for key in stat_keys])
+        if dist.is_initialized():
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        reduced_stats = dict(zip(stat_keys, packed))
+        metric_log = means_from_reduced_stats(reduced_stats)
+
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        valid_count = float(reduced_stats["diagnostic_valid"].item())
+        expected_count = float(local_batch_count * world_size)
+        diagnostic_valid = valid_count == expected_count
+        elapsed_seconds = time.perf_counter() - started_at
+
+        if int(getattr(self.config, "rank", 0)) != 0:
+            return {}
+
+        record = {
+            "step": int(self.step),
+            "seed": int(self.config.mechanism_diagnostic_seed),
+            "diagnostic_index": int(diagnostic_index),
+            "r": int(self.config.mechanism_diagnostic_r),
+            "s": int(self.config.mechanism_diagnostic_s),
+            "teacher_steps": int(
+                self.config.mechanism_diagnostic_teacher_steps
+            ),
+            "valid_count": valid_count,
+            "diagnostic_valid": diagnostic_valid,
+            "elapsed_seconds": float(elapsed_seconds),
+            **metric_log,
+        }
+        diagnostics_dir = Path(self.config.output_dir) / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        with open(diagnostics_dir / "mechanism_metrics.jsonl", "a") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        return {key: float(value) for key, value in metric_log.items()}
+
+    def _maybe_run_mechanism_diagnostics(self, *, skipped_optimizer_step):
+        boundary_due = diagnostic_due(
+            self.step,
+            int(getattr(self.config, "mechanism_diagnostic_interval", 100)),
+        )
+        self._mechanism_pending = self._mechanism_pending or (
+            boundary_due and self._last_mechanism_diagnostic_step != self.step
+        )
+        run_now = (
+            bool(getattr(self.config, "mechanism_diagnostics", False))
+            and self._mechanism_pending
+            and not skipped_optimizer_step
+            and self._last_mechanism_diagnostic_step != self.step
+        )
+        if not run_now:
+            return {}
+
+        log_dict = self._run_mechanism_diagnostics()
+        self._mechanism_pending = False
+        self._last_mechanism_diagnostic_step = self.step
+        if int(getattr(self.config, "rank", 0)) == 0 and log_dict:
+            if self.config.enable_wandb and HAS_WANDB:
+                wandb.log(log_dict, step=self.step)
+            if self.tb_writer is not None:
+                for key, value in log_dict.items():
+                    self.tb_writer.add_scalar(key, value, self.step)
+                self.tb_writer.flush()
+        return log_dict
 
     def _light_eval_pairs(self):
         pairs = getattr(self.config, "light_eval_pairs", None)
@@ -3202,6 +3349,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                             self.tb_writer.flush()
 
                 self.step += 1
+
+                # Run fixed-sample mechanism probes only after a successful
+                # optimizer update. A skipped boundary remains pending.
+                self._maybe_run_mechanism_diagnostics(
+                    skipped_optimizer_step=skipped_optimizer_step
+                )
 
                 # Lightweight deterministic eval. All ranks run this because
                 # the student may be FSDP-wrapped; only rank 0 logs results.

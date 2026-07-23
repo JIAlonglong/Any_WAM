@@ -1426,6 +1426,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         seen_models = set()
         for name in (
             "student",
+            "_student_nofsdp",
             "teacher",
             "video_teacher",
             "_teacher_nofsdp",

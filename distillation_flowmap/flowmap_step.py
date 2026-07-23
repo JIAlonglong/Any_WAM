@@ -5235,7 +5235,6 @@ class FlowMapStepMixin:
             if not getattr(self, '_nofsdp_synced', False):
                 self._sync_student_nofsdp()
                 self._nofsdp_synced = True
-            student_model.train()
             video_base = {
                 key: _to_regular_tensor(value)
                 if isinstance(value, torch.Tensor) else value

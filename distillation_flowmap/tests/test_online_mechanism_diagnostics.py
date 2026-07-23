@@ -411,6 +411,195 @@ def test_rank_zero_logs_jsonl_wandb_tensorboard_and_preserves_state(tmp_path):
     assert record["elapsed_seconds"] >= 0.0
 
 
+def test_runner_uses_nofsdp_student_in_eval_and_restores_all_model_modes(
+    tmp_path,
+):
+    host = _trainer_host(tmp_path)
+    host.step = 100
+    host._mechanism_diagnostic_batches = [{"latents": torch.zeros(1)}]
+    original_modes = {
+        "student": True,
+        "_student_nofsdp": False,
+        "teacher": True,
+        "video_teacher": False,
+        "_teacher_nofsdp": False,
+        "_video_teacher_nofsdp": True,
+        "target_student": True,
+    }
+
+    class TrackingLinear(torch.nn.Linear):
+        def __init__(self):
+            super().__init__(1, 1)
+            self.eval_calls = 0
+
+        def eval(self):
+            self.eval_calls += 1
+            return super().eval()
+
+    for name, training in original_modes.items():
+        model = TrackingLinear()
+        model.train(training)
+        setattr(host, name, model)
+    host._student_nofsdp.eval_calls = 0
+    selected_models = []
+
+    def compute(batch, diagnostic_index):
+        del batch, diagnostic_index
+        selected_models.append(host._student_nofsdp)
+        assert all(
+            not getattr(host, name).training for name in original_modes
+        )
+        return {
+            "mechanism/g_anchor_sum": torch.tensor(1.0),
+            "mechanism/g_anchor_count": torch.tensor(1.0),
+            "diagnostic_valid": torch.tensor(1.0),
+        }
+
+    host._compute_mechanism_diagnostic_stats = compute
+    host._run_mechanism_diagnostics()
+
+    assert selected_models == [host._student_nofsdp]
+    assert host._student_nofsdp.eval_calls == 1
+    assert {
+        name: getattr(host, name).training for name in original_modes
+    } == original_modes
+
+
+def test_task3_context_selects_preexisting_eval_nofsdp_student_without_forcing_train():
+    mixin = _load_mixin()
+    host = _DiagnosticHarness(mixin)
+    host.student = torch.nn.Linear(1, 1)
+    host.student.train()
+    host._student_nofsdp = torch.nn.Linear(1, 1)
+    host._student_nofsdp.eval()
+    host._nofsdp_synced = True
+    host.empty_emb = torch.zeros(1, 1, 1)
+    host._prepare_base_dict = lambda batch: {
+        "latent_dict": {
+            "latent": batch["latents"],
+            "text_emb": torch.zeros(batch["latents"].shape[0], 1, 1),
+        },
+        "action_dict": {
+            "latent": batch["actions"],
+            "cond_timesteps": torch.zeros(
+                batch["actions"].shape[0], batch["actions"].shape[2]
+            ),
+            "text_emb": torch.zeros(batch["actions"].shape[0], 1, 1),
+            "grid_id": None,
+            "actions_mask": batch["action_mask"],
+        },
+        "chunk_size": 1,
+        "window_size": 1,
+    }
+    prepare = types.MethodType(
+        mixin._prepare_mechanism_diagnostic_context, host
+    )
+
+    context = prepare(_batch())
+
+    assert context["student_model"] is host._student_nofsdp
+    assert not host._student_nofsdp.training
+    assert host.student.training
+
+
+def test_real_compute_pack_excludes_inf_and_ranks_keep_identical_order(tmp_path):
+    finite_host = _host()
+    finite_host.config.rank = 0
+    invalid_host = _host()
+    invalid_host.config.rank = 1
+    with torch.no_grad():
+        invalid_host.parameter.fill_(float("inf"))
+
+    finite_stats = finite_host._compute_mechanism_diagnostic_stats(
+        _batch(), diagnostic_index=1
+    )
+    invalid_stats = invalid_host._compute_mechanism_diagnostic_stats(
+        _batch(), diagnostic_index=1
+    )
+
+    assert [
+        (call["from"], call["to"]) for call in finite_host.student_calls
+    ] == [
+        (call["from"], call["to"]) for call in invalid_host.student_calls
+    ]
+    assert [
+        (call["from"], call["to"], call["steps"])
+        for call in finite_host.teacher_calls
+    ] == [
+        (call["from"], call["to"], call["steps"])
+        for call in invalid_host.teacher_calls
+    ]
+    assert invalid_stats["diagnostic_valid"].item() == 0.0
+    assert invalid_stats["mechanism/g_anchor_sum"].item() == 0.0
+    assert invalid_stats["mechanism/g_anchor_count"].item() == 0.0
+    assert all(
+        torch.isfinite(value).all()
+        for value in invalid_stats.values()
+    )
+    assert any(
+        key.endswith("_count") and value.item() == 0.0
+        for key, value in invalid_stats.items()
+    )
+
+    stat_keys = sorted(finite_stats)
+    global_packed = torch.stack(
+        [
+            finite_stats[key].detach().float()
+            + invalid_stats[key].detach().float()
+            for key in stat_keys
+        ]
+    )
+    assert global_packed[
+        stat_keys.index("mechanism/g_anchor_sum")
+    ].item() == finite_stats["mechanism/g_anchor_sum"].item()
+    assert global_packed[
+        stat_keys.index("mechanism/g_anchor_count")
+    ].item() == finite_stats["mechanism/g_anchor_count"].item()
+    collective_traces = []
+    results = []
+    for rank, local_stats in enumerate((finite_stats, invalid_stats)):
+        runner = _trainer_host(tmp_path / f"rank{rank}", rank=rank)
+        runner.step = 100
+        runner._mechanism_diagnostic_batches = [{"latents": torch.zeros(1)}]
+        runner._compute_mechanism_diagnostic_stats = (
+            lambda batch, diagnostic_index, stats=local_stats: stats
+        )
+        trace = []
+
+        def fake_all_reduce(packed, op):
+            trace.append((tuple(stat_keys), packed.numel(), op))
+            packed.copy_(global_packed)
+
+        with (
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+            mock.patch.object(
+                torch.distributed, "all_reduce", side_effect=fake_all_reduce
+            ),
+        ):
+            results.append(runner._run_mechanism_diagnostics())
+        collective_traces.append(trace)
+
+    assert collective_traces[0] == collective_traces[1]
+    assert len(collective_traces[0]) == 1
+    expected_anchor = (
+        global_packed[stat_keys.index("mechanism/g_anchor_sum")]
+        / global_packed[stat_keys.index("mechanism/g_anchor_count")]
+    ).item()
+    assert results[0]["mechanism/g_anchor"] == expected_anchor
+    record = json.loads(
+        (
+            tmp_path
+            / "rank0"
+            / "diagnostics"
+            / "mechanism_metrics.jsonl"
+        ).read_text()
+    )
+    assert record["valid_count"] == 1.0
+    assert record["diagnostic_valid"] is False
+    assert not (tmp_path / "rank1" / "diagnostics").exists()
+
+
 def test_nonzero_rank_does_not_log_or_create_diagnostics_directory(tmp_path):
     host = _trainer_host(tmp_path, rank=1)
     host.step = 100

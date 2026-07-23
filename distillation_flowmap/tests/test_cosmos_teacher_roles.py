@@ -262,6 +262,10 @@ def test_flowmap_step_cosmos_latent_opd_queries_velocity_at_student_state():
             assert noise.shape == (1, 2, 3, 4, 4)
             assert t.shape == (1, 3)
             assert r.shape == (1, 3)
+            assert bool((t >= 0.8).all())
+            assert bool((t <= 80.0 / 81.0).all())
+            assert bool((r >= 0.8).all())
+            assert bool((r <= t).all())
             assert epsilon == 0.001
             return {
                 "actions": torch.zeros(1, 16, 7),
@@ -270,6 +274,8 @@ def test_flowmap_step_cosmos_latent_opd_queries_velocity_at_student_state():
 
         def predict_raw_latent_velocity(self, raw_batch, query_latent, t):
             assert raw_batch["raw_task"] == ["open drawer"]
+            assert bool((t >= 0.8).all())
+            assert bool((t <= 80.0 / 81.0).all())
             self.velocity_query = (query_latent.detach().clone(), t.detach().clone())
             return {
                 "actions": torch.zeros(1, 16, 7),
@@ -331,8 +337,10 @@ def test_flowmap_step_cosmos_latent_opd_queries_velocity_at_student_state():
         cosmos_latent_channels=2,
         cosmos_latent_frames=3,
         cosmos_latent_height=4,
-        cosmos_latent_width=4,
-        cosmos_latent_epsilon=0.001,
+            cosmos_latent_width=4,
+            cosmos_latent_epsilon=0.001,
+            cosmos_latent_t_min=0.8,
+            cosmos_latent_t_max=80.0 / 81.0,
         opd_rollout_step_pairs=[[1, 1]],
         cfg_min=1.0,
         cfg_max=1.0,
@@ -368,5 +376,124 @@ def test_flowmap_step_cosmos_latent_opd_queries_velocity_at_student_state():
     assert teacher.velocity_query is not None
     query_latent, query_t = teacher.velocity_query
     assert query_latent.shape == (1, 2, 3, 4, 4)
-    assert torch.allclose(query_t, torch.full((1, 3), 0.4))
+    assert torch.allclose(query_t, torch.full((1, 3), 0.8))
+    assert distiller.student_velocity.grad is not None
+
+
+def test_full_cosmos_opd_focus_never_queries_raw_teacher_outside_supported_window():
+    repo_root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repo_root))
+    sys.path.insert(0, str(repo_root / "wan_va"))
+
+    import torch
+    from distillation_flowmap.flowmap_step import FlowMapStepMixin
+
+    class Scheduler:
+        def training_target(self, latents, noise, _timesteps):
+            return noise - latents
+
+    class Teacher:
+        raw_inference_enabled = True
+
+        def __init__(self):
+            self.target_pairs = []
+            self.velocity_timesteps = []
+
+        def predict_raw_latent_target(self, raw_batch, noise, t, r, epsilon, include_cdiff=True):
+            assert raw_batch["raw_task"] == ["open drawer"]
+            assert include_cdiff is False
+            assert epsilon == 0.001
+            self.target_pairs.append((t.detach().clone(), r.detach().clone()))
+            return {"cosmos_latent_x0": torch.zeros_like(noise)}
+
+        def predict_raw_latent_velocity(self, raw_batch, query_latent, t):
+            assert raw_batch["raw_task"] == ["open drawer"]
+            self.velocity_timesteps.append(t.detach().clone())
+            return {"cosmos_latent_velocity": torch.zeros_like(query_latent)}
+
+    class DummyDistiller(FlowMapStepMixin):
+        def convert_input_format(self, batch):
+            return batch
+
+        def sample_cosmos_latent_timestep_mixed(self, batch_size, num_frames, dtype, device):
+            t_norm = torch.full((batch_size, num_frames), 0.9, dtype=dtype, device=device)
+            r_norm = torch.zeros((batch_size, num_frames), dtype=dtype, device=device)
+            return t_norm * 1000, r_norm * 1000, t_norm, r_norm, torch.zeros(batch_size, dtype=torch.bool)
+
+        def _prepare_base_dict(self, batch):
+            return {
+                "latent_dict": {"text_emb": torch.zeros(batch["actions"].shape[0], 1, 2)},
+                "action_dict": {},
+                "chunk_size": 1,
+                "window_size": 1,
+            }
+
+        def _student_euler_integrate(
+            self,
+            noisy_latents,
+            timesteps,
+            target_r,
+            base_input_dict,
+            empty_emb,
+            cfg_scale,
+            ref_shape,
+            B,
+            num_frames,
+            K_steps=1,
+            action_target_r=None,
+            return_final_action=False,
+            return_final_action_state=False,
+        ):
+            self.student_velocity = torch.zeros_like(noisy_latents, requires_grad=True)
+            return noisy_latents.detach(), self.student_velocity
+
+    teacher = Teacher()
+    distiller = DummyDistiller()
+    distiller.config = SimpleNamespace(
+        rank=0,
+        num_train_timesteps=1000,
+        cosmos_latent_channels=2,
+        cosmos_latent_frames=3,
+        cosmos_latent_height=4,
+        cosmos_latent_width=4,
+        cosmos_latent_epsilon=0.001,
+        cosmos_latent_t_min=0.8,
+        cosmos_latent_t_max=80.0 / 81.0,
+        cosmos_use_teacher_action_anchor=False,
+        opd_endpoint_focus_prob=1.0,
+        opd_rollout_step_pairs=[[1, 1]],
+        opd_joint_action_rollout=False,
+        opd_danceopd_action_endpoint_weight=0.0,
+        opd_danceopd_endpoint_weight=1.0,
+        opd_danceopd_velocity_weight=0.0,
+        opd_aux_weight=1.0,
+        cfg_min=1.0,
+        cfg_max=1.0,
+        opd_cosmos_spatial_crop_size=0,
+    )
+    distiller.device = torch.device("cpu")
+    distiller.distill_action = False
+    distiller.action_aware = False
+    distiller.empty_emb = torch.zeros(1, 1, 2)
+    distiller.teacher = teacher
+    distiller._teacher_nofsdp = teacher
+    distiller.train_scheduler_latent = Scheduler()
+    batch = {
+        "actions": torch.zeros(1, 1, 1, 1, 1),
+        "raw_task": ["open drawer"],
+    }
+
+    result = distiller._cosmos_latent_full_opd_aux_transition_step(batch, batch_idx=0)
+
+    assert result["skip_step"] is False
+    assert teacher.target_pairs
+    assert teacher.velocity_timesteps
+    for t, r in teacher.target_pairs:
+        assert bool((t >= 0.8).all())
+        assert bool((t <= 80.0 / 81.0).all())
+        assert bool((r >= 0.8).all())
+        assert bool((r <= t).all())
+    for t in teacher.velocity_timesteps:
+        assert bool((t >= 0.8).all())
+        assert bool((t <= 80.0 / 81.0).all())
     assert distiller.student_velocity.grad is not None

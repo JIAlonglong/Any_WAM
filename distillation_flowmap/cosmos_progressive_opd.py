@@ -30,6 +30,75 @@ def build_uniform_timestep_path(timesteps, target_timesteps, num_steps):
     ).unsqueeze(0) * alpha.view(-1, 1, 1)
 
 
+def constrain_cosmos_teacher_timestep_pair(
+    timesteps,
+    target_timesteps,
+    *,
+    t_min,
+    t_max,
+    num_train_timesteps,
+):
+    """Keep a raw-Cosmos velocity rollout inside its supported time window.
+
+    Raw Cosmos latent velocities are only calibrated on an interior noise
+    interval.  Both endpoints must therefore be clamped before a rollout is
+    constructed; clamping only the teacher's reported time would pair a
+    low-noise state with the wrong noise label.
+    """
+    if timesteps.shape != target_timesteps.shape:
+        raise ValueError("timesteps and target_timesteps must have matching shapes")
+    if int(num_train_timesteps) <= 0:
+        raise ValueError("num_train_timesteps must be positive")
+    t_min = float(t_min)
+    t_max = float(t_max)
+    if not (
+        math.isfinite(t_min)
+        and math.isfinite(t_max)
+        and 0.0 < t_min < t_max < 1.0
+    ):
+        raise ValueError(
+            "Cosmos raw teacher window must satisfy 0 < t_min < t_max < 1"
+        )
+
+    lower = t_min * int(num_train_timesteps)
+    upper = t_max * int(num_train_timesteps)
+    timesteps = timesteps.clamp(min=lower, max=upper)
+    target_timesteps = target_timesteps.clamp(min=lower, max=upper)
+    return timesteps, torch.minimum(target_timesteps, timesteps)
+
+
+def build_cosmos_teacher_window_path(
+    *,
+    batch_size,
+    num_frames,
+    num_steps,
+    t_min,
+    t_max,
+    num_train_timesteps,
+    device,
+    dtype,
+):
+    """Build a full high-to-low raw-Cosmos rollout in the valid teacher band."""
+    if int(batch_size) <= 0 or int(num_frames) <= 0:
+        raise ValueError("batch_size and num_frames must be positive")
+    if int(num_steps) <= 0:
+        raise ValueError("num_steps must be positive")
+    if int(num_train_timesteps) <= 0:
+        raise ValueError("num_train_timesteps must be positive")
+
+    probe = torch.empty(
+        (int(batch_size), int(num_frames)), device=device, dtype=dtype
+    )
+    start, end = constrain_cosmos_teacher_timestep_pair(
+        torch.full_like(probe, float(t_max) * int(num_train_timesteps)),
+        torch.full_like(probe, float(t_min) * int(num_train_timesteps)),
+        t_min=t_min,
+        t_max=t_max,
+        num_train_timesteps=num_train_timesteps,
+    )
+    return build_uniform_timestep_path(start, end, num_steps)
+
+
 def broadcast_joint_action_timesteps(video_t, video_r, *, action_frames):
     """Map a scalar video endpoint pair to every action token in the joint state."""
     if video_t.ndim != 2 or video_r.ndim != 2 or video_t.shape != video_r.shape:
@@ -105,6 +174,8 @@ def apply_full_endpoint_focus(
     *,
     probability,
     num_train_timesteps,
+    focus_timestep=None,
+    focus_target_timestep=None,
 ):
     """Replace a sample-level subset of pairs with the full deployment path."""
     if timesteps.shape != target_timesteps.shape:
@@ -125,9 +196,27 @@ def apply_full_endpoint_focus(
     else:
         focus_mask = torch.rand(timesteps.shape[0], device=timesteps.device) < probability
 
+    focus_timestep = (
+        float(num_train_timesteps)
+        if focus_timestep is None
+        else float(focus_timestep)
+    )
+    focus_target_timestep = (
+        0.0 if focus_target_timestep is None else float(focus_target_timestep)
+    )
+    if not (
+        math.isfinite(focus_timestep)
+        and math.isfinite(focus_target_timestep)
+        and 0.0 <= focus_target_timestep <= focus_timestep <= int(num_train_timesteps)
+    ):
+        raise ValueError(
+            "focused endpoint pair must satisfy "
+            "0 <= focus_target_timestep <= focus_timestep <= num_train_timesteps"
+        )
+
     expanded_mask = focus_mask[:, None].expand_as(timesteps)
-    full_t = torch.full_like(timesteps, float(num_train_timesteps))
-    full_r = torch.zeros_like(target_timesteps)
+    full_t = torch.full_like(timesteps, focus_timestep)
+    full_r = torch.full_like(target_timesteps, focus_target_timestep)
     return (
         torch.where(expanded_mask, full_t, timesteps),
         torch.where(expanded_mask, full_r, target_timesteps),

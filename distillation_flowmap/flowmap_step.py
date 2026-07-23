@@ -109,9 +109,11 @@ from distillation_flowmap.danceopd_query import (
 )
 from distillation_flowmap.cosmos_progressive_opd import (
     apply_full_endpoint_focus,
+    build_cosmos_teacher_window_path,
     broadcast_joint_action_timesteps,
     center_spatial_crop_slices,
     compose_cosmos_endpoint_loss,
+    constrain_cosmos_teacher_timestep_pair,
     rollout_velocity_field,
 )
 
@@ -3961,21 +3963,28 @@ class FlowMapStepMixin:
             rollout_steps = rollout_step_choices[choice_index.item()]
         query_alpha = float(getattr(self.config, 'opd_danceopd_query_alpha', 5.0))
         query_beta = float(getattr(self.config, 'opd_danceopd_query_beta', 2.0))
-
-        terminal_video_t = torch.full(
-            (B, video_frames),
-            float(self.config.num_train_timesteps),
+        cosmos_t_min = float(getattr(self.config, 'cosmos_latent_t_min', 4.0 / 5.0))
+        cosmos_t_max = float(getattr(self.config, 'cosmos_latent_t_max', 80.0 / 81.0))
+        video_path = build_cosmos_teacher_window_path(
+            batch_size=B,
+            num_frames=video_frames,
+            num_steps=rollout_steps,
+            t_min=cosmos_t_min,
+            t_max=cosmos_t_max,
+            num_train_timesteps=self.config.num_train_timesteps,
             device=self.device,
             dtype=torch.float32,
         )
-        terminal_action_t = torch.full(
-            (B, action_frames),
-            float(self.config.num_train_timesteps),
+        action_path = build_cosmos_teacher_window_path(
+            batch_size=B,
+            num_frames=action_frames,
+            num_steps=rollout_steps,
+            t_min=cosmos_t_min,
+            t_max=cosmos_t_max,
+            num_train_timesteps=self.config.num_train_timesteps,
             device=self.device,
             dtype=torch.float32,
         )
-        zero_video_t = torch.zeros_like(terminal_video_t)
-        zero_action_t = torch.zeros_like(terminal_action_t)
         full_dance_noise = None
         if teacher_crop_context is None:
             video_noise = torch.randn_like(batch['latents'])
@@ -3987,33 +3996,44 @@ class FlowMapStepMixin:
                 ..., teacher_crop_context['h_slice'], teacher_crop_context['w_slice']
             ].to(batch['latents'])
         action_noise = torch.randn_like(action_clean)
-        current_video = self.train_scheduler_latent.add_noise(
-            batch['latents'], video_noise, terminal_video_t, t_dim=2
+        video_start_sigma = self._timestep_to_sigma_5d(video_path[0]).to(batch['latents'])
+        action_start_sigma = self._timestep_to_sigma_5d(action_path[0]).to(action_clean)
+        # Raw Cosmos velocity uses x_t=(1-t)x0+t*noise.  Keep the entire
+        # student rollout in the same supported raw-teacher coordinates.
+        current_video = (
+            (1.0 - video_start_sigma) * batch['latents']
+            + video_start_sigma * video_noise
         )
-        current_action = self.train_scheduler_action.add_noise(
-            action_clean, action_noise, terminal_action_t, t_dim=2
+        current_action = (
+            (1.0 - action_start_sigma) * action_clean
+            + action_start_sigma * action_noise
         )
-        terminal_prior_error = torch.maximum(
-            (current_video.float() - video_noise.float()).abs().amax(),
-            (current_action.float() - action_noise.float()).abs().amax(),
+        window_start_error = torch.maximum(
+            (
+                current_video.float()
+                - (
+                    (1.0 - video_start_sigma) * batch['latents']
+                    + video_start_sigma * video_noise
+                ).float()
+            ).abs().amax(),
+            (
+                current_action.float()
+                - (
+                    (1.0 - action_start_sigma) * action_clean
+                    + action_start_sigma * action_noise
+                ).float()
+            ).abs().amax(),
         )
         if (
             bool(getattr(self.config, 'opd_danceopd_verify_terminal_prior', True))
-            and terminal_prior_error.detach().item() > float(getattr(
+            and window_start_error.detach().item() > float(getattr(
                 self.config, 'opd_danceopd_terminal_prior_tolerance', 1e-6
             ))
         ):
             raise RuntimeError(
-                "Cosmos DanceOPD terminal state is not pure scheduler noise: "
-                f"max_error={terminal_prior_error.detach().item():.3e}"
+                "Cosmos DanceOPD window start state is inconsistent with the "
+                f"raw-teacher interpolation: max_error={window_start_error.detach().item():.3e}"
             )
-
-        video_path = self._build_timestep_path(
-            terminal_video_t, zero_video_t, rollout_steps
-        )
-        action_path = self._build_timestep_path(
-            terminal_action_t, zero_action_t, rollout_steps
-        )
         action_base = input_dict['action_dict']
         action_grid_id = _downsample_action_grid_id(
             action_base.get('grid_id'), action_base['latent'], action_downsample
@@ -4205,7 +4225,7 @@ class FlowMapStepMixin:
             'query_sigma_mean': (
                 query_video_t.float() / self.config.num_train_timesteps
             ).mean().detach(),
-            'terminal_prior_max_error': terminal_prior_error.detach(),
+            'terminal_prior_max_error': window_start_error.detach(),
         }
         return velocity_loss, diagnostics
 
@@ -4244,6 +4264,19 @@ class FlowMapStepMixin:
             video_t,
             video_r,
             probability=float(getattr(self.config, 'opd_endpoint_focus_prob', 0.0)),
+            num_train_timesteps=self.config.num_train_timesteps,
+            focus_timestep=float(getattr(
+                self.config, 'cosmos_latent_t_max', 80.0 / 81.0
+            )) * self.config.num_train_timesteps,
+            focus_target_timestep=float(getattr(
+                self.config, 'cosmos_latent_t_min', 4.0 / 5.0
+            )) * self.config.num_train_timesteps,
+        )
+        video_t, video_r = constrain_cosmos_teacher_timestep_pair(
+            video_t,
+            video_r,
+            t_min=float(getattr(self.config, 'cosmos_latent_t_min', 4.0 / 5.0)),
+            t_max=float(getattr(self.config, 'cosmos_latent_t_max', 80.0 / 81.0)),
             num_train_timesteps=self.config.num_train_timesteps,
         )
         video_t_norm = (video_t / self.config.num_train_timesteps).clamp(0.0, 1.0)
@@ -4606,6 +4639,13 @@ class FlowMapStepMixin:
             )
         )
         video_r = self._apply_opd_low_noise_query_bias(video_t, video_r)
+        video_t, video_r = constrain_cosmos_teacher_timestep_pair(
+            video_t,
+            video_r,
+            t_min=float(getattr(self.config, 'cosmos_latent_t_min', 4.0 / 5.0)),
+            t_max=float(getattr(self.config, 'cosmos_latent_t_max', 80.0 / 81.0)),
+            num_train_timesteps=self.config.num_train_timesteps,
+        )
         video_r_norm = (video_r / self.config.num_train_timesteps).clamp(0.0, 1.0)
 
         video_noise_teacher = torch.randn(

@@ -5,9 +5,11 @@ import torch
 
 from distillation_flowmap.cosmos_progressive_opd import (
     apply_full_endpoint_focus,
+    build_cosmos_teacher_window_path,
     broadcast_joint_action_timesteps,
     center_spatial_crop_slices,
     compose_cosmos_endpoint_loss,
+    constrain_cosmos_teacher_timestep_pair,
     rollout_velocity_field,
     should_stop_training_at_step,
     should_run_standalone_opd,
@@ -62,6 +64,64 @@ def test_zero_focus_leaves_random_endpoint_pairs_unchanged():
     assert not bool(focus_mask.any())
     assert torch.equal(focused_t, t)
     assert torch.equal(focused_r, r)
+
+
+@pytest.mark.parametrize("num_steps", [1, 2, 4])
+def test_cosmos_teacher_window_path_never_leaves_raw_teacher_support(num_steps):
+    t_min = 4.0 / 5.0
+    t_max = 80.0 / 81.0
+
+    path = build_cosmos_teacher_window_path(
+        batch_size=2,
+        num_frames=3,
+        num_steps=num_steps,
+        t_min=t_min,
+        t_max=t_max,
+        num_train_timesteps=1000,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert path.shape == (num_steps + 1, 2, 3)
+    assert torch.allclose(path[0], torch.full((2, 3), t_max * 1000))
+    assert torch.allclose(path[-1], torch.full((2, 3), t_min * 1000))
+    assert bool((path >= t_min * 1000).all())
+    assert bool((path <= t_max * 1000).all())
+
+
+def test_constrain_cosmos_teacher_pair_clamps_invalid_raw_velocity_endpoints():
+    timesteps = torch.tensor([[1000.0, 900.0], [700.0, 850.0]])
+    target_timesteps = torch.tensor([[0.0, 1000.0], [100.0, 820.0]])
+
+    t, r = constrain_cosmos_teacher_timestep_pair(
+        timesteps,
+        target_timesteps,
+        t_min=0.8,
+        t_max=80.0 / 81.0,
+        num_train_timesteps=1000,
+    )
+
+    assert bool((t >= 800.0).all())
+    assert bool((t <= (80.0 / 81.0) * 1000).all())
+    assert bool((r >= 800.0).all())
+    assert bool((r <= t).all())
+
+
+def test_full_endpoint_focus_can_use_the_raw_cosmos_teacher_window():
+    t = torch.full((2, 3), 840.0)
+    r = torch.full((2, 3), 820.0)
+
+    focused_t, focused_r, _ = apply_full_endpoint_focus(
+        t,
+        r,
+        probability=1.0,
+        num_train_timesteps=1000,
+        focus_timestep=(80.0 / 81.0) * 1000,
+        focus_target_timestep=800.0,
+    )
+
+    assert torch.allclose(focused_t, torch.full_like(t, (80.0 / 81.0) * 1000))
+    assert torch.allclose(focused_r, torch.full_like(r, 800.0))
 
 
 def test_standalone_opd_schedule_respects_warmup_and_interval():

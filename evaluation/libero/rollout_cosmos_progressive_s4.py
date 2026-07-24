@@ -203,6 +203,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--warmup-gripper", type=float, default=0.0)
     parser.add_argument("--skip-first-action", action="store_true")
+    parser.add_argument("--save-video", action="store_true")
     parser.add_argument("--preflight", action="store_true")
     parser.add_argument(
         "--serve-stdio",
@@ -602,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
                         max_env_steps=args.max_env_steps,
                         env_seed=args.env_seed,
                         initial_states_json=args.initial_states_json,
+                        save_video=args.save_video,
                     )
                 )
         print(json.dumps({"records": records}, indent=2, sort_keys=True))

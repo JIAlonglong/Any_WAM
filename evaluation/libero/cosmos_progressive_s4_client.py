@@ -164,6 +164,7 @@ class CosmosProgressiveS4Client:
         init_env_fn = init_env_fn or _init_env_like_official_loop
         extract_video_fn = extract_video_fn or _video_observation
         frames: list[Mapping[str, Any]] = []
+        capture_video = video_path is not None and save_video_fn is not None
         chunks = 0
         done = False
         service_metadata: dict[str, Any] = {}
@@ -216,11 +217,12 @@ class CosmosProgressiveS4Client:
                 for action in actions[start_idx:]:
                     obs, _, done, _ = env.step(action.astype(np.float32, copy=False))
                     env_steps += 1
-                    frames.append(extract_video_fn(obs))
+                    if capture_video:
+                        frames.append(extract_video_fn(obs))
                     if done or int(env.env.timestep) >= int(max_env_steps):
                         break
                 chunks += 1
-            if video_path is not None and frames and save_video_fn is not None:
+            if capture_video and frames:
                 save_video_fn(frames, video_path)
             record = {
                 "task_idx": int(task_idx),
@@ -276,6 +278,7 @@ class CosmosProgressiveS4Client:
         env_seed: int | None = None,
         initial_states_json: str | None = None,
         video_fps: int = 15,
+        save_video: bool = True,
     ) -> dict[str, Any]:
         """Construct a real LIBERO task while reusing the official rollout helpers."""
         if env_seed is None:
@@ -289,7 +292,7 @@ class CosmosProgressiveS4Client:
                 construct_single_env,
                 extract_video_obs,
                 resolve_initial_state,
-                save_video,
+                save_video as save_video_file,
             )
         except Exception as exc:
             raise CosmosProgressiveS4ClientPrerequisiteError(
@@ -332,12 +335,13 @@ class CosmosProgressiveS4Client:
         }
         env = construct_single_env(env_args, env_seed=rollout_seed)
         task_name = prompt.replace(" ", "_").replace("/", "_")
-        video_path = (
+        planned_video_path = (
             self.output_dir
             / libero_benchmark
             / f"task_{int(task_idx)}_{task_name}"
             / f"episode_{int(episode_idx)}_done.mp4"
         )
+        video_path = planned_video_path if save_video else None
         # TASK_MAX_STEPS import prevents a caller accidentally using a generic
         # 48-channel server default; its value is only a sane upper bound here.
         bounded_steps = min(int(max_env_steps), int(TASK_MAX_STEPS.get(libero_benchmark, max_env_steps)))
@@ -358,7 +362,7 @@ class CosmosProgressiveS4Client:
                 warmup_gripper=warmup_gripper,
             ),
             extract_video_fn=extract_video_obs,
-            save_video_fn=lambda frames, path: save_video(frames, path, fps=video_fps),
+            save_video_fn=lambda frames, path: save_video_file(frames, path, fps=video_fps),
             video_path=video_path,
             close_env=True,
         )

@@ -284,6 +284,32 @@ def test_client_records_rollout_seed_on_success(tmp_path):
     assert persisted["student_steps"] == 2
 
 
+def test_non_video_episode_does_not_extract_or_save_frames(tmp_path):
+    client = CosmosProgressiveS4Client(
+        _SuccessfulService(), output_dir=tmp_path, student_steps=2, warmup_steps=0
+    )
+    extracted = []
+    saved = []
+
+    record = client.run_with_env(
+        env=_DoneEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=3,
+        episode_idx=1,
+        prompt="open the drawer",
+        max_env_steps=1,
+        init_env_fn=lambda *_args, **_kwargs: OBS,
+        extract_video_fn=lambda obs: extracted.append(obs),
+        save_video_fn=lambda frames, path: saved.append((frames, path)),
+        video_path=None,
+        rollout_seed=23,
+    )
+
+    assert extracted == []
+    assert saved == []
+    assert record["video_path"] is None
+
+
 def test_client_records_rollout_seed_on_setup_failure(tmp_path):
     client = CosmosProgressiveS4Client(
         _SuccessfulService(), output_dir=tmp_path, student_steps=2, warmup_steps=0
@@ -583,6 +609,43 @@ def test_run_libero_task_forwards_env_seed_to_run_with_env_without_libero(tmp_pa
     assert record["seed"] == 37
 
 
+@pytest.mark.parametrize(("save_video", "has_path"), [(False, False), (True, True)])
+def test_run_libero_task_controls_video_capture(
+    tmp_path, monkeypatch, save_video, has_path
+):
+    _install_fake_libero(monkeypatch, skipped=False)
+    client = CosmosProgressiveS4Client(
+        _SuccessfulService(), output_dir=tmp_path, student_steps=2
+    )
+    captured = {}
+
+    def fake_run_with_env(**kwargs):
+        captured.update(kwargs)
+        return {
+            "task_idx": kwargs["task_idx"],
+            "episode_idx": kwargs["episode_idx"],
+            "seed": kwargs["rollout_seed"],
+            "video_path": (
+                str(kwargs["video_path"]) if kwargs["video_path"] is not None else None
+            ),
+        }
+
+    monkeypatch.setattr(client, "run_with_env", fake_run_with_env)
+
+    record = client.run_libero_task(
+        libero_benchmark="libero_10",
+        task_idx=7,
+        episode_idx=1,
+        camera_size=128,
+        max_env_steps=1,
+        env_seed=37,
+        save_video=save_video,
+    )
+
+    assert (record["video_path"] is not None) is has_path
+    assert (captured["video_path"] is not None) is has_path
+
+
 def test_live_runtime_preflight_rejects_cpu_with_actionable_error(tmp_path):
     from evaluation.libero.rollout_cosmos_progressive_s4 import require_live_s4_prerequisites
 
@@ -704,6 +767,7 @@ def test_cli_defaults_joint_student_steps_to_four():
     )
 
     assert args.student_steps == 4
+    assert args.save_video is False
 
 
 @pytest.mark.parametrize("steps", [0, 3, 5])

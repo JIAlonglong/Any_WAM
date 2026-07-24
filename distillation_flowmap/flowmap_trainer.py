@@ -21,6 +21,7 @@ FlowMapDistiller：Flow Map 蒸馏训练主类。
 import gc
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import torch
@@ -102,9 +103,14 @@ def _select_progressive_training_objective(
 
 def _write_json_atomic(path, payload):
     path = Path(path)
-    temp_path = path.with_name(f".{path.name}.tmp")
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
     try:
-        with open(temp_path, "w") as handle:
+        with os.fdopen(descriptor, "w") as handle:
             json.dump(payload, handle, indent=2)
             handle.flush()
             os.fsync(handle.fileno())
@@ -1278,6 +1284,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             if dist.is_initialized():
                 dist.barrier(device_ids=[torch.cuda.current_device()])
             return
+        stage_name = getattr(self.config, "training_contract_stage", None)
+        persisted_contract = None
+        if stage_name is not None:
+            persisted_contract = contract_metadata(self.config, stage=stage_name)
         try:
             if self.use_lora:
                 # LoRA 模式：只保存 adapter 权重（不含基座模型权重，文件更小）
@@ -1311,11 +1321,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 config_dict['distill_mode'] = getattr(self.config, 'distill_mode', 'flashwam')
                 config_dict['checkpoint_step'] = self.step
                 _set_video_channel_config_from_heads(config_dict, model, state_dict_bf16)
-                stage_name = getattr(self.config, "training_contract_stage", None)
-                if stage_name is not None:
-                    config_dict.update(
-                        contract_metadata(self.config, stage=stage_name)
-                    )
+                if persisted_contract is not None:
+                    config_dict.update(persisted_contract)
                 # 保存 LoRA 元信息，方便恢复时重建 LoRA 结构
                 if self.use_lora:
                     config_dict['use_lora'] = True

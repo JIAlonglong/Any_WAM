@@ -18,11 +18,20 @@ _PROGRESSIVE_STAGE2_CONTRACT = {
     "deployment_timestep_end": 0,
     "joint_student_steps": [1, 2, 4],
     "deployment_joint_rollout_interval": 4,
+    "deployment_action_weight": 1.0,
     "raw_teacher_window_is_auxiliary": True,
 }
 
 
 def _require_exact(field: str, actual: object, expected: object) -> None:
+    if type(actual) is list and type(expected) is list:
+        if len(actual) != len(expected):
+            raise ValueError(
+                f"{field} must be exactly {expected!r} (list), got {actual!r} (list)"
+            )
+        for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
+            _require_exact(f"{field}[{index}]", actual_item, expected_item)
+        return
     if type(actual) is not type(expected) or actual != expected:
         raise ValueError(
             f"{field} must be exactly {expected!r} "
@@ -45,6 +54,13 @@ def validate_contract_metadata(
     }
     if required_stage == PROGRESSIVE_STAGE2:
         expected.update(_PROGRESSIVE_STAGE2_CONTRACT)
+    else:
+        forbidden = sorted(set(payload).intersection(_PROGRESSIVE_STAGE2_CONTRACT))
+        if forbidden:
+            raise ValueError(
+                "raw_stage1 contract metadata must not contain Stage-2 field "
+                f"{forbidden[0]!r}"
+            )
 
     for field, value in expected.items():
         if field not in payload:
@@ -79,6 +95,9 @@ def contract_metadata(config, *, stage: str) -> dict[str, object]:
                 "joint_student_steps": list(deployment_steps),
                 "deployment_joint_rollout_interval": getattr(
                     config, "deployment_joint_rollout_interval", None
+                ),
+                "deployment_action_weight": getattr(
+                    config, "deployment_action_weight", None
                 ),
                 "raw_teacher_window_is_auxiliary": getattr(
                     config, "raw_teacher_window_is_auxiliary", None

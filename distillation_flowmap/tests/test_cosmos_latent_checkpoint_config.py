@@ -109,6 +109,7 @@ def test_checkpoint_config_persists_stage2_contract_atomically(tmp_path, monkeyp
         deployment_timestep_end=0,
         deployment_joint_steps=(1, 2, 4),
         deployment_joint_rollout_interval=4,
+        deployment_action_weight=1.0,
         raw_teacher_window_is_auxiliary=True,
     )
     monkeypatch.setattr(
@@ -135,11 +136,13 @@ def test_checkpoint_config_persists_stage2_contract_atomically(tmp_path, monkeyp
     payload = json.loads(config_path.read_text())
     assert payload["training_contract_stage"] == "progressive_stage2"
     assert payload["joint_student_steps"] == [1, 2, 4]
-    assert replacements[-1] == (
-        os.fspath(config_path.with_name(".config.json.tmp")),
-        os.fspath(config_path),
-    )
-    assert not config_path.with_name(".config.json.tmp").exists()
+    assert payload["deployment_action_weight"] == 1.0
+    source, destination = replacements[-1]
+    assert os.path.dirname(source) == os.fspath(config_path.parent)
+    assert os.path.basename(source).startswith(".config.json.")
+    assert os.path.basename(source).endswith(".tmp")
+    assert destination == os.fspath(config_path)
+    assert not os.path.exists(source)
 
 
 def test_atomic_checkpoint_config_failure_preserves_prior_file(tmp_path, monkeypatch):
@@ -159,3 +162,75 @@ def test_atomic_checkpoint_config_failure_preserves_prior_file(tmp_path, monkeyp
 
     assert config_path.read_text() == '{"prior": true}\n'
     assert not (tmp_path / ".config.json.tmp").exists()
+
+
+@pytest.mark.parametrize("stale_kind", ["file", "dangling_symlink"])
+def test_atomic_checkpoint_config_ignores_fixed_stale_temp(
+    tmp_path, stale_kind
+):
+    config_path = tmp_path / "config.json"
+    stale_path = tmp_path / ".config.json.tmp"
+    victim_path = tmp_path / "victim.json"
+    if stale_kind == "file":
+        stale_path.write_text("stale")
+    else:
+        stale_path.symlink_to(victim_path.name)
+
+    _write_json_atomic(config_path, {"complete": True})
+
+    assert json.loads(config_path.read_text()) == {"complete": True}
+    if stale_kind == "file":
+        assert stale_path.read_text() == "stale"
+    else:
+        assert stale_path.is_symlink()
+        assert not victim_path.exists()
+
+
+def test_invalid_contract_prevents_all_checkpoint_writes(tmp_path, monkeypatch):
+    import distillation_flowmap.flowmap_trainer as trainer_module
+
+    trainer = FlowMapDistiller.__new__(FlowMapDistiller)
+    trainer.student = _CheckpointModel()
+    trainer.target_student = None
+    trainer.use_lora = False
+    trainer.use_dmd = False
+    trainer.discriminator = None
+    trainer.save_dir = tmp_path
+    trainer.step = 17
+    trainer.optimizer = _Stateful()
+    trainer.lr_scheduler = _Stateful()
+    trainer.config = SimpleNamespace(
+        rank=0,
+        training_contract_stage="progressive_stage2",
+        contract_version=2,
+        action_packing_schema="downsample_survivor_v2",
+        action_downsample_factor=4,
+        deployment_timestep_start=1000,
+        deployment_timestep_end=0,
+        deployment_joint_steps=(1, 2, 4),
+        deployment_joint_rollout_interval=4,
+        deployment_action_weight=2.0,
+        raw_teacher_window_is_auxiliary=True,
+    )
+    writes = []
+    monkeypatch.setattr(
+        trainer_module,
+        "get_model_state_dict",
+        lambda *args, **kwargs: writes.append("state_dict") or {},
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "save_file",
+        lambda *args, **kwargs: writes.append("weights"),
+    )
+    monkeypatch.setattr(
+        trainer_module.torch,
+        "save",
+        lambda *args, **kwargs: writes.append("torch_save"),
+    )
+
+    with pytest.raises(ValueError, match="deployment_action_weight"):
+        trainer._save_checkpoint()
+
+    assert writes == []
+    assert not list(tmp_path.iterdir())

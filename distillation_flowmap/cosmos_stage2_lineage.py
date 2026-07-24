@@ -3,27 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
 from distillation_flowmap.cosmos_training_contract import validate_contract_metadata
 
 
-_COMMON_CONTRACT_FIELDS = (
-    "contract_version",
-    "training_contract_stage",
-    "action_packing_schema",
-    "action_downsample_factor",
-    "action_chunk_shape",
-)
-_STAGE2_CONTRACT_FIELDS = _COMMON_CONTRACT_FIELDS + (
-    "deployment_timestep_start",
-    "deployment_timestep_end",
-    "joint_student_steps",
-    "deployment_joint_rollout_interval",
-    "deployment_action_weight",
-    "raw_teacher_window_is_auxiliary",
-)
 _MONOLITHIC_WEIGHTS = "diffusion_pytorch_model.safetensors"
 _SHARDED_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 
@@ -34,9 +20,24 @@ class ValidatedStage1Parent:
     contract_identity: str
 
 
+def _reject_symlink_components(path: Path, *, label: str) -> None:
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    anchor = Path(absolute.anchor)
+    current = anchor
+    if stat.S_ISLNK(os.lstat(anchor).st_mode):
+        raise ValueError(f"{label} filesystem anchor must not be a symlink: {anchor}")
+    for part in absolute.parts[1:]:
+        current /= part
+        try:
+            component_stat = os.lstat(current)
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(component_stat.st_mode):
+            raise ValueError(f"{label} path contains a symlink component: {current}")
+
+
 def _require_plain_directory(path: Path, *, label: str) -> None:
-    if path.is_symlink():
-        raise ValueError(f"{label} must not be a symlink: {path}")
+    _reject_symlink_components(path, label=label)
     if not path.exists():
         raise FileNotFoundError(f"{label} is missing: {path}")
     if not path.is_dir():
@@ -44,8 +45,7 @@ def _require_plain_directory(path: Path, *, label: str) -> None:
 
 
 def _require_plain_file(path: Path, *, label: str) -> None:
-    if path.is_symlink():
-        raise ValueError(f"{label} must not be a symlink: {path}")
+    _reject_symlink_components(path, label=label)
     if not path.exists():
         raise FileNotFoundError(f"{label} is missing: {path}")
     if not path.is_file():
@@ -74,13 +74,12 @@ def _validate_step(
         )
 
 
-def _contract_payload(
-    payload: dict[str, object], *, stage: str
-) -> dict[str, object]:
-    fields = (
-        _COMMON_CONTRACT_FIELDS if stage == "raw_stage1" else _STAGE2_CONTRACT_FIELDS
-    )
-    return {field: payload[field] for field in fields}
+def _contract_payload(payload: dict[str, object]) -> dict[str, object]:
+    return {
+        field: value
+        for field, value in payload.items()
+        if field != "checkpoint_step"
+    }
 
 
 def _validate_weights(transformer: Path, *, label: str) -> tuple[Path, ...]:
@@ -123,13 +122,12 @@ def _validate_weights(transformer: Path, *, label: str) -> tuple[Path, ...]:
     return (index, *sorted(shards))
 
 
-def _same_inode(first: Path, second: Path) -> bool:
-    first_stat = first.stat()
-    second_stat = second.stat()
-    return (first_stat.st_dev, first_stat.st_ino) == (
-        second_stat.st_dev,
-        second_stat.st_ino,
-    )
+def _inode_map(paths: tuple[Path, ...]) -> dict[tuple[int, int], Path]:
+    result: dict[tuple[int, int], Path] = {}
+    for path in paths:
+        path_stat = path.stat()
+        result[(path_stat.st_dev, path_stat.st_ino)] = path
+    return result
 
 
 def _canonical_json_digest(payload: object) -> str:
@@ -151,7 +149,7 @@ def validate_stage1_parent(
         raise TypeError("expected_step must be a plain integer")
 
     records: dict[str, tuple[Path, bytes, dict[str, object], dict[str, object]]] = {}
-    controlled: dict[str, tuple[Path, Path, tuple[Path, ...]]] = {}
+    controlled: dict[str, tuple[Path, ...]] = {}
     for variant in ("online_student", "target_student"):
         component = path / variant
         transformer = component / "transformer"
@@ -161,30 +159,20 @@ def validate_stage1_parent(
         exact, payload = _read_json_object(config, label=f"{variant} config.json")
         validate_contract_metadata(payload, required_stage="raw_stage1")
         _validate_step(payload, expected_step=expected_step, label=variant)
-        contract = _contract_payload(payload, stage="raw_stage1")
+        contract = _contract_payload(payload)
         weights = _validate_weights(transformer, label=variant)
         records[variant] = (config, exact, payload, contract)
-        controlled[variant] = (component, transformer, weights)
+        controlled[variant] = (component, transformer, config, *weights)
 
-    online_component, online_transformer, online_weights = controlled[
-        "online_student"
-    ]
-    target_component, target_transformer, target_weights = controlled[
-        "target_student"
-    ]
-    inode_pairs = [
-        (online_component, target_component),
-        (online_transformer, target_transformer),
-        (records["online_student"][0], records["target_student"][0]),
-    ]
-    if len(online_weights) == len(target_weights):
-        inode_pairs.extend(zip(online_weights, target_weights))
-    for online_path, target_path in inode_pairs:
-        if _same_inode(online_path, target_path):
-            raise ValueError(
-                "online_student and target_student must not resolve to the same inode: "
-                f"{online_path} and {target_path}"
-            )
+    online_inodes = _inode_map(controlled["online_student"])
+    target_inodes = _inode_map(controlled["target_student"])
+    shared_inodes = online_inodes.keys() & target_inodes.keys()
+    if shared_inodes:
+        shared = next(iter(shared_inodes))
+        raise ValueError(
+            "online_student and target_student must not share the same inode: "
+            f"{online_inodes[shared]} and {target_inodes[shared]}"
+        )
 
     online_payload = records["online_student"][2]
     target_payload = records["target_student"][2]
@@ -251,14 +239,7 @@ def validate_stage2_resume(
 
 
 def _reject_path_symlinks(path: Path, *, label: str) -> None:
-    absolute = Path(os.path.abspath(path))
-    for component in reversed(absolute.parents):
-        if component == component.parent:
-            continue
-        if component.is_symlink():
-            raise ValueError(f"{label} parent must not be a symlink: {component}")
-    if absolute.is_symlink():
-        raise ValueError(f"{label} must not be a symlink: {absolute}")
+    _reject_symlink_components(path, label=label)
 
 
 def _is_within(path: Path, root: Path) -> bool:

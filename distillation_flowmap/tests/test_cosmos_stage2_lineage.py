@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -110,6 +111,45 @@ def test_valid_stage1_parent_is_independent_and_identity_is_deterministic(tmp_pa
     assert first.contract_identity != "0" * 64
 
 
+def test_stage1_identity_changes_with_canonical_parent_path(tmp_path):
+    original = _stage1(tmp_path / "original")
+    copied = tmp_path / "copied" / original.name
+    shutil.copytree(original, copied)
+
+    assert (
+        validate_stage1_parent(original).contract_identity
+        != validate_stage1_parent(copied).contract_identity
+    )
+
+
+@pytest.mark.parametrize("variant", ["online_student", "target_student"])
+def test_stage1_identity_changes_with_either_exact_config_bytes(tmp_path, variant):
+    root = _stage1(tmp_path)
+    before = validate_stage1_parent(root).contract_identity
+    config = _config(root, variant)
+    config.write_text(config.read_text(encoding="utf-8") + " \n", encoding="utf-8")
+
+    assert validate_stage1_parent(root).contract_identity != before
+
+
+def test_stage1_identity_changes_with_validated_contract_payload(tmp_path):
+    root = _stage1(tmp_path)
+    before = validate_stage1_parent(root).contract_identity
+    for variant in ("online_student", "target_student"):
+        _rewrite(_config(root, variant), model_hint="changed validated payload")
+
+    assert validate_stage1_parent(root).contract_identity != before
+
+
+def test_stage1_identity_does_not_hash_weight_bytes(tmp_path):
+    root = _stage1(tmp_path)
+    before = validate_stage1_parent(root).contract_identity
+    _weights(root, "online_student").write_bytes(b"changed online weight bytes")
+    _weights(root, "target_student").write_bytes(b"changed target weight bytes")
+
+    assert validate_stage1_parent(root).contract_identity == before
+
+
 @pytest.mark.parametrize(
     ("variant", "field", "value"),
     [
@@ -142,6 +182,14 @@ def test_stage1_rejects_contract_or_checkpoint_mismatch_between_variants(tmp_pat
 
     with pytest.raises(ValueError, match="checkpoint"):
         validate_stage1_parent(root, expected_step=4000)
+
+
+def test_stage1_rejects_validated_payload_mismatch_between_variants(tmp_path):
+    root = _stage1(tmp_path)
+    _rewrite(_config(root, "target_student"), model_hint="different")
+
+    with pytest.raises(ValueError, match="contract payloads"):
+        validate_stage1_parent(root)
 
 
 @pytest.mark.parametrize("component", ["online_student", "target_student"])
@@ -177,6 +225,60 @@ def test_stage1_rejects_contaminated_name_and_root_symlink(tmp_path):
     alias.symlink_to(_stage1(tmp_path / "plain"), target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
         validate_stage1_parent(alias)
+
+
+def test_stage1_rejects_symlink_in_ancestor_path(tmp_path):
+    real_parent = tmp_path / "real-parent"
+    root = _stage1(real_parent)
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        validate_stage1_parent(alias_parent / root.name)
+
+
+def test_stage1_lstat_walk_does_not_normalize_away_symlink_before_dotdot(tmp_path):
+    root = _stage1(tmp_path)
+    hop = tmp_path / "hop"
+    hop.mkdir()
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    alias = holder / "alias"
+    alias.symlink_to(hop, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        validate_stage1_parent(alias / ".." / root.name)
+
+
+def test_stage1_rejects_cross_layout_hardlink_alias(tmp_path):
+    root = _stage1(tmp_path)
+    online_weight = _weights(root, "online_student")
+    target_transformer = root / "target_student" / "transformer"
+    _weights(root, "target_student").unlink()
+    target_shard = target_transformer / "renamed-target-shard.safetensors"
+    os.link(online_weight, target_shard)
+    (target_transformer / "diffusion_pytorch_model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"tensor": target_shard.name}})
+    )
+
+    with pytest.raises(ValueError, match="same inode"):
+        validate_stage1_parent(root)
+
+
+def test_stage1_rejects_cross_name_sharded_hardlink_alias(tmp_path):
+    root = _stage1(tmp_path)
+    online_transformer = root / "online_student" / "transformer"
+    target_transformer = root / "target_student" / "transformer"
+    _make_sharded(online_transformer, ["online-a.safetensors", "online-b.safetensors"])
+    _make_sharded(target_transformer, ["target-a.safetensors", "target-b.safetensors"])
+    (target_transformer / "target-b.safetensors").unlink()
+    os.link(
+        online_transformer / "online-a.safetensors",
+        target_transformer / "target-b.safetensors",
+    )
+
+    with pytest.raises(ValueError, match="same inode"):
+        validate_stage1_parent(root)
 
 
 @pytest.mark.parametrize("variant", ["online_student", "target_student"])
@@ -304,6 +406,20 @@ def test_stage2_resume_rejects_checkpoint_outside_arm(tmp_path):
 
     with pytest.raises(ValueError, match="checkpoints"):
         validate_stage2_resume(outside, arm_root=arm, expected_step=1000)
+
+
+def test_stage2_resume_rejects_symlink_in_ancestor_path(tmp_path):
+    arm, checkpoint = _stage2(tmp_path / "real")
+    alias = tmp_path / "arm-alias"
+    alias.symlink_to(arm, target_is_directory=True)
+    aliased_checkpoint = alias / checkpoint.relative_to(arm)
+
+    with pytest.raises(ValueError, match="symlink"):
+        validate_stage2_resume(
+            aliased_checkpoint,
+            arm_root=arm,
+            expected_step=1000,
+        )
 
 
 @pytest.mark.parametrize(

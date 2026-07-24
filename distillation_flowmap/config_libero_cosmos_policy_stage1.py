@@ -12,6 +12,10 @@ from distillation_flowmap.config_libero_fullfinetune_stage1_warmup import cfg as
 cfg = copy.deepcopy(_base_cfg)
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 
+cfg.contract_version = 2
+cfg.action_packing_schema = "downsample_survivor_v2"
+cfg.action_downsample_factor = 4
+
 
 def _env_bool(name, default):
     val = os.environ.get(name)

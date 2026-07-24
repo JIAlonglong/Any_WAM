@@ -1244,6 +1244,8 @@ def test_s4_action_encoder_preserves_sixteen_decodable_actions_after_downsample(
     config = SimpleNamespace(
         inverse_used_action_channel_ids=list(range(7)),
         action_per_frame=4,
+        action_packing_schema="downsample_survivor_v2",
+        action_downsample_factor=4,
         norm_stat={"q01": [-1.0] * 7, "q99": [1.0] * 7},
     )
     encoder = FlowMapActionAnchorEncoder(
@@ -1256,6 +1258,8 @@ def test_s4_action_encoder_preserves_sixteen_decodable_actions_after_downsample(
     encoder(np.zeros((1, 16, 7), dtype=np.float32))
 
     assert captured["target_shape"] == (1, 7, 16, 4, 1)
+    assert captured["packing_schema"] == "downsample_survivor_v2"
+    assert captured["downsample_factor"] == 4
 
 
 @pytest.mark.parametrize("steps", [1, 2, 4])

@@ -349,6 +349,8 @@ class FlowMapActionAnchorEncoder:
             inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
             device=self.device,
             dtype=self.dtype,
+            packing_schema=self.config.action_packing_schema,
+            downsample_factor=self.config.action_downsample_factor,
         )
 
 

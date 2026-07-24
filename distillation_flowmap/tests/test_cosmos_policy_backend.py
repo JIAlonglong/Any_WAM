@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 
@@ -335,24 +336,67 @@ def test_cosmos_actions_map_to_flowmap_x0_with_quantile_norm():
         [[[0.25, 0.50, 0.75, 0.00, 1.00, -0.50, 0.10],
           [0.50, 0.25, 0.00, 1.00, 0.50, 0.25, -0.10]]],
         dtype=torch.float32,
-    )
+    ).repeat(1, 8, 1)
     inverse_ids = list(range(7)) + [7] * 23
     x0 = cosmos_actions_to_flowmap_x0(
         actions,
-        target_shape=(1, 30, 2, 4, 1),
+        target_shape=(1, 30, 16, 4, 1),
         q01=[0.0] * 30,
         q99=[1.0] * 30,
         inverse_used_action_channel_ids=inverse_ids,
         device=torch.device("cpu"),
         dtype=torch.float32,
+        packing_schema="downsample_survivor_v2",
+        downsample_factor=4,
     )
 
-    assert x0.shape == (1, 30, 2, 4, 1)
-    flat = x0.permute(0, 2, 3, 4, 1).reshape(1, 8, 30)
+    assert x0.shape == (1, 30, 16, 4, 1)
+    flat = x0[:, :, ::4].permute(0, 2, 3, 4, 1).reshape(1, 16, 30)
     assert torch.allclose(flat[0, 0, :7], actions[0, 0] * 2.0 - 1.0, atol=2e-6)
     assert torch.allclose(flat[0, 1, :7], actions[0, 1] * 2.0 - 1.0, atol=2e-6)
     assert torch.count_nonzero(flat[0, :, 7:]) == 0
-    assert torch.count_nonzero(flat[0, 2:]) == 0
+
+
+def test_cosmos_action_packing_v2_preserves_all_sixteen_actions_after_downsample():
+    from distillation_flowmap.cosmos_policy_adapter import cosmos_actions_to_flowmap_x0
+
+    actions = torch.arange(1, 16 * 7 + 1, dtype=torch.float32).reshape(1, 16, 7)
+    q01 = torch.zeros(30)
+    q99 = torch.ones(30) * 200
+    inverse = list(range(7)) + [7] * 23
+
+    full = cosmos_actions_to_flowmap_x0(
+        actions,
+        target_shape=(1, 30, 16, 4, 1),
+        q01=q01,
+        q99=q99,
+        inverse_used_action_channel_ids=inverse,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        packing_schema="downsample_survivor_v2",
+        downsample_factor=4,
+    )
+    compact = full[:, :, ::4]
+    expected = ((actions - q01[:7]) / (q99[:7] - q01[:7] + 1e-6) * 2 - 1)
+    observed = compact[:, :7, :, :, 0].permute(0, 2, 3, 1).reshape(1, 16, 7)
+
+    assert torch.allclose(observed, expected)
+    assert full[:, :7, 1:4].abs().sum() == 0
+
+
+@pytest.mark.parametrize("schema", ["", "legacy_dense_v1", "unknown"])
+def test_corrected_cosmos_training_rejects_non_v2_packing(schema):
+    from distillation_flowmap.cosmos_training_contract import (
+        pack_actions_for_downsample,
+    )
+
+    with pytest.raises(ValueError, match="action packing schema"):
+        pack_actions_for_downsample(
+            torch.ones(1, 16, 7),
+            (1, 30, 16, 4, 1),
+            downsample_factor=4,
+            schema=schema,
+        )
 
 
 def test_raw_cosmos_teacher_uses_provider_action_x0(tmp_path):
@@ -364,12 +408,14 @@ def test_raw_cosmos_teacher_uses_provider_action_x0(tmp_path):
         cosmos_policy_use_raw_inference=True,
         norm_stat={"q01": [0.0] * 30, "q99": [1.0] * 30},
         inverse_used_action_channel_ids=list(range(7)) + [7] * 23,
+        action_packing_schema="downsample_survivor_v2",
+        action_downsample_factor=4,
     )
     teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32, config=cfg)
-    teacher._raw_action_provider = lambda raw_batch: torch.ones(1, 2, 7) * 0.5
+    teacher._raw_action_provider = lambda raw_batch: torch.ones(1, 16, 7) * 0.5
 
     x0 = teacher.action_target_x0(
-        {"latent": torch.zeros(1, 30, 2, 4, 1)},
+        {"latent": torch.zeros(1, 30, 16, 4, 1)},
         raw_batch={
             "raw_primary_image": torch.zeros(1, 128, 128, 3, dtype=torch.uint8),
             "raw_wrist_image": torch.zeros(1, 128, 128, 3, dtype=torch.uint8),
@@ -378,8 +424,8 @@ def test_raw_cosmos_teacher_uses_provider_action_x0(tmp_path):
         },
     )
 
-    flat = x0.permute(0, 2, 3, 4, 1).reshape(1, 8, 30)
-    assert torch.allclose(flat[0, :2, :7], torch.zeros(2, 7), atol=2e-6)
+    flat = x0[:, :, ::4].permute(0, 2, 3, 4, 1).reshape(1, 16, 30)
+    assert torch.allclose(flat[0, :, :7], torch.zeros(16, 7), atol=2e-6)
     assert torch.count_nonzero(flat[0, :, 7:]) == 0
 
 

@@ -11,6 +11,10 @@ from distillation_flowmap.config_libero_cosmos_policy_stage2_cosmos_latent_cdiff
 cfg = copy.deepcopy(_base_cfg)
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 
+cfg.contract_version = 2
+cfg.action_packing_schema = "downsample_survivor_v2"
+cfg.action_downsample_factor = 4
+
 
 def _env_bool(name, default):
     value = os.environ.get(name)

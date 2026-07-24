@@ -1753,6 +1753,8 @@ class FlowMapStepMixin:
                     inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
                     device=batch["actions"].device,
                     dtype=batch["actions"].dtype,
+                    packing_schema=self.config.action_packing_schema,
+                    downsample_factor=self.config.action_downsample_factor,
                 )
                 batch["latents"] = cosmos_latent_teacher_result[
                     "cosmos_latent_x0"
@@ -1781,6 +1783,8 @@ class FlowMapStepMixin:
                     inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
                     device=batch["actions"].device,
                     dtype=batch["actions"].dtype,
+                    packing_schema=self.config.action_packing_schema,
+                    downsample_factor=self.config.action_downsample_factor,
                 )
                 batch["latents"] = self._encode_cosmos_future_video_latents(
                     raw_teacher_result.get("future_image_predictions"),
@@ -4308,6 +4312,8 @@ class FlowMapStepMixin:
                 inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
                 device=self.device,
                 dtype=batch['actions'].dtype,
+                packing_schema=self.config.action_packing_schema,
+                downsample_factor=self.config.action_downsample_factor,
             )
         full_video_noise = video_noise_teacher.to(
             device=self.device, dtype=full_anchor.dtype

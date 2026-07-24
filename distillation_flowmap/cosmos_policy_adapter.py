@@ -20,6 +20,10 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from distillation_flowmap.cosmos_training_contract import (
+    pack_actions_for_downsample,
+)
+
 
 COSMOS_POLICY_WEIGHT_NAMES = (
     "Cosmos-Policy-LIBERO-Predict2-2B.pt",
@@ -174,6 +178,9 @@ def cosmos_actions_to_flowmap_x0(
     inverse_used_action_channel_ids,
     device,
     dtype,
+    *,
+    packing_schema,
+    downsample_factor,
 ):
     """Map official Cosmos action chunks to FlowMap's normalized action x0."""
     if len(target_shape) != 5:
@@ -209,11 +216,12 @@ def cosmos_actions_to_flowmap_x0(
     valid_channel_mask = (inverse < action_dim).to(dtype=aligned.dtype).view(1, 1, channels)
     aligned = aligned * valid_channel_mask
 
-    flat = torch.zeros(batch_size, frames * per_frame, channels, device=device, dtype=actions.dtype)
-    num_tokens = min(aligned.shape[1], flat.shape[1])
-    flat[:, :num_tokens] = aligned[:, :num_tokens]
-    x0 = flat.reshape(batch_size, frames, per_frame, channels).permute(0, 3, 1, 2).unsqueeze(-1)
-    return x0.to(dtype=dtype)
+    return pack_actions_for_downsample(
+        aligned,
+        tuple(target_shape),
+        downsample_factor=downsample_factor,
+        schema=packing_schema,
+    ).to(dtype=dtype)
 
 
 def compute_masked_action_stats(teacher_x0, target_x0, mask=None):
@@ -992,6 +1000,8 @@ class CosmosPolicyActionTeacher:
             inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
             device=target.device,
             dtype=target.dtype,
+            packing_schema=self.config.action_packing_schema,
+            downsample_factor=self.config.action_downsample_factor,
         )
 
     def __call__(self, input_dict, train_mode=True, **_kwargs):

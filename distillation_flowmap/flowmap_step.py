@@ -104,6 +104,7 @@ from distillation_flowmap.opd_rollout_grad import (
 from distillation_flowmap.danceopd_query import (
     denoised_endpoint_mse,
     direct_velocity_mse,
+    sample_low_noise_query_indices,
     sample_semantic_query_indices,
     select_per_sample_trajectory_state,
 )
@@ -4157,15 +4158,8 @@ class FlowMapStepMixin:
                     action_sigma_next.to(action_velocity) - action_sigma.to(action_velocity)
                 )
 
-            # Keep the post-update terminal state and exclude initial pure
-            # noise from query selection, matching the LingBotVA policy.
-            video_states.append(current_video.detach().clone())
-            action_states.append(current_action.detach().clone())
-            video_timesteps.append(video_path[-1].detach().clone())
-            action_timesteps.append(action_path[-1].detach().clone())
-
-        query_indices = sample_semantic_query_indices(
-            rollout_steps=rollout_steps,
+        query_indices = sample_low_noise_query_indices(
+            n_states=rollout_steps,
             batch_size=B,
             alpha=query_alpha,
             beta=query_beta,

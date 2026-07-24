@@ -174,6 +174,10 @@ cfg.opd_rollout_grad_steps = int(
 cfg.opd_endpoint_focus_prob = float(
     os.environ.get("OPD_ENDPOINT_FOCUS_PROB", _spec["focus_prob"])
 )
+cfg.opd_query_bias = "low_noise"
+cfg.opd_low_noise_alpha = 5.0
+cfg.opd_low_noise_beta = 2.0
+cfg.opd_low_noise_max_sigma = 0.25
 
 # DanceOPD samples its configured semantic-query rollout choices independently
 # of the endpoint pair sampled by the main progressive OPD objective.
@@ -200,6 +204,9 @@ cfg.opd_danceopd_endpoint_weight = float(
 cfg.opd_danceopd_action_endpoint_weight = float(
     os.environ.get("OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT", 1.0)
 )
+# The compositional objective is video-field supervision. Action state remains
+# joint conditioning, but action velocity is not an optimization target.
+cfg.opd_danceopd_action_velocity_weight = 0.0
 cfg.opd_danceopd_velocity_weight = float(
     os.environ.get("OPD_DANCEOPD_VELOCITY_WEIGHT", _spec["velocity_weight"])
 )

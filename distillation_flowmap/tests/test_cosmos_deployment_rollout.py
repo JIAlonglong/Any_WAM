@@ -15,6 +15,16 @@ def test_deployment_k_cycle_is_balanced_and_deterministic():
     ]
 
 
+def test_deployment_steps_match_the_compositional_training_budgets():
+    deployment_steps = tuple(
+        deployment_joint_step_for_update(i) for i in range(3)
+    )
+    compositional_steps = (2, 4)
+
+    assert deployment_steps == (1, 2, 4)
+    assert tuple(step for step in deployment_steps if step > 1) == compositional_steps
+
+
 def test_deployment_and_raw_auxiliary_never_share_an_optimizer_step():
     deployment = {
         step for step in range(64)

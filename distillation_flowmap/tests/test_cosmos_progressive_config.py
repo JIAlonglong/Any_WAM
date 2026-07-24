@@ -31,7 +31,14 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
 
     assert module.cfg.opd_teacher_target_mode == "cosmos_latent_full"
     assert module.cfg.opd_rollout_step_pairs == [[8, 4]]
+    assert module.cfg.diffusion_ratio == 0.5
+    assert module.cfg.consistency_ratio == 0.25
+    assert module.cfg.flowmap_ratio == 0.25
     assert module.cfg.opd_endpoint_focus_prob > 0
+    assert module.cfg.opd_query_bias == "low_noise"
+    assert module.cfg.opd_low_noise_alpha == 5.0
+    assert module.cfg.opd_low_noise_beta == 2.0
+    assert module.cfg.opd_low_noise_max_sigma == 0.25
     assert module.cfg.opd_danceopd_rollout_steps == 4
     assert module.cfg.opd_danceopd_endpoint_weight > 0
     assert module.cfg.opd_danceopd_velocity_weight == 1.0
@@ -42,6 +49,7 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
     assert module.cfg.cosmos_use_teacher_action_anchor is True
     assert module.cfg.opd_joint_action_rollout is True
     assert module.cfg.opd_danceopd_action_endpoint_weight > 0
+    assert module.cfg.opd_danceopd_action_velocity_weight == 0.0
     assert module.cfg.deployment_joint_rollout_enabled is True
     assert module.cfg.deployment_joint_rollout_interval == 4
     assert module.cfg.deployment_joint_steps == (1, 2, 4)
@@ -102,13 +110,61 @@ def test_progressive_universal_retains_original_lingbotva_definition(monkeypatch
     module = importlib.reload(importlib.import_module(
         "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive"
     ))
-    assert module.cfg.opd_rollout_step_pairs == [[8, 1], [8, 2], [8, 4]]
+    OPD_ROLLOUT_STEP_PAIRS = tuple(
+        tuple(pair) for pair in module.cfg.opd_rollout_step_pairs
+    )
+    assert OPD_ROLLOUT_STEP_PAIRS == ((8, 1), (8, 2), (8, 4))
     assert module.cfg.opd_danceopd_rollout_step_choices == (2, 4)
     assert module.cfg.opd_danceopd_rollout_steps == 2
     assert module.cfg.opd_danceopd_velocity_weight == 1.0
 
 
-def test_cosmos_danceopd_uses_terminal_semantic_states_and_skips_s1_velocity():
+def test_main_anyflow_branch_boundaries_preserve_arbitrary_intervals():
+    source = (
+        Path(__file__).resolve().parents[1] / "flowmap_step.py"
+    ).read_text(encoding="utf-8")
+    sampling_block = source.split("def sample_timestep_mixed(")[1].split(
+        "def sample_cosmos_latent_timestep_mixed("
+    )[0]
+
+    assert "diffusion_ratio = self.diffusion_ratio / total_ratio" in sampling_block
+    assert "consistency_ratio = self.consistency_ratio / total_ratio" in sampling_block
+    assert "mode_rand < diffusion_ratio" in sampling_block
+    assert "mode_rand < diffusion_ratio + consistency_ratio" in sampling_block
+    assert "r = torch.where(is_diffusion, t, r)" in sampling_block
+    assert "r = torch.where(is_consistency, torch.zeros_like(r), r)" in sampling_block
+
+    def branch_for(probability):
+        if probability < 0.5:
+            return "diffusion"
+        if probability < 0.75:
+            return "endpoint"
+        return "arbitrary"
+
+    assert branch_for(0.00) == "diffusion"
+    assert branch_for(0.499999) == "diffusion"
+    assert branch_for(0.50) == "endpoint"
+    assert branch_for(0.749999) == "endpoint"
+    assert branch_for(0.75) == "arbitrary"
+    t = max(0.8, 0.2)
+    arbitrary_r = min(0.8, 0.2)
+    assert arbitrary_r > 0
+    assert arbitrary_r < t
+
+
+def test_endpoint_pairs_are_selected_uniformly():
+    source = (
+        Path(__file__).resolve().parents[1] / "flowmap_step.py"
+    ).read_text(encoding="utf-8")
+    endpoint_block = source.split(
+        "def _danceopd_independent_endpoint_loss("
+    )[1].split("def _danceopd_aux_transition_step(")[0]
+
+    assert "torch.randint(" in endpoint_block
+    assert "random.choice(rollout_step_pairs)" in endpoint_block
+
+
+def test_cosmos_danceopd_uses_pre_update_compositional_states_and_skips_s1_velocity():
     source = (
         Path(__file__).resolve().parents[1] / "flowmap_step.py"
     ).read_text(encoding="utf-8")
@@ -119,8 +175,22 @@ def test_cosmos_danceopd_uses_terminal_semantic_states_and_skips_s1_velocity():
         "def _cosmos_latent_full_opd_aux_transition_step("
     )[1].split("def _cosmos_latent_opd_aux_transition_step(")[0]
 
-    assert "sample_semantic_query_indices(" in cosmos_dance_block
-    assert cosmos_dance_block.count("video_states.append(current_video.detach().clone())") >= 2
+    assert "sample_low_noise_query_indices(" in cosmos_dance_block
+    assert "sample_semantic_query_indices(" not in cosmos_dance_block
+    assert cosmos_dance_block.count(
+        "video_states.append(current_video.detach().clone())"
+    ) == 1
+    update_position = cosmos_dance_block.index(
+        "current_video = current_video + video_velocity"
+    )
+    capture_position = cosmos_dance_block.index(
+        "video_states.append(current_video.detach().clone())"
+    )
+    query_position = cosmos_dance_block.index(
+        "query_indices = sample_low_noise_query_indices("
+    )
+    assert capture_position < update_position < query_position
+    assert "return_action=False" in cosmos_dance_block
     assert "if velocity_weight > 0:" in cosmos_full_block
 
 

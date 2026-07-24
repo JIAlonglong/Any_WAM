@@ -1,7 +1,10 @@
 import importlib
+import json
 import os
 import sys
+from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -12,7 +15,11 @@ for path in (FLOWMAP_DIR, WANVA_DIR):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from distillation_flowmap.flowmap_trainer import _set_video_channel_config_from_heads
+from distillation_flowmap.flowmap_trainer import (
+    FlowMapDistiller,
+    _set_video_channel_config_from_heads,
+    _write_json_atomic,
+)
 
 
 class _FakeModel:
@@ -53,3 +60,102 @@ def test_cosmos_latent_stage2_defaults_are_memory_safe(monkeypatch):
     assert module.cfg.opd_aux_warmup_steps >= 8
     assert module.cfg.opd_rollout_step_pairs == [[1, 1]]
     assert module.cfg.opd_transition_group_weight <= 1e-2
+
+
+def test_stage_configs_identify_their_persisted_training_contract():
+    stage1 = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage1"
+    )
+    stage2 = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive"
+    )
+
+    assert stage1.cfg.training_contract_stage == "raw_stage1"
+    assert stage2.cfg.training_contract_stage == "progressive_stage2"
+
+
+class _CheckpointModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(1))
+        self.config = {"in_channels": 16, "out_channels": 16}
+
+
+class _Stateful:
+    def state_dict(self):
+        return {}
+
+
+def test_checkpoint_config_persists_stage2_contract_atomically(tmp_path, monkeypatch):
+    import distillation_flowmap.flowmap_trainer as trainer_module
+
+    trainer = FlowMapDistiller.__new__(FlowMapDistiller)
+    trainer.student = _CheckpointModel()
+    trainer.target_student = None
+    trainer.use_lora = False
+    trainer.use_dmd = False
+    trainer.discriminator = None
+    trainer.save_dir = tmp_path
+    trainer.step = 17
+    trainer.optimizer = _Stateful()
+    trainer.lr_scheduler = _Stateful()
+    trainer.config = SimpleNamespace(
+        rank=0,
+        training_contract_stage="progressive_stage2",
+        contract_version=2,
+        action_packing_schema="downsample_survivor_v2",
+        action_downsample_factor=4,
+        deployment_timestep_start=1000,
+        deployment_timestep_end=0,
+        deployment_joint_steps=(1, 2, 4),
+        deployment_joint_rollout_interval=4,
+        raw_teacher_window_is_auxiliary=True,
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "get_model_state_dict",
+        lambda model, options: model.state_dict(),
+    )
+    monkeypatch.setattr(trainer_module, "save_file", lambda state, path: None)
+    monkeypatch.setattr(trainer_module.torch, "save", lambda state, path: None)
+    replacements = []
+    real_replace = os.replace
+
+    def recording_replace(source, destination):
+        replacements.append((os.fspath(source), os.fspath(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(trainer_module.os, "replace", recording_replace)
+
+    trainer._save_checkpoint()
+
+    config_path = (
+        tmp_path / "step_17" / "online_student" / "transformer" / "config.json"
+    )
+    payload = json.loads(config_path.read_text())
+    assert payload["training_contract_stage"] == "progressive_stage2"
+    assert payload["joint_student_steps"] == [1, 2, 4]
+    assert replacements[-1] == (
+        os.fspath(config_path.with_name(".config.json.tmp")),
+        os.fspath(config_path),
+    )
+    assert not config_path.with_name(".config.json.tmp").exists()
+
+
+def test_atomic_checkpoint_config_failure_preserves_prior_file(tmp_path, monkeypatch):
+    import distillation_flowmap.flowmap_trainer as trainer_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"prior": true}\n')
+
+    def fail_json_dump(payload, handle, **kwargs):
+        handle.write('{"partial":')
+        raise RuntimeError("serialization failed")
+
+    monkeypatch.setattr(trainer_module.json, "dump", fail_json_dump)
+
+    with pytest.raises(RuntimeError, match="serialization failed"):
+        _write_json_atomic(config_path, {"next": True})
+
+    assert config_path.read_text() == '{"prior": true}\n'
+    assert not (tmp_path / ".config.json.tmp").exists()

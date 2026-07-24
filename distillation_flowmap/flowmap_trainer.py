@@ -49,6 +49,7 @@ from distillation_flowmap.cosmos_progressive_opd import (
 from distillation_flowmap.cosmos_deployment_rollout import (
     deployment_joint_step_for_update,
 )
+from distillation_flowmap.cosmos_training_contract import contract_metadata
 from distillation_flowmap.cosmos_teacher_roles import resolve_teacher_roles
 from distillation_flowmap.ablation.robotwin_diagnostics import (
     classify_parameter_branch,
@@ -97,6 +98,21 @@ def _select_progressive_training_objective(
         raw_auxiliary_interval=int(getattr(config, "opd_aux_interval", 8)),
         raw_auxiliary_phase=int(getattr(config, "opd_aux_phase", 2)),
     )
+
+
+def _write_json_atomic(path, payload):
+    path = Path(path)
+    temp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        with open(temp_path, "w") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
 
 # DMD 判别器（仅在 use_dmd=True 时导入）
 try:
@@ -1295,14 +1311,19 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 config_dict['distill_mode'] = getattr(self.config, 'distill_mode', 'flashwam')
                 config_dict['checkpoint_step'] = self.step
                 _set_video_channel_config_from_heads(config_dict, model, state_dict_bf16)
+                stage_name = getattr(self.config, "training_contract_stage", None)
+                if stage_name is not None:
+                    config_dict.update(
+                        contract_metadata(self.config, stage=stage_name)
+                    )
                 # 保存 LoRA 元信息，方便恢复时重建 LoRA 结构
                 if self.use_lora:
                     config_dict['use_lora'] = True
                     config_dict['lora_rank'] = self.config.lora_rank
                     config_dict['lora_alpha'] = self.config.lora_alpha
                     config_dict['lora_target_modules'] = self.config.lora_target_modules
-                with open(ckpt_dir / "config.json", "w") as f:
-                    json.dump(config_dict, f, indent=2)
+                config_path = ckpt_dir / "config.json"
+                _write_json_atomic(config_path, config_dict)
                 logger.info(f"  Saved {which} -> {ckpt_dir} ({'LoRA adapter' if self.use_lora else 'full model'})")
 
                 if which == "online_student":

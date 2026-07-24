@@ -4,6 +4,89 @@ import torch
 
 CONTRACT_VERSION = 2
 ACTION_PACKING_SCHEMA = "downsample_survivor_v2"
+ACTION_DOWNSAMPLE_FACTOR = 4
+RAW_STAGE1 = "raw_stage1"
+PROGRESSIVE_STAGE2 = "progressive_stage2"
+
+_COMMON_CONTRACT = {
+    "contract_version": CONTRACT_VERSION,
+    "action_packing_schema": ACTION_PACKING_SCHEMA,
+    "action_downsample_factor": ACTION_DOWNSAMPLE_FACTOR,
+}
+_PROGRESSIVE_STAGE2_CONTRACT = {
+    "deployment_timestep_start": 1000,
+    "deployment_timestep_end": 0,
+    "joint_student_steps": [1, 2, 4],
+    "deployment_joint_rollout_interval": 4,
+    "raw_teacher_window_is_auxiliary": True,
+}
+
+
+def _require_exact(field: str, actual: object, expected: object) -> None:
+    if type(actual) is not type(expected) or actual != expected:
+        raise ValueError(
+            f"{field} must be exactly {expected!r} "
+            f"({type(expected).__name__}), got {actual!r} "
+            f"({type(actual).__name__})"
+        )
+
+
+def validate_contract_metadata(
+    payload: dict[str, object], *, required_stage: str
+) -> None:
+    if not isinstance(payload, dict):
+        raise TypeError(f"contract metadata must be a dict, got {type(payload).__name__}")
+    if required_stage not in (RAW_STAGE1, PROGRESSIVE_STAGE2):
+        raise ValueError(f"unsupported training contract stage {required_stage!r}")
+
+    expected = {
+        **_COMMON_CONTRACT,
+        "training_contract_stage": required_stage,
+    }
+    if required_stage == PROGRESSIVE_STAGE2:
+        expected.update(_PROGRESSIVE_STAGE2_CONTRACT)
+
+    for field, value in expected.items():
+        if field not in payload:
+            raise ValueError(f"contract metadata is missing required field {field!r}")
+        _require_exact(field, payload[field], value)
+
+
+def contract_metadata(config, *, stage: str) -> dict[str, object]:
+    if stage not in (RAW_STAGE1, PROGRESSIVE_STAGE2):
+        raise ValueError(f"unsupported training contract stage {stage!r}")
+
+    payload = {
+        "contract_version": getattr(config, "contract_version", None),
+        "training_contract_stage": stage,
+        "action_packing_schema": getattr(config, "action_packing_schema", None),
+        "action_downsample_factor": getattr(config, "action_downsample_factor", None),
+    }
+    if stage == PROGRESSIVE_STAGE2:
+        deployment_steps = getattr(config, "deployment_joint_steps", None)
+        if type(deployment_steps) is not tuple:
+            raise ValueError(
+                "deployment_joint_steps must be exactly the tuple (1, 2, 4)"
+            )
+        payload.update(
+            {
+                "deployment_timestep_start": getattr(
+                    config, "deployment_timestep_start", None
+                ),
+                "deployment_timestep_end": getattr(
+                    config, "deployment_timestep_end", None
+                ),
+                "joint_student_steps": list(deployment_steps),
+                "deployment_joint_rollout_interval": getattr(
+                    config, "deployment_joint_rollout_interval", None
+                ),
+                "raw_teacher_window_is_auxiliary": getattr(
+                    config, "raw_teacher_window_is_auxiliary", None
+                ),
+            }
+        )
+    validate_contract_metadata(payload, required_stage=stage)
+    return payload
 
 
 def pack_actions_for_downsample(
@@ -19,7 +102,7 @@ def pack_actions_for_downsample(
         )
     batch, channels, frames, per_frame, width = target_shape
     if (
-        downsample_factor != 4
+        downsample_factor != ACTION_DOWNSAMPLE_FACTOR
         or frames != downsample_factor * 4
         or per_frame != 4
         or width != 1

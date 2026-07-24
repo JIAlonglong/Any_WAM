@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+import torch
 
 from distillation_flowmap.runtime_metadata import (
     flowmap_runtime_metadata,
@@ -57,3 +58,20 @@ def test_checkpoint_saver_and_server_share_runtime_metadata_contract():
     assert "config_dict.update(flowmap_runtime_metadata(self.config))" in trainer_source
     assert "resolve_action_downsample_factor(" in server_source
     assert 'getattr(job_config, "action_downsample_factor", 1)' in server_source
+
+
+def test_factor_one_preserves_every_continuous_action_position():
+    factor = resolve_action_downsample_factor(
+        {"action_downsample_factor": 1}, fallback=4
+    )
+    actions = torch.arange(16)
+
+    assert torch.equal(actions[::factor], actions)
+
+    inference_source = (
+        Path(__file__).resolve().parents[1] / "inference.py"
+    ).read_text(encoding="utf-8")
+    assert "action_ds = max(1, int(action_downsample_factor))" in inference_source
+    assert "current_action_ds = current_action[:, :, ::action_ds]" in inference_source
+    assert "current_action[:, :, ::action_ds] = (" in inference_source
+    assert "action_model_input = action.repeat(" in inference_source

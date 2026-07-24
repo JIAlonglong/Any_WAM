@@ -176,7 +176,9 @@ class _WarmupEnv:
 
 
 def test_client_records_server_failure_as_unsuccessful_trial(tmp_path):
-    client = CosmosProgressiveS4Client(_FailingService(), output_dir=tmp_path, warmup_steps=1)
+    client = CosmosProgressiveS4Client(
+        _FailingService(), output_dir=tmp_path, student_steps=2, warmup_steps=1
+    )
 
     record = client.run_with_env(
         env=_WarmupEnv(),
@@ -192,19 +194,22 @@ def test_client_records_server_failure_as_unsuccessful_trial(tmp_path):
     assert record["done"] is False
     assert record["server_failure"] is True
     assert record["seed"] == 17
+    assert record["student_steps"] == 2
     record_path = tmp_path / "records" / "task_2_episode_5.json"
     persisted = json.loads(record_path.read_text(encoding="utf-8"))
     assert persisted["success"] is False
     assert persisted["seed"] == 17
+    assert persisted["student_steps"] == 2
 
 
 class _SuccessfulService:
     def infer(self, request):
         if request.get("reset"):
-            return {"ok": True, "s4_checkpoint": "s4-checkpoint"}
+            return {"ok": True, "s4_checkpoint": "s4-checkpoint", "student_steps": 2}
         return {
             "action": np.zeros((16, 7), dtype=np.float32),
             "s4_checkpoint": "s4-checkpoint",
+            "student_steps": 2,
         }
 
 
@@ -221,7 +226,9 @@ class _DoneEnv:
 
 
 def test_client_records_rollout_seed_on_success(tmp_path):
-    client = CosmosProgressiveS4Client(_SuccessfulService(), output_dir=tmp_path, warmup_steps=0)
+    client = CosmosProgressiveS4Client(
+        _SuccessfulService(), output_dir=tmp_path, student_steps=2, warmup_steps=0
+    )
 
     record = client.run_with_env(
         env=_DoneEnv(),
@@ -238,14 +245,18 @@ def test_client_records_rollout_seed_on_success(tmp_path):
     assert record["success"] is True
     assert record["server_failure"] is False
     assert record["seed"] == 23
+    assert record["student_steps"] == 2
     persisted = json.loads(
         (tmp_path / "records" / "task_3_episode_0.json").read_text(encoding="utf-8")
     )
     assert persisted["seed"] == 23
+    assert persisted["student_steps"] == 2
 
 
 def test_client_records_rollout_seed_on_setup_failure(tmp_path):
-    client = CosmosProgressiveS4Client(_SuccessfulService(), output_dir=tmp_path, warmup_steps=0)
+    client = CosmosProgressiveS4Client(
+        _SuccessfulService(), output_dir=tmp_path, student_steps=2, warmup_steps=0
+    )
 
     def fail_init(*_args, **_kwargs):
         raise RuntimeError("fixture setup failure")
@@ -264,10 +275,104 @@ def test_client_records_rollout_seed_on_setup_failure(tmp_path):
     assert record["success"] is False
     assert record["server_failure"] is False
     assert record["seed"] == 29
+    assert record["student_steps"] == 2
     persisted = json.loads(
         (tmp_path / "records" / "task_4_episode_0.json").read_text(encoding="utf-8")
     )
     assert persisted["seed"] == 29
+    assert persisted["student_steps"] == 2
+
+
+@pytest.mark.parametrize("steps", [0, 3, 5])
+def test_client_rejects_unsupported_student_steps(tmp_path, steps):
+    with pytest.raises(ValueError, match="student_steps must be one of"):
+        CosmosProgressiveS4Client(
+            _SuccessfulService(), output_dir=tmp_path, student_steps=steps
+        )
+
+
+class _MismatchedInferStepsService:
+    def infer(self, request):
+        if request.get("reset"):
+            return {"ok": True, "student_steps": 2}
+        return {
+            "action": np.zeros((16, 7), dtype=np.float32),
+            "student_steps": 4,
+        }
+
+
+def test_client_rejects_infer_student_steps_mismatch_without_overwriting_record(tmp_path):
+    client = CosmosProgressiveS4Client(
+        _MismatchedInferStepsService(),
+        output_dir=tmp_path,
+        student_steps=2,
+        warmup_steps=0,
+    )
+
+    record = client.run_with_env(
+        env=_DoneEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=5,
+        episode_idx=0,
+        prompt="open the drawer",
+        max_env_steps=1,
+        init_env_fn=lambda *_args, **_kwargs: OBS,
+        extract_video_fn=lambda _obs: {},
+        rollout_seed=30,
+    )
+
+    assert record["server_failure"] is True
+    assert record["student_steps"] == 2
+    assert "student_steps mismatch" in record["error"]
+    persisted = json.loads(
+        (tmp_path / "records" / "task_5_episode_0.json").read_text(encoding="utf-8")
+    )
+    assert persisted["student_steps"] == 2
+
+
+class _MismatchedResetStepsService:
+    def __init__(self):
+        self.calls = 0
+
+    def infer(self, request):
+        self.calls += 1
+        if request.get("reset"):
+            return {"ok": True, "student_steps": 4}
+        return {
+            "action": np.zeros((16, 7), dtype=np.float32),
+            "student_steps": 2,
+        }
+
+
+def test_client_rejects_reset_student_steps_mismatch_before_infer(tmp_path):
+    service = _MismatchedResetStepsService()
+    client = CosmosProgressiveS4Client(
+        service,
+        output_dir=tmp_path,
+        student_steps=2,
+        warmup_steps=0,
+    )
+
+    record = client.run_with_env(
+        env=_DoneEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=5,
+        episode_idx=1,
+        prompt="open the drawer",
+        max_env_steps=1,
+        init_env_fn=lambda *_args, **_kwargs: OBS,
+        extract_video_fn=lambda _obs: {},
+        rollout_seed=30,
+    )
+
+    assert service.calls == 1
+    assert record["server_failure"] is True
+    assert record["student_steps"] == 2
+    assert "student_steps mismatch" in record["error"]
+    persisted = json.loads(
+        (tmp_path / "records" / "task_5_episode_1.json").read_text(encoding="utf-8")
+    )
+    assert persisted["student_steps"] == 2
 
 
 def _install_fake_libero(monkeypatch, *, skipped):
@@ -313,7 +418,9 @@ def _install_fake_libero(monkeypatch, *, skipped):
 
 def test_run_libero_task_persists_env_seed_for_skipped_record_without_libero(tmp_path, monkeypatch):
     _install_fake_libero(monkeypatch, skipped=True)
-    client = CosmosProgressiveS4Client(_SuccessfulService(), output_dir=tmp_path)
+    client = CosmosProgressiveS4Client(
+        _SuccessfulService(), output_dir=tmp_path, student_steps=2
+    )
 
     record = client.run_libero_task(
         libero_benchmark="libero_10",
@@ -326,15 +433,19 @@ def test_run_libero_task_persists_env_seed_for_skipped_record_without_libero(tmp
 
     assert record["skipped"] is True
     assert record["seed"] == 31
+    assert record["student_steps"] == 2
     persisted = json.loads(
         (tmp_path / "records" / "task_6_episode_0.json").read_text(encoding="utf-8")
     )
     assert persisted["seed"] == 31
+    assert persisted["student_steps"] == 2
 
 
 def test_run_libero_task_forwards_env_seed_to_run_with_env_without_libero(tmp_path, monkeypatch):
     _install_fake_libero(monkeypatch, skipped=False)
-    client = CosmosProgressiveS4Client(_SuccessfulService(), output_dir=tmp_path)
+    client = CosmosProgressiveS4Client(
+        _SuccessfulService(), output_dir=tmp_path, student_steps=2
+    )
     captured = {}
 
     def fake_run_with_env(**kwargs):
@@ -430,6 +541,42 @@ def test_live_cli_requires_seed_before_constructing_service(monkeypatch):
                 "/tmp/training-prompt-table.pt",
             ]
         )
+
+
+def test_live_rollout_constructs_client_with_requested_student_steps(monkeypatch):
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    captured = {}
+
+    class RecordingClient:
+        def __init__(self, _service, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        rollout,
+        "build_live_service",
+        lambda _args: (object(), SimpleNamespace(close=lambda: None)),
+    )
+    monkeypatch.setattr(rollout, "CosmosProgressiveS4Client", RecordingClient)
+
+    result = rollout.main(
+        [
+            "--checkpoint-transformer",
+            "/tmp/s4-transformer",
+            "--prompt-table",
+            "/tmp/training-prompt-table.pt",
+            "--student-steps",
+            "2",
+            "--env-seed",
+            "41",
+            "--task-range",
+            "0",
+            "0",
+        ]
+    )
+
+    assert result == 0
+    assert captured["student_steps"] == 2
 
 
 def test_cli_defaults_joint_student_steps_to_four():

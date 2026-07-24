@@ -573,6 +573,7 @@ def main(argv: list[str] | None = None) -> int:
         client = CosmosProgressiveS4Client(
             service,
             output_dir=args.output_dir,
+            student_steps=args.student_steps,
             warmup_steps=args.warmup_steps,
             warmup_gripper=args.warmup_gripper,
             skip_first_action=args.skip_first_action,

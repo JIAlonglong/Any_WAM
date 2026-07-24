@@ -14,7 +14,11 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
-from evaluation.libero.cosmos_progressive_s4_server import S4_ACTION_DIM, S4_ACTION_STEPS
+from evaluation.libero.cosmos_progressive_s4_server import (
+    S4_ACTION_DIM,
+    S4_ACTION_STEPS,
+    normalize_student_steps,
+)
 
 
 def _video_observation(obs: Mapping[str, Any]) -> dict[str, np.ndarray]:
@@ -47,6 +51,7 @@ class CosmosProgressiveS4Client:
         service: Any,
         *,
         output_dir: str | Path,
+        student_steps: int,
         warmup_steps: int = 5,
         warmup_gripper: float = 0.0,
         skip_first_action: bool = False,
@@ -55,6 +60,7 @@ class CosmosProgressiveS4Client:
             raise TypeError("service must provide infer(request)")
         self.service = service
         self.output_dir = Path(output_dir)
+        self.student_steps = normalize_student_steps(student_steps)
         self.warmup_steps = int(warmup_steps)
         self.warmup_gripper = float(warmup_gripper)
         self.skip_first_action = bool(skip_first_action)
@@ -87,6 +93,16 @@ class CosmosProgressiveS4Client:
             )
         return action
 
+    def _validate_service_student_steps(self, response: Mapping[str, Any]) -> None:
+        if "student_steps" not in response:
+            return
+        response_steps = normalize_student_steps(response["student_steps"])
+        if response_steps != self.student_steps:
+            raise ValueError(
+                "S4 service student_steps mismatch: "
+                f"client={self.student_steps}, service={response_steps}"
+            )
+
     def _server_failure_record(
         self,
         *,
@@ -103,6 +119,7 @@ class CosmosProgressiveS4Client:
             "episode_idx": int(episode_idx),
             "prompt": str(prompt),
             "seed": int(rollout_seed),
+            "student_steps": self.student_steps,
             "done": False,
             "success": False,
             "server_failure": True,
@@ -158,7 +175,8 @@ class CosmosProgressiveS4Client:
             # It is a service operation, so a failed connection here is a
             # failed trial rather than an environment setup failure.
             try:
-                self.service.infer({"reset": True, "prompt": prompt})
+                reset_response = self.service.infer({"reset": True, "prompt": prompt})
+                self._validate_service_student_steps(reset_response)
             except Exception as exc:
                 return self._server_failure_record(
                     task_idx=task_idx,
@@ -172,6 +190,7 @@ class CosmosProgressiveS4Client:
             while int(env.env.timestep) < int(max_env_steps) and not done:
                 try:
                     response = self.service.infer({"obs": obs, "prompt": prompt})
+                    self._validate_service_student_steps(response)
                     actions = self._validate_service_action(response)
                 except Exception as exc:
                     return self._server_failure_record(
@@ -203,6 +222,7 @@ class CosmosProgressiveS4Client:
                 "episode_idx": int(episode_idx),
                 "prompt": str(prompt),
                 "seed": int(rollout_seed),
+                "student_steps": self.student_steps,
                 "done": bool(done),
                 "success": bool(done),
                 "server_failure": False,
@@ -221,6 +241,7 @@ class CosmosProgressiveS4Client:
                 "episode_idx": int(episode_idx),
                 "prompt": str(prompt),
                 "seed": int(rollout_seed),
+                "student_steps": self.student_steps,
                 "done": False,
                 "success": False,
                 "server_failure": False,
@@ -286,6 +307,7 @@ class CosmosProgressiveS4Client:
                 "episode_idx": int(episode_idx),
                 "prompt": prompt,
                 "seed": rollout_seed,
+                "student_steps": self.student_steps,
                 "done": False,
                 "success": False,
                 "server_failure": False,

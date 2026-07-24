@@ -33,10 +33,11 @@ from evaluation.libero.cosmos_progressive_s4_server import (
     PromptEmbeddingTable,
     S4_ACTION_DIM,
     S4_ACTION_STEPS,
+    SUPPORTED_STUDENT_STEPS,
+    normalize_student_steps,
 )
 
 
-S4_STEPS = 4
 _MIN_COSMOS_DRIVER = (570, 124, 6)
 _MIN_COSMOS_CUDA = (12, 8)
 _DEFAULT_COSMOS_PYTHON = "/root/nas/junjie/cosmos_predict2_5/envs/predict2_py310/bin/python"
@@ -184,6 +185,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--teacher-model-path", default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--cfg-scale", type=float, default=3.0)
+    parser.add_argument(
+        "--student-steps",
+        type=int,
+        choices=SUPPORTED_STUDENT_STEPS,
+        default=4,
+    )
     parser.add_argument("--anchor-record-dir", default="outputs/cosmos_progressive_s4/anchors")
     parser.add_argument("--output-dir", default="outputs/cosmos_progressive_s4")
     parser.add_argument("--libero-benchmark", default="libero_10")
@@ -353,8 +360,7 @@ class FlowMapJointS4Runner:
         t0: Any,
         k_steps: int,
     ) -> Any:
-        if int(k_steps) != S4_STEPS:
-            raise ValueError(f"Progressive S4 deployment requires k_steps={S4_STEPS}, got {k_steps}")
+        k_steps = normalize_student_steps(k_steps)
         torch = self.torch
         video_x0 = torch.as_tensor(video_x0, device=self.device, dtype=torch.bfloat16)
         video_noise = torch.as_tensor(noise, device=self.device, dtype=video_x0.dtype)
@@ -416,7 +422,7 @@ class FlowMapJointS4Runner:
                 ref_shape=tuple(video_x0.shape),
                 B=1,
                 num_frames=video_x0.shape[2],
-                K_steps=S4_STEPS,
+                K_steps=k_steps,
                 action_target_r=action_r,
                 return_final_action=True,
                 return_final_action_state=True,
@@ -502,6 +508,7 @@ def build_live_service(args: argparse.Namespace) -> tuple[CosmosProgressiveS4Ser
             runner, video_x0, action_x0, text_emb, **kwargs
         ),
         anchor_epsilon=float(getattr(config, "cosmos_latent_epsilon", 0.001)),
+        student_steps=args.student_steps,
     )
     service = CosmosProgressiveS4Service(
         engine=engine,

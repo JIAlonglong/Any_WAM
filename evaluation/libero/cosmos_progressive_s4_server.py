@@ -23,6 +23,16 @@ S4_ACTION_STEPS = 16
 S4_ACTION_DIM = 7
 COSMOS_VIDEO_SHAPE = (1, 16, 9, 28, 28)
 PROMPT_EMBEDDING_SHAPE = (1, 512, 4096)
+SUPPORTED_STUDENT_STEPS = (1, 2, 4)
+
+
+def normalize_student_steps(value: int) -> int:
+    value = int(value)
+    if value not in SUPPORTED_STUDENT_STEPS:
+        raise ValueError(
+            f"student_steps must be one of {SUPPORTED_STUDENT_STEPS}, got {value}"
+        )
+    return value
 
 
 class CosmosProgressiveS4Error(RuntimeError):
@@ -351,6 +361,7 @@ class CosmosProgressiveS4Engine:
         joint_s4_runner: Callable[..., Any],
         anchor_noise_factory: Callable[[], Any] | None = None,
         anchor_epsilon: float = 0.001,
+        student_steps: int = 4,
     ) -> None:
         self.anchor_worker = SharedNpzCosmosAnchorWorker(cosmos_teacher)
         self.prompt_table = prompt_table
@@ -359,6 +370,7 @@ class CosmosProgressiveS4Engine:
         self.joint_s4_runner = joint_s4_runner
         self.anchor_noise_factory = anchor_noise_factory or self._default_anchor_noise
         self.anchor_epsilon = float(anchor_epsilon)
+        self.student_steps = normalize_student_steps(student_steps)
         if self.anchor_epsilon <= 0:
             raise ValueError("anchor_epsilon must be positive")
 
@@ -417,7 +429,7 @@ class CosmosProgressiveS4Engine:
             noise=noise,
             t1000=t1000,
             t0=t0,
-            k_steps=4,
+            k_steps=self.student_steps,
         )
         action = decode_student_action(student_action, self.action_template)
         return S4Decision(
@@ -479,6 +491,7 @@ class CosmosProgressiveS4Service:
                 "ok": True,
                 "reset": True,
                 "s4_checkpoint": self.checkpoint_identifier,
+                "student_steps": self.engine.student_steps,
             }
         prompt = _require_prompt(request.get("prompt", request.get("task")))
         libero_obs = request.get("obs", request.get("libero_obs"))
@@ -506,6 +519,7 @@ class CosmosProgressiveS4Service:
             "raw_anchor_record": anchor_record,
             "raw_anchor_shape": list(COSMOS_VIDEO_SHAPE),
             "s4_checkpoint": self.checkpoint_identifier,
+            "student_steps": self.engine.student_steps,
         }
 
 

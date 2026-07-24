@@ -115,6 +115,12 @@ class _RecordingTeacher:
 def test_every_infer_request_queries_a_fresh_cosmos_raw_anchor(tmp_path):
     teacher = _RecordingTeacher()
     template = _template()
+    joint_calls = []
+
+    def run_joint_student(video_x0, action_x0, text_emb, **kwargs):
+        joint_calls.append(kwargs)
+        return np.zeros((1, 7, 4, 4, 1), dtype=np.float32)
+
     engine = CosmosProgressiveS4Engine(
         cosmos_teacher=teacher,
         prompt_table=PromptEmbeddingTable(
@@ -122,10 +128,9 @@ def test_every_infer_request_queries_a_fresh_cosmos_raw_anchor(tmp_path):
         ),
         action_template=template,
         action_encoder=lambda raw_actions: raw_actions,
-        joint_s4_runner=lambda video_x0, action_x0, text_emb, **_: np.zeros(
-            (1, 7, 4, 4, 1), dtype=np.float32
-        ),
+        joint_s4_runner=run_joint_student,
         anchor_noise_factory=lambda: np.ones((1, 16, 9, 28, 28), dtype=np.float32),
+        student_steps=2,
     )
     service = CosmosProgressiveS4Service(
         engine=engine,
@@ -137,12 +142,14 @@ def test_every_infer_request_queries_a_fresh_cosmos_raw_anchor(tmp_path):
     second = service.infer({"obs": OBS, "prompt": "open the drawer"})
 
     assert len(teacher.calls) == 2
+    assert [call["k_steps"] for call in joint_calls] == [2, 2]
     assert all(call["include_cdiff"] is False for call in teacher.calls)
     assert first["action"].shape == (16, 7)
     assert first["action"].dtype == np.float32
     assert first["raw_anchor_record"] != second["raw_anchor_record"]
     assert (tmp_path / "anchors" / first["raw_anchor_record"]).is_file()
     assert first["s4_checkpoint"] == "s4-checkpoint"
+    assert first["student_steps"] == 2
     assert first["decision_duration_s"] >= 0.0
 
 
@@ -425,6 +432,38 @@ def test_live_cli_requires_seed_before_constructing_service(monkeypatch):
         )
 
 
+def test_cli_defaults_joint_student_steps_to_four():
+    from evaluation.libero.rollout_cosmos_progressive_s4 import parse_args
+
+    args = parse_args(
+        [
+            "--checkpoint-transformer",
+            "/tmp/s4-transformer",
+            "--prompt-table",
+            "/tmp/training-prompt-table.pt",
+        ]
+    )
+
+    assert args.student_steps == 4
+
+
+@pytest.mark.parametrize("steps", [0, 3, 5])
+def test_cli_rejects_unsupported_joint_steps(steps):
+    from evaluation.libero.rollout_cosmos_progressive_s4 import parse_args
+
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--checkpoint-transformer",
+                "/tmp/s4-transformer",
+                "--prompt-table",
+                "/tmp/training-prompt-table.pt",
+                "--student-steps",
+                str(steps),
+            ]
+        )
+
+
 def test_s4_action_encoder_preserves_sixteen_decodable_actions_after_downsample():
     from evaluation.libero.rollout_cosmos_progressive_s4 import FlowMapActionAnchorEncoder
 
@@ -451,7 +490,8 @@ def test_s4_action_encoder_preserves_sixteen_decodable_actions_after_downsample(
     assert captured["target_shape"] == (1, 7, 16, 4, 1)
 
 
-def test_flowmap_joint_s4_runner_starts_from_fresh_video_noise_at_raw_t1000():
+@pytest.mark.parametrize("steps", [1, 2, 4])
+def test_joint_runner_uses_requested_steps_for_video_and_action(steps):
     import torch
 
     from evaluation.libero.rollout_cosmos_progressive_s4 import FlowMapJointS4Runner
@@ -538,7 +578,7 @@ def test_flowmap_joint_s4_runner_starts_from_fresh_video_noise_at_raw_t1000():
         noise=video_noise,
         t1000=np.ones((1, 9), dtype=np.float32),
         t0=np.zeros((1, 9), dtype=np.float32),
-        k_steps=4,
+        k_steps=steps,
     )
 
     assert len(harness.calls) == 1
@@ -550,7 +590,19 @@ def test_flowmap_joint_s4_runner_starts_from_fresh_video_noise_at_raw_t1000():
         rtol=0,
         atol=0,
     )
-    assert call["K_steps"] == 4
+    assert [
+        {
+            "K_steps": call["K_steps"],
+            "return_final_action": call["return_final_action"],
+            "return_final_action_state": call["return_final_action_state"],
+        }
+    ] == [
+        {
+            "K_steps": steps,
+            "return_final_action": True,
+            "return_final_action_state": True,
+        }
+    ]
     decoded = decode_student_action(final_action, _template())
     assert decoded.shape == (16, 7)
     assert decoded.dtype == np.float32

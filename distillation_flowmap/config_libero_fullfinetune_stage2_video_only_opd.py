@@ -76,6 +76,7 @@ if (
 cfg.opd_aux_action = False
 cfg.opd_danceopd_action_velocity_weight = 0.0
 cfg.opd_joint_action_rollout = False
+cfg.action_condition_on_student_video = True
 cfg.action_loss_weight = float(os.environ.get("ACTION_LOSS_WEIGHT", 1.0))
 if cfg.action_loss_weight <= 0:
     raise ValueError("ACTION_LOSS_WEIGHT must remain positive")

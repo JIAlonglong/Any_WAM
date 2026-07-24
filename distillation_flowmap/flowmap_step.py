@@ -79,6 +79,29 @@ def _same_state_velocity_loss(
         per_token = diff ** 2
     per_sample = per_token.mean(dim=[1, 2, 3, 4])
     return (per_sample * sample_weight.to(per_sample.device)).mean()
+
+
+def danceopd_action_euler_update(
+    current_action,
+    action_velocity,
+    action_t,
+    action_r,
+    *,
+    num_train_timesteps,
+    enabled,
+):
+    """Advance the action state only for a joint video/action OPD rollout."""
+    if not enabled:
+        return current_action
+    action_sigma = (
+        action_t[:, None, :, None, None] / float(num_train_timesteps)
+    ).to(action_velocity)
+    action_sigma_next = (
+        action_r[:, None, :, None, None] / float(num_train_timesteps)
+    ).to(action_velocity)
+    return current_action + action_velocity * (action_sigma_next - action_sigma)
+
+
 from einops import rearrange
 
 from utils import data_seq_to_patch, logger
@@ -2672,6 +2695,62 @@ class FlowMapStepMixin:
             _action_num_frames = student_input['action_dict']['noisy_latents'].shape[2]  # 下采样后的动作帧数
             student_action_v = self._extract_action_v(student_action_v_seq, _action_num_frames)
 
+        # Stage-2 video-to-action transfer: the joint first pass predicts the
+        # video transition, then a second action pass reads that detached
+        # student-generated state. This preserves the action teacher-forcing
+        # target while preventing its gradient from bypassing video OPD.
+        student_video_condition_r = None
+        if (
+            bool(getattr(self.config, "action_condition_on_student_video", False))
+            and self.distill_video
+            and (self.distill_action or self.action_aware)
+        ):
+            video_sigma_t = self._timestep_to_sigma_5d(video_t)
+            video_sigma_r = self._timestep_to_sigma_5d(video_r)
+            student_video_condition_r = (
+                video_noisy_latents
+                + student_video_v
+                * (
+                    video_sigma_r.to(student_video_v)
+                    - video_sigma_t.to(student_video_v)
+                )
+            ).detach()
+            action_conditioned_input = {
+                "latent_dict": {
+                    **student_input["latent_dict"],
+                    "noisy_latents": student_video_condition_r,
+                    "timesteps": video_r,
+                },
+                "action_dict": student_input["action_dict"],
+                "chunk_size": student_input["chunk_size"],
+                "window_size": student_input["window_size"],
+            }
+            _ld = action_conditioned_input["latent_dict"]
+            _ad = action_conditioned_input["action_dict"]
+            _total_length = (
+                _ld["noisy_latents"].flatten(0, 1).shape[0] * 2
+                + _ad["noisy_latents"].flatten(0, 1).shape[0] * 2
+            )
+            _padded_length = (128 - _total_length % 128) % 128
+            FlexAttnFunc.init_mask(
+                _ld["noisy_latents"].shape,
+                _ad["noisy_latents"].shape,
+                _padded_length,
+                action_conditioned_input["chunk_size"],
+                window_size=action_conditioned_input["window_size"],
+                patch_size=self.patch_size,
+                device=self.device,
+            )
+            _, student_action_v_seq = self.student(
+                action_conditioned_input,
+                train_mode=True,
+                r_timestep=video_r,
+                action_r_timestep=action_r_ds,
+            )
+            student_action_v = self._extract_action_v(
+                student_action_v_seq, _action_num_frames
+            )
+
         # ==============================================================
         # 步骤 8b: 目标学生（EMA）生成 action 目标（教师蒸馏）
         # ==============================================================
@@ -2687,7 +2766,11 @@ class FlowMapStepMixin:
             target_input = {
                 'latent_dict': {
                     **input_dict['latent_dict'],
-                    'noisy_latents': x_prev_video.detach(),
+                    'noisy_latents': (
+                        student_video_condition_r
+                        if student_video_condition_r is not None
+                        else x_prev_video.detach()
+                    ),
                     'timesteps': video_r,  # 视频使用 r 时间步
                 },
                 'action_dict': {
@@ -5731,6 +5814,9 @@ class FlowMapStepMixin:
         action_path = self._build_timestep_path(
             terminal_action_t, zero_action_t, rollout_steps
         )
+        joint_action_rollout = bool(
+            getattr(self.config, "opd_joint_action_rollout", True)
+        )
 
         action_base = input_dict['action_dict']
         action_grid_id = _downsample_action_grid_id(
@@ -5775,8 +5861,12 @@ class FlowMapStepMixin:
             for step_index in range(rollout_steps):
                 video_t = video_path[step_index]
                 video_r = video_path[step_index + 1]
-                action_t = action_path[step_index]
-                action_r = action_path[step_index + 1]
+                if joint_action_rollout:
+                    action_t = action_path[step_index]
+                    action_r = action_path[step_index + 1]
+                else:
+                    action_t = terminal_action_t
+                    action_r = terminal_action_t
                 video_states.append(current_video.detach().clone())
                 action_states.append(current_action.detach().clone())
                 video_timesteps.append(video_t.detach().clone())
@@ -5794,7 +5884,7 @@ class FlowMapStepMixin:
                     window_size=input_dict['window_size'],
                 )
                 self._init_joint_mask(rollout_input)
-                video_velocity, action_velocity_seq = self._student_joint_forward(
+                rollout_output = self._student_joint_forward(
                     rollout_model,
                     rollout_input,
                     rollout_empty_emb,
@@ -5803,20 +5893,33 @@ class FlowMapStepMixin:
                     cfg_scale=cfg_scale,
                     batch_size=B,
                     ref_shape=ref_shape,
-                    require_action=True,
+                    require_action=joint_action_rollout,
                 )
-                if action_velocity_seq is None:
-                    raise RuntimeError("DanceOPD joint rollout requires a student action output")
-                action_velocity = self._extract_action_v(action_velocity_seq, action_frames)
-                current_video, current_action = self._joint_euler_update(
-                    current_video,
+                if joint_action_rollout:
+                    video_velocity, action_velocity_seq = rollout_output
+                    if action_velocity_seq is None:
+                        raise RuntimeError(
+                            "DanceOPD joint rollout requires a student action output"
+                        )
+                    action_velocity = self._extract_action_v(
+                        action_velocity_seq, action_frames
+                    )
+                else:
+                    video_velocity = rollout_output
+                    action_velocity = None
+                video_sigma = self._timestep_to_sigma_5d(video_t)
+                video_sigma_next = self._timestep_to_sigma_5d(video_r)
+                current_video = current_video + video_velocity * (
+                    video_sigma_next.to(video_velocity)
+                    - video_sigma.to(video_velocity)
+                )
+                current_action = danceopd_action_euler_update(
                     current_action,
-                    video_velocity,
                     action_velocity,
-                    video_t,
-                    video_r,
                     action_t,
                     action_r,
+                    num_train_timesteps=self.config.num_train_timesteps,
+                    enabled=joint_action_rollout,
                 )
 
         query_indices = sample_low_noise_query_indices(

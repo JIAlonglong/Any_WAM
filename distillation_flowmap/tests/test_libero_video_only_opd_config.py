@@ -45,6 +45,7 @@ def test_defaults_define_full_video_only_universal_contract():
     assert cfg.opd_aux_action is False
     assert cfg.opd_danceopd_action_velocity_weight == 0.0
     assert cfg.opd_joint_action_rollout is False
+    assert cfg.action_condition_on_student_video is True
     assert cfg.action_loss_weight > 0
     assert cfg.gt_regression_weight > 0
     assert cfg.mechanism_diagnostics is True

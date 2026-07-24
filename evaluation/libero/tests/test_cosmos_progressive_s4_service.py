@@ -310,6 +310,32 @@ def test_non_video_episode_does_not_extract_or_save_frames(tmp_path):
     assert record["video_path"] is None
 
 
+def test_enabled_capture_with_no_frames_does_not_save_or_report_video(tmp_path):
+    client = CosmosProgressiveS4Client(
+        _SuccessfulService(), output_dir=tmp_path, student_steps=2, warmup_steps=0
+    )
+    extracted = []
+    saved = []
+
+    record = client.run_with_env(
+        env=_DoneEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=3,
+        episode_idx=2,
+        prompt="open the drawer",
+        max_env_steps=0,
+        init_env_fn=lambda *_args, **_kwargs: OBS,
+        extract_video_fn=lambda obs: extracted.append(obs),
+        save_video_fn=lambda frames, path: saved.append((frames, path)),
+        video_path=tmp_path / "empty.mp4",
+        rollout_seed=23,
+    )
+
+    assert extracted == []
+    assert saved == []
+    assert record["video_path"] is None
+
+
 def test_client_records_rollout_seed_on_setup_failure(tmp_path):
     client = CosmosProgressiveS4Client(
         _SuccessfulService(), output_dir=tmp_path, student_steps=2, warmup_steps=0
@@ -552,6 +578,7 @@ def _install_fake_libero(monkeypatch, *, skipped):
     monkeypatch.setitem(sys.modules, "libero.libero.benchmark", benchmark_module)
     monkeypatch.setitem(sys.modules, "libero.libero.envs", envs_module)
     monkeypatch.setitem(sys.modules, "evaluation.libero.rollout_cosmos_policy", rollout_module)
+    return rollout_module
 
 
 def test_run_libero_task_persists_env_seed_for_skipped_record_without_libero(tmp_path, monkeypatch):
@@ -644,6 +671,71 @@ def test_run_libero_task_controls_video_capture(
 
     assert (record["video_path"] is not None) is has_path
     assert (captured["video_path"] is not None) is has_path
+
+
+def test_run_libero_task_enabled_capture_extracts_and_saves_planned_video(
+    tmp_path, monkeypatch
+):
+    rollout_module = _install_fake_libero(monkeypatch, skipped=False)
+    client = CosmosProgressiveS4Client(
+        _SuccessfulService(), output_dir=tmp_path, student_steps=2, warmup_steps=0
+    )
+    extracted = []
+    saved = []
+    frame = {"frame": "sentinel"}
+
+    def extract_video(obs):
+        extracted.append(obs)
+        return frame
+
+    rollout_module.extract_video_obs = extract_video
+    rollout_module.save_video = lambda frames, path, *, fps: saved.append(
+        (list(frames), path, fps)
+    )
+
+    record = client.run_libero_task(
+        libero_benchmark="libero_10",
+        task_idx=7,
+        episode_idx=2,
+        camera_size=128,
+        max_env_steps=1,
+        env_seed=37,
+        save_video=True,
+    )
+
+    expected_path = (
+        tmp_path
+        / "libero_10"
+        / "task_7_open_the_drawer"
+        / "episode_2_done.mp4"
+    )
+    assert extracted == [OBS]
+    assert saved == [([frame], expected_path, 15)]
+    assert record["video_path"] == str(expected_path)
+
+
+def test_run_libero_task_omitted_save_video_defaults_to_enabled(tmp_path, monkeypatch):
+    rollout_module = _install_fake_libero(monkeypatch, skipped=False)
+    client = CosmosProgressiveS4Client(
+        _SuccessfulService(), output_dir=tmp_path, student_steps=2, warmup_steps=0
+    )
+    saved = []
+    rollout_module.extract_video_obs = lambda _obs: {"frame": "default"}
+    rollout_module.save_video = lambda frames, path, *, fps: saved.append(
+        (list(frames), path, fps)
+    )
+
+    record = client.run_libero_task(
+        libero_benchmark="libero_10",
+        task_idx=7,
+        episode_idx=3,
+        camera_size=128,
+        max_env_steps=1,
+        env_seed=37,
+    )
+
+    assert len(saved) == 1
+    assert record["video_path"] == str(saved[0][1])
 
 
 def test_live_runtime_preflight_rejects_cpu_with_actionable_error(tmp_path):
@@ -752,6 +844,57 @@ def test_live_rollout_constructs_client_with_requested_student_steps(monkeypatch
 
     assert result == 0
     assert captured["student_steps"] == 2
+
+
+@pytest.mark.parametrize(
+    ("video_args", "expected_save_video"),
+    [([], False), (["--save-video"], True)],
+)
+def test_live_rollout_forwards_cli_video_choice_to_every_task_call(
+    monkeypatch, video_args, expected_save_video
+):
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    calls = []
+
+    class RecordingClient:
+        def __init__(self, _service, **_kwargs):
+            pass
+
+        def run_libero_task(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "task_idx": kwargs["task_idx"],
+                "episode_idx": kwargs["episode_idx"],
+            }
+
+    monkeypatch.setattr(
+        rollout,
+        "build_live_service",
+        lambda _args: (object(), SimpleNamespace(close=lambda: None)),
+    )
+    monkeypatch.setattr(rollout, "CosmosProgressiveS4Client", RecordingClient)
+
+    result = rollout.main(
+        [
+            "--checkpoint-transformer",
+            "/tmp/s4-transformer",
+            "--prompt-table",
+            "/tmp/training-prompt-table.pt",
+            "--env-seed",
+            "41",
+            "--task-range",
+            "0",
+            "2",
+            "--episodes",
+            "2",
+            *video_args,
+        ]
+    )
+
+    assert result == 0
+    assert len(calls) == 4
+    assert all(call["save_video"] is expected_save_video for call in calls)
 
 
 def test_cli_defaults_joint_student_steps_to_four():

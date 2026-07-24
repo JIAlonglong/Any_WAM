@@ -4247,6 +4247,15 @@ class FlowMapStepMixin:
             raise ValueError(
                 "deployment joint rollout requires gradient_accumulation_steps=1"
             )
+        rollout_grad_mode = str(
+            getattr(self.config, "opd_rollout_grad_mode", "endpoint")
+        ).lower()
+        if rollout_grad_mode == "endpoint":
+            raise ValueError(
+                "deployment joint rollout is incompatible with "
+                "opd_rollout_grad_mode='endpoint' because final video/action "
+                "states are detached"
+            )
 
         batch = self.convert_input_format(batch)
         teacher = self._action_teacher_model
@@ -4388,11 +4397,18 @@ class FlowMapStepMixin:
         zero = torch.zeros((), device=self.device, dtype=loss.dtype)
         if is_finite:
             loss.backward()
+        deployment_video_loss = (
+            endpoint_losses["video"].detach() if is_finite else zero
+        )
+        deployment_action_loss = (
+            endpoint_losses["action"].detach() if is_finite else zero
+        )
+        deployment_total_loss = loss.detach() if is_finite else zero
         return {
-            "loss": loss.detach() if is_finite else zero,
-            "deployment_video_endpoint_loss": endpoint_losses["video"].detach(),
-            "deployment_action_endpoint_loss": endpoint_losses["action"].detach(),
-            "deployment_total_loss": loss.detach() if is_finite else zero,
+            "loss": deployment_total_loss,
+            "deployment_video_endpoint_loss": deployment_video_loss,
+            "deployment_action_endpoint_loss": deployment_action_loss,
+            "deployment_total_loss": deployment_total_loss,
             "deployment_student_steps": torch.tensor(
                 float(student_steps), device=self.device
             ),

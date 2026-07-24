@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 from distillation_flowmap.cosmos_progressive_protocol import (
     aligned_teacher_path_indices,
@@ -100,6 +101,55 @@ def test_trainer_runs_deployment_and_raw_aux_on_disjoint_steps():
     assert scheduled_kind(step=10) == "raw_auxiliary"
     assert scheduled_kind(step=12) == "deployment"
     assert scheduled_kind(step=11) == "main"
+
+
+def test_trainer_call_site_delegates_schedule_to_the_shared_selector():
+    source = (
+        Path(__file__).resolve().parents[1] / "flowmap_trainer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_select_progressive_training_objective"
+    )
+    calls = []
+
+    def selector(**kwargs):
+        calls.append(kwargs)
+        return "sentinel"
+
+    namespace = {"select_progressive_training_objective": selector}
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+            "<trainer-selector>",
+            "exec",
+        ),
+        namespace,
+    )
+    config = SimpleNamespace(
+        deployment_joint_rollout_interval=4,
+        opd_aux_warmup_steps=0,
+        opd_aux_interval=8,
+        opd_aux_phase=2,
+    )
+
+    assert namespace["_select_progressive_training_objective"](
+        config,
+        step=12,
+        deployment_enabled=True,
+        raw_auxiliary_enabled=True,
+    ) == "sentinel"
+    assert calls == [{
+        "step": 12,
+        "deployment_enabled": True,
+        "deployment_interval": 4,
+        "raw_auxiliary_enabled": True,
+        "raw_auxiliary_warmup": 0,
+        "raw_auxiliary_interval": 8,
+        "raw_auxiliary_phase": 2,
+    }]
 
 
 def test_deployment_student_path_is_not_clamped_to_the_raw_teacher_window():

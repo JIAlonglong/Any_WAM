@@ -51,21 +51,36 @@ def test_paired_eval_timesteps_keep_video_and_action_horizons_separate():
 
 
 def test_trainer_reduces_all_deployment_metrics_in_a_fixed_position():
+    from distillation_flowmap.cosmos_progressive_opd import (
+        DEPLOYMENT_METRIC_SPECS,
+    )
+
     source = (
         Path(__file__).resolve().parents[1] / "flowmap_trainer.py"
     ).read_text(encoding="utf-8")
     metric_block = source.split("metric_tensors = [", 1)[1].split(
         "kto_main_enabled =", 1
     )[0]
-    expected = [
-        "acc_deployment_video_endpoint_losses",
-        "acc_deployment_action_endpoint_losses",
-        "acc_deployment_total_losses",
-        "acc_deployment_student_steps",
-        "acc_deployment_t_starts",
-        "acc_deployment_t_ends",
-    ]
+    expected = [spec.accumulator for spec in DEPLOYMENT_METRIC_SPECS]
 
     positions = [metric_block.index(name) for name in expected]
     assert positions == sorted(positions)
+    append_block = source.split("# 累积损失值", 1)[1].split(
+        "step_in_acc += 1", 1
+    )[0]
+    unpack_block = source.split("base_metric_count = 47", 1)[1].split(
+        "metric_cursor =", 1
+    )[0]
+    reset_block = source.split("# 重置累积器", 1)[1].split(
+        "step_in_acc = 0", 1
+    )[0]
+    logging_block = source.split('postfix["dep"]', 1)[1].split(
+        "if self.distill_video:", 1
+    )[0]
+    for spec in DEPLOYMENT_METRIC_SPECS:
+        assert spec.result_key in append_block
+        assert spec.average_name in unpack_block
+        assert spec.accumulator in reset_block
+        assert spec.log_name in logging_block
+    assert len(DEPLOYMENT_METRIC_SPECS) == 6
     assert "base_metric_count = 47" in source

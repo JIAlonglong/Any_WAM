@@ -1,12 +1,60 @@
 """Small, testable primitives for progressive Cosmos Stage 2 OPD."""
 
 import math
+from typing import NamedTuple
 
 import torch
 
 from distillation_flowmap.cosmos_deployment_rollout import (
     should_run_deployment_joint_rollout,
     should_run_raw_auxiliary,
+)
+
+
+class DeploymentMetricSpec(NamedTuple):
+    result_key: str
+    accumulator: str
+    average_name: str
+    log_name: str
+
+
+DEPLOYMENT_METRIC_SPECS = (
+    DeploymentMetricSpec(
+        "deployment_video_endpoint_loss",
+        "acc_deployment_video_endpoint_losses",
+        "avg_deployment_video_endpoint_loss",
+        "deployment/video_endpoint_loss",
+    ),
+    DeploymentMetricSpec(
+        "deployment_action_endpoint_loss",
+        "acc_deployment_action_endpoint_losses",
+        "avg_deployment_action_endpoint_loss",
+        "deployment/action_endpoint_loss",
+    ),
+    DeploymentMetricSpec(
+        "deployment_total_loss",
+        "acc_deployment_total_losses",
+        "avg_deployment_total_loss",
+        "deployment/total_loss",
+    ),
+    DeploymentMetricSpec(
+        "deployment_student_steps",
+        "acc_deployment_student_steps",
+        "avg_deployment_student_steps",
+        "deployment/student_steps",
+    ),
+    DeploymentMetricSpec(
+        "deployment_t_start",
+        "acc_deployment_t_starts",
+        "avg_deployment_t_start",
+        "deployment/t_start",
+    ),
+    DeploymentMetricSpec(
+        "deployment_t_end",
+        "acc_deployment_t_ends",
+        "avg_deployment_t_end",
+        "deployment/t_end",
+    ),
 )
 
 

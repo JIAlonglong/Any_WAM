@@ -43,12 +43,11 @@ from modules.utils import WanVAEStreamingWrapper, load_transformer, load_vae
 from utils import logger, warmup_constant_lambda, FlowMatchScheduler
 from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
 from distillation_flowmap.cosmos_progressive_opd import (
+    select_progressive_training_objective,
     should_stop_training_at_step,
 )
 from distillation_flowmap.cosmos_deployment_rollout import (
     deployment_joint_step_for_update,
-    should_run_deployment_joint_rollout,
-    should_run_raw_auxiliary,
 )
 from distillation_flowmap.cosmos_teacher_roles import resolve_teacher_roles
 from distillation_flowmap.ablation.robotwin_diagnostics import (
@@ -78,6 +77,24 @@ from distillation.data import DataMixin
 from distillation.ema import update_ema
 from flowmap_step import FlowMapStepMixin
 from model_flowmap import setup_flowmap_model, patch_model_forward
+
+
+def _select_progressive_training_objective(
+    config,
+    *,
+    step,
+    deployment_enabled,
+    raw_auxiliary_enabled,
+):
+    return select_progressive_training_objective(
+        step=step,
+        deployment_enabled=deployment_enabled,
+        deployment_interval=int(config.deployment_joint_rollout_interval),
+        raw_auxiliary_enabled=raw_auxiliary_enabled,
+        raw_auxiliary_warmup=int(getattr(config, "opd_aux_warmup_steps", 0)),
+        raw_auxiliary_interval=int(getattr(config, "opd_aux_interval", 8)),
+        raw_auxiliary_phase=int(getattr(config, "opd_aux_phase", 2)),
+    )
 
 # DMD 判别器（仅在 use_dmd=True 时导入）
 try:
@@ -2578,20 +2595,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     'starts from zero gradients.'
                 )
 
-            if deployment_enabled and should_run_deployment_joint_rollout(
-                self.step,
-                int(self.config.deployment_joint_rollout_interval),
-            ):
-                scheduled_kind = "deployment"
-            elif standalone_opd and should_run_raw_auxiliary(
-                self.step,
-                warmup=int(getattr(self.config, "opd_aux_warmup_steps", 0)),
-                interval=int(getattr(self.config, "opd_aux_interval", 8)),
-                phase=int(getattr(self.config, "opd_aux_phase", 2)),
-            ):
-                scheduled_kind = "raw_auxiliary"
-            else:
-                scheduled_kind = "main"
+            scheduled_kind = _select_progressive_training_objective(
+                self.config,
+                step=self.step,
+                deployment_enabled=deployment_enabled,
+                raw_auxiliary_enabled=standalone_opd,
+            )
             use_opd_aux_now = scheduled_kind == "raw_auxiliary"
             if use_opd_aux_now:
                 opd_aux_prob = float(getattr(self.config, 'opd_aux_prob', 1.0))

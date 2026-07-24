@@ -99,6 +99,11 @@ def test_sourceable_env_file_exports_concrete_cosmos_s4_defaults():
         "/kpfs-intern/jialongliu/projects/Flash-WAM/training_data/libero-long-lerobot/empty_emb.pt"
     )
     assert values["SUITE_ROOT"] == "/tmp/cosmos progressive results/cosmos_s4_full_unit-test"
+    assert values["S4_VIDEO_SEEDS"] == "0,1"
+    assert values["S4_FORMAL_NUM_SHARDS"] == "4"
+    assert values["MATRIX_ROOT"] == (
+        "/tmp/cosmos progressive results/cosmos_joint_124_unit-test"
+    )
     assert values["HF_HUB_OFFLINE"] == "1"
     assert values["HF_DATASETS_OFFLINE"] == "1"
     assert values["TRANSFORMERS_OFFLINE"] == "1"
@@ -113,6 +118,9 @@ def test_sourceable_env_file_preserves_caller_overrides():
             "COSMOS_POLICY_EXTRA_PYTHONPATH": "/custom/cosmos/site-packages",
             "COSMOS_WORKER_CUDA_LIBRARY_PATH": "/custom/cuda-libs",
             "LD_LIBRARY_PATH": "/caller/lib",
+            "S4_VIDEO_SEEDS": "3",
+            "S4_FORMAL_NUM_SHARDS": "2",
+            "MATRIX_ROOT": "/custom/matrix",
         }
     )
 
@@ -122,3 +130,6 @@ def test_sourceable_env_file_preserves_caller_overrides():
     assert values["COSMOS_POLICY_EXTRA_PYTHONPATH"] == "/custom/cosmos/site-packages"
     assert values["COSMOS_WORKER_CUDA_LIBRARY_PATH"] == "/custom/cuda-libs"
     assert values["LD_LIBRARY_PATH"] == "/custom/cuda-libs:/caller/lib"
+    assert values["S4_VIDEO_SEEDS"] == "3"
+    assert values["S4_FORMAL_NUM_SHARDS"] == "2"
+    assert values["MATRIX_ROOT"] == "/custom/matrix"

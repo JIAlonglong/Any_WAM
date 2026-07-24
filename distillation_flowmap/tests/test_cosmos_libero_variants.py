@@ -34,6 +34,7 @@ PROGRESSIVE_ALLOWED_DIFFERENCES = {
     "danceopd_rollout_steps",
     "video_velocity_weight",
     "opd_rollout_grad_mode",
+    "opd_action_rollout_grad_mode",
     "opd_rollout_grad_steps",
     "opd_endpoint_focus_prob",
 }

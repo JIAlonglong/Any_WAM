@@ -57,6 +57,17 @@ print_assignment() {
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 PREFLIGHT_BIN="${PREFLIGHT_BIN:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
+[[ -n "${COSMOS_STAGE1_ROOT:-}" ]] || die "COSMOS_STAGE1_ROOT must be explicitly set"
+[[ -n "${STUDENT_BASE_MODEL_PATH:-}" ]] || die "STUDENT_BASE_MODEL_PATH must be explicitly set"
+STAGE1_ROOT="$COSMOS_STAGE1_ROOT"
+DATASET_PATH="${DATASET_PATH:-/kpfs-intern/jialongliu/projects/Flash-WAM/training_data/libero-long-lerobot}"
+COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B}"
+COSMOS_WORKER_ENV_ROOT="${COSMOS_WORKER_ENV_ROOT:-/kpfs-intern/jialongliu/envs/cosmos-predict2-cu128-py310}"
+COSMOS_POLICY_PYTHON="${COSMOS_POLICY_PYTHON:-${COSMOS_WORKER_ENV_ROOT}/bin/python}"
+COSMOS_PREDICT2_REPO="${COSMOS_PREDICT2_REPO:-/kpfs-intern/jialongliu/projects/cosmos-predict2.5}"
+COSMOS_PREDICT25_LOCAL_MODEL_DIR="${COSMOS_PREDICT25_LOCAL_MODEL_DIR:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/local_hf/Cosmos-Predict2-2B-Video2World}"
+COSMOS_WORKER_SITE_PACKAGES="${COSMOS_WORKER_SITE_PACKAGES:-${COSMOS_WORKER_ENV_ROOT}/lib/python3.10/site-packages}"
+COSMOS_POLICY_EXTRA_PYTHONPATH="$COSMOS_PREDICT2_REPO/packages/cosmos-cuda:$COSMOS_PREDICT2_REPO/packages/cosmos-oss"
 
 arm="${1:-}"
 [[ -n "$arm" ]] || die "an experiment arm is required"
@@ -108,7 +119,11 @@ resolver_code='import sys
 from distillation_flowmap.cosmos_libero_variants import (
     VariantError, canonical_variant_json, resolve_variant,
 )
-name, output_root, run_tag, steps_raw, save_raw, port_raw = sys.argv[1:]
+(
+    name, output_root, run_tag, steps_raw, save_raw, port_raw,
+    dataset_path, teacher_path, vae_path, repo, worker_python,
+    worker_pythonpath, local_model,
+) = sys.argv[1:]
 try:
     record = resolve_variant(
         name,
@@ -117,6 +132,14 @@ try:
         steps=int(steps_raw) if steps_raw else None,
         save_interval=int(save_raw),
         master_port=int(port_raw) if port_raw else None,
+        dataset_path=dataset_path,
+        teacher_model_path=teacher_path,
+        cosmos_video_vae_model_path=vae_path,
+        cosmos_policy_repo=repo,
+        cosmos_policy_python=worker_python,
+        cosmos_policy_extra_pythonpath=worker_pythonpath,
+        cosmos_policy_local_model_dir=local_model,
+        attention_mode="flex",
     )
 except (VariantError, ValueError) as exc:
     raise SystemExit(str(exc))
@@ -156,55 +179,100 @@ values = {
     "HF_HUB_OFFLINE": int(record["hf_hub_offline"]),
     "COSMOS_LIBERO_VARIANT_JSON": canonical_variant_json(record),
 }
+identity_exports = {
+    "BETA1": "beta1",
+    "BETA2": "beta2",
+    "EMA_DECAY": "ema_decay",
+    "EMA_WARMUP_STEPS": "ema_warmup_steps",
+    "DROP_TEXT_RATIO": "drop_text_ratio",
+    "FUSE_GUIDANCE_SCALE": "fuse_guidance_scale",
+    "CFG_MIN": "cfg_min",
+    "CFG_MAX": "cfg_max",
+    "MAX_GRAD_NORM": "max_grad_norm",
+    "WARMUP_STEPS": "warmup_steps",
+    "NUM_DDIM_TIMESTEPS_ACTION": "num_ddim_timesteps_action",
+    "DIFFUSION_RATIO": "diffusion_ratio",
+    "CONSISTENCY_RATIO": "consistency_ratio",
+    "FLOWMAP_RATIO": "flowmap_ratio",
+    "VIDEO_LOSS_WEIGHT": "video_loss_weight",
+    "ACTION_LOSS_WEIGHT": "action_loss_weight",
+    "ACTION_BLOCK_WEIGHT": "action_block_weight",
+    "COSMOS_POLICY_USE_RAW_INFERENCE": "cosmos_policy_use_raw_inference",
+    "SKIP_TARGET_STUDENT_FOR_COSMOS_LATENT": "skip_target_student_for_cosmos_latent",
+    "COSMOS_LATENT_CDIFF_LOSS_WEIGHT": "cosmos_latent_cdiff_loss_weight",
+    "COSMOS_LATENT_ENDPOINT_LOSS_WEIGHT": "cosmos_latent_endpoint_loss_weight",
+    "COSMOS_LATENT_EPSILON": "cosmos_latent_epsilon",
+    "COSMOS_LATENT_T_MIN": "cosmos_latent_t_min",
+    "COSMOS_LATENT_T_MAX": "cosmos_latent_t_max",
+    "COSMOS_LATENT_CHANNELS": "cosmos_latent_channels",
+    "COSMOS_LATENT_FRAMES": "cosmos_latent_frames",
+    "COSMOS_LATENT_HEIGHT": "cosmos_latent_height",
+    "COSMOS_LATENT_WIDTH": "cosmos_latent_width",
+    "COSMOS_LATENT_CENTER_VELOCITY_MODE": "cosmos_latent_center_velocity_mode",
+    "COSMOS_LATENT_TARGET_MODE": "cosmos_latent_target_mode",
+    "COSMOS_LATENT_CDIFF_INTERVAL": "cosmos_latent_cdiff_interval",
+    "OPD_ACTION_ROLLOUT_GRAD_MODE": "opd_action_rollout_grad_mode",
+    "OPD_AUX_INTERVAL": "opd_aux_interval",
+    "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR": "opd_danceopd_verify_terminal_prior",
+    "OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE": "opd_danceopd_terminal_prior_tolerance",
+    "OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR": "opd_danceopd_terminal_prior_warn_factor",
+    "OPD_COSMOS_SPATIAL_CROP_SIZE": "opd_cosmos_spatial_crop_size",
+    "COSMOS_USE_TEACHER_ACTION_ANCHOR": "cosmos_use_teacher_action_anchor",
+    "OPD_JOINT_ACTION_ROLLOUT": "opd_joint_action_rollout",
+    "MECHANISM_DIAGNOSTICS": "mechanism_diagnostics",
+    "MECHANISM_DIAGNOSTIC_INTERVAL": "mechanism_diagnostic_interval",
+    "MECHANISM_DIAGNOSTIC_SEED": "mechanism_diagnostic_seed",
+    "MECHANISM_DIAGNOSTIC_R": "mechanism_diagnostic_r",
+    "MECHANISM_DIAGNOSTIC_S": "mechanism_diagnostic_s",
+    "MECHANISM_DIAGNOSTIC_TEACHER_STEPS": "mechanism_diagnostic_teacher_steps",
+    "MECHANISM_COSMOS_T_MIN": "mechanism_cosmos_t_min",
+    "MECHANISM_COSMOS_T_MAX": "mechanism_cosmos_t_max",
+    "DATASET_PATH": "dataset_path",
+    "COSMOS_POLICY_PATH": "teacher_model_path",
+    "COSMOS_VIDEO_VAE_MODEL_PATH": "cosmos_video_vae_model_path",
+    "COSMOS_PREDICT2_REPO": "cosmos_policy_repo",
+    "COSMOS_POLICY_PYTHON": "cosmos_policy_python",
+    "COSMOS_POLICY_EXTRA_PYTHONPATH": "cosmos_policy_extra_pythonpath",
+    "COSMOS_PREDICT25_LOCAL_MODEL_DIR": "cosmos_policy_local_model_dir",
+    "COSMOS_POLICY_CONFIG_NAME": "cosmos_policy_config_name",
+    "COSMOS_POLICY_CONFIG_FILE": "cosmos_policy_config_file",
+    "COSMOS_POLICY_NUM_DENOISING_STEPS_ACTION": "cosmos_policy_num_denoising_steps_action",
+    "COSMOS_POLICY_SEED": "cosmos_policy_seed",
+    "COSMOS_POLICY_PRIMARY_IMAGE_KEY": "cosmos_policy_primary_image_key",
+    "COSMOS_POLICY_WRIST_IMAGE_KEY": "cosmos_policy_wrist_image_key",
+    "COSMOS_POLICY_INFERENCE_MODE": "cosmos_policy_inference_mode",
+    "ATTN_MODE": "attention_mode",
+}
+for env_name, field in identity_exports.items():
+    value = record[field]
+    if isinstance(value, bool):
+        value = int(value)
+    values[env_name] = value
 for key, value in values.items():
     print(f"{key}={value}")'
 resolved="$(
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
         "$PREFLIGHT_BIN" -c "$resolver_code" \
-        "$arm" "$output_root" "$run_tag" "$steps" "$save_interval" "$master_port"
+        "$arm" "$output_root" "$run_tag" "$steps" "$save_interval" "$master_port" \
+        "$DATASET_PATH" "$COSMOS_POLICY_PATH" "$STUDENT_BASE_MODEL_PATH" \
+        "$COSMOS_PREDICT2_REPO" "$COSMOS_POLICY_PYTHON" \
+        "$COSMOS_POLICY_EXTRA_PYTHONPATH" "$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
 )" || die "variant resolution failed"
-declare -A expected_keys=(
-    [VARIANT_NAME]=1
-    [RUN_TAG]=1
-    [COSMOS_PROGRESSIVE_STAGE]=1
-    [MAX_TRAIN_STEPS]=1
-    [SAVE_INTERVAL]=1
-    [MASTER_PORT]=1
-    [OUTPUT_DIR]=1
-    [OPD_ROLLOUT_STEP_PAIRS]=1
-    [OPD_DANCEOPD_ROLLOUT_STEPS]=1
-    [OPD_DANCEOPD_ENDPOINT_WEIGHT]=1
-    [OPD_DANCEOPD_VELOCITY_WEIGHT]=1
-    [OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT]=1
-    [OPD_AUX_ACTION]=1
-    [USE_OPD_AUX]=1
-    [OPD_AUX_STANDALONE_STEP]=1
-    [LEARNING_RATE]=1
-    [OPD_AUX_WEIGHT]=1
-    [OPD_AUX_WARMUP_STEPS]=1
-    [OPD_AUX_PROB]=1
-    [OPD_ROLLOUT_GRAD_MODE]=1
-    [OPD_ROLLOUT_GRAD_STEPS]=1
-    [OPD_ENDPOINT_FOCUS_PROB]=1
-    [OPD_DANCEOPD_QUERY_ALPHA]=1
-    [OPD_DANCEOPD_QUERY_BETA]=1
-    [TRAIN_SEED]=1
-    [ENABLE_TENSORBOARD]=1
-    [ENABLE_WANDB]=1
-    [WANDB_MODE]=1
-    [HF_DATASETS_OFFLINE]=1
-    [TRANSFORMERS_OFFLINE]=1
-    [HF_HUB_OFFLINE]=1
-    [COSMOS_LIBERO_VARIANT_JSON]=1
-)
+declare -A seen_resolver_keys=()
 while IFS='=' read -r key value; do
-    [[ -n "${expected_keys[$key]:-}" ]] || die "unexpected resolver output: $key"
+    [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid resolver output key: $key"
+    [[ -z "${seen_resolver_keys[$key]:-}" ]] || die \
+        "duplicate resolver output key: $key"
     printf -v "$key" '%s' "$value"
     export "$key"
-    unset 'expected_keys[$key]'
+    seen_resolver_keys["$key"]=1
 done <<< "$resolved"
-(( ${#expected_keys[@]} == 0 )) || die "variant resolver omitted required fields"
+for key in VARIANT_NAME RUN_TAG COSMOS_PROGRESSIVE_STAGE MAX_TRAIN_STEPS \
+    SAVE_INTERVAL MASTER_PORT OUTPUT_DIR COSMOS_LIBERO_VARIANT_JSON; do
+    [[ -n "${seen_resolver_keys[$key]:-}" ]] || die \
+        "variant resolver omitted required field: $key"
+done
 validate_port "$MASTER_PORT"
 if [[ -n "$resume_step" ]]; then
     (( resume_step < MAX_TRAIN_STEPS )) || die \
@@ -357,24 +425,44 @@ export LEARNING_RATE OPD_AUX_WEIGHT OPD_AUX_WARMUP_STEPS OPD_AUX_PROB
 export OPD_ROLLOUT_GRAD_MODE OPD_ROLLOUT_GRAD_STEPS
 export OPD_ENDPOINT_FOCUS_PROB OPD_DANCEOPD_QUERY_ALPHA
 export OPD_DANCEOPD_QUERY_BETA
-export COSMOS_USE_TEACHER_ACTION_ANCHOR=1
-export OPD_JOINT_ACTION_ROLLOUT=1
-export MECHANISM_DIAGNOSTICS="${MECHANISM_DIAGNOSTICS:-1}"
-export MECHANISM_DIAGNOSTIC_INTERVAL="${MECHANISM_DIAGNOSTIC_INTERVAL:-100}"
-export MECHANISM_DIAGNOSTIC_SEED="${MECHANISM_DIAGNOSTIC_SEED:-42}"
-export MECHANISM_DIAGNOSTIC_R="${MECHANISM_DIAGNOSTIC_R:-500}"
-export MECHANISM_DIAGNOSTIC_S="${MECHANISM_DIAGNOSTIC_S:-250}"
-export MECHANISM_DIAGNOSTIC_TEACHER_STEPS="${MECHANISM_DIAGNOSTIC_TEACHER_STEPS:-8}"
-export MECHANISM_COSMOS_T_MIN="${MECHANISM_COSMOS_T_MIN:-0.8}"
-export MECHANISM_COSMOS_T_MAX="${MECHANISM_COSMOS_T_MAX:-0.9876543209876543}"
+export COSMOS_USE_TEACHER_ACTION_ANCHOR OPD_JOINT_ACTION_ROLLOUT
+export MECHANISM_DIAGNOSTICS MECHANISM_DIAGNOSTIC_INTERVAL
+export MECHANISM_DIAGNOSTIC_SEED MECHANISM_DIAGNOSTIC_R
+export MECHANISM_DIAGNOSTIC_S MECHANISM_DIAGNOSTIC_TEACHER_STEPS
+export MECHANISM_COSMOS_T_MIN MECHANISM_COSMOS_T_MAX
+export OPD_AUX_EMPTY_CACHE=1
+export COSMOS_TRAIN_STEP_PROFILE=0
+export OPD_PROFILE=0
+export SKIP_TEACHER_COMPILE=1
+export CACHE_DATASET_IN_MEMORY=0
+export COSMOS_POLICY_VALIDATE_WEIGHTS=1
+export ENABLE_LIGHT_EVAL=0
+export ENABLE_ROLLOUT_EVAL=0
+export ENABLE_STAGE1_START_EVAL=0
+export ENABLE_STAGE1_START_EVAL_BASELINE=0
+export LIGHT_EVAL_INTERVAL="$SAVE_INTERVAL"
+export LIGHT_EVAL_NUM_BATCHES=1
+export LIGHT_EVAL_SEED=42
+export LIGHT_EVAL_START_INDEX=0
+export STOP_AFTER_STEP=0
+unset DATASET_SAMPLE_MANIFEST STAGE1_CKPT_NAME
+unset DISTILL_MODE TEACHER_PATH COSMOS_PROGRESSIVE_RUN_ID
+unset OPD_AUX_VARIANT OPD_TEACHER_TARGET_MODE ROLLOUT_STEP_PAIRS
+unset VIDEO_TRANSITION_PARAM VIDEO_TRANSITION_WEIGHT
+unset OPD_ENDPOINT_AUX_WEIGHT LOCAL_FM_WEIGHT
+unset OPD_TRANSITION_GROUP_WEIGHT OPD_ANCHOR_CAP_RATIO
+unset OPD_AUX_USE_NOFSDP_ROLLOUT
+unset ACTION_AWARE_WEIGHT GT_REGRESSION_WEIGHT ACTION_TRANSITION_PARAM
+unset ACTION_LOCAL_FM_WEIGHT ACTION_TRANSITION_BLOCK_WEIGHT
+unset ACTION_LOCAL_FM_BLOCK_WEIGHT
 export WANDB_MODE=offline
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
-export ATTN_MODE="${ATTN_MODE:-flex}"
-export COSMOS_POLICY_INFERENCE_MODE="${COSMOS_POLICY_INFERENCE_MODE:-subprocess}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export HF_HOME="${HF_HOME:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/hf_cache}"
+export ATTN_MODE
+export COSMOS_POLICY_INFERENCE_MODE
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HF_HOME=/kpfs-intern/jialongliu/models/cosmos_predict2_5/hf_cache
 export CUDA_VISIBLE_DEVICES COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES
 export COSMOS_POLICY_PATH COSMOS_POLICY_PYTHON COSMOS_PREDICT2_REPO
 export COSMOS_PREDICT25_LOCAL_MODEL_DIR
@@ -453,6 +541,56 @@ for key in \
     MECHANISM_DIAGNOSTIC_S MECHANISM_DIAGNOSTIC_TEACHER_STEPS \
     MECHANISM_COSMOS_T_MIN MECHANISM_COSMOS_T_MAX; do
     print_assignment "$key" "${!key}"
+done
+for key in \
+    BETA1 BETA2 EMA_DECAY EMA_WARMUP_STEPS DROP_TEXT_RATIO \
+    FUSE_GUIDANCE_SCALE CFG_MIN CFG_MAX MAX_GRAD_NORM WARMUP_STEPS \
+    NUM_DDIM_TIMESTEPS_ACTION DIFFUSION_RATIO CONSISTENCY_RATIO \
+    FLOWMAP_RATIO VIDEO_LOSS_WEIGHT ACTION_LOSS_WEIGHT \
+    ACTION_BLOCK_WEIGHT COSMOS_POLICY_USE_RAW_INFERENCE \
+    SKIP_TARGET_STUDENT_FOR_COSMOS_LATENT \
+    COSMOS_LATENT_CDIFF_LOSS_WEIGHT COSMOS_LATENT_ENDPOINT_LOSS_WEIGHT \
+    COSMOS_LATENT_EPSILON COSMOS_LATENT_T_MIN COSMOS_LATENT_T_MAX \
+    COSMOS_LATENT_CHANNELS COSMOS_LATENT_FRAMES COSMOS_LATENT_HEIGHT \
+    COSMOS_LATENT_WIDTH COSMOS_LATENT_CENTER_VELOCITY_MODE \
+    COSMOS_LATENT_TARGET_MODE COSMOS_LATENT_CDIFF_INTERVAL \
+    OPD_ACTION_ROLLOUT_GRAD_MODE OPD_AUX_INTERVAL \
+    OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR \
+    OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE \
+    OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR \
+    OPD_COSMOS_SPATIAL_CROP_SIZE COSMOS_USE_TEACHER_ACTION_ANCHOR \
+    OPD_JOINT_ACTION_ROLLOUT \
+    COSMOS_POLICY_CONFIG_NAME COSMOS_POLICY_CONFIG_FILE \
+    COSMOS_POLICY_NUM_DENOISING_STEPS_ACTION COSMOS_POLICY_SEED \
+    COSMOS_POLICY_PRIMARY_IMAGE_KEY COSMOS_POLICY_WRIST_IMAGE_KEY \
+    COSMOS_VIDEO_VAE_MODEL_PATH COSMOS_POLICY_INFERENCE_MODE; do
+    print_assignment "$key" "${!key}"
+done
+for key in \
+    OPD_AUX_EMPTY_CACHE COSMOS_TRAIN_STEP_PROFILE OPD_PROFILE \
+    SKIP_TEACHER_COMPILE CACHE_DATASET_IN_MEMORY \
+    COSMOS_POLICY_VALIDATE_WEIGHTS ENABLE_LIGHT_EVAL ENABLE_ROLLOUT_EVAL \
+    ENABLE_STAGE1_START_EVAL ENABLE_STAGE1_START_EVAL_BASELINE \
+    LIGHT_EVAL_INTERVAL LIGHT_EVAL_NUM_BATCHES LIGHT_EVAL_SEED \
+    LIGHT_EVAL_START_INDEX \
+    STOP_AFTER_STEP GRADIENT_CHECKPOINTING USE_FSDP1 \
+    OPD_AUX_GRADIENT_CHECKPOINTING OPD_SERIAL_STUDENT_CFG \
+    PYTORCH_CUDA_ALLOC_CONF HF_HOME; do
+    print_assignment "$key" "${!key}"
+done
+print_assignment DATASET_SAMPLE_MANIFEST "<unset>"
+print_assignment STAGE1_CKPT_NAME "<unset>"
+for key in \
+    DISTILL_MODE TEACHER_PATH COSMOS_PROGRESSIVE_RUN_ID \
+    OPD_AUX_VARIANT OPD_TEACHER_TARGET_MODE ROLLOUT_STEP_PAIRS \
+    VIDEO_TRANSITION_PARAM VIDEO_TRANSITION_WEIGHT \
+    OPD_ENDPOINT_AUX_WEIGHT LOCAL_FM_WEIGHT \
+    OPD_TRANSITION_GROUP_WEIGHT OPD_ANCHOR_CAP_RATIO \
+    OPD_AUX_USE_NOFSDP_ROLLOUT ACTION_AWARE_WEIGHT \
+    GT_REGRESSION_WEIGHT ACTION_TRANSITION_PARAM \
+    ACTION_LOCAL_FM_WEIGHT ACTION_TRANSITION_BLOCK_WEIGHT \
+    ACTION_LOCAL_FM_BLOCK_WEIGHT; do
+    print_assignment "$key" "<unset>"
 done
 printf 'COMMAND='
 printf '%q ' "${train_cmd[@]}"

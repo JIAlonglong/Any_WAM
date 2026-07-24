@@ -103,6 +103,26 @@ def _run(*args: str, env: dict[str, str], cwd: Path | None = None):
     )
 
 
+def _resolve_for_launcher(env, name, *, output_root, run_tag, **overrides):
+    repo = Path(env["COSMOS_PREDICT2_REPO"])
+    return resolve_variant(
+        name,
+        output_root=output_root,
+        run_tag=run_tag,
+        dataset_path=env["DATASET_PATH"],
+        teacher_model_path=env["COSMOS_POLICY_PATH"],
+        cosmos_video_vae_model_path=env["STUDENT_BASE_MODEL_PATH"],
+        cosmos_policy_repo=env["COSMOS_PREDICT2_REPO"],
+        cosmos_policy_python=env["COSMOS_POLICY_PYTHON"],
+        cosmos_policy_extra_pythonpath=(
+            f"{repo}/packages/cosmos-cuda:{repo}/packages/cosmos-oss"
+        ),
+        cosmos_policy_local_model_dir=env["COSMOS_PREDICT25_LOCAL_MODEL_DIR"],
+        attention_mode="flex",
+        **overrides,
+    )
+
+
 def _assignments(stdout: str) -> dict[str, str]:
     return {
         key: value
@@ -132,7 +152,8 @@ def test_each_arm_has_one_complete_write_free_eight_gpu_dry_run(tmp_path, arm):
     values = _assignments(result.stdout)
     expected = json.loads(
         canonical_variant_json(
-            resolve_variant(
+            _resolve_for_launcher(
+                env,
                 arm,
                 output_root=output_root,
                 run_tag="contract-red",
@@ -232,7 +253,8 @@ def test_formal_fresh_run_claims_one_arm_and_persists_canonical_manifest_before_
     assert result.returncode == 0, result.stderr
     output = output_root / "formal" / "field_only"
     expected = canonical_variant_json(
-        resolve_variant(
+        _resolve_for_launcher(
+            env,
             "field_only", output_root=output_root, run_tag="formal"
         )
     )
@@ -284,7 +306,8 @@ def test_hostile_ambient_scientific_values_cannot_change_canonical_experiment(
     values = _assignments(result.stdout)
     expected = json.loads(
         canonical_variant_json(
-            resolve_variant(
+            _resolve_for_launcher(
+                env,
                 "universal",
                 output_root=output_root,
                 run_tag="canonical",
@@ -325,6 +348,229 @@ def test_stage1_only_imported_config_has_no_opd_schedule_or_action_opd(tmp_path)
     assert imported["use_opd_aux"] is False
     assert imported["opd_aux_standalone_step"] is False
     assert imported["action_opd_enabled"] is False
+
+
+def test_entire_inherited_config_environment_is_sealed_against_hostile_ambient(
+    tmp_path,
+):
+    env, _ = _env(tmp_path)
+    hostile = {
+        "BETA1": "0.1",
+        "BETA2": "0.2",
+        "EMA_DECAY": "0.5",
+        "EMA_WARMUP_STEPS": "999",
+        "DROP_TEXT_RATIO": "0.9",
+        "FUSE_GUIDANCE_SCALE": "99",
+        "CFG_MIN": "98",
+        "CFG_MAX": "99",
+        "MAX_GRAD_NORM": "99",
+        "WARMUP_STEPS": "999",
+        "NUM_DDIM_TIMESTEPS_ACTION": "99",
+        "DIFFUSION_RATIO": "0.1",
+        "CONSISTENCY_RATIO": "0.1",
+        "FLOWMAP_RATIO": "0.8",
+        "VIDEO_LOSS_WEIGHT": "99",
+        "ACTION_LOSS_WEIGHT": "99",
+        "ACTION_BLOCK_WEIGHT": "99",
+        "COSMOS_POLICY_USE_RAW_INFERENCE": "0",
+        "SKIP_TARGET_STUDENT_FOR_COSMOS_LATENT": "0",
+        "COSMOS_LATENT_CDIFF_LOSS_WEIGHT": "99",
+        "COSMOS_LATENT_ENDPOINT_LOSS_WEIGHT": "99",
+        "COSMOS_LATENT_EPSILON": "0.5",
+        "COSMOS_LATENT_T_MIN": "0.1",
+        "COSMOS_LATENT_T_MAX": "0.2",
+        "COSMOS_LATENT_CHANNELS": "99",
+        "COSMOS_LATENT_FRAMES": "99",
+        "COSMOS_LATENT_HEIGHT": "99",
+        "COSMOS_LATENT_WIDTH": "99",
+        "COSMOS_LATENT_CENTER_VELOCITY_MODE": "hostile",
+        "COSMOS_LATENT_TARGET_MODE": "hostile",
+        "COSMOS_LATENT_CDIFF_INTERVAL": "99",
+        "OPD_ACTION_ROLLOUT_GRAD_MODE": "hostile",
+        "OPD_AUX_INTERVAL": "99",
+        "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR": "0",
+        "OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE": "1",
+        "OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR": "0",
+        "OPD_COSMOS_SPATIAL_CROP_SIZE": "1",
+        "COSMOS_USE_TEACHER_ACTION_ANCHOR": "0",
+        "OPD_JOINT_ACTION_ROLLOUT": "0",
+        "COSMOS_POLICY_CONFIG_NAME": "hostile",
+        "COSMOS_POLICY_CONFIG_FILE": "hostile",
+        "COSMOS_POLICY_NUM_DENOISING_STEPS_ACTION": "99",
+        "COSMOS_POLICY_SEED": "99",
+        "COSMOS_POLICY_PRIMARY_IMAGE_KEY": "hostile",
+        "COSMOS_POLICY_WRIST_IMAGE_KEY": "hostile",
+        "MECHANISM_DIAGNOSTICS": "0",
+        "MECHANISM_DIAGNOSTIC_INTERVAL": "999",
+        "MECHANISM_DIAGNOSTIC_SEED": "999",
+        "MECHANISM_DIAGNOSTIC_R": "900",
+        "MECHANISM_DIAGNOSTIC_S": "800",
+        "MECHANISM_DIAGNOSTIC_TEACHER_STEPS": "4",
+        "MECHANISM_COSMOS_T_MIN": "0.1",
+        "MECHANISM_COSMOS_T_MAX": "0.2",
+        "GRADIENT_CHECKPOINTING": "0",
+        "USE_FSDP1": "0",
+        "OPD_AUX_GRADIENT_CHECKPOINTING": "0",
+        "OPD_SERIAL_STUDENT_CFG": "0",
+        "OPD_AUX_EMPTY_CACHE": "0",
+        "COSMOS_TRAIN_STEP_PROFILE": "1",
+        "OPD_PROFILE": "1",
+        "SKIP_TEACHER_COMPILE": "0",
+        "CACHE_DATASET_IN_MEMORY": "1",
+        "COSMOS_POLICY_VALIDATE_WEIGHTS": "0",
+        "ENABLE_LIGHT_EVAL": "1",
+        "ENABLE_ROLLOUT_EVAL": "1",
+        "ENABLE_STAGE1_START_EVAL": "1",
+        "ENABLE_STAGE1_START_EVAL_BASELINE": "1",
+        "STOP_AFTER_STEP": "7",
+        "ATTN_MODE": "hostile",
+        "DATASET_SAMPLE_MANIFEST": "/hostile/manifest.json",
+        "STAGE1_CKPT_NAME": "hostile",
+        "DISTILL_MODE": "hostile",
+        "TEACHER_PATH": "/hostile/teacher",
+        "COSMOS_PROGRESSIVE_RUN_ID": "hostile",
+        "OPD_AUX_VARIANT": "hostile",
+        "OPD_TEACHER_TARGET_MODE": "hostile",
+        "ROLLOUT_STEP_PAIRS": "99,99",
+        "VIDEO_TRANSITION_PARAM": "hostile",
+        "VIDEO_TRANSITION_WEIGHT": "99",
+        "OPD_ENDPOINT_AUX_WEIGHT": "99",
+        "LOCAL_FM_WEIGHT": "99",
+        "OPD_TRANSITION_GROUP_WEIGHT": "99",
+        "OPD_ANCHOR_CAP_RATIO": "99",
+        "OPD_AUX_USE_NOFSDP_ROLLOUT": "1",
+        "ACTION_AWARE_WEIGHT": "99",
+        "GT_REGRESSION_WEIGHT": "99",
+        "ACTION_TRANSITION_PARAM": "hostile",
+        "ACTION_LOCAL_FM_WEIGHT": "99",
+        "ACTION_TRANSITION_BLOCK_WEIGHT": "99",
+        "ACTION_LOCAL_FM_BLOCK_WEIGHT": "99",
+        "LIGHT_EVAL_INTERVAL": "999",
+        "LIGHT_EVAL_NUM_BATCHES": "999",
+        "LIGHT_EVAL_SEED": "999",
+        "LIGHT_EVAL_START_INDEX": "999",
+        "PYTORCH_CUDA_ALLOC_CONF": "hostile",
+        "HF_HOME": "/hostile/hf",
+    }
+    env.update(hostile)
+    output_root = tmp_path / "sealed"
+    result = _run(
+        "universal",
+        "--output-root",
+        str(output_root),
+        "--run-tag",
+        "sealed",
+        "--dry-run",
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    values = _assignments(result.stdout)
+    expected = json.loads(
+        canonical_variant_json(
+            _resolve_for_launcher(
+                env,
+                "universal",
+                output_root=output_root,
+                run_tag="sealed",
+            )
+        )
+    )
+    assert json.loads(values["COSMOS_LIBERO_VARIANT_JSON"]) == expected
+    assert json.loads(values["CONFIG_IDENTITY_JSON"]) == expected
+    for key, canonical in {
+        "BETA1": "0.9",
+        "BETA2": "0.95",
+        "EMA_DECAY": "0.999",
+        "EMA_WARMUP_STEPS": "100",
+        "DROP_TEXT_RATIO": "0.1",
+        "FUSE_GUIDANCE_SCALE": "3.0",
+        "CFG_MIN": "3.0",
+        "CFG_MAX": "3.0",
+        "MAX_GRAD_NORM": "0.3",
+        "WARMUP_STEPS": "100",
+        "NUM_DDIM_TIMESTEPS_ACTION": "1",
+        "DIFFUSION_RATIO": "0.5",
+        "CONSISTENCY_RATIO": "0.25",
+        "FLOWMAP_RATIO": "0.25",
+        "VIDEO_LOSS_WEIGHT": "1.0",
+        "ACTION_LOSS_WEIGHT": "1.0",
+        "ACTION_BLOCK_WEIGHT": "4.0",
+        "COSMOS_POLICY_USE_RAW_INFERENCE": "1",
+        "SKIP_TARGET_STUDENT_FOR_COSMOS_LATENT": "1",
+        "COSMOS_LATENT_CDIFF_LOSS_WEIGHT": "1.0",
+        "COSMOS_LATENT_ENDPOINT_LOSS_WEIGHT": "0.0",
+        "COSMOS_LATENT_EPSILON": "0.001",
+        "COSMOS_LATENT_T_MIN": "0.8",
+        "COSMOS_LATENT_T_MAX": "0.9876543209876543",
+        "COSMOS_LATENT_CHANNELS": "16",
+        "COSMOS_LATENT_FRAMES": "9",
+        "COSMOS_LATENT_HEIGHT": "28",
+        "COSMOS_LATENT_WIDTH": "28",
+        "COSMOS_LATENT_CENTER_VELOCITY_MODE": "symmetric_average",
+        "COSMOS_LATENT_TARGET_MODE": "hybrid_cdiff",
+        "COSMOS_LATENT_CDIFF_INTERVAL": "4",
+        "OPD_ACTION_ROLLOUT_GRAD_MODE": "last_step",
+        "OPD_AUX_INTERVAL": "8",
+        "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR": "1",
+        "OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE": "2e-06",
+        "OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR": "0.5",
+        "OPD_COSMOS_SPATIAL_CROP_SIZE": "28",
+        "COSMOS_USE_TEACHER_ACTION_ANCHOR": "1",
+        "OPD_JOINT_ACTION_ROLLOUT": "1",
+        "MECHANISM_DIAGNOSTICS": "1",
+        "MECHANISM_DIAGNOSTIC_INTERVAL": "100",
+        "MECHANISM_DIAGNOSTIC_SEED": "42",
+        "MECHANISM_DIAGNOSTIC_R": "500",
+        "MECHANISM_DIAGNOSTIC_S": "250",
+        "MECHANISM_DIAGNOSTIC_TEACHER_STEPS": "8",
+        "MECHANISM_COSMOS_T_MIN": "0.8",
+        "MECHANISM_COSMOS_T_MAX": "0.9876543209876543",
+        "GRADIENT_CHECKPOINTING": "1",
+        "USE_FSDP1": "1",
+        "OPD_AUX_GRADIENT_CHECKPOINTING": "1",
+        "OPD_SERIAL_STUDENT_CFG": "1",
+        "OPD_AUX_EMPTY_CACHE": "1",
+        "COSMOS_TRAIN_STEP_PROFILE": "0",
+        "OPD_PROFILE": "0",
+        "SKIP_TEACHER_COMPILE": "1",
+        "CACHE_DATASET_IN_MEMORY": "0",
+        "COSMOS_POLICY_VALIDATE_WEIGHTS": "1",
+        "ENABLE_LIGHT_EVAL": "0",
+        "ENABLE_ROLLOUT_EVAL": "0",
+        "ENABLE_STAGE1_START_EVAL": "0",
+        "ENABLE_STAGE1_START_EVAL_BASELINE": "0",
+        "STOP_AFTER_STEP": "0",
+        "ATTN_MODE": "flex",
+        "DATASET_SAMPLE_MANIFEST": "<unset>",
+        "STAGE1_CKPT_NAME": "<unset>",
+        "DISTILL_MODE": "<unset>",
+        "TEACHER_PATH": "<unset>",
+        "COSMOS_PROGRESSIVE_RUN_ID": "<unset>",
+        "OPD_AUX_VARIANT": "<unset>",
+        "OPD_TEACHER_TARGET_MODE": "<unset>",
+        "ROLLOUT_STEP_PAIRS": "<unset>",
+        "VIDEO_TRANSITION_PARAM": "<unset>",
+        "VIDEO_TRANSITION_WEIGHT": "<unset>",
+        "OPD_ENDPOINT_AUX_WEIGHT": "<unset>",
+        "LOCAL_FM_WEIGHT": "<unset>",
+        "OPD_TRANSITION_GROUP_WEIGHT": "<unset>",
+        "OPD_ANCHOR_CAP_RATIO": "<unset>",
+        "OPD_AUX_USE_NOFSDP_ROLLOUT": "<unset>",
+        "ACTION_AWARE_WEIGHT": "<unset>",
+        "GT_REGRESSION_WEIGHT": "<unset>",
+        "ACTION_TRANSITION_PARAM": "<unset>",
+        "ACTION_LOCAL_FM_WEIGHT": "<unset>",
+        "ACTION_TRANSITION_BLOCK_WEIGHT": "<unset>",
+        "ACTION_LOCAL_FM_BLOCK_WEIGHT": "<unset>",
+        "LIGHT_EVAL_INTERVAL": "1000",
+        "LIGHT_EVAL_NUM_BATCHES": "1",
+        "LIGHT_EVAL_SEED": "42",
+        "LIGHT_EVAL_START_INDEX": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "HF_HOME": "/kpfs-intern/jialongliu/models/cosmos_predict2_5/hf_cache",
+    }.items():
+        assert values[key] == canonical
 
 
 @pytest.mark.parametrize("switch", ("--dry-run", "--check-only"))
@@ -406,7 +652,9 @@ def test_resume_is_allowed_only_from_same_arm_with_same_parent_and_variant_recor
     output_root = tmp_path / "out"
     own = output_root / "resume" / "apm"
     parent = validate_stage1_parent(stage1)
-    own_record = resolve_variant("apm", output_root=output_root, run_tag="resume")
+    own_record = _resolve_for_launcher(
+        env, "apm", output_root=output_root, run_tag="resume"
+    )
     _write_resume_checkpoint(
         own,
         arm="apm",
@@ -420,7 +668,9 @@ def test_resume_is_allowed_only_from_same_arm_with_same_parent_and_variant_recor
     assert result.returncode == 0, result.stderr
     assert _assignments(result.stdout)["RESUME_FROM_PATH"] == str(own / "checkpoints" / "step_100")
 
-    other_record = resolve_variant("anchor_only", output_root=output_root, run_tag="resume")
+    other_record = _resolve_for_launcher(
+        env, "anchor_only", output_root=output_root, run_tag="resume"
+    )
     for student in ("online_student", "target_student"):
         config = own / "checkpoints" / "step_100" / student / "transformer" / "config.json"
         payload = json.loads(config.read_text(encoding="utf-8"))
@@ -438,7 +688,9 @@ def test_resume_rejects_a_changed_supported_scientific_identity(tmp_path):
     output_root = tmp_path / "out"
     own = output_root / "resume" / "apm"
     parent = validate_stage1_parent(stage1)
-    record = resolve_variant("apm", output_root=output_root, run_tag="resume")
+    record = _resolve_for_launcher(
+        env, "apm", output_root=output_root, run_tag="resume"
+    )
     payload = json.loads(canonical_variant_json(record))
     payload["opd_aux_weight"] = 0.25
     changed = json.dumps(payload, sort_keys=True, separators=(",", ":"))

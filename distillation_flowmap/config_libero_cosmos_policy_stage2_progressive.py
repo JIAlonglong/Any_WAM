@@ -349,6 +349,106 @@ if _cosmos_libero_variant_payload is not None:
         "opd_endpoint_focus_prob": cfg.opd_endpoint_focus_prob,
         "opd_danceopd_query_alpha": cfg.opd_danceopd_query_alpha,
         "opd_danceopd_query_beta": cfg.opd_danceopd_query_beta,
+        "opd_aux_interval": cfg.opd_aux_interval,
+        "opd_aux_phase": cfg.opd_aux_phase,
+        "opd_action_rollout_grad_mode": cfg.opd_action_rollout_grad_mode,
+        "opd_danceopd_verify_terminal_prior": (
+            cfg.opd_danceopd_verify_terminal_prior
+        ),
+        "opd_danceopd_terminal_prior_tolerance": (
+            cfg.opd_danceopd_terminal_prior_tolerance
+        ),
+        "opd_danceopd_terminal_prior_warn_factor": (
+            cfg.opd_danceopd_terminal_prior_warn_factor
+        ),
+        "opd_cosmos_spatial_crop_size": cfg.opd_cosmos_spatial_crop_size,
+        "opd_joint_action_rollout": cfg.opd_joint_action_rollout,
+        "cosmos_use_teacher_action_anchor": (
+            cfg.cosmos_use_teacher_action_anchor
+        ),
+        "diffusion_ratio": cfg.diffusion_ratio,
+        "consistency_ratio": cfg.consistency_ratio,
+        "flowmap_ratio": cfg.flowmap_ratio,
+        "video_loss_weight": cfg.video_loss_weight,
+        "action_loss_weight": cfg.action_loss_weight,
+        "action_block_weight": cfg.action_block_weight,
+        "beta1": cfg.beta1,
+        "beta2": cfg.beta2,
+        "ema_decay": cfg.ema_decay,
+        "ema_warmup_steps": cfg.ema_warmup_steps,
+        "drop_text_ratio": cfg.drop_text_ratio,
+        "fuse_guidance_scale": cfg.fuse_guidance_scale,
+        "cfg_min": cfg.cfg_min,
+        "cfg_max": cfg.cfg_max,
+        "max_grad_norm": cfg.max_grad_norm,
+        "warmup_steps": cfg.warmup_steps,
+        "num_ddim_timesteps_action": cfg.num_ddim_timesteps_action,
+        "cosmos_policy_use_raw_inference": cfg.cosmos_policy_use_raw_inference,
+        "skip_target_student_for_cosmos_latent": (
+            cfg.skip_target_student_for_cosmos_latent
+        ),
+        "cosmos_latent_cdiff_loss_weight": cfg.cosmos_latent_cdiff_loss_weight,
+        "cosmos_latent_endpoint_loss_weight": (
+            cfg.cosmos_latent_endpoint_loss_weight
+        ),
+        "cosmos_latent_epsilon": cfg.cosmos_latent_epsilon,
+        "cosmos_latent_t_min": cfg.cosmos_latent_t_min,
+        "cosmos_latent_t_max": cfg.cosmos_latent_t_max,
+        "cosmos_latent_channels": cfg.cosmos_latent_channels,
+        "cosmos_latent_frames": cfg.cosmos_latent_frames,
+        "cosmos_latent_height": cfg.cosmos_latent_height,
+        "cosmos_latent_width": cfg.cosmos_latent_width,
+        "cosmos_latent_center_velocity_mode": (
+            cfg.cosmos_latent_center_velocity_mode
+        ),
+        "cosmos_latent_target_mode": cfg.cosmos_latent_target_mode,
+        "cosmos_latent_cdiff_interval": cfg.cosmos_latent_cdiff_interval,
+        "mechanism_diagnostics": _env_bool("MECHANISM_DIAGNOSTICS", True),
+        "mechanism_diagnostic_interval": int(
+            os.environ["MECHANISM_DIAGNOSTIC_INTERVAL"]
+        ),
+        "mechanism_diagnostic_seed": int(
+            os.environ["MECHANISM_DIAGNOSTIC_SEED"]
+        ),
+        "mechanism_diagnostic_r": int(
+            os.environ["MECHANISM_DIAGNOSTIC_R"]
+        ),
+        "mechanism_diagnostic_s": int(
+            os.environ["MECHANISM_DIAGNOSTIC_S"]
+        ),
+        "mechanism_diagnostic_teacher_steps": int(
+            os.environ["MECHANISM_DIAGNOSTIC_TEACHER_STEPS"]
+        ),
+        "mechanism_cosmos_t_min": float(os.environ["MECHANISM_COSMOS_T_MIN"]),
+        "mechanism_cosmos_t_max": float(os.environ["MECHANISM_COSMOS_T_MAX"]),
+        "dataset_path": str(Path(cfg.dataset_path).resolve(strict=False)),
+        "dataset_sample_manifest": cfg.dataset_sample_manifest,
+        "teacher_model_path": str(
+            Path(cfg.teacher_model_path).resolve(strict=False)
+        ),
+        "cosmos_video_vae_model_path": str(
+            Path(cfg.cosmos_video_vae_model_path).resolve(strict=False)
+        ),
+        "cosmos_policy_repo": str(
+            Path(cfg.cosmos_policy_repo).resolve(strict=False)
+        ),
+        "cosmos_policy_python": str(
+            Path(cfg.cosmos_policy_python).resolve(strict=False)
+        ),
+        "cosmos_policy_extra_pythonpath": cfg.cosmos_policy_extra_pythonpath,
+        "cosmos_policy_local_model_dir": str(
+            Path(cfg.cosmos_policy_local_model_dir).resolve(strict=False)
+        ),
+        "cosmos_policy_config_name": cfg.cosmos_policy_config_name,
+        "cosmos_policy_config_file": cfg.cosmos_policy_config_file,
+        "cosmos_policy_num_denoising_steps_action": (
+            cfg.cosmos_policy_num_denoising_steps_action
+        ),
+        "cosmos_policy_seed": cfg.cosmos_policy_seed,
+        "cosmos_policy_primary_image_key": cfg.raw_primary_image_key,
+        "cosmos_policy_wrist_image_key": cfg.raw_wrist_image_key,
+        "cosmos_policy_inference_mode": cfg.cosmos_policy_inference_mode,
+        "attention_mode": os.environ["ATTN_MODE"],
         "train_seed": int(os.environ["TRAIN_SEED"]),
         "tensorboard_enabled": _env_bool("ENABLE_TENSORBOARD", True),
         "enable_wandb": cfg.enable_wandb,

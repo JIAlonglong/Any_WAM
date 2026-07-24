@@ -169,6 +169,12 @@ def _coefficient(value: object, *, label: str) -> float:
     return float(value)
 
 
+def _canonical_optional_path(value: str | Path | None) -> str | None:
+    if value is None:
+        return None
+    return str(Path(value).resolve(strict=False))
+
+
 def load_video_apm_variants(
     path: str | Path = APM_VARIANTS_PATH,
 ) -> Mapping[str, Mapping[str, object]]:
@@ -252,6 +258,14 @@ def resolve_variant(
     save_interval: int = 1000,
     master_port: int | None = None,
     output_dir: str | Path | None = None,
+    dataset_path: str | Path | None = None,
+    teacher_model_path: str | Path | None = None,
+    cosmos_video_vae_model_path: str | Path | None = None,
+    cosmos_policy_repo: str | Path | None = None,
+    cosmos_policy_python: str | Path | None = None,
+    cosmos_policy_extra_pythonpath: str | None = None,
+    cosmos_policy_local_model_dir: str | Path | None = None,
+    attention_mode: str = "flex",
 ) -> FrozenVariant:
     """Resolve one arm without creating, modifying, or probing output paths."""
 
@@ -299,6 +313,78 @@ def resolve_variant(
         "opd_endpoint_focus_prob": spec["opd_endpoint_focus_prob"],
         "opd_danceopd_query_alpha": 5.0,
         "opd_danceopd_query_beta": 2.0,
+        "opd_aux_interval": 8,
+        "opd_aux_phase": 2,
+        "opd_action_rollout_grad_mode": spec["opd_rollout_grad_mode"],
+        "opd_danceopd_verify_terminal_prior": True,
+        "opd_danceopd_terminal_prior_tolerance": 2e-6,
+        "opd_danceopd_terminal_prior_warn_factor": 0.5,
+        "opd_cosmos_spatial_crop_size": 28,
+        "opd_joint_action_rollout": True,
+        "cosmos_use_teacher_action_anchor": True,
+        "diffusion_ratio": 0.5,
+        "consistency_ratio": 0.25,
+        "flowmap_ratio": 0.25,
+        "video_loss_weight": 1.0,
+        "action_loss_weight": 1.0,
+        "action_block_weight": 4.0,
+        "beta1": 0.9,
+        "beta2": 0.95,
+        "ema_decay": 0.999,
+        "ema_warmup_steps": 100,
+        "drop_text_ratio": 0.1,
+        "fuse_guidance_scale": 3.0,
+        "cfg_min": 3.0,
+        "cfg_max": 3.0,
+        "max_grad_norm": 0.3,
+        "warmup_steps": 100,
+        "num_ddim_timesteps_action": 1,
+        "cosmos_policy_use_raw_inference": True,
+        "skip_target_student_for_cosmos_latent": True,
+        "cosmos_latent_cdiff_loss_weight": 1.0,
+        "cosmos_latent_endpoint_loss_weight": 0.0,
+        "cosmos_latent_epsilon": 0.001,
+        "cosmos_latent_t_min": 4.0 / 5.0,
+        "cosmos_latent_t_max": 80.0 / 81.0,
+        "cosmos_latent_channels": 16,
+        "cosmos_latent_frames": 9,
+        "cosmos_latent_height": 28,
+        "cosmos_latent_width": 28,
+        "cosmos_latent_center_velocity_mode": "symmetric_average",
+        "cosmos_latent_target_mode": "hybrid_cdiff",
+        "cosmos_latent_cdiff_interval": 4,
+        "mechanism_diagnostics": True,
+        "mechanism_diagnostic_interval": 100,
+        "mechanism_diagnostic_seed": 42,
+        "mechanism_diagnostic_r": 500,
+        "mechanism_diagnostic_s": 250,
+        "mechanism_diagnostic_teacher_steps": 8,
+        "mechanism_cosmos_t_min": 4.0 / 5.0,
+        "mechanism_cosmos_t_max": 80.0 / 81.0,
+        "dataset_path": _canonical_optional_path(dataset_path),
+        "dataset_sample_manifest": None,
+        "teacher_model_path": _canonical_optional_path(teacher_model_path),
+        "cosmos_video_vae_model_path": _canonical_optional_path(
+            cosmos_video_vae_model_path
+        ),
+        "cosmos_policy_repo": _canonical_optional_path(cosmos_policy_repo),
+        "cosmos_policy_python": _canonical_optional_path(cosmos_policy_python),
+        "cosmos_policy_extra_pythonpath": cosmos_policy_extra_pythonpath,
+        "cosmos_policy_local_model_dir": _canonical_optional_path(
+            cosmos_policy_local_model_dir
+        ),
+        "cosmos_policy_config_name": "cosmos_predict2_2b_480p_libero__inference_only",
+        "cosmos_policy_config_file": (
+            "cosmos_predict2/_src/predict2/cosmos_policy/config/config.py"
+        ),
+        "cosmos_policy_num_denoising_steps_action": 5,
+        "cosmos_policy_seed": 1,
+        "cosmos_policy_primary_image_key": "observation.images.agentview_rgb",
+        "cosmos_policy_wrist_image_key": (
+            "observation.images.eye_in_hand_rgb"
+        ),
+        "cosmos_policy_inference_mode": "subprocess",
+        "attention_mode": attention_mode,
         "train_seed": 42,
         "tensorboard_enabled": True,
         "enable_wandb": False,

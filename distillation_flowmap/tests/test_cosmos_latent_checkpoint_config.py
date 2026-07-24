@@ -62,7 +62,9 @@ def test_cosmos_latent_stage2_defaults_are_memory_safe(monkeypatch):
     assert module.cfg.opd_transition_group_weight <= 1e-2
 
 
-def test_stage_configs_identify_their_persisted_training_contract():
+def test_stage_configs_identify_their_persisted_training_contract(monkeypatch):
+    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/explicit/cosmos-base")
+    monkeypatch.setenv("RESUME_FROM_PATH", "/explicit/cosmos-stage1")
     stage1 = importlib.import_module(
         "distillation_flowmap.config_libero_cosmos_policy_stage1"
     )

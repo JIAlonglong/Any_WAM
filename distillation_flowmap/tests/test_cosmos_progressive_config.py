@@ -1,7 +1,10 @@
 import importlib
 import os
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -10,6 +13,58 @@ WANVA_DIR = os.path.join(REPO_ROOT, "wan_va")
 for path in (FLOWMAP_DIR, WANVA_DIR):
     if path not in sys.path:
         sys.path.insert(0, path)
+
+
+@pytest.fixture(autouse=True)
+def _explicit_cosmos_paths(monkeypatch):
+    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/explicit/cosmos-base")
+    monkeypatch.setenv("RESUME_FROM_PATH", "/explicit/cosmos-stage1")
+
+
+@pytest.mark.parametrize(
+    "missing", ["STUDENT_BASE_MODEL_PATH", "RESUME_FROM_PATH"]
+)
+def test_progressive_config_requires_explicit_cosmos_paths(missing):
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONPATH": REPO_ROOT,
+            "STUDENT_BASE_MODEL_PATH": "/explicit/cosmos-base",
+            "RESUME_FROM_PATH": "/explicit/cosmos-stage1",
+        }
+    )
+    env.pop(missing)
+
+    result = subprocess.run(
+        [
+            "/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python",
+            "-c",
+            "import distillation_flowmap.config_libero_cosmos_policy_stage2_progressive",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert missing in result.stderr
+
+
+def test_progressive_sources_have_no_forbidden_legacy_path_fallbacks():
+    config = (
+        Path(__file__).resolve().parents[1]
+        / "config_libero_cosmos_policy_stage2_progressive.py"
+    ).read_text(encoding="utf-8")
+    launcher = (
+        Path(__file__).resolve().parents[1]
+        / "run_cosmos_progressive_stage2_8gpu.sh"
+    ).read_text(encoding="utf-8")
+
+    for source in (config, launcher):
+        assert "/root/nas" not in source
+        assert "lingbot-va/checkpoints" not in source.lower()
 
 
 def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):

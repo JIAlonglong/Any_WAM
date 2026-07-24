@@ -19,6 +19,7 @@ RAW_CONTRACT = {
     "action_packing_schema": "downsample_survivor_v2",
     "action_downsample_factor": 4,
     "action_chunk_shape": [4, 4],
+    "teacher_backend": "cosmos_policy",
 }
 STAGE2_CONTRACT = {
     "contract_version": 2,
@@ -53,11 +54,12 @@ def _stage1(tmp_path: Path, *, name: str = "corrected-stage1") -> Path:
 def _stage2(tmp_path: Path, *, step: int = 1000) -> tuple[Path, Path]:
     arm_root = tmp_path / "stage2-arm"
     checkpoint = arm_root / "checkpoints" / f"step_{step}"
-    _transformer(
-        checkpoint / "online_student" / "transformer",
-        STAGE2_CONTRACT,
-        step,
-    )
+    for variant in ("online_student", "target_student"):
+        _transformer(
+            checkpoint / variant / "transformer",
+            STAGE2_CONTRACT,
+            step,
+        )
     (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
     (checkpoint / "lr_scheduler.pt").write_bytes(b"scheduler")
     return arm_root, checkpoint

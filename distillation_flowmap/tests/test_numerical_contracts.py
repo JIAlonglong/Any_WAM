@@ -302,6 +302,8 @@ def test_shared_configs_preserve_explicit_tolerance_override(
     monkeypatch, module_name
 ):
     _flowmap_step_module()
+    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/explicit/cosmos-base")
+    monkeypatch.setenv("RESUME_FROM_PATH", "/explicit/cosmos-stage1")
     monkeypatch.setenv("OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE", "4e-6")
     monkeypatch.setenv("OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR", "0.75")
     sys.modules.pop(module_name, None)
@@ -321,6 +323,8 @@ def test_shared_configs_preserve_explicit_tolerance_override(
 )
 def test_shared_configs_reject_invalid_tolerance(monkeypatch, module_name):
     _flowmap_step_module()
+    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/explicit/cosmos-base")
+    monkeypatch.setenv("RESUME_FROM_PATH", "/explicit/cosmos-stage1")
     monkeypatch.setenv("OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE", "nan")
     sys.modules.pop(module_name, None)
     with pytest.raises(ValueError, match="TERMINAL_PRIOR_TOLERANCE"):

@@ -91,18 +91,23 @@ if _stage not in _stage_specs:
     )
 _spec = _stage_specs[_stage]
 
-_stage1_checkpoint = (
-    "/root/nas/junjie/jj/Any_WAM/distillation_flowmap/"
-    "output_libero_cosmos_policy_stage1_cosmos_latent_cdiff_8gpu_20260706_"
-    "cosmos_latent_s1s2_8gpu/checkpoints/step_5000"
-)
 _run_id = os.environ.get("COSMOS_PROGRESSIVE_RUN_ID", "20260714")
 _output_root = os.environ.get(
     "COSMOS_PROGRESSIVE_OUTPUT_ROOT",
     os.path.join(_this_dir, f"output_libero_cosmos_policy_stage2_progressive_{_run_id}"),
 )
 
-cfg.resume_from_path = os.environ.get("RESUME_FROM_PATH", _stage1_checkpoint)
+if not os.environ.get("STUDENT_BASE_MODEL_PATH"):
+    raise ValueError("STUDENT_BASE_MODEL_PATH must be explicitly set")
+if not os.environ.get("RESUME_FROM_PATH"):
+    raise ValueError("RESUME_FROM_PATH must be explicitly set")
+cfg.student_base_model_path = os.environ["STUDENT_BASE_MODEL_PATH"]
+cfg.resume_from_path = os.environ["RESUME_FROM_PATH"]
+cfg.parent_stage1_path = os.environ.get("PARENT_STAGE1_PATH")
+cfg.parent_stage1_contract_identity = os.environ.get(
+    "PARENT_STAGE1_CONTRACT_IDENTITY"
+)
+cfg.stage2_lineage_json = os.environ.get("STAGE2_LINEAGE_JSON")
 cfg.resume_online_from_target = _env_bool("RESUME_ONLINE_FROM_TARGET", False)
 cfg.reset_resume_step = _env_bool("RESET_RESUME_STEP", True)
 cfg.resume_optimizer_state = _env_bool("RESUME_OPTIMIZER_STATE", False)

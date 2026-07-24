@@ -172,6 +172,10 @@ def validate_stage1_parent(
         config = transformer / "config.json"
         exact, payload = _read_json_object(config, label=f"{variant} config.json")
         validate_contract_metadata(payload, required_stage="raw_stage1")
+        if payload.get("teacher_backend") != "cosmos_policy":
+            raise ValueError(
+                f"{variant} teacher_backend must be exactly 'cosmos_policy'"
+            )
         _validate_step(payload, expected_step=expected_step, label=variant)
         contract = _contract_payload(payload)
         weights = _validate_weights(transformer, label=variant)
@@ -215,7 +219,11 @@ def validate_stage1_parent(
 
 
 def validate_stage2_resume(
-    checkpoint: Path, *, arm_root: Path, expected_step: int
+    checkpoint: Path,
+    *,
+    arm_root: Path,
+    expected_step: int,
+    expected_parent: ValidatedStage1Parent | None = None,
 ) -> Path:
     checkpoint = Path(checkpoint)
     arm_root = Path(arm_root)
@@ -237,16 +245,44 @@ def validate_stage2_resume(
             f"Stage-2 checkpoint must be exactly below {canonical_checkpoints_root}"
         )
 
-    online = checkpoint / "online_student"
-    transformer = online / "transformer"
-    _require_plain_directory(online, label="online_student")
-    _require_plain_directory(transformer, label="online_student/transformer")
-    _, payload = _read_json_object(
-        transformer / "config.json", label="online_student config.json"
-    )
-    validate_contract_metadata(payload, required_stage="progressive_stage2")
-    _validate_step(payload, expected_step=expected_step, label="online_student")
-    _validate_weights(transformer, label="online_student")
+    payloads: dict[str, dict[str, object]] = {}
+    controlled: dict[str, tuple[Path, ...]] = {}
+    for variant in ("online_student", "target_student"):
+        component = checkpoint / variant
+        transformer = component / "transformer"
+        config = transformer / "config.json"
+        _require_plain_directory(component, label=variant)
+        _require_plain_directory(transformer, label=f"{variant}/transformer")
+        _, payload = _read_json_object(
+            config, label=f"{variant} config.json"
+        )
+        validate_contract_metadata(payload, required_stage="progressive_stage2")
+        _validate_step(payload, expected_step=expected_step, label=variant)
+        weights = _validate_weights(transformer, label=variant)
+        payloads[variant] = payload
+        controlled[variant] = (component, transformer, config, *weights)
+        if expected_parent is not None:
+            if payload.get("parent_stage1_path") != expected_parent.canonical_path:
+                raise ValueError(
+                    f"{variant} parent_stage1_path does not match validated parent"
+                )
+            if (
+                payload.get("parent_stage1_contract_identity")
+                != expected_parent.contract_identity
+            ):
+                raise ValueError(
+                    f"{variant} parent_stage1_contract_identity does not match "
+                    "validated parent"
+                )
+    if _contract_payload(payloads["online_student"]) != _contract_payload(
+        payloads["target_student"]
+    ):
+        raise ValueError("online and target Stage-2 contract payloads must match")
+    shared = _inode_map(controlled["online_student"]).keys() & _inode_map(
+        controlled["target_student"]
+    ).keys()
+    if shared:
+        raise ValueError("online_student and target_student must be independent")
     _require_plain_file(checkpoint / "optimizer.pt", label="optimizer.pt")
     _require_plain_file(checkpoint / "lr_scheduler.pt", label="lr_scheduler.pt")
     return canonical_checkpoint

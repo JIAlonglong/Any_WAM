@@ -66,8 +66,12 @@ print_assignment() {
 
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-STAGE1_ROOT="${COSMOS_STAGE1_ROOT:-/kpfs-intern/jialongliu/models/modelscope/JIAlonglong/any-wam-cosmos-checkpoints/raw_stage1_5000}"
-STUDENT_BASE_MODEL_PATH="${STUDENT_BASE_MODEL_PATH:-${STAGE1_ROOT}/target_student}"
+[[ -n "${COSMOS_STAGE1_ROOT:-}" ]] || die \
+    "COSMOS_STAGE1_ROOT must be explicitly set"
+[[ -n "${STUDENT_BASE_MODEL_PATH:-}" ]] || die \
+    "STUDENT_BASE_MODEL_PATH must be explicitly set"
+STAGE1_ROOT="$COSMOS_STAGE1_ROOT"
+STUDENT_BASE_MODEL_PATH="$STUDENT_BASE_MODEL_PATH"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_cosmos_independent_dance_4way_8gpu_20260721}"
 DATASET_PATH="${DATASET_PATH:-/kpfs-intern/jialongliu/projects/Flash-WAM/training_data/libero-long-lerobot}"
 COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B}"
@@ -79,6 +83,7 @@ COSMOS_WORKER_SITE_PACKAGES="${COSMOS_WORKER_SITE_PACKAGES:-${COSMOS_WORKER_ENV_
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES="${COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES:-$CUDA_VISIBLE_DEVICES}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
+PREFLIGHT_BIN="${PREFLIGHT_BIN:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python}"
 
 stage="${1:-}"
 if (( $# > 0 )); then
@@ -163,7 +168,7 @@ esac
 master_port="${master_port:-$default_port}"
 validate_port "$master_port"
 MASTER_PORT="$master_port"
-output_dir="$OUTPUT_ROOT/$stage"
+output_dir="${OUTPUT_DIR:-$OUTPUT_ROOT/$stage}"
 
 validate_devices CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES"
 validate_devices COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES \
@@ -184,36 +189,79 @@ else
     require_transformer STUDENT_BASE_MODEL_PATH \
         "$STUDENT_BASE_MODEL_PATH/transformer"
 fi
+expected_student_base="$STAGE1_ROOT/target_student"
+[[ "$(cd "$STUDENT_BASE_MODEL_PATH" && pwd -P)" == \
+   "$(cd "$expected_student_base" && pwd -P)" ]] || die \
+    "STUDENT_BASE_MODEL_PATH must identify validated Stage-1 target_student"
 
 if [[ -n "$resume_step" ]]; then
     [[ "$resume_step" =~ ^[1-9][0-9]*$ ]] && (( resume_step < max_steps )) || die \
         "resume step must be in [1, $((max_steps - 1))]"
     resume_from_path="$output_dir/checkpoints/step_$resume_step"
-    require_transformer "resume online_student/transformer" \
-        "$resume_from_path/online_student/transformer"
-    require_file resume_optimizer "$resume_from_path/optimizer.pt"
     resume_online_from_target=0
     reset_resume_step=0
     resume_optimizer_state=1
 else
-    if [[ -e "$output_dir/checkpoints" ]]; then
-        [[ -d "$output_dir/checkpoints" ]] || die \
-            "fresh checkpoint path is not a directory: $output_dir/checkpoints"
-        # A failed run can create this directory before its first checkpoint.
-        # Preserve its logs and allow a safe fresh restart only while it is empty.
-        checkpoint_entry="$(find "$output_dir/checkpoints" -mindepth 1 -maxdepth 1 -print -quit)" || die \
-            "cannot inspect fresh checkpoint path: $output_dir/checkpoints"
-        [[ -z "$checkpoint_entry" ]] || die \
-            "Refusing fresh run with existing checkpoints: $output_dir/checkpoints"
-    fi
     resume_from_path="$STAGE1_ROOT"
     resume_online_from_target=1
     reset_resume_step=1
     resume_optimizer_state=0
-    require_transformer "Stage-1 online_student/transformer" \
-        "$resume_from_path/online_student/transformer"
-    require_transformer "Stage-1 target_student/transformer" \
-        "$resume_from_path/target_student/transformer"
+fi
+
+lineage_code='import json, os, sys
+from pathlib import Path
+from distillation_flowmap.cosmos_stage2_lineage import (
+    validate_stage1_parent,
+    validate_stage2_path_isolation,
+    validate_stage2_resume,
+)
+stage1 = Path(os.environ["COSMOS_STAGE1_ROOT"])
+output = Path(os.environ["OUTPUT_DIR"])
+resume_raw = os.environ.get("STAGE2_RESUME_CHECKPOINT", "")
+resume = Path(resume_raw) if resume_raw else None
+parent = validate_stage1_parent(stage1, expected_step=5000)
+validate_stage2_path_isolation(
+    stage1_root=stage1,
+    output_dir=output,
+    resume_checkpoint=resume,
+)
+if resume is not None:
+    validate_stage2_resume(
+        resume,
+        arm_root=output,
+        expected_step=int(os.environ["STAGE2_RESUME_STEP"]),
+        expected_parent=parent,
+    )
+payload = {
+    "parent_stage1_path": parent.canonical_path,
+    "parent_stage1_contract_identity": parent.contract_identity,
+}
+print("PARENT_STAGE1_PATH=" + parent.canonical_path)
+print("PARENT_STAGE1_CONTRACT_IDENTITY=" + parent.contract_identity)
+print("STAGE2_LINEAGE_JSON=" + json.dumps(payload, sort_keys=True, separators=(",", ":")))'
+lineage_output="$(
+    cd "$PROJECT_ROOT"
+    env \
+        COSMOS_STAGE1_ROOT="$STAGE1_ROOT" \
+        OUTPUT_DIR="$output_dir" \
+        STAGE2_RESUME_CHECKPOINT="${resume_step:+$resume_from_path}" \
+        STAGE2_RESUME_STEP="${resume_step:-0}" \
+        PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
+        "$PREFLIGHT_BIN" -c "$lineage_code"
+)" || die "Stage-2 lineage preflight failed"
+while IFS='=' read -r key value; do
+    case "$key" in
+        PARENT_STAGE1_PATH|PARENT_STAGE1_CONTRACT_IDENTITY|STAGE2_LINEAGE_JSON)
+            printf -v "$key" '%s' "$value"
+            export "$key"
+            ;;
+        *) die "unexpected lineage preflight output: $key" ;;
+    esac
+done <<< "$lineage_output"
+if [[ -z "$resume_step" ]]; then
+    [[ ! -e "$output_dir" && ! -L "$output_dir" ]] || die \
+        "Refusing fresh run with existing OUTPUT_DIR: $output_dir"
 fi
 
 COSMOS_POLICY_EXTRA_PYTHONPATH="${COSMOS_POLICY_EXTRA_PYTHONPATH:-$COSMOS_PREDICT2_REPO/packages/cosmos-cuda:$COSMOS_PREDICT2_REPO/packages/cosmos-oss}"
@@ -289,6 +337,9 @@ for key in \
     COSMOS_USE_TEACHER_ACTION_ANCHOR \
     OPD_JOINT_ACTION_ROLLOUT \
     STUDENT_BASE_MODEL_PATH \
+    PARENT_STAGE1_PATH \
+    PARENT_STAGE1_CONTRACT_IDENTITY \
+    STAGE2_LINEAGE_JSON \
     CUDA_VISIBLE_DEVICES \
     COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES; do
     print_assignment "$key" "${!key}"
@@ -304,6 +355,10 @@ if (( dry_run )); then
     exit 0
 fi
 
-mkdir -p "$output_dir"
+output_parent="$(dirname "$output_dir")"
+mkdir -p "$output_parent"
+if [[ -z "$resume_step" ]]; then
+    mkdir "$output_dir" || die "failed to atomically claim OUTPUT_DIR: $output_dir"
+fi
 cd "$PROJECT_ROOT"
 exec "${train_cmd[@]}"

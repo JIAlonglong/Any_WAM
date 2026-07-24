@@ -1,27 +1,56 @@
+import json
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from distillation_flowmap.cosmos_stage2_lineage import validate_stage1_parent
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "distillation_flowmap" / "run_cosmos_progressive_stage2_8gpu.sh"
 DEVICES = "0,1,2,3,4,5,6,7"
+RAW_CONTRACT = {
+    "contract_version": 2,
+    "training_contract_stage": "raw_stage1",
+    "action_packing_schema": "downsample_survivor_v2",
+    "action_downsample_factor": 4,
+    "action_chunk_shape": [4, 4],
+    "checkpoint_step": 5000,
+    "teacher_backend": "cosmos_policy",
+}
+STAGE2_CONTRACT = {
+    "contract_version": 2,
+    "training_contract_stage": "progressive_stage2",
+    "action_packing_schema": "downsample_survivor_v2",
+    "action_downsample_factor": 4,
+    "action_chunk_shape": [4, 4],
+    "deployment_timestep_start": 1000,
+    "deployment_timestep_end": 0,
+    "joint_student_steps": [1, 2, 4],
+    "deployment_joint_rollout_interval": 4,
+    "deployment_action_weight": 1.0,
+    "raw_teacher_window_is_auxiliary": True,
+    "teacher_backend": "cosmos_policy",
+}
 
 
-def _transformer(root: Path) -> Path:
+def _transformer(root: Path, payload: dict | None = None) -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    (root / "config.json").write_text('{"checkpoint_step": 1000}\n', encoding="utf-8")
+    (root / "config.json").write_text(
+        json.dumps(payload or RAW_CONTRACT) + "\n", encoding="utf-8"
+    )
     (root / "diffusion_pytorch_model.safetensors").write_bytes(b"test")
     return root
 
 
 def _layout(tmp_path: Path):
     stage1 = tmp_path / "stage1"
-    _transformer(stage1 / "target_student" / "transformer")
-    (stage1 / "online_student").symlink_to("target_student", target_is_directory=True)
+    for variant in ("online_student", "target_student"):
+        _transformer(stage1 / variant / "transformer")
 
     output = tmp_path / "output"
     dataset = tmp_path / "dataset"
@@ -46,6 +75,7 @@ def _env(tmp_path: Path):
     env.update(
         {
             "COSMOS_STAGE1_ROOT": str(stage1),
+            "STUDENT_BASE_MODEL_PATH": str(stage1 / "target_student"),
             "OUTPUT_ROOT": str(output),
             "DATASET_PATH": str(dataset),
             "COSMOS_POLICY_PATH": str(policy),
@@ -57,6 +87,22 @@ def _env(tmp_path: Path):
         }
     )
     return env, output
+
+
+def _resume_checkpoint(env, output: Path, stage: str, step: int) -> Path:
+    checkpoint = output / stage / "checkpoints" / f"step_{step}"
+    parent = validate_stage1_parent(Path(env["COSMOS_STAGE1_ROOT"]))
+    payload = {
+        **STAGE2_CONTRACT,
+        "checkpoint_step": step,
+        "parent_stage1_path": parent.canonical_path,
+        "parent_stage1_contract_identity": parent.contract_identity,
+    }
+    for variant in ("online_student", "target_student"):
+        _transformer(checkpoint / variant / "transformer", payload)
+    (checkpoint / "optimizer.pt").write_bytes(b"test")
+    (checkpoint / "lr_scheduler.pt").write_bytes(b"test")
+    return checkpoint
 
 
 def _run(*args: str, env: dict[str, str]):
@@ -153,14 +199,80 @@ def test_dual_universal_video_modes_are_a_paired_cosmos_loss_ablation(tmp_path):
         assert video[key] == video_action[key]
 
 
-def test_s4_dry_run_rejects_missing_target_to_online_compatibility_link(tmp_path):
+def test_s4_dry_run_rejects_missing_online_student(tmp_path):
     env, _ = _env(tmp_path)
-    Path(env["COSMOS_STAGE1_ROOT"]).joinpath("online_student").unlink()
+    shutil.rmtree(Path(env["COSMOS_STAGE1_ROOT"]) / "online_student")
 
     result = _run("s4", "--dry-run", env=env)
 
     assert result.returncode != 0
-    assert "online_student/transformer" in result.stderr
+    assert "online_student" in result.stderr
+
+
+def test_launcher_rejects_missing_explicit_cosmos_base_config(tmp_path):
+    env, _ = _env(tmp_path)
+    (
+        Path(env["STUDENT_BASE_MODEL_PATH"]) / "transformer" / "config.json"
+    ).unlink()
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "config.json" in result.stderr
+
+
+def test_launcher_rejects_non_cosmos_backend(tmp_path):
+    env, _ = _env(tmp_path)
+    for variant in ("online_student", "target_student"):
+        config = (
+            Path(env["COSMOS_STAGE1_ROOT"])
+            / variant
+            / "transformer"
+            / "config.json"
+        )
+        payload = json.loads(config.read_text())
+        payload["teacher_backend"] = "wanva"
+        config.write_text(json.dumps(payload))
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "cosmos_policy" in result.stderr
+
+
+def test_launcher_rejects_base_model_identity_mismatch(tmp_path):
+    env, _ = _env(tmp_path)
+    other = tmp_path / "other-base"
+    _transformer(other / "transformer")
+    env["STUDENT_BASE_MODEL_PATH"] = str(other)
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "STUDENT_BASE_MODEL_PATH" in result.stderr
+
+
+@pytest.mark.parametrize("relation", ["equal", "nested", "contains", "symlink"])
+def test_launcher_rejects_unsafe_output_relation(tmp_path, relation):
+    env, _ = _env(tmp_path)
+    stage1 = Path(env["COSMOS_STAGE1_ROOT"])
+    if relation == "equal":
+        env["OUTPUT_DIR"] = str(stage1)
+    elif relation == "nested":
+        env["OUTPUT_DIR"] = str(stage1 / "stage2")
+    elif relation == "contains":
+        env["OUTPUT_DIR"] = str(tmp_path)
+    else:
+        real = tmp_path / "real-output"
+        real.mkdir()
+        alias = tmp_path / "output-alias"
+        alias.symlink_to(real, target_is_directory=True)
+        env["OUTPUT_DIR"] = str(alias)
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "isolat" in result.stderr.lower() or "symlink" in result.stderr.lower()
 
 
 def test_dry_run_rejects_non_eight_gpu_layout(tmp_path):
@@ -193,13 +305,14 @@ def test_dry_run_rejects_invalid_or_mismatched_worker_gpu_layout(
     assert message in result.stderr
 
 
-def test_dry_run_allows_empty_fresh_checkpoint_root(tmp_path):
+def test_dry_run_rejects_existing_empty_fresh_output(tmp_path):
     env, output = _env(tmp_path)
     (output / "s4" / "checkpoints").mkdir(parents=True)
 
     result = _run("s4", "--dry-run", env=env)
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode != 0
+    assert "existing OUTPUT_DIR" in result.stderr
 
 
 def test_dry_run_rejects_nonempty_fresh_checkpoint_root(tmp_path):
@@ -248,9 +361,7 @@ def test_dry_run_rejects_invalid_port_and_unknown_stage(tmp_path):
 
 def test_resume_step_uses_own_online_checkpoint_and_optimizer(tmp_path):
     env, output = _env(tmp_path)
-    resume = output / "s4" / "checkpoints" / "step_1000"
-    _transformer(resume / "online_student" / "transformer")
-    (resume / "optimizer.pt").write_bytes(b"test")
+    resume = _resume_checkpoint(env, output, "s4", 1000)
 
     result = _run("s4", "--resume-step", "1000", "--dry-run", env=env)
 
@@ -263,10 +374,63 @@ def test_resume_step_uses_own_online_checkpoint_and_optimizer(tmp_path):
 
 def test_resume_step_rejects_missing_optimizer(tmp_path):
     env, output = _env(tmp_path)
-    resume = output / "s4" / "checkpoints" / "step_1000"
-    _transformer(resume / "online_student" / "transformer")
+    resume = _resume_checkpoint(env, output, "s4", 1000)
+    (resume / "optimizer.pt").unlink()
 
     result = _run("s4", "--resume-step", "1000", "--dry-run", env=env)
 
     assert result.returncode != 0
-    assert "resume_optimizer" in result.stderr
+    assert "optimizer.pt" in result.stderr
+
+
+@pytest.mark.parametrize("missing", ["target_student", "lr_scheduler.pt"])
+def test_resume_rejects_missing_target_or_scheduler(tmp_path, missing):
+    env, output = _env(tmp_path)
+    resume = _resume_checkpoint(env, output, "s4", 1000)
+    path = resume / missing
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+    result = _run("s4", "--resume-step", "1000", "--dry-run", env=env)
+
+    assert result.returncode != 0
+    assert missing in result.stderr
+
+
+@pytest.mark.parametrize("mismatch", ["step", "parent"])
+def test_resume_rejects_step_or_parent_identity_mismatch(tmp_path, mismatch):
+    env, output = _env(tmp_path)
+    resume = _resume_checkpoint(env, output, "s4", 1000)
+    for variant in ("online_student", "target_student"):
+        config = resume / variant / "transformer" / "config.json"
+        payload = json.loads(config.read_text())
+        if mismatch == "step":
+            payload["checkpoint_step"] = 999
+        else:
+            payload["parent_stage1_contract_identity"] = "0" * 64
+        config.write_text(json.dumps(payload))
+
+    result = _run("s4", "--resume-step", "1000", "--dry-run", env=env)
+
+    assert result.returncode != 0
+    expected = "checkpoint_step" if mismatch == "step" else "parent"
+    assert expected in result.stderr.lower()
+
+
+def test_dry_run_emits_lineage_and_writes_nothing(tmp_path):
+    env, output = _env(tmp_path)
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assignments = _assignments(result.stdout)
+    assert assignments["PARENT_STAGE1_PATH"] == str(
+        Path(env["COSMOS_STAGE1_ROOT"]).resolve()
+    )
+    assert len(assignments["PARENT_STAGE1_CONTRACT_IDENTITY"]) == 64
+    assert assignments["STAGE2_LINEAGE_JSON"].startswith("{")
+    after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    assert after == before

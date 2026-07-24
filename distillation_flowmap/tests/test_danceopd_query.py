@@ -325,9 +325,12 @@ class DanceOPDQueryTest(unittest.TestCase):
         release_position = cosmos_block.index(
             "del video_states, action_states, video_timesteps, action_timesteps"
         )
-        query_position = cosmos_block.index("student_velocity = _student_joint_forward(")
+        query_position = cosmos_block.index(
+            "student_velocity = self._student_joint_forward("
+        )
 
         self.assertLess(release_position, query_position)
+        self.assertIn("require_action=False", cosmos_block[query_position:])
         self.assertIn("torch.cuda.empty_cache()", cosmos_block)
 
     def test_flowmap_step_has_an_opt_in_danceopd_aux_dispatch(self):

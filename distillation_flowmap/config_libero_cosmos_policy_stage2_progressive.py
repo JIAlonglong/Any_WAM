@@ -314,6 +314,65 @@ cfg.deployment_timestep_end = 0
 cfg.deployment_action_weight = 1.0
 cfg.raw_teacher_window_is_auxiliary = True
 
+# Mechanism diagnostics are observation-only.  R/S retain the public
+# LingBotVA-compatible student action-map times; they are never forwarded to
+# the official Cosmos teacher.  Teacher field queries use only the separately
+# validated normalized Cosmos band below.
+cfg.mechanism_diagnostics = _env_bool("MECHANISM_DIAGNOSTICS", True)
+cfg.mechanism_diagnostic_interval = int(
+    os.environ.get("MECHANISM_DIAGNOSTIC_INTERVAL", 100)
+)
+cfg.mechanism_diagnostic_seed = int(
+    os.environ.get("MECHANISM_DIAGNOSTIC_SEED", 42)
+)
+cfg.mechanism_diagnostic_r = float(
+    os.environ.get("MECHANISM_DIAGNOSTIC_R", 500)
+)
+cfg.mechanism_diagnostic_s = float(
+    os.environ.get("MECHANISM_DIAGNOSTIC_S", 250)
+)
+cfg.mechanism_diagnostic_teacher_steps = int(
+    os.environ.get("MECHANISM_DIAGNOSTIC_TEACHER_STEPS", 8)
+)
+cfg.mechanism_cosmos_t_min = float(
+    os.environ.get("MECHANISM_COSMOS_T_MIN", 4.0 / 5.0)
+)
+cfg.mechanism_cosmos_t_max = float(
+    os.environ.get("MECHANISM_COSMOS_T_MAX", 80.0 / 81.0)
+)
+cfg.mechanism_teacher_joint_available = False
+if cfg.mechanism_diagnostic_interval <= 0:
+    raise ValueError("MECHANISM_DIAGNOSTIC_INTERVAL must be positive")
+if not (
+    math.isfinite(cfg.mechanism_diagnostic_s)
+    and math.isfinite(cfg.mechanism_diagnostic_r)
+    and 0 <= cfg.mechanism_diagnostic_s
+    < cfg.mechanism_diagnostic_r
+    <= cfg.num_train_timesteps
+):
+    raise ValueError(
+        "MECHANISM_DIAGNOSTIC_S and MECHANISM_DIAGNOSTIC_R are student-only "
+        "times and must satisfy 0 <= S < R <= num_train_timesteps"
+    )
+if cfg.mechanism_diagnostic_teacher_steps != 8:
+    raise ValueError(
+        "MECHANISM_DIAGNOSTIC_TEACHER_STEPS must be 8 for the official Cosmos teacher"
+    )
+_mechanism_calibrated_min = 4.0 / 5.0
+_mechanism_calibrated_max = 80.0 / 81.0
+if not (
+    math.isfinite(cfg.mechanism_cosmos_t_min)
+    and math.isfinite(cfg.mechanism_cosmos_t_max)
+    and _mechanism_calibrated_min
+    <= cfg.mechanism_cosmos_t_min
+    < cfg.mechanism_cosmos_t_max
+    <= _mechanism_calibrated_max
+):
+    raise ValueError(
+        "MECHANISM_COSMOS_T_MIN and MECHANISM_COSMOS_T_MAX must stay inside "
+        "the calibrated Cosmos [4/5, 80/81] teacher band"
+    )
+
 # Legacy Cosmos OPD controls remain neutral. The progressive path reports its
 # endpoint and same-state velocity contributions directly.
 cfg.video_transition_param = "velocity"

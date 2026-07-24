@@ -80,6 +80,85 @@ def _import_progressive(env):
     )
 
 
+def _read_progressive_fields(env, fields):
+    process_env = os.environ.copy()
+    process_env.update(env)
+    process_env["PYTHONPATH"] = REPO_ROOT
+    expression = repr(tuple(fields))
+    return subprocess.run(
+        [
+            "/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python",
+            "-c",
+            (
+                "import json\n"
+                "from distillation_flowmap.config_libero_cosmos_policy_stage2_progressive "
+                "import cfg\n"
+                f"print('MECHANISM_JSON=' + json.dumps({{name: getattr(cfg, name) "
+                f"for name in {expression}}}, sort_keys=True))"
+            ),
+        ],
+        cwd=REPO_ROOT,
+        env=process_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_progressive_config_exposes_cosmos_mechanism_defaults(
+    _explicit_cosmos_paths,
+):
+    fields = (
+        "mechanism_diagnostics",
+        "mechanism_diagnostic_interval",
+        "mechanism_diagnostic_seed",
+        "mechanism_diagnostic_r",
+        "mechanism_diagnostic_s",
+        "mechanism_diagnostic_teacher_steps",
+        "mechanism_cosmos_t_min",
+        "mechanism_cosmos_t_max",
+        "mechanism_teacher_joint_available",
+    )
+    result = _read_progressive_fields(_explicit_cosmos_paths["env"], fields)
+    assert result.returncode == 0, result.stderr
+    payload_line = next(
+        line for line in result.stdout.splitlines() if line.startswith("MECHANISM_JSON=")
+    )
+    payload = json.loads(payload_line.removeprefix("MECHANISM_JSON="))
+    assert payload == {
+        "mechanism_diagnostics": True,
+        "mechanism_diagnostic_interval": 100,
+        "mechanism_diagnostic_seed": 42,
+        "mechanism_diagnostic_r": 500.0,
+        "mechanism_diagnostic_s": 250.0,
+        "mechanism_diagnostic_teacher_steps": 8,
+        "mechanism_cosmos_t_min": pytest.approx(4.0 / 5.0),
+        "mechanism_cosmos_t_max": pytest.approx(80.0 / 81.0),
+        "mechanism_teacher_joint_available": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("MECHANISM_DIAGNOSTIC_INTERVAL", "0"),
+        ("MECHANISM_DIAGNOSTIC_TEACHER_STEPS", "0"),
+        ("MECHANISM_DIAGNOSTIC_R", "1001"),
+        ("MECHANISM_DIAGNOSTIC_S", "-1"),
+        ("MECHANISM_COSMOS_T_MIN", "0.5"),
+        ("MECHANISM_COSMOS_T_MAX", "1.0"),
+    ],
+)
+def test_progressive_config_rejects_invalid_mechanism_controls(
+    _explicit_cosmos_paths, name, value
+):
+    env = dict(_explicit_cosmos_paths["env"])
+    env[name] = value
+    result = _import_progressive(env)
+    assert result.returncode != 0
+    assert name in result.stderr
+
+
 @pytest.mark.parametrize(
     "missing", ["STUDENT_BASE_MODEL_PATH", "RESUME_FROM_PATH"]
 )
@@ -504,7 +583,7 @@ def test_cosmos_danceopd_uses_pre_update_compositional_states_and_skips_s1_veloc
         "query_indices = sample_low_noise_query_indices("
     )
     assert capture_position < update_position < query_position
-    assert "return_action=False" in cosmos_dance_block
+    assert "require_action=False" in cosmos_dance_block
     assert "predict_raw_joint_latent_velocity(" in cosmos_dance_block
     assert "masked_video_velocity_mse(" in cosmos_dance_block
     assert "if velocity_weight > 0:" in cosmos_full_block

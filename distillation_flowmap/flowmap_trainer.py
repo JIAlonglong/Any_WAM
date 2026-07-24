@@ -64,7 +64,11 @@ from distillation_flowmap.distributed_safety import (
 )
 from distillation_flowmap.mechanism_diagnostics import (
     MechanismDiagnosticScheduler,
+    diagnostic_seed,
+    diagnostic_runtime,
     fan_out_mechanism_metrics,
+    means_from_reduced_stats,
+    reduce_metric_stats,
 )
 
 try:
@@ -432,10 +436,13 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self._mechanism_diagnostic_scheduler = MechanismDiagnosticScheduler(
             int(getattr(config, "mechanism_diagnostic_interval", 100))
         )
-        # Task 6 installs the backend-specific probe.  Keeping this callback
-        # explicit prevents this backend-neutral trainer hook from guessing at
-        # latent, scheduler, or action representations.
-        self._mechanism_diagnostic_runner = None
+        self._mechanism_diagnostic_batch = None
+        self._mechanism_diagnostic_index = 0
+        self._mechanism_diagnostic_runner = (
+            self._run_cosmos_mechanism_diagnostics
+            if hasattr(self, "_run_cosmos_mechanism_probe")
+            else None
+        )
         self._mechanism_metrics_path = (
             Path(config.output_dir) / "diagnostics" / "mechanism_metrics.jsonl"
         )
@@ -3420,6 +3427,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         if self.step % tb_flush_interval == 0:
                             self.tb_writer.flush()
 
+                if not skipped_optimizer_step:
+                    # Keep the exact successful training sample for the
+                    # observation-only all-rank mechanism probe.
+                    self._mechanism_diagnostic_batch = batch
+
                 self.step += 1
 
                 self._maybe_run_mechanism_diagnostics(
@@ -3490,6 +3502,67 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         if self.tb_writer is not None:
             self.tb_writer.flush()
             self.tb_writer.close()
+
+    def _sync_cosmos_mechanism_preflight(self, local_ready: bool) -> None:
+        status = torch.tensor(
+            [1.0 if local_ready else 0.0], device=self.device
+        )
+        if dist.is_initialized():
+            dist.all_reduce(status, op=dist.ReduceOp.MIN)
+        if status.item() != 1.0:
+            raise RuntimeError(
+                "Cosmos mechanism preflight failed on at least one rank"
+            )
+
+    def _abort_cosmos_mechanism_forward_failure(self, error):
+        if dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+        raise RuntimeError(
+            "Cosmos mechanism forward failed; distributed group aborted"
+        ) from error
+
+    def _run_cosmos_mechanism_diagnostics(self, *, completed_step: int):
+        del completed_step
+        self._sync_cosmos_mechanism_preflight(
+            self._mechanism_diagnostic_batch is not None
+        )
+        diagnostic_index = self._mechanism_diagnostic_index
+        rank = int(getattr(self.config, "rank", 0))
+        seed = diagnostic_seed(
+            int(self.config.mechanism_diagnostic_seed),
+            diagnostic_index,
+            0,
+            rank,
+        )
+        student_steps = deployment_joint_step_for_update(diagnostic_index)
+        models = []
+        seen = set()
+        for name in ("student", "_student_nofsdp", "target_student"):
+            model = getattr(self, name, None)
+            if (
+                isinstance(model, torch.nn.Module)
+                and id(model) not in seen
+            ):
+                seen.add(id(model))
+                models.append(model)
+        try:
+            with diagnostic_runtime(seed=seed, models=tuple(models)):
+                local_stats = self._run_cosmos_mechanism_probe(
+                    self._mechanism_diagnostic_batch,
+                    seed=seed,
+                    teacher_steps=int(
+                        self.config.mechanism_diagnostic_teacher_steps
+                    ),
+                    student_steps=student_steps,
+                )
+        except Exception as error:
+            self._abort_cosmos_mechanism_forward_failure(error)
+        reduced = reduce_metric_stats(local_stats)
+        self._mechanism_diagnostic_index += 1
+        return means_from_reduced_stats(reduced)
 
     def _maybe_run_mechanism_diagnostics(
         self,

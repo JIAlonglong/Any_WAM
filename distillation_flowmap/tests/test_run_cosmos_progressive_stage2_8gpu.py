@@ -151,6 +151,14 @@ def test_dry_run_prints_independent_stage_contract_without_creating_output(
     assert "RESUME_ONLINE_FROM_TARGET=1" in result.stdout
     assert "RESET_RESUME_STEP=1" in result.stdout
     assert "RESUME_OPTIMIZER_STATE=0" in result.stdout
+    assert "MECHANISM_DIAGNOSTICS=1" in result.stdout
+    assert "MECHANISM_DIAGNOSTIC_INTERVAL=100" in result.stdout
+    assert "MECHANISM_DIAGNOSTIC_SEED=42" in result.stdout
+    assert "MECHANISM_DIAGNOSTIC_R=500" in result.stdout
+    assert "MECHANISM_DIAGNOSTIC_S=250" in result.stdout
+    assert "MECHANISM_DIAGNOSTIC_TEACHER_STEPS=8" in result.stdout
+    assert "MECHANISM_COSMOS_T_MIN=0.8" in result.stdout
+    assert "MECHANISM_COSMOS_T_MAX=0.9876543209876543" in result.stdout
     assert f"--master_port={port}" in result.stdout
     assert not (output / stage).exists()
 

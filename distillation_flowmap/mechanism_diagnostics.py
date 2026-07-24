@@ -18,6 +18,9 @@ import torch
 
 
 MECHANISM_RATIO_EPS = 1e-8
+MECHANISM_NEAR_ZERO_THRESHOLD = 1e-10
+MECHANISM_EXPLOSION_THRESHOLD = 1e6
+MECHANISM_DOMINANCE_THRESHOLD = 100.0
 
 
 def squared_l2_per_sample(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
@@ -37,6 +40,23 @@ def masked_action_mse_per_sample(
     if mask is None:
         return squared_error.flatten(1).mean(1)
     expanded_mask = torch.broadcast_to(mask.to(squared_error), squared_error.shape)
+    numerator = (squared_error * expanded_mask).flatten(1).sum(1)
+    denominator = expanded_mask.flatten(1).sum(1).clamp_min(1)
+    return numerator / denominator
+
+
+def masked_video_mse_per_sample(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> torch.Tensor:
+    squared_error = (prediction.float() - target.float()).square()
+    if mask is None:
+        return squared_error.flatten(1).mean(1)
+    expanded_mask = mask.to(device=squared_error.device, dtype=squared_error.dtype)
+    if expanded_mask.ndim == 2 and squared_error.ndim == 5:
+        expanded_mask = expanded_mask[:, None, :, None, None]
+    expanded_mask = torch.broadcast_to(expanded_mask, squared_error.shape)
     numerator = (squared_error * expanded_mask).flatten(1).sum(1)
     denominator = expanded_mask.flatten(1).sum(1).clamp_min(1)
     return numerator / denominator
@@ -66,8 +86,12 @@ def compute_mechanism_metric_samples(
     teacher_endpoint_action: torch.Tensor,
     action_student_context: torch.Tensor,
     action_teacher_video_context: torch.Tensor,
-    action_teacher_joint_context: torch.Tensor,
+    action_teacher_joint_context: torch.Tensor | None,
     action_mask: torch.Tensor | None,
+    student_field_video: torch.Tensor | None = None,
+    teacher_field_video: torch.Tensor | None = None,
+    video_frame_mask: torch.Tensor | None = None,
+    teacher_joint_available: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Return per-sample metrics; callers retain raw non-finite values for validity."""
     anchor = squared_l2_per_sample(teacher_cont_video, teacher_endpoint_video)
@@ -80,12 +104,8 @@ def compute_mechanism_metric_samples(
     action_error_teacher_video = masked_action_mse_per_sample(
         action_teacher_video_context, teacher_endpoint_action, action_mask
     )
-    action_error_teacher_joint = masked_action_mse_per_sample(
-        action_teacher_joint_context, teacher_endpoint_action, action_mask
-    )
     oracle_gain = action_error_student - action_error_teacher_video
-
-    return {
+    result = {
         "mechanism/g_anchor": anchor,
         "mechanism/g_anchor_mse": anchor_mse,
         "mechanism/g_comp": comp,
@@ -94,18 +114,67 @@ def compute_mechanism_metric_samples(
         "mechanism/g_anchor_to_comp_ratio": _finite_safe_divide(
             anchor_mse, comp_mse
         ),
+        "mechanism/video_endpoint_error": squared_l2_per_sample(
+            student_direct_video, teacher_endpoint_video
+        ),
         "mechanism/action_error_student_context": action_error_student,
         "mechanism/action_error_teacher_video_context": action_error_teacher_video,
-        "mechanism/action_error_teacher_joint_context": action_error_teacher_joint,
         "mechanism/video_to_action_oracle_gain": oracle_gain,
-        "mechanism/video_to_action_full_joint_gain": action_error_student
-        - action_error_teacher_joint,
         "mechanism/video_to_action_recoverable_fraction": _finite_safe_divide(
             oracle_gain.clamp_min(0), action_error_student
         ),
-        "mechanism/video_to_action_residual_action_gap": action_error_teacher_video
-        - action_error_teacher_joint,
+        "mechanism/g_anchor_near_zero": (
+            anchor_mse <= MECHANISM_NEAR_ZERO_THRESHOLD
+        ).to(anchor_mse),
+        "mechanism/g_comp_near_zero": (
+            comp_mse <= MECHANISM_NEAR_ZERO_THRESHOLD
+        ).to(comp_mse),
+        "mechanism/g_anchor_exploded": (
+            anchor_mse >= MECHANISM_EXPLOSION_THRESHOLD
+        ).to(anchor_mse),
+        "mechanism/g_comp_exploded": (
+            comp_mse >= MECHANISM_EXPLOSION_THRESHOLD
+        ).to(comp_mse),
+        "mechanism/branch_dominance": (
+            (_finite_safe_divide(anchor_mse, comp_mse) >= MECHANISM_DOMINANCE_THRESHOLD)
+            | (_finite_safe_divide(comp_mse, anchor_mse) >= MECHANISM_DOMINANCE_THRESHOLD)
+        ).to(anchor_mse),
+        "mechanism/teacher_joint_available": torch.full_like(
+            action_error_student, float(bool(teacher_joint_available))
+        ),
     }
+    if student_field_video is not None and teacher_field_video is not None:
+        result["mechanism/video_field_match_error"] = masked_video_mse_per_sample(
+            student_field_video, teacher_field_video, video_frame_mask
+        )
+
+    if teacher_joint_available:
+        if action_teacher_joint_context is None:
+            raise ValueError(
+                "teacher_joint_available=True requires action_teacher_joint_context"
+            )
+        action_error_teacher_joint = masked_action_mse_per_sample(
+            action_teacher_joint_context, teacher_endpoint_action, action_mask
+        )
+        result.update(
+            {
+                "mechanism/action_error_teacher_joint_context": action_error_teacher_joint,
+                "mechanism/video_to_action_full_joint_gain": action_error_student
+                - action_error_teacher_joint,
+                "mechanism/video_to_action_residual_action_gap": action_error_teacher_video
+                - action_error_teacher_joint,
+            }
+        )
+    else:
+        unavailable = action_error_student.new_empty((0,))
+        result.update(
+            {
+                "mechanism/action_error_teacher_joint_context": unavailable,
+                "mechanism/video_to_action_full_joint_gain": unavailable,
+                "mechanism/video_to_action_residual_action_gap": unavailable,
+            }
+        )
+    return result
 
 
 def pack_finite_metric_stats(
@@ -165,8 +234,23 @@ def means_from_reduced_stats(stats: Mapping[str, torch.Tensor]) -> dict[str, flo
         means[metric_name] = total / count if count > 0 else 0.0
     batch_count = float(stats.get("diagnostic_batch_count", torch.tensor(0.0)).item())
     valid_count = float(stats.get("diagnostic_valid_count", torch.tensor(0.0)).item())
+    teacher_joint_available = means.get(
+        "mechanism/teacher_joint_available", 1.0
+    )
+    capability_gated = (
+        {
+            "mechanism/action_error_teacher_joint_context",
+            "mechanism/video_to_action_full_joint_gain",
+            "mechanism/video_to_action_residual_action_gap",
+        }
+        if teacher_joint_available == 0.0
+        else set()
+    )
     every_metric_has_samples = all(
-        float(stats[f"{name.removesuffix('_sum')}_count"].item()) > 0
+        (
+            float(stats[f"{name.removesuffix('_sum')}_count"].item()) > 0
+            or name.removesuffix("_sum") in capability_gated
+        )
         for name in stats
         if name.endswith("_sum")
     )

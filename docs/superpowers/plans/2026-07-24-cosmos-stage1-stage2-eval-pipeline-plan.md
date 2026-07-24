@@ -24,6 +24,11 @@
 - Stage-1 and Stage-2 both use all eight visible GPUs, seed `42`, and `5,000` optimizer steps.
 - Default torchrun ports are Stage-1 `29671` and Stage-2 `29672`.
 - Evaluation is sequential K=1→2→4, 500 records per K, four shards across all eight GPUs, video seeds `0,1`, and 60 saved videos total.
+- Launcher structure follows the proven
+  `run_libero_video_opd_train_eval_8gpu.sh` pattern: command arrays, shared
+  checkout root resolution, strict numeric/port/GPU validation, `--phase
+  train|eval|all`, `--run-tag`, resolved dry-run output, and synchronous
+  train-before-eval failure propagation.
 - `dry-run` creates no files/directories and starts no child process; `status` is read-only.
 - A different immutable run identity, incomplete checkpoint, failed contract, child failure, or signal must prevent every later stage.
 - State files, completion manifests, attestations, and summaries use sibling temporary files plus atomic `os.replace`.
@@ -752,7 +757,8 @@ git commit -m "feat: attest Cosmos training contracts"
 **Interfaces:**
 - Consumes env: `STAGE1_OUTPUT`, `CLEAN_STUDENT_BASE_MODEL_PATH`, `DATASET_PATH`, `COSMOS_POLICY_PATH`, `TRAIN_SEED`, `MASTER_PORT`.
 - Produces modes: `run`, `dry-run`.
-- Produces option: `--resume-step N`.
+- Produces options: `--steps N`, `--save-interval N`, `--master-port PORT`,
+  `--output-dir PATH`, `--run-tag TAG`, and `--resume-step N`.
 - Produces corrected Stage-1 `step_5000`.
 
 - [ ] **Step 1: Write failing launcher tests**
@@ -764,6 +770,7 @@ result = run_stage1("dry-run", env=env)
 assert result.returncode == 0
 assert "CONFIG_FILE=distillation_flowmap.config_libero_cosmos_policy_stage1" in result.stdout
 assert "MAX_TRAIN_STEPS=5000" in result.stdout
+assert "SAVE_INTERVAL=1000" in result.stdout
 assert "TRAIN_SEED=42" in result.stdout
 assert "--nproc_per_node=8" in result.stdout
 assert "--master_port=29671" in result.stdout
@@ -798,6 +805,7 @@ PYTHON_BIN="${PYTHON_BIN:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/p
 TORCHRUN_BIN="${TORCHRUN_BIN:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/torchrun}"
 CLEAN_STUDENT_BASE_MODEL_PATH="${CLEAN_STUDENT_BASE_MODEL_PATH:-/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero}"
 MAX_TRAIN_STEPS=5000
+SAVE_INTERVAL="${SAVE_INTERVAL:-1000}"
 TRAIN_SEED="${TRAIN_SEED:-42}"
 MASTER_PORT="${MASTER_PORT:-29671}"
 ```
@@ -1244,8 +1252,17 @@ git commit -m "feat: resume joint Cosmos evaluation matrix"
 - Create: `distillation_flowmap/tests/test_run_cosmos_stage1_stage2_eval_8gpu.py`
 
 **Interfaces:**
-- Modes: `run`, `dry-run`, `status`.
-- Required env: `RUN_ROOT`.
+- Modes: positional `run`, `dry-run`, `status`; no positional mode defaults
+  to `run` for compatibility with the reference launcher.
+- Phase filter: `--phase train|eval|all`, default `all`. `train` executes
+  contract→Stage-1→Stage-2; `eval` revalidates those completed artifacts then
+  runs K1→K2→K4; `all` runs the full chain.
+- Accepts reference-style options: `--steps N` (applies to both training
+  stages), `--save-interval N`, `--episodes N`, `--stage1-master-port PORT`,
+  `--stage2-master-port PORT`, `--eval-master-port-base PORT`,
+  `--eval-ws-port-base PORT`, and `--run-tag TAG`.
+- `RUN_ROOT` may be supplied explicitly. Otherwise a validated nonempty
+  `--run-tag` derives one immutable root below the shared checkout.
 - Produces sequence: contract → Stage-1 → Stage-2 → K1 → K2 → K4.
 - Consumes all launchers and state APIs from Tasks 4–8.
 
@@ -1255,7 +1272,10 @@ Use executable sentinel launchers and a temporary run root. Cover:
 
 ```python
 def test_dry_run_prints_complete_order_and_creates_nothing(tmp_path):
-    result = run_pipeline("dry-run", root=tmp_path / "run")
+    result = run_pipeline(
+        "dry-run", "--phase", "all", "--run-tag", "contract-test",
+        root=tmp_path / "run",
+    )
     assert parsed_stage_order(result.stdout) == [
         "contract", "stage1", "stage2", "evaluation:k1",
         "evaluation:k2", "evaluation:k4",
@@ -1282,6 +1302,29 @@ def test_run_hands_corrected_stage1_target_to_stage2_and_stage2_online_to_eval(t
         stage2_step_5000 / "online_student/transformer"
     )
     assert eval_env["S4_ALIGNMENT_VERIFIED"] == "1"
+
+
+def test_reference_style_phase_and_port_options_are_forwarded(tmp_path):
+    fixture = PipelineSentinels(tmp_path)
+    result = fixture.run(
+        "dry-run",
+        "--phase", "all",
+        "--steps", "5000",
+        "--save-interval", "1000",
+        "--episodes", "500",
+        "--stage1-master-port", "29671",
+        "--stage2-master-port", "29672",
+        "--eval-master-port-base", "29680",
+        "--eval-ws-port-base", "29780",
+        "--run-tag", "reference-style",
+    )
+    assert result.returncode == 0
+    assert fixture.resolved_value(result.stdout, "STAGE1_STEPS") == "5000"
+    assert fixture.resolved_value(result.stdout, "STAGE2_STEPS") == "5000"
+    assert fixture.resolved_value(result.stdout, "SAVE_INTERVAL") == "1000"
+    assert fixture.resolved_value(result.stdout, "EPISODES") == "500"
+    assert fixture.resolved_value(result.stdout, "STAGE1_MASTER_PORT") == "29671"
+    assert fixture.resolved_value(result.stdout, "STAGE2_MASTER_PORT") == "29672"
 
 
 def test_rerun_skips_completed_stage1_and_resumes_stage2(tmp_path):
@@ -1385,6 +1428,8 @@ DATASET_PATH="${DATASET_PATH:-/kpfs-intern/jialongliu/projects/Flash-WAM/trainin
 TRAIN_SEED="${TRAIN_SEED:-42}"
 STAGE1_STEPS=5000
 STAGE2_STEPS=5000
+SAVE_INTERVAL=1000
+EPISODES=500
 STAGE1_OUTPUT="${RUN_ROOT}/stage1"
 STAGE2_OUTPUT_ROOT="${RUN_ROOT}/stage2"
 MATRIX_ROOT="${RUN_ROOT}/evaluation"

@@ -152,6 +152,84 @@ def test_trainer_call_site_delegates_schedule_to_the_shared_selector():
     }]
 
 
+def test_trainer_selector_supports_legacy_configs_without_deployment_fields():
+    from distillation_flowmap.cosmos_progressive_opd import (
+        select_progressive_training_objective,
+    )
+
+    source = (
+        Path(__file__).resolve().parents[1] / "flowmap_trainer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_select_progressive_training_objective"
+    )
+    namespace = {
+        "select_progressive_training_objective":
+            select_progressive_training_objective,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+            "<trainer-selector>",
+            "exec",
+        ),
+        namespace,
+    )
+    legacy_config = SimpleNamespace()
+    selector = namespace["_select_progressive_training_objective"]
+
+    assert selector(
+        legacy_config,
+        step=11,
+        deployment_enabled=False,
+        raw_auxiliary_enabled=False,
+    ) == "main"
+    assert selector(
+        legacy_config,
+        step=10,
+        deployment_enabled=False,
+        raw_auxiliary_enabled=True,
+    ) == "raw_auxiliary"
+
+
+def test_real_train_loop_calls_shared_schedule_adapter_once_before_branches():
+    source = (
+        Path(__file__).resolve().parents[1] / "flowmap_trainer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    trainer = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "FlowMapDistiller"
+    )
+    train = next(
+        node for node in trainer.body
+        if isinstance(node, ast.FunctionDef) and node.name == "train"
+    )
+    adapter_calls = [
+        node
+        for node in ast.walk(train)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_select_progressive_training_objective"
+    ]
+    objective_branches = [
+        node
+        for node in ast.walk(train)
+        if isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == "scheduled_kind"
+    ]
+
+    assert len(adapter_calls) == 1
+    assert len(objective_branches) >= 2
+    assert adapter_calls[0].lineno < min(
+        branch.lineno for branch in objective_branches
+    )
+
+
 def test_deployment_student_path_is_not_clamped_to_the_raw_teacher_window():
     root = Path(__file__).resolve().parents[1]
     step_source = (root / "flowmap_step.py").read_text(encoding="utf-8")

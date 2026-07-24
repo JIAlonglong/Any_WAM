@@ -63,8 +63,6 @@ def test_trainer_reduces_all_deployment_metrics_in_a_fixed_position():
     )[0]
     expected = [spec.accumulator for spec in DEPLOYMENT_METRIC_SPECS]
 
-    positions = [metric_block.index(name) for name in expected]
-    assert positions == sorted(positions)
     append_block = source.split("# 累积损失值", 1)[1].split(
         "step_in_acc += 1", 1
     )[0]
@@ -77,10 +75,15 @@ def test_trainer_reduces_all_deployment_metrics_in_a_fixed_position():
     logging_block = source.split('postfix["dep"]', 1)[1].split(
         "if self.distill_video:", 1
     )[0]
-    for spec in DEPLOYMENT_METRIC_SPECS:
-        assert spec.result_key in append_block
-        assert spec.average_name in unpack_block
-        assert spec.accumulator in reset_block
-        assert spec.log_name in logging_block
+    stages = (
+        (append_block, [spec.result_key for spec in DEPLOYMENT_METRIC_SPECS]),
+        (metric_block, expected),
+        (unpack_block, [spec.average_name for spec in DEPLOYMENT_METRIC_SPECS]),
+        (reset_block, expected),
+        (logging_block, [spec.log_name for spec in DEPLOYMENT_METRIC_SPECS]),
+    )
+    for block, names in stages:
+        positions = [block.index(name) for name in names]
+        assert positions == sorted(positions)
     assert len(DEPLOYMENT_METRIC_SPECS) == 6
     assert "base_metric_count = 47" in source

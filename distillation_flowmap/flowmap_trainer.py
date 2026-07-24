@@ -89,7 +89,9 @@ def _select_progressive_training_objective(
     return select_progressive_training_objective(
         step=step,
         deployment_enabled=deployment_enabled,
-        deployment_interval=int(config.deployment_joint_rollout_interval),
+        deployment_interval=int(getattr(
+            config, "deployment_joint_rollout_interval", 4
+        )),
         raw_auxiliary_enabled=raw_auxiliary_enabled,
         raw_auxiliary_warmup=int(getattr(config, "opd_aux_warmup_steps", 0)),
         raw_auxiliary_interval=int(getattr(config, "opd_aux_interval", 8)),

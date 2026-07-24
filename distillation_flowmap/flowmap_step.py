@@ -5833,8 +5833,15 @@ class FlowMapStepMixin:
                     action_r,
                 )
 
-        query_indices = sample_low_noise_query_indices(
-            n_states=rollout_steps,
+            # Include the post-update terminal state. Semantic queries exclude
+            # the initial pure-noise state and can select the deployed endpoint.
+            video_states.append(current_video.detach().clone())
+            action_states.append(current_action.detach().clone())
+            video_timesteps.append(video_path[-1].detach().clone())
+            action_timesteps.append(action_path[-1].detach().clone())
+
+        query_indices = sample_semantic_query_indices(
+            rollout_steps=rollout_steps,
             batch_size=B,
             alpha=query_alpha,
             beta=query_beta,
@@ -5852,6 +5859,11 @@ class FlowMapStepMixin:
         query_action_t = select_per_sample_trajectory_state(
             torch.stack(action_timesteps, dim=0), query_indices
         ).detach()
+        del video_states, action_states, video_timesteps, action_timesteps
+        del current_video, current_action, rollout_input
+        del video_velocity, action_velocity_seq, action_velocity
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         danceopd_query_index_mean = query_indices.float().mean().detach()
         danceopd_query_sigma_mean = (
             query_video_t.float() / self.config.num_train_timesteps

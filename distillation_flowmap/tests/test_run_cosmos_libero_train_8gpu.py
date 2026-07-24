@@ -146,13 +146,34 @@ def test_each_arm_has_one_complete_write_free_eight_gpu_dry_run(tmp_path, arm):
     assert values["MAX_TRAIN_STEPS"] == "123"
     assert values["SAVE_INTERVAL"] == "37"
     assert values["MASTER_PORT"] == "32123"
+    assert values["RUN_TAG"] == "contract-red"
     assert json.loads(values["COSMOS_LIBERO_VARIANT_JSON"]) == expected
+    assert json.loads(values["CONFIG_IDENTITY_JSON"]) == expected
     assert values["ENABLE_TENSORBOARD"] == "1"
     assert values["ENABLE_WANDB"] == "0"
     assert values["WANDB_MODE"] == "offline"
     assert values["HF_DATASETS_OFFLINE"] == "1"
     assert values["TRANSFORMERS_OFFLINE"] == "1"
     assert values["HF_HUB_OFFLINE"] == "1"
+    assert values["MECHANISM_DIAGNOSTICS"] == "1"
+    assert values["MECHANISM_DIAGNOSTIC_INTERVAL"] == "100"
+    assert values["MECHANISM_DIAGNOSTIC_SEED"] == "42"
+    assert values["MECHANISM_DIAGNOSTIC_R"] == "500"
+    assert values["MECHANISM_DIAGNOSTIC_S"] == "250"
+    assert values["MECHANISM_DIAGNOSTIC_TEACHER_STEPS"] == "8"
+    assert values["MECHANISM_COSMOS_T_MIN"] == "0.8"
+    assert values["MECHANISM_COSMOS_T_MAX"] == "0.9876543209876543"
+    assert values["CONFIG_FILE"] == (
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive"
+    )
+    assert values["COSMOS_POLICY_PATH"] == env["COSMOS_POLICY_PATH"]
+    assert values["DATASET_PATH"] == env["DATASET_PATH"]
+    assert values["COSMOS_POLICY_PYTHON"] == env["COSMOS_POLICY_PYTHON"]
+    assert values["COSMOS_PREDICT2_REPO"] == env["COSMOS_PREDICT2_REPO"]
+    assert values["COSMOS_PREDICT25_LOCAL_MODEL_DIR"] == env[
+        "COSMOS_PREDICT25_LOCAL_MODEL_DIR"
+    ]
+    assert values["ATTN_MODE"] == "flex"
     assert values["STUDENT_BASE_MODEL_PATH"] == env["STUDENT_BASE_MODEL_PATH"]
     assert values["RESUME_FROM_PATH"] == env["COSMOS_STAGE1_ROOT"]
     assert values["PARENT_STAGE1_PATH"] == str(Path(env["COSMOS_STAGE1_ROOT"]).resolve())
@@ -229,6 +250,81 @@ def test_default_save_interval_is_exactly_1000(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert _assignments(result.stdout)["SAVE_INTERVAL"] == "1000"
+
+
+def test_hostile_ambient_scientific_values_cannot_change_canonical_experiment(
+    tmp_path,
+):
+    env, _ = _env(tmp_path)
+    env.update(
+        {
+            "LEARNING_RATE": "9.0",
+            "OPD_AUX_WEIGHT": "9.0",
+            "OPD_AUX_WARMUP_STEPS": "999",
+            "OPD_AUX_PROB": "0.125",
+            "OPD_ROLLOUT_GRAD_MODE": "suffix",
+            "OPD_ROLLOUT_GRAD_STEPS": "99",
+            "OPD_ENDPOINT_FOCUS_PROB": "0.125",
+            "OPD_DANCEOPD_QUERY_ALPHA": "1.0",
+            "OPD_DANCEOPD_QUERY_BETA": "1.0",
+        }
+    )
+    output_root = tmp_path / "hostile"
+    result = _run(
+        "universal",
+        "--output-root",
+        str(output_root),
+        "--run-tag",
+        "canonical",
+        "--dry-run",
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    values = _assignments(result.stdout)
+    expected = json.loads(
+        canonical_variant_json(
+            resolve_variant(
+                "universal",
+                output_root=output_root,
+                run_tag="canonical",
+            )
+        )
+    )
+    assert json.loads(values["COSMOS_LIBERO_VARIANT_JSON"]) == expected
+    assert json.loads(values["CONFIG_IDENTITY_JSON"]) == expected
+    assert values["LEARNING_RATE"] == "2e-07"
+    assert values["OPD_AUX_WEIGHT"] == "0.1"
+    assert values["OPD_AUX_WARMUP_STEPS"] == "8"
+    assert values["OPD_AUX_PROB"] == "1.0"
+    assert values["OPD_ROLLOUT_GRAD_MODE"] == "last_step"
+    assert values["OPD_ROLLOUT_GRAD_STEPS"] == "1"
+    assert values["OPD_ENDPOINT_FOCUS_PROB"] == "0.85"
+    assert values["OPD_DANCEOPD_QUERY_ALPHA"] == "5.0"
+    assert values["OPD_DANCEOPD_QUERY_BETA"] == "2.0"
+
+
+def test_stage1_only_imported_config_has_no_opd_schedule_or_action_opd(tmp_path):
+    env, _ = _env(tmp_path)
+    output_root = tmp_path / "stage1-only"
+    result = _run(
+        "stage1_only",
+        "--output-root",
+        str(output_root),
+        "--run-tag",
+        "isolation",
+        "--dry-run",
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    values = _assignments(result.stdout)
+    imported = json.loads(values["CONFIG_IDENTITY_JSON"])
+    assert values["USE_OPD_AUX"] == "0"
+    assert values["OPD_AUX_STANDALONE_STEP"] == "0"
+    assert values["OPD_AUX_ACTION"] == "0"
+    assert imported["use_opd_aux"] is False
+    assert imported["opd_aux_standalone_step"] is False
+    assert imported["action_opd_enabled"] is False
 
 
 @pytest.mark.parametrize("switch", ("--dry-run", "--check-only"))
@@ -333,6 +429,39 @@ def test_resume_is_allowed_only_from_same_arm_with_same_parent_and_variant_recor
     result = _run(
         "apm", "--output-root", str(output_root), "--run-tag", "resume", "--resume-step", "100", "--dry-run", env=env
     )
+    assert result.returncode != 0
+    assert "variant" in result.stderr.lower()
+
+
+def test_resume_rejects_a_changed_supported_scientific_identity(tmp_path):
+    env, stage1 = _env(tmp_path)
+    output_root = tmp_path / "out"
+    own = output_root / "resume" / "apm"
+    parent = validate_stage1_parent(stage1)
+    record = resolve_variant("apm", output_root=output_root, run_tag="resume")
+    payload = json.loads(canonical_variant_json(record))
+    payload["opd_aux_weight"] = 0.25
+    changed = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    _write_resume_checkpoint(
+        own,
+        arm="apm",
+        step=100,
+        parent=parent,
+        variant_json=changed,
+    )
+
+    result = _run(
+        "apm",
+        "--output-root",
+        str(output_root),
+        "--run-tag",
+        "resume",
+        "--resume-step",
+        "100",
+        "--dry-run",
+        env=env,
+    )
+
     assert result.returncode != 0
     assert "variant" in result.stderr.lower()
 

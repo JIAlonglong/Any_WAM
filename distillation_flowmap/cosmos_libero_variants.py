@@ -25,6 +25,9 @@ _PROGRESSIVE = {
         "video_endpoint_weight": 1.0,
         "video_velocity_weight": 0.0,
         "action_endpoint_weight": 1.0,
+        "opd_rollout_grad_mode": "last_step",
+        "opd_rollout_grad_steps": 1,
+        "opd_endpoint_focus_prob": 0.90,
     },
     "s2": {
         "progressive_stage": "s2",
@@ -35,6 +38,9 @@ _PROGRESSIVE = {
         "video_endpoint_weight": 1.0,
         "video_velocity_weight": 1.0,
         "action_endpoint_weight": 1.0,
+        "opd_rollout_grad_mode": "last_step",
+        "opd_rollout_grad_steps": 1,
+        "opd_endpoint_focus_prob": 0.85,
     },
     "s4": {
         "progressive_stage": "s4",
@@ -45,6 +51,9 @@ _PROGRESSIVE = {
         "video_endpoint_weight": 1.0,
         "video_velocity_weight": 1.0,
         "action_endpoint_weight": 1.0,
+        "opd_rollout_grad_mode": "suffix",
+        "opd_rollout_grad_steps": 2,
+        "opd_endpoint_focus_prob": 0.80,
     },
     "universal": {
         "progressive_stage": "universal",
@@ -55,6 +64,9 @@ _PROGRESSIVE = {
         "video_endpoint_weight": 1.0,
         "video_velocity_weight": 1.0,
         "action_endpoint_weight": 1.0,
+        "opd_rollout_grad_mode": "last_step",
+        "opd_rollout_grad_steps": 1,
+        "opd_endpoint_focus_prob": 0.85,
     },
     "universal-video-action": {
         "progressive_stage": "universal",
@@ -65,6 +77,9 @@ _PROGRESSIVE = {
         "video_endpoint_weight": 1.0,
         "video_velocity_weight": 1.0,
         "action_endpoint_weight": 1.0,
+        "opd_rollout_grad_mode": "last_step",
+        "opd_rollout_grad_steps": 1,
+        "opd_endpoint_focus_prob": 0.85,
     },
 }
 _APM_PORTS = {
@@ -221,6 +236,9 @@ def _base_spec(name: str) -> dict[str, object]:
             "video_endpoint_weight": apm[name]["endpoint"],
             "video_velocity_weight": apm[name]["velocity"],
             "action_endpoint_weight": 0.0,
+            "opd_rollout_grad_mode": "last_step",
+            "opd_rollout_grad_steps": 1,
+            "opd_endpoint_focus_prob": 0.85,
         }
     raise VariantError(f"unknown Cosmos LIBERO variant: {name!r}")
 
@@ -258,6 +276,7 @@ def resolve_variant(
     )
     record = {
         "name": name,
+        "run_tag": tag,
         "progressive_stage": spec["progressive_stage"],
         "max_train_steps": max_steps,
         "save_interval": interval,
@@ -271,6 +290,15 @@ def resolve_variant(
         "action_opd_enabled": False,
         "use_opd_aux": use_opd_aux,
         "opd_aux_standalone_step": use_opd_aux,
+        "learning_rate": 2e-7,
+        "opd_aux_weight": 0.10,
+        "opd_aux_warmup_steps": 8,
+        "opd_aux_prob": 1.0,
+        "opd_rollout_grad_mode": spec["opd_rollout_grad_mode"],
+        "opd_rollout_grad_steps": spec["opd_rollout_grad_steps"],
+        "opd_endpoint_focus_prob": spec["opd_endpoint_focus_prob"],
+        "opd_danceopd_query_alpha": 5.0,
+        "opd_danceopd_query_beta": 2.0,
         "train_seed": 42,
         "tensorboard_enabled": True,
         "enable_wandb": False,

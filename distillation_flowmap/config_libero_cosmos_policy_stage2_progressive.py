@@ -325,18 +325,43 @@ cfg.opd_joint_action_rollout = _env_bool("OPD_JOINT_ACTION_ROLLOUT", True)
 
 if _cosmos_libero_variant_payload is not None:
     _variant_expected = {
+        "name": os.environ["VARIANT_NAME"],
+        "run_tag": os.environ["RUN_TAG"],
         "progressive_stage": _stage,
         "max_train_steps": cfg.max_train_steps,
         "save_interval": cfg.save_interval,
+        "master_port": int(os.environ["MASTER_PORT"]),
         "output_dir": str(Path(cfg.output_dir).resolve(strict=False)),
         "rollout_step_pairs": cfg.opd_rollout_step_pairs,
         "danceopd_rollout_steps": list(cfg.opd_danceopd_rollout_step_choices),
         "video_endpoint_weight": cfg.opd_danceopd_endpoint_weight,
         "video_velocity_weight": cfg.opd_danceopd_velocity_weight,
         "action_endpoint_weight": cfg.opd_danceopd_action_endpoint_weight,
+        "action_opd_enabled": cfg.opd_aux_action,
         "use_opd_aux": cfg.use_opd_aux,
         "opd_aux_standalone_step": cfg.opd_aux_standalone_step,
+        "learning_rate": cfg.learning_rate,
+        "opd_aux_weight": cfg.opd_aux_weight,
+        "opd_aux_warmup_steps": cfg.opd_aux_warmup_steps,
+        "opd_aux_prob": cfg.opd_aux_prob,
+        "opd_rollout_grad_mode": cfg.opd_rollout_grad_mode,
+        "opd_rollout_grad_steps": cfg.opd_rollout_grad_steps,
+        "opd_endpoint_focus_prob": cfg.opd_endpoint_focus_prob,
+        "opd_danceopd_query_alpha": cfg.opd_danceopd_query_alpha,
+        "opd_danceopd_query_beta": cfg.opd_danceopd_query_beta,
+        "train_seed": int(os.environ["TRAIN_SEED"]),
+        "tensorboard_enabled": _env_bool("ENABLE_TENSORBOARD", True),
+        "enable_wandb": cfg.enable_wandb,
+        "wandb_mode": os.environ["WANDB_MODE"],
+        "hf_offline": _env_bool("HF_DATASETS_OFFLINE", True),
+        "transformers_offline": _env_bool("TRANSFORMERS_OFFLINE", True),
+        "hf_hub_offline": _env_bool("HF_HUB_OFFLINE", True),
     }
+    if set(_cosmos_libero_variant_payload) != set(_variant_expected):
+        raise ValueError(
+            "COSMOS_LIBERO_VARIANT_JSON fields must exactly match the "
+            "resolved config identity"
+        )
     for _variant_field, _variant_value in _variant_expected.items():
         if (
             _cosmos_libero_variant_payload.get(_variant_field)
@@ -346,6 +371,7 @@ if _cosmos_libero_variant_payload is not None:
                 "COSMOS_LIBERO_VARIANT_JSON field "
                 f"{_variant_field!r} does not match resolved config"
             )
+    cfg.cosmos_libero_variant_identity = dict(_variant_expected)
 
 cfg.deployment_joint_rollout_enabled = True
 cfg.deployment_joint_rollout_interval = 4

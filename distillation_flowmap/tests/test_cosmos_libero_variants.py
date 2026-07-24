@@ -24,6 +24,19 @@ from distillation_flowmap.cosmos_libero_variants import (
 PROGRESSIVE_ARMS = ("s1", "s2", "s4", "universal", "universal-video-action")
 APM_ARMS = ("stage1_only", "anchor_only", "field_only", "apm")
 ALL_ARMS = PROGRESSIVE_ARMS + APM_ARMS
+PROGRESSIVE_ALLOWED_DIFFERENCES = {
+    "name",
+    "progressive_stage",
+    "max_train_steps",
+    "master_port",
+    "output_dir",
+    "rollout_step_pairs",
+    "danceopd_rollout_steps",
+    "video_velocity_weight",
+    "opd_rollout_grad_mode",
+    "opd_rollout_grad_steps",
+    "opd_endpoint_focus_prob",
+}
 
 
 def _resolve(tmp_path: Path, name: str, **overrides):
@@ -54,7 +67,14 @@ def test_every_variant_resolves_to_an_immutable_canonical_record(tmp_path, name)
         (tmp_path / "outputs" / "task7-red" / name).resolve()
     )
     assert payload["save_interval"] == 1000
+    assert payload["run_tag"] == "task7-red"
     assert payload["train_seed"] == 42
+    assert payload["learning_rate"] == pytest.approx(2e-7)
+    assert payload["opd_aux_weight"] == pytest.approx(0.10)
+    assert payload["opd_aux_warmup_steps"] == 8
+    assert payload["opd_aux_prob"] == pytest.approx(1.0)
+    assert payload["opd_danceopd_query_alpha"] == pytest.approx(5.0)
+    assert payload["opd_danceopd_query_beta"] == pytest.approx(2.0)
     assert payload["tensorboard_enabled"] is True
     assert payload["wandb_mode"] == "offline"
     assert payload["enable_wandb"] is False
@@ -83,6 +103,9 @@ def test_progressive_arms_differ_only_in_declared_budget_fields(tmp_path):
             "danceopd_rollout_steps": [1],
             "video_endpoint_weight": 1.0,
             "video_velocity_weight": 0.0,
+            "opd_rollout_grad_mode": "last_step",
+            "opd_rollout_grad_steps": 1,
+            "opd_endpoint_focus_prob": 0.90,
         },
         "s2": {
             "progressive_stage": "s2",
@@ -92,6 +115,9 @@ def test_progressive_arms_differ_only_in_declared_budget_fields(tmp_path):
             "danceopd_rollout_steps": [2],
             "video_endpoint_weight": 1.0,
             "video_velocity_weight": 1.0,
+            "opd_rollout_grad_mode": "last_step",
+            "opd_rollout_grad_steps": 1,
+            "opd_endpoint_focus_prob": 0.85,
         },
         "s4": {
             "progressive_stage": "s4",
@@ -101,6 +127,9 @@ def test_progressive_arms_differ_only_in_declared_budget_fields(tmp_path):
             "danceopd_rollout_steps": [4],
             "video_endpoint_weight": 1.0,
             "video_velocity_weight": 1.0,
+            "opd_rollout_grad_mode": "suffix",
+            "opd_rollout_grad_steps": 2,
+            "opd_endpoint_focus_prob": 0.80,
         },
         "universal": {
             "progressive_stage": "universal",
@@ -110,6 +139,9 @@ def test_progressive_arms_differ_only_in_declared_budget_fields(tmp_path):
             "danceopd_rollout_steps": [2, 4],
             "video_endpoint_weight": 1.0,
             "video_velocity_weight": 1.0,
+            "opd_rollout_grad_mode": "last_step",
+            "opd_rollout_grad_steps": 1,
+            "opd_endpoint_focus_prob": 0.85,
         },
         "universal-video-action": {
             "progressive_stage": "universal",
@@ -119,6 +151,9 @@ def test_progressive_arms_differ_only_in_declared_budget_fields(tmp_path):
             "danceopd_rollout_steps": [2, 4],
             "video_endpoint_weight": 1.0,
             "video_velocity_weight": 1.0,
+            "opd_rollout_grad_mode": "last_step",
+            "opd_rollout_grad_steps": 1,
+            "opd_endpoint_focus_prob": 0.85,
         },
     }
     for name, subset in expected.items():
@@ -126,6 +161,28 @@ def test_progressive_arms_differ_only_in_declared_budget_fields(tmp_path):
         assert records[name]["action_endpoint_weight"] == 1.0
         assert records[name]["action_opd_enabled"] is False
         assert records[name]["use_opd_aux"] is True
+
+    _assert_only_declared_progressive_differences(records.values())
+
+
+def _assert_only_declared_progressive_differences(records):
+    normalised = []
+    for record in records:
+        copy = dict(record)
+        for key in PROGRESSIVE_ALLOWED_DIFFERENCES:
+            copy.pop(key)
+        normalised.append(copy)
+    assert normalised.count(normalised[0]) == len(normalised)
+
+
+def test_progressive_isolation_check_detects_an_undeclared_arm_specific_mutation(
+    tmp_path,
+):
+    records = [_plain(_resolve(tmp_path, name)) for name in PROGRESSIVE_ARMS]
+    _assert_only_declared_progressive_differences(records)
+    records[1]["undeclared_scientific_toggle"] = True
+    with pytest.raises(AssertionError):
+        _assert_only_declared_progressive_differences(records)
 
 
 def test_apm_arms_differ_only_in_video_endpoint_and_compositional_coefficients(

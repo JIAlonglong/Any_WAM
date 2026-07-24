@@ -124,6 +124,7 @@ pairs = ";".join(",".join(str(v) for v in pair) for pair in record["rollout_step
 choices = ",".join(str(v) for v in record["danceopd_rollout_steps"])
 values = {
     "VARIANT_NAME": record["name"],
+    "RUN_TAG": record["run_tag"],
     "COSMOS_PROGRESSIVE_STAGE": record["progressive_stage"],
     "MAX_TRAIN_STEPS": record["max_train_steps"],
     "SAVE_INTERVAL": record["save_interval"],
@@ -137,6 +138,15 @@ values = {
     "OPD_AUX_ACTION": int(record["action_opd_enabled"]),
     "USE_OPD_AUX": int(record["use_opd_aux"]),
     "OPD_AUX_STANDALONE_STEP": int(record["opd_aux_standalone_step"]),
+    "LEARNING_RATE": record["learning_rate"],
+    "OPD_AUX_WEIGHT": record["opd_aux_weight"],
+    "OPD_AUX_WARMUP_STEPS": record["opd_aux_warmup_steps"],
+    "OPD_AUX_PROB": record["opd_aux_prob"],
+    "OPD_ROLLOUT_GRAD_MODE": record["opd_rollout_grad_mode"],
+    "OPD_ROLLOUT_GRAD_STEPS": record["opd_rollout_grad_steps"],
+    "OPD_ENDPOINT_FOCUS_PROB": record["opd_endpoint_focus_prob"],
+    "OPD_DANCEOPD_QUERY_ALPHA": record["opd_danceopd_query_alpha"],
+    "OPD_DANCEOPD_QUERY_BETA": record["opd_danceopd_query_beta"],
     "TRAIN_SEED": record["train_seed"],
     "ENABLE_TENSORBOARD": int(record["tensorboard_enabled"]),
     "ENABLE_WANDB": int(record["enable_wandb"]),
@@ -156,6 +166,7 @@ resolved="$(
 )" || die "variant resolution failed"
 declare -A expected_keys=(
     [VARIANT_NAME]=1
+    [RUN_TAG]=1
     [COSMOS_PROGRESSIVE_STAGE]=1
     [MAX_TRAIN_STEPS]=1
     [SAVE_INTERVAL]=1
@@ -169,6 +180,15 @@ declare -A expected_keys=(
     [OPD_AUX_ACTION]=1
     [USE_OPD_AUX]=1
     [OPD_AUX_STANDALONE_STEP]=1
+    [LEARNING_RATE]=1
+    [OPD_AUX_WEIGHT]=1
+    [OPD_AUX_WARMUP_STEPS]=1
+    [OPD_AUX_PROB]=1
+    [OPD_ROLLOUT_GRAD_MODE]=1
+    [OPD_ROLLOUT_GRAD_STEPS]=1
+    [OPD_ENDPOINT_FOCUS_PROB]=1
+    [OPD_DANCEOPD_QUERY_ALPHA]=1
+    [OPD_DANCEOPD_QUERY_BETA]=1
     [TRAIN_SEED]=1
     [ENABLE_TENSORBOARD]=1
     [ENABLE_WANDB]=1
@@ -322,6 +342,7 @@ export CONFIG_FILE=distillation_flowmap.config_libero_cosmos_policy_stage2_progr
 export OUTPUT_DIR MAX_TRAIN_STEPS SAVE_INTERVAL MASTER_PORT TRAIN_SEED
 export COSMOS_PROGRESSIVE_STAGE
 export COSMOS_PROGRESSIVE_OUTPUT_ROOT="$output_root"
+export OUTPUT_ROOT="$output_root"
 export STUDENT_BASE_MODEL_PATH COSMOS_LIBERO_VARIANT_JSON
 export USE_FSDP1=1
 export GRADIENT_CHECKPOINTING=1
@@ -332,6 +353,10 @@ export OPD_ROLLOUT_STEP_PAIRS OPD_DANCEOPD_ROLLOUT_STEPS
 export OPD_DANCEOPD_ENDPOINT_WEIGHT OPD_DANCEOPD_VELOCITY_WEIGHT
 export OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT OPD_AUX_ACTION USE_OPD_AUX
 export OPD_AUX_STANDALONE_STEP
+export LEARNING_RATE OPD_AUX_WEIGHT OPD_AUX_WARMUP_STEPS OPD_AUX_PROB
+export OPD_ROLLOUT_GRAD_MODE OPD_ROLLOUT_GRAD_STEPS
+export OPD_ENDPOINT_FOCUS_PROB OPD_DANCEOPD_QUERY_ALPHA
+export OPD_DANCEOPD_QUERY_BETA
 export COSMOS_USE_TEACHER_ACTION_ANCHOR=1
 export OPD_JOINT_ACTION_ROLLOUT=1
 export MECHANISM_DIAGNOSTICS="${MECHANISM_DIAGNOSTICS:-1}"
@@ -357,7 +382,7 @@ export COSMOS_POLICY_EXTRA_PYTHONPATH="${COSMOS_POLICY_EXTRA_PYTHONPATH:-$COSMOS
 export COSMOS_WORKER_CUDA_LIBRARY_PATH="${COSMOS_WORKER_CUDA_LIBRARY_PATH:-${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cublas/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_cupti/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_nvrtc/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_runtime/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cudnn/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cufft/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cufile/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/curand/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusolver/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusparse/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusparselt/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/nccl/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/nvjitlink/lib}"
 export LD_LIBRARY_PATH="${COSMOS_WORKER_CUDA_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-config_preflight_code='import os
+config_preflight_code='import json, os
 from importlib import import_module
 cfg = import_module(os.environ["CONFIG_FILE"]).cfg
 required = {
@@ -371,7 +396,15 @@ required = {
 for field, expected in required.items():
     actual = getattr(cfg, field, None)
     if actual != expected:
-        raise RuntimeError(f"{field} must be exactly {expected!r}, got {actual!r}")'
+        raise RuntimeError(f"{field} must be exactly {expected!r}, got {actual!r}")
+print(
+    "CONFIG_IDENTITY_JSON="
+    + json.dumps(
+        cfg.cosmos_libero_variant_identity,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+)'
 (
     cd "$PROJECT_ROOT"
     PYTHONDONTWRITEBYTECODE=1 \
@@ -392,18 +425,33 @@ train_cmd=(
 )
 
 for key in \
-    VARIANT_NAME COSMOS_PROGRESSIVE_STAGE MASTER_PORT OUTPUT_DIR \
+    VARIANT_NAME RUN_TAG COSMOS_PROGRESSIVE_STAGE MASTER_PORT OUTPUT_ROOT OUTPUT_DIR \
     MAX_TRAIN_STEPS SAVE_INTERVAL RESUME_FROM_PATH \
     RESUME_ONLINE_FROM_TARGET RESET_RESUME_STEP RESUME_OPTIMIZER_STATE \
     OPD_ROLLOUT_STEP_PAIRS OPD_DANCEOPD_ROLLOUT_STEPS \
     OPD_DANCEOPD_ENDPOINT_WEIGHT OPD_DANCEOPD_VELOCITY_WEIGHT \
     OPD_DANCEOPD_ACTION_ENDPOINT_WEIGHT OPD_AUX_ACTION USE_OPD_AUX \
-    OPD_AUX_STANDALONE_STEP TRAIN_SEED ENABLE_TENSORBOARD ENABLE_WANDB \
+    OPD_AUX_STANDALONE_STEP LEARNING_RATE OPD_AUX_WEIGHT \
+    OPD_AUX_WARMUP_STEPS OPD_AUX_PROB OPD_ROLLOUT_GRAD_MODE \
+    OPD_ROLLOUT_GRAD_STEPS OPD_ENDPOINT_FOCUS_PROB \
+    OPD_DANCEOPD_QUERY_ALPHA OPD_DANCEOPD_QUERY_BETA \
+    TRAIN_SEED ENABLE_TENSORBOARD ENABLE_WANDB \
     WANDB_MODE HF_DATASETS_OFFLINE TRANSFORMERS_OFFLINE HF_HUB_OFFLINE \
+    CONFIG_FILE COSMOS_POLICY_PATH DATASET_PATH COSMOS_POLICY_PYTHON \
+    COSMOS_PREDICT2_REPO COSMOS_PREDICT25_LOCAL_MODEL_DIR \
+    COSMOS_POLICY_EXTRA_PYTHONPATH COSMOS_WORKER_CUDA_LIBRARY_PATH \
+    ATTN_MODE \
     STUDENT_BASE_MODEL_PATH PARENT_STAGE1_PATH \
     PARENT_STAGE1_CONTRACT_IDENTITY STAGE2_LINEAGE_JSON \
     COSMOS_LIBERO_VARIANT_JSON CUDA_VISIBLE_DEVICES \
     COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES; do
+    print_assignment "$key" "${!key}"
+done
+for key in \
+    MECHANISM_DIAGNOSTICS MECHANISM_DIAGNOSTIC_INTERVAL \
+    MECHANISM_DIAGNOSTIC_SEED MECHANISM_DIAGNOSTIC_R \
+    MECHANISM_DIAGNOSTIC_S MECHANISM_DIAGNOSTIC_TEACHER_STEPS \
+    MECHANISM_COSMOS_T_MIN MECHANISM_COSMOS_T_MAX; do
     print_assignment "$key" "${!key}"
 done
 printf 'COMMAND='

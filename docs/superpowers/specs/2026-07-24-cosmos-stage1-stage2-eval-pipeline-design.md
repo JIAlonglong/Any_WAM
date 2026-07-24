@@ -190,9 +190,10 @@ cycle, not independently per rank.
 
 The deployment rollout runs every four optimizer steps. Across 5,000 Stage-2
 steps this gives 1,250 full-path joint rollout updates, balanced across the
-three K values. The raw-window auxiliary update remains separately scheduled
-and must not run in the same microstep, avoiding two expensive rollout graphs
-at once.
+three K values. The raw-window auxiliary retains interval eight with phase
+offset two: after its warmup it runs where `step % 8 == 2`. Deployment updates
+run where `step % 4 == 0`, so the two expensive rollout graphs never occupy the
+same optimizer step.
 
 This objective is the only path allowed to attest that the checkpoint supports
 full K-step deployment.

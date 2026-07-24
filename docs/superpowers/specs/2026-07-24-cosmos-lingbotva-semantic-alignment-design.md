@@ -69,11 +69,17 @@ Each pair is sampled uniformly. Teacher and student start from the same
 sigma_r = (1 - Beta(5, 2)) * 0.25
 ```
 
-Thus `sigma_r` lies in `[0, 0.25]` and is biased toward zero. At `x_r`, the
-clean endpoint estimate is:
+Thus the student endpoint `sigma_r` lies in `[0, 0.25]` and is biased toward
+zero. The official Cosmos Predict2 teacher is calibrated only for EDM
+`sigma in [4,80]`, equivalent to normalized FlowUniPC time
+`[4/5,80/81]`; it must not be queried for velocity at the student's low-noise
+endpoint. Instead, the teacher clean target is predicted from the shared
+high-noise state inside that calibrated band, while the student clean estimate
+is evaluated at its low-noise endpoint:
 
 ```text
-x0_hat = x_r - sigma_r * v(x_r, sigma_r)
+x0_hat_student = x_r - sigma_r * v_student(x_r, sigma_r)
+x0_hat_teacher = teacher_x0(x_t, t), with t in [4/5, 80/81]
 L_anchor = mse(x0_hat_student, stop_gradient(x0_hat_teacher))
 ```
 
@@ -85,36 +91,41 @@ timesteps and sigma. A WanVA timestep formula must not be substituted.
 The compositional objective supervises the local diffusion/flow vector field,
 not robot action velocity and not adjacent-frame optical or pixel motion.
 
-The rollout budget is:
+The deployment rollout budget is:
 
 ```text
 OPD_DANCEOPD_ROLLOUT_STEPS=2,4
 ```
 
-K=1 is excluded because it has no meaningful intermediate trajectory. A
-rollout begins at terminal pure scheduler noise and integrates both the video
-and action state under `no_grad`:
+K=1 is excluded because it has no meaningful intermediate trajectory. The
+student deployment rollout begins at terminal pure scheduler noise and
+integrates both the video and action state under `no_grad`:
 
 ```text
 K=2: sigma = 1.00 -> 0.50 -> 0.00
 K=4: sigma = 1.00 -> 0.75 -> 0.50 -> 0.25 -> 0.00
 ```
 
-Pre-update states are query candidates:
+Those canonical grids define deployment behavior, not the teacher-supervised
+query band. The official teacher is never queried outside normalized
+`[4/5,80/81]`. G-comp therefore constructs a separate K=2 or K=4 linear path
+inside the calibrated teacher band:
 
 ```text
-K=2: 1.00, 0.50
-K=4: 1.00, 0.75, 0.50, 0.25
+K=2: 80/81 -> midpoint -> 4/5
+K=4: 80/81 -> three interior points -> 4/5
 ```
 
-Every batch sample independently draws:
+Only the K pre-update states are query candidates; the post-update terminal
+state is excluded. Every batch sample independently draws:
 
 ```text
 q = floor(Beta(5, 2) * K)
 ```
 
 The index is clamped only for numerical boundary safety. Student and teacher
-are queried at the identical joint `(video_state, action_state, sigma)`:
+are queried at the identical joint `(video_state, action_state, normalized
+time)` inside the calibrated band:
 
 ```text
 L_velocity = mse(
@@ -122,6 +133,12 @@ L_velocity = mse(
     stop_gradient(v_teacher(video_q, action_q, sigma_q)),
 )
 ```
+
+The selected noisy action is unpacked from `downsample_survivor_v2`, normalized
+with the Cosmos action statistics, and injected into the official unified
+latent action frame before the teacher query. Changing only
+`batch["actions"]` is insufficient. The local-field loss is masked to true
+video frames and excludes conditional, non-video, and action-carrier frames.
 
 The default video-only experiments set action velocity OPD weight to exactly
 zero. Action OPD is enabled only in a separately named experiment.
@@ -143,7 +160,8 @@ zero. Action OPD is enabled only in a separately named experiment.
 
 ### Cosmos-specific behavior
 
-- scheduler raw-time/sigma conversion and terminal expected-state formulas;
+- scheduler raw-time/sigma conversion, calibrated teacher band, and terminal
+  expected-state formulas;
 - raw teacher latent target and velocity APIs;
 - 16-channel latent validation and crop handling;
 - joint video/action state construction and `downsample_survivor_v2`;
@@ -348,4 +366,3 @@ video/action K.
 
 Resource-gated gates remain explicitly unverified until an actual GPU and
 simulator allocation executes them.
-

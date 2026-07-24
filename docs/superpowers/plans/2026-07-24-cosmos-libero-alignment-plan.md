@@ -16,8 +16,12 @@
 - Main AnyFlow sampling remains 50% `r=t`, 25% `r=0`, and 25% arbitrary nonzero `r<t`.
 - Endpoint pairs are exactly `8,1;8,2;8,4`, selected uniformly.
 - Endpoint clean-region sampling is `sigma_r=(1-Beta(5,2))*0.25`.
-- Compositional rollout choices are exactly `2,4`; K=1 is excluded.
-- Compositional queries use pre-update joint video/action states and per-sample `floor(Beta(5,2)*K)`.
+- Student deployment rollout choices are exactly `2,4`; K=1 is excluded and
+  its canonical trajectory remains terminal pure noise to the clean endpoint.
+- Teacher-supervised compositional queries use a separate Cosmos-calibrated
+  path from normalized `80/81` to `4/5`, K pre-update joint video/action
+  states only, and per-sample `floor(Beta(5,2)*K)`.
+- The teacher is not queried outside its calibrated EDM `sigma in [4,80]`.
 - Video-only experiments set action velocity OPD weight to exactly `0`.
 - Do not copy WanVA timestep formulas, token layouts, LoRA inheritance, fixed 16-step defaults, or LingBotVA paths.
 - No existing checkpoint, output directory, or experiment record may be deleted or overwritten.
@@ -38,6 +42,9 @@
 - Modify only if a test exposes a gap: `distillation_flowmap/config_libero_cosmos_policy_stage2_progressive.py`
 - Modify only if a test exposes a gap: `distillation_flowmap/danceopd_query.py`
 - Modify only if a test exposes a gap: `distillation_flowmap/flowmap_step.py`
+- Modify: `distillation_flowmap/cosmos_policy_adapter.py`
+- Modify: `distillation_flowmap/cosmos_policy_raw_worker.py`
+- Modify: `distillation_flowmap/tests/test_cosmos_policy_backend.py`
 
 **Interfaces:**
 - Consumes: current progressive config and `DanceOPDQuerySampler`.
@@ -63,15 +70,18 @@ formula with detached teacher target.
 
 - [ ] **Step 2: Add failing compositional-grid tests**
 
-For K=2 and K=4, assert the pre-update candidate sigmas are exactly:
+For K=2 and K=4, assert the student deployment grids are exactly:
 
 ```python
 {2: (1.0, 0.5), 4: (1.0, 0.75, 0.5, 0.25)}
 ```
 
-Patch distinct Beta samples per batch element and assert independent
-`floor(beta*K)` indices. Assert teacher and student receive identical video,
-action, and sigma tensors, teacher output is detached, student output remains
+Separately assert the teacher-supervised production path is a linear K-step
+path from normalized `80/81` to `4/5`, exposes only K pre-update candidates,
+and never queries the post-update endpoint. Patch distinct Beta samples per
+batch element and assert independent `floor(beta*K)` indices. Assert teacher
+and student receive identical video, injected action, and normalized-time
+tensors inside that band, teacher output is detached, student output remains
 gradient-bearing, and action-velocity contribution is zero in video-only mode.
 
 - [ ] **Step 3: Run RED**
@@ -103,6 +113,12 @@ def sample_main_anyflow_branch(probability: torch.Tensor) -> torch.Tensor:
 ```
 
 Keep Cosmos timestep-to-sigma conversion in its existing scheduler helpers.
+Do not remap or clamp an out-of-support teacher query and call it valid.
+Extend the raw-teacher adapter with an explicit joint query payload: unpack
+the selected `downsample_survivor_v2` state, normalize it with the official
+Cosmos action statistics, inject it into the unified latent action frame, and
+mask the returned loss to true video frames. A production-path test double
+must capture the payload received by the raw worker.
 
 - [ ] **Step 5: Run GREEN and regressions**
 
@@ -116,7 +132,7 @@ PYTHONPATH=. /kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python \
 - [ ] **Step 6: Commit**
 
 ```bash
-git add distillation_flowmap/tests distillation_flowmap/config_libero_cosmos_policy_stage2_progressive.py distillation_flowmap/danceopd_query.py distillation_flowmap/flowmap_step.py
+git add distillation_flowmap/tests distillation_flowmap/config_libero_cosmos_policy_stage2_progressive.py distillation_flowmap/danceopd_query.py distillation_flowmap/flowmap_step.py distillation_flowmap/cosmos_policy_adapter.py distillation_flowmap/cosmos_policy_raw_worker.py
 git commit -m "test: freeze Cosmos AnyFlow and OPD semantics"
 ```
 
@@ -787,4 +803,3 @@ Include:
 git add docs/superpowers/reports/2026-07-24-cosmos-libero-alignment-verification.md
 git commit -m "docs: verify Cosmos LIBERO semantic alignment"
 ```
-

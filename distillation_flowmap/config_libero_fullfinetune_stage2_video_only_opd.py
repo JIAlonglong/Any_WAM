@@ -52,6 +52,10 @@ finally:
 cfg = copy.deepcopy(_base_cfg)
 
 cfg.wandb_name_prefix = "libero_stage2_video_only_opd_universal"
+cfg.attn_mode = os.environ.get("ATTN_MODE", "torch").strip().lower()
+if cfg.attn_mode not in ("torch", "flex", "flashattn"):
+    raise ValueError("ATTN_MODE must be torch, flex, or flashattn")
+cfg.use_fsdp1 = _env_bool("USE_FSDP1", True)
 cfg.max_train_steps = int(os.environ.get("MAX_TRAIN_STEPS", 10000))
 cfg.save_interval = int(os.environ.get("SAVE_INTERVAL", 1000))
 cfg.seed = int(os.environ.get("TRAIN_SEED", 42))

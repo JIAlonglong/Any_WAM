@@ -104,6 +104,7 @@ from distillation_flowmap.opd_rollout_grad import (
 from distillation_flowmap.danceopd_query import (
     denoised_endpoint_mse,
     direct_velocity_mse,
+    sample_low_noise_query_indices,
     sample_semantic_query_indices,
     select_per_sample_trajectory_state,
 )

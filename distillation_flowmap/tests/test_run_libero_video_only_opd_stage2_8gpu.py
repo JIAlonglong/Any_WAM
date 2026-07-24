@@ -85,6 +85,7 @@ def test_dry_run_prints_full_eight_gpu_video_only_contract(tmp_path):
     assert "OPD_AUX_ACTION=0" in result.stdout
     assert "OPD_JOINT_ACTION_ROLLOUT=0" in result.stdout
     assert "MECHANISM_DIAGNOSTIC_INTERVAL=50" in result.stdout
+    assert "ATTN_MODE=torch" in result.stdout
     assert "--nproc_per_node=8" in result.stdout
     assert "--master_port=29659" in result.stdout
     assert 'import_module(os.environ["CONFIG_FILE"])' in log.read_text()

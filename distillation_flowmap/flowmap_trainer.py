@@ -56,6 +56,7 @@ from distillation_flowmap.mechanism_diagnostics import (
     diagnostic_due,
     means_from_reduced_stats,
 )
+from distillation_flowmap.distributed_safety import all_ranks_finite
 
 try:
     import wandb
@@ -292,6 +293,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.action_block_weight = getattr(config, 'action_block_weight', 1.0)
         # LoRA 微调开关
         self.use_lora = getattr(config, 'use_lora', False)
+        self.attn_mode = getattr(config, "attn_mode", None)
+        if config.rank == 0:
+            logger.info(
+                "Transformer attention backend: %s",
+                self.attn_mode or "checkpoint default",
+            )
 
         # ==============================================================
         # DMD（On-Policy Distribution Matching Distillation）参数
@@ -565,6 +572,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         video_teacher_path,
                         torch_dtype=self.dtype,
                         torch_device="cpu",
+                        attn_mode=self.attn_mode,
                     )
                     self.video_teacher.requires_grad_(False)
                     self.video_teacher.eval()
@@ -591,6 +599,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     video_teacher_path,
                     torch_dtype=self.dtype,
                     torch_device="cpu",
+                    attn_mode=self.attn_mode,
                 )
                 self.video_teacher.requires_grad_(False)
                 self.video_teacher.eval()
@@ -600,7 +609,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 logger.info("WanVA video teacher ready for Cosmos dual-teacher mode.")
         else:
             logger.info("Loading teacher (frozen) ...")
-            self.teacher = load_transformer(teacher_path, torch_dtype=self.dtype, torch_device="cpu")
+            self.teacher = load_transformer(
+                teacher_path,
+                torch_dtype=self.dtype,
+                torch_device="cpu",
+                attn_mode=self.attn_mode,
+            )
             self.teacher.requires_grad_(False)  # 冻结所有参数
             self.teacher.eval()                 # 评估模式
             self.teacher = self.teacher.to(self.dtype)
@@ -756,10 +770,20 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         if self._is_lora_resume:
             logger.info("Loading online student from LoRA checkpoint ...")
             logger.info("  Step 1: Loading base model from teacher ...")
-            self.student = load_transformer(teacher_path, torch_dtype=torch.float32, torch_device="cpu")
+            self.student = load_transformer(
+                teacher_path,
+                torch_dtype=torch.float32,
+                torch_device="cpu",
+                attn_mode=self.attn_mode,
+            )
         else:
             logger.info("Loading online student (trainable) ...")
-            self.student = load_transformer(student_path, torch_dtype=torch.float32, torch_device="cpu")
+            self.student = load_transformer(
+                student_path,
+                torch_dtype=torch.float32,
+                torch_device="cpu",
+                attn_mode=self.attn_mode,
+            )
         # apply_ac disabled - checkpointing + batched CFG = mask mismatch during backward
         # apply_ac(self.student)
         self.student = self.student.to(self.dtype)
@@ -972,10 +996,20 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             if self._is_lora_resume:
                 logger.info("Loading target student from LoRA checkpoint ...")
                 logger.info("  Step 1: Loading base model from teacher ...")
-                self.target_student = load_transformer(teacher_path, torch_dtype=self.dtype, torch_device="cpu")
+                self.target_student = load_transformer(
+                    teacher_path,
+                    torch_dtype=self.dtype,
+                    torch_device="cpu",
+                    attn_mode=self.attn_mode,
+                )
             else:
                 logger.info("Loading target student (EMA, frozen) ...")
-                self.target_student = load_transformer(target_path, torch_dtype=self.dtype, torch_device="cpu")
+                self.target_student = load_transformer(
+                    target_path,
+                    torch_dtype=self.dtype,
+                    torch_device="cpu",
+                    attn_mode=self.attn_mode,
+                )
             self.target_student = self.target_student.to(self.dtype)
             self.target_student = adapt_cosmos_latent_video_heads(self.target_student, "target student")
 
@@ -2721,6 +2755,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         acc_kto_main_weight_maxs = []
         acc_kto_main_thresholds = []
         step_in_acc = 0              # 当前累积步数
+        # A non-finite microbatch invalidates the entire accumulation window.
+        # Keep this sticky until the next optimizer boundary.
+        accumulation_skip_step = False
         # DMD 参数
         dmd_weight = getattr(config, 'dmd_weight', 0.1)
         dmd_warmup_steps = getattr(config, 'dmd_warmup_steps', 0)
@@ -2816,10 +2853,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 else:
                     result = self._train_step(batch, step_in_acc)
 
+                accumulation_skip_step = not all_ranks_finite(
+                    not (accumulation_skip_step or result.get("skip_step", False)),
+                    device=self.device,
+                )
+                result["skip_step"] = accumulation_skip_step
+
                 if (not standalone_opd and self.use_opd_aux and not use_onpolicy_now and
                         result.get("should_sync", False) and
                         self.step >= getattr(self.config, 'opd_aux_warmup_steps', 0) and
-                        not result.get("skip_step", False)):
+                        not accumulation_skip_step):
                     opd_aux_interval = max(1, int(getattr(self.config, 'opd_aux_interval', 1)))
                     use_opd_aux_now = (self.step % opd_aux_interval == 0)
                     opd_aux_prob = float(getattr(self.config, 'opd_aux_prob', 1.0))
@@ -2844,6 +2887,14 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         result.get("skip_step", False) or
                         opd_aux_result.get("skip_step", False)
                     )
+
+            accumulation_skip_step = not all_ranks_finite(
+                not (accumulation_skip_step or result.get("skip_step", False)),
+                device=self.device,
+            )
+            result["skip_step"] = accumulation_skip_step
+            if accumulation_skip_step:
+                self.optimizer.zero_grad()
 
             # 累积损失值
             acc_losses.append(result["loss"])
@@ -2974,7 +3025,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             # ---- 第二阶段：DMD（条件满足时执行）----
             d_loss_val = torch.tensor(0.0, device=self.device)
             dmd_grad_norm = 0.0
-            skip_step = result.get("skip_step", False)
+            skip_step = accumulation_skip_step
             use_dmd_now = (self.use_dmd
                            and self.distill_action
                            and self.step >= dmd_warmup_steps
@@ -3017,8 +3068,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     (self.step + 1 >= config.max_train_steps)
                 )
                 grad_branch_norms = {}
-                if skip_step:
-                    total_norm = torch.tensor(float("nan"), device=self.device)
+                skipped_optimizer_step = accumulation_skip_step
+                if skipped_optimizer_step:
+                    total_norm = torch.zeros((), device=self.device)
                     self.optimizer.zero_grad()
                 else:
                     if (
@@ -3030,10 +3082,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     total_norm = torch.nn.utils.clip_grad_norm_(
                         self.student.parameters(), config.max_grad_norm)
 
-                    if not torch.isfinite(total_norm):
+                    local_grad_finite = bool(
+                        torch.isfinite(total_norm.detach()).all().item()
+                    )
+                    if not all_ranks_finite(local_grad_finite, device=self.device):
                         # 梯度范数为 NaN/Inf，跳过这一步
                         if config.rank == 0:
                             logger.warning(f"[step {self.step}] NaN grad norm, skipping")
+                        skipped_optimizer_step = True
+                        total_norm = torch.zeros((), device=self.device)
+                        grad_branch_norms = {}
                         self.optimizer.zero_grad()
                     else:
                         # 正常更新参数
@@ -3120,6 +3178,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         torch.stack(acc_kto_thresholds).sum(),
                     ])
                 metric_values = torch.stack(metric_tensors).float()
+                if skipped_optimizer_step:
+                    metric_values = torch.zeros_like(metric_values)
+                metric_values = torch.nan_to_num(
+                    metric_values, nan=0.0, posinf=0.0, neginf=0.0
+                )
                 metric_results = dist_mean(metric_values).tolist()
                 base_metric_count = 41
                 (
@@ -3262,6 +3325,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_kto_main_weight_maxs = []
                 acc_kto_main_thresholds = []
                 step_in_acc = 0
+                accumulation_skip_step = False
 
                 # 定期清理显存；只在真正清理时同步，避免每个 optimizer step 强制等待 GPU。
                 if self.step % config.gc_interval == 0:
@@ -3281,6 +3345,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     log_dict = {
                         "loss/total": avg_loss,
                         "train/grad_norm": total_norm.item(),
+                        "train/step_skipped": float(skipped_optimizer_step),
                         "train/lr": lr,
                         "train/ema_decay": getattr(self, '_last_ema_decay', config.ema_decay),
                     }

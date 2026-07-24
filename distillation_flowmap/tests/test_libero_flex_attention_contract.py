@@ -1,9 +1,11 @@
+import ast
 import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 WAN_VA_ROOT = ROOT / "wan_va"
+TRAINER = ROOT / "distillation_flowmap" / "flowmap_trainer.py"
 
 
 def test_flex_attention_exposes_packed_length_and_padding_contract():
@@ -47,3 +49,19 @@ def test_mask_cache_key_distinguishes_action_geometries():
         assert full != downsampled
     finally:
         sys.path.pop(0)
+
+
+def test_every_transformer_load_receives_configured_attention_backend():
+    tree = ast.parse(TRAINER.read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "load_transformer"
+    ]
+    assert len(calls) == 7
+    for call in calls:
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        assert "attn_mode" in keywords
+        assert ast.unparse(keywords["attn_mode"]) == "self.attn_mode"

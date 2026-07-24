@@ -14,6 +14,8 @@ def load_config(**env):
         "OPD_DANCEOPD_ROLLOUT_STEPS",
         "OPD_QUERY_MODE",
         "OPD_ROLLOUT_STEP_PAIRS",
+        "ATTN_MODE",
+        "USE_FSDP1",
         "OPD_DANCEOPD_ACTION_VELOCITY_WEIGHT",
         "OPD_AUX_ACTION",
         "OPD_JOINT_ACTION_ROLLOUT",
@@ -57,6 +59,8 @@ def test_defaults_define_full_video_only_universal_contract():
     assert cfg.max_train_steps == 10000
     assert cfg.save_interval == 1000
     assert cfg.seed == 42
+    assert cfg.attn_mode == "torch"
+    assert cfg.use_fsdp1 is True
 
 
 def test_explicit_mixed_query_grid_survives_fresh_base_import():
@@ -68,6 +72,22 @@ def test_explicit_mixed_query_grid_survives_fresh_base_import():
 
     assert cfg.opd_danceopd_rollout_step_choices == (2, 4)
     assert cfg.opd_rollout_step_pairs == [[8, 1], [8, 2], [8, 4]]
+
+
+def test_attention_backend_is_explicit_and_validated():
+    assert load_config(ATTN_MODE="torch").attn_mode == "torch"
+    assert load_config(ATTN_MODE="flex").attn_mode == "flex"
+    try:
+        load_config(ATTN_MODE="unknown")
+    except ValueError as exc:
+        assert "ATTN_MODE" in str(exc)
+    else:
+        raise AssertionError("invalid attention backend must fail")
+
+
+def test_fsdp1_backend_is_enabled_for_real_training():
+    assert load_config(USE_FSDP1=1).use_fsdp1 is True
+    assert load_config(USE_FSDP1=0).use_fsdp1 is False
 
 
 def test_action_opd_cannot_be_enabled_by_environment():

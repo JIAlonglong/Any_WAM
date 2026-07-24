@@ -111,6 +111,7 @@ launch_env=(
     "MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS}"
     "SAVE_INTERVAL=${SAVE_INTERVAL}"
     "TRAIN_SEED=42"
+    "ATTN_MODE=${ATTN_MODE:-torch}"
     "OPD_QUERY_MODE=danceopd"
     "OPD_ROLLOUT_STEP_PAIRS=8,1;8,2;8,4"
     "OPD_DANCEOPD_ROLLOUT_STEPS=2,4"
@@ -162,6 +163,7 @@ assert tuple(cfg.opd_danceopd_rollout_step_choices) == (2, 4)
 assert cfg.opd_rollout_step_pairs == [[8, 1], [8, 2], [8, 4]]
 assert not cfg.opd_aux_action
 assert cfg.opd_danceopd_action_velocity_weight == 0.0
+assert cfg.attn_mode == os.environ["ATTN_MODE"].strip().lower()
 packed = FlexAttnFunc._packed_sequence_length(
     (1, 48, 16, 8, 8), (1, 30, 16, 4, 1), (1, 2, 2)
 )

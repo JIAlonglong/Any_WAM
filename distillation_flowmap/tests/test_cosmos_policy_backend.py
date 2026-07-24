@@ -384,6 +384,73 @@ def test_cosmos_action_packing_v2_preserves_all_sixteen_actions_after_downsample
     assert full[:, :7, 1:4].abs().sum() == 0
 
 
+@pytest.mark.parametrize(
+    ("aligned_shape", "target_shape", "downsample_factor"),
+    [
+        ((1, 8, 30), (1, 30, 16, 2, 1), 4),
+        ((1, 32, 30), (1, 30, 16, 8, 1), 4),
+        ((1, 16, 30), (1, 30, 8, 4, 1), 2),
+        ((1, 8, 30), (1, 30, 8, 4, 1), 4),
+    ],
+    ids=("n2", "n8", "factor2", "compact_frames2"),
+)
+def test_cosmos_action_packing_v2_rejects_non_production_geometry(
+    aligned_shape,
+    target_shape,
+    downsample_factor,
+):
+    from distillation_flowmap.cosmos_training_contract import (
+        ACTION_PACKING_SCHEMA,
+        pack_actions_for_downsample,
+    )
+
+    with pytest.raises(ValueError, match="production action carrier"):
+        pack_actions_for_downsample(
+            torch.ones(aligned_shape),
+            target_shape,
+            downsample_factor=downsample_factor,
+            schema=ACTION_PACKING_SCHEMA,
+        )
+
+
+def test_cosmos_action_packing_v2_round_trips_through_production_decoder():
+    from distillation_flowmap.cosmos_policy_adapter import cosmos_actions_to_flowmap_x0
+    from distillation_flowmap.cosmos_training_contract import ACTION_PACKING_SCHEMA
+    from evaluation.libero.cosmos_progressive_s4_server import (
+        ActionDecodingTemplate,
+        decode_student_action,
+    )
+
+    actions = torch.arange(1, 16 * 7 + 1, dtype=torch.float32).reshape(1, 16, 7)
+    q01 = torch.zeros(30)
+    q99 = torch.ones(30) * 200
+    inverse = tuple(range(7)) + (7,) * 23
+    full = cosmos_actions_to_flowmap_x0(
+        actions,
+        target_shape=(1, 30, 16, 4, 1),
+        q01=q01,
+        q99=q99,
+        inverse_used_action_channel_ids=inverse,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        packing_schema=ACTION_PACKING_SCHEMA,
+        downsample_factor=4,
+    )
+
+    decoded = decode_student_action(
+        full[:, :, ::4],
+        ActionDecodingTemplate(
+            q01=q01,
+            q99=q99,
+            inverse_used_action_channel_ids=inverse,
+            action_dim=7,
+        ),
+    )
+
+    assert decoded.shape == (16, 7)
+    np.testing.assert_allclose(decoded, actions[0].numpy(), rtol=0, atol=1e-4)
+
+
 @pytest.mark.parametrize("schema", ["", "legacy_dense_v1", "unknown"])
 def test_corrected_cosmos_training_rejects_non_v2_packing(schema):
     from distillation_flowmap.cosmos_training_contract import (

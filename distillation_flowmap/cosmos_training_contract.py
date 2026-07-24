@@ -18,12 +18,22 @@ def pack_actions_for_downsample(
             f"action packing schema must be {ACTION_PACKING_SCHEMA!r}, got {schema!r}"
         )
     batch, channels, frames, per_frame, width = target_shape
-    if width != 1 or downsample_factor <= 0:
-        raise ValueError("action carrier requires width=1 and a positive downsample factor")
-    if frames % downsample_factor != 0:
-        raise ValueError("action carrier frames must be divisible by downsample_factor")
+    if (
+        downsample_factor != 4
+        or frames != downsample_factor * 4
+        or per_frame != 4
+        or width != 1
+    ):
+        raise ValueError(
+            "production action carrier requires downsample_factor=4, "
+            "compact_frames=4, per_frame=4, and width=1"
+        )
     compact_frames = frames // downsample_factor
     capacity = compact_frames * per_frame
+    if capacity != 16:
+        raise ValueError(
+            f"production action carrier requires capacity=16, got {capacity}"
+        )
     if aligned.shape != (batch, capacity, channels):
         raise ValueError(
             f"expected aligned actions {(batch, capacity, channels)}, got {tuple(aligned.shape)}"

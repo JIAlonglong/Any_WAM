@@ -1271,7 +1271,40 @@ def test_formal_preflight_does_not_execute_ambient_sitecustomize(
 def test_production_preflights_never_append_ambient_pythonpath():
     source = SCRIPT.read_text(encoding="utf-8")
     assert "${PYTHONPATH:-}" not in source
-    assert " -I " in source or " -I" in source
+    assert ' -I -E -s -S -B -c "$FORMAL_PREFLIGHT_DRIVER"' in source
+    assert "PYTHONDONTWRITEBYTECODE" not in source
+    assert "PYTHONHASHSEED" not in source
+
+
+def test_repeated_dry_and_check_preflights_do_not_write_bytecode(tmp_path):
+    env, _ = _env(tmp_path)
+
+    def snapshot():
+        return {
+            str(path): (
+                path.read_bytes(),
+                path.stat().st_mtime_ns,
+                path.stat().st_ctime_ns,
+            )
+            for path in ROOT.joinpath("distillation_flowmap").rglob("*")
+            if path.name == "__pycache__" or path.suffix == ".pyc"
+            if path.is_file()
+        }
+
+    before = snapshot()
+    for mode in ("--dry-run", "--check-only", "--dry-run", "--check-only"):
+        result = _run(
+            "apm",
+            "--output-root",
+            str(tmp_path / "out"),
+            "--run-tag",
+            "bytecode-read-only",
+            mode,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+    assert snapshot() == before
+    assert not (tmp_path / "out").exists()
 
 
 def test_formal_default_hashes_same_size_large_artifact_mutation(tmp_path):

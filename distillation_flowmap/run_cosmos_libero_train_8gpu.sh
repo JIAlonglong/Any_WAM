@@ -122,8 +122,8 @@ run_formal_preflight() {
         "${clean_environment[@]}" \
         PATH=/usr/bin:/bin HOME=/nonexistent \
         LANG=C.UTF-8 LC_ALL=C.UTF-8 \
-        PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0 PYTHONNOUSERSITE=1 \
-        "$PREFLIGHT_BIN" -I -E -s -S -c "$FORMAL_PREFLIGHT_DRIVER" \
+        PYTHONNOUSERSITE=1 \
+        "$PREFLIGHT_BIN" -I -E -s -S -B -c "$FORMAL_PREFLIGHT_DRIVER" \
         "$PROJECT_ROOT" "$PROJECT_ROOT/wan_va" "$PREFLIGHT_SITE_PACKAGES" \
         "$encoded" "$@"
 }

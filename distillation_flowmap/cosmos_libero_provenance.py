@@ -215,10 +215,9 @@ def fingerprint_git_repository(
     path: str | Path,
     *,
     purpose: str,
-    git_executor: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     root = _canonical_root(path, label=f"{purpose} repository")
-    executor = dict(git_executor or _git_executor_identity())
+    executor = _git_executor_identity()
     git_environment = _git_environment(executor["exec_path"])
     git_prefix = [
         executor["binary_realpath"],
@@ -482,10 +481,10 @@ def resolve_formal_provenance(
             verify_large_artifact_digests=verify_large_artifact_digests,
         ),
         "flashwam_repo": fingerprint_git_repository(
-            flashwam_repo, purpose="Flash-WAM", git_executor=git_executor
+            flashwam_repo, purpose="Flash-WAM"
         ),
         "cosmos_repo": fingerprint_git_repository(
-            cosmos_repo, purpose="Cosmos", git_executor=git_executor
+            cosmos_repo, purpose="Cosmos"
         ),
         "preflight": _preflight_identity(
             preflight_python,

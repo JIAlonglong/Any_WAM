@@ -1,4 +1,5 @@
 import json
+import inspect
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,12 @@ from distillation_flowmap.cosmos_libero_provenance import (
     resolve_formal_provenance,
     verify_artifact_lock,
 )
+
+
+def test_public_git_fingerprint_has_no_executor_override():
+    assert "git_executor" not in inspect.signature(
+        fingerprint_git_repository
+    ).parameters
 
 
 def _git_repo(root: Path) -> Path:

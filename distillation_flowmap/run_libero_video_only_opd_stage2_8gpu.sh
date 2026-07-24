@@ -157,10 +157,15 @@ command=(
 
 preflight_code='import importlib, os
 cfg = importlib.import_module(os.environ["CONFIG_FILE"]).cfg
+from modules.model import FlexAttnFunc
 assert tuple(cfg.opd_danceopd_rollout_step_choices) == (2, 4)
 assert cfg.opd_rollout_step_pairs == [[8, 1], [8, 2], [8, 4]]
 assert not cfg.opd_aux_action
 assert cfg.opd_danceopd_action_velocity_weight == 0.0
+packed = FlexAttnFunc._packed_sequence_length(
+    (1, 48, 16, 8, 8), (1, 30, 16, 4, 1), (1, 2, 2)
+)
+FlexAttnFunc.resolve_padded_length(packed, attn_mode="torch")
 print("LIBERO Stage-2 config preflight passed")'
 if ! (
     cd "${PROJECT_ROOT}"

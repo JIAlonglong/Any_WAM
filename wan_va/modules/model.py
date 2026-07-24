@@ -26,6 +26,10 @@ from torch.nn.attention.flex_attention import (
 )
 from functools import partial
 
+from .flex_attention_padding import (
+    resolve_padded_length as _resolve_flex_attention_padded_length,
+)
+
 try:
     from flash_attn_interface import flash_attn_func
 except Exception:
@@ -42,21 +46,53 @@ def custom_sdpa(q, k, v):
                                          v.transpose(1, 2))
     return out.transpose(1, 2)
 
+
+_FLEX_KERNEL_OPTIONS = {
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_M1": 32,
+    "BLOCK_N1": 64,
+    "BLOCK_M2": 64,
+    "BLOCK_N2": 32,
+}
+
+
+def _flex_attention_with_runtime_mask(query, key, value, block_mask):
+    """Run FlexAttention with the regenerated BlockMask as a graph input."""
+    return flex_attention(
+        query,
+        key,
+        value,
+        block_mask=block_mask,
+        kernel_options=_FLEX_KERNEL_OPTIONS,
+    )
+
+
+# Calling flex_attention directly outside an Inductor graph makes PyTorch 2.6
+# compile it with the eager backend, which materializes a dense QxK score
+# matrix.  Keep the mask explicit here: init_mask can rebuild it for teacher
+# and student batch shapes without it becoming a captured ClassVar constant.
+_compiled_flex_attention = torch.compile(
+    _flex_attention_with_runtime_mask,
+    fullgraph=True,
+    dynamic=False,
+)
+
+
 class FlexAttnFunc(nn.Module):
-    # NOTE: flex_attention and create_block_mask are intentionally NOT torch.compile'd.
-    # torch.compile captures ClassVar (attention_mask / cross_attention_mask) as
-    # compile-time constants, so runtime updates via init_mask are invisible to the
-    # compiled graph.  Since the flowmap distillation uses different batch sizes for
-    # teacher (2B) and student (B), the stale constant causes a shape mismatch.
-    # flex_attention's underlying CUDA kernels still run at full speed without compile.
-    flex_attn: ClassVar[Callable] = flex_attention
+    # The compiled callable receives the current BlockMask as an explicit argument.
+    # Do not compile FlexAttnFunc.forward itself: that would capture these class
+    # variables and reuse a stale mask when the teacher/student batch shape changes.
+    flex_attn: ClassVar[Callable] = _compiled_flex_attention
     create_block_mask_fn: ClassVar[Callable] = create_block_mask
     attention_mask: ClassVar[BlockMask] = None
     cross_attention_mask: ClassVar[BlockMask] = None
-    # Mask cache: avoids redundant create_block_mask calls when the same
-    # (B, padded_length, fdm) combination is requested repeatedly (e.g.
-    # teacher and student masks are each constant across gradient-accumulation
-    # steps).  Key = (B, padded_length, fdm), Value = (attn_mask, cross_mask).
+    _logical_batch_size: ClassVar[int | None] = None
+    _valid_query_length: ClassVar[int | None] = None
+    # Mask cache: avoids redundant create_block_mask calls when the full mask
+    # geometry is reused across gradient-accumulation steps.  Teacher and
+    # student can share B/padded_length while using different action lengths,
+    # so those dimensions must be part of the key as well.
     _mask_cache: ClassVar[dict] = {}
 
     def __init__(
@@ -88,19 +124,79 @@ class FlexAttnFunc(nn.Module):
         q_varlen = q_varlen.to(v_varlen.dtype)
         k_varlen = k_varlen.to(v_varlen.dtype)
 
-        block_mask = FlexAttnFunc.cross_attention_mask if self.is_cross else FlexAttnFunc.attention_mask
-
-        x_out = FlexAttnFunc.flex_attn(q_varlen, k_varlen, v_varlen, block_mask=block_mask, kernel_options = {
-                                                    "BLOCK_M": 64,
-                                                    "BLOCK_N": 64,
-                                                    "BLOCK_M1": 32,
-                                                    "BLOCK_N1": 64,
-                                                    "BLOCK_M2": 64,
-                                                    "BLOCK_N2": 32,
-                                                })
+        if self.is_cross and FlexAttnFunc._logical_batch_size == 1:
+            # For B=1 the cross mask permits every real packed query token to
+            # attend to all 512 text tokens, so unmasked SDPA is equivalent.
+            # PyTorch 2.6 cannot lower FlexAttention's Q>>K cross-attention
+            # backward kernel; SDPA selects its stable Flash kernel instead.
+            x_out = F.scaled_dot_product_attention(q_varlen, k_varlen, v_varlen)
+            valid_query_length = FlexAttnFunc._valid_query_length
+            if (
+                valid_query_length is not None
+                and valid_query_length < x_out.shape[-2]
+            ):
+                valid_queries = torch.arange(
+                    x_out.shape[-2], device=x_out.device
+                ) < valid_query_length
+                x_out = x_out * valid_queries.view(1, 1, -1, 1).to(x_out.dtype)
+        else:
+            block_mask = (
+                FlexAttnFunc.cross_attention_mask
+                if self.is_cross else FlexAttnFunc.attention_mask
+            )
+            x_out = FlexAttnFunc.flex_attn(q_varlen, k_varlen, v_varlen, block_mask)
 
         x_out = rearrange(x_out, "b n s d -> b s n d")
         return x_out
+
+    @staticmethod
+    def _mask_cache_key(
+        latent_shape,
+        action_shape,
+        padded_length,
+        chunk_size,
+        window_size,
+        patch_size,
+        device,
+        fdm,
+    ):
+        """Build a geometry-complete key for cached FlexAttention masks."""
+        return (
+            tuple(int(dim) for dim in latent_shape),
+            tuple(int(dim) for dim in action_shape),
+            int(padded_length),
+            int(chunk_size),
+            int(window_size),
+            tuple(int(dim) for dim in patch_size),
+            str(device),
+            bool(fdm),
+        )
+
+    @staticmethod
+    def _packed_sequence_length(latent_shape, action_shape, patch_size):
+        """Return the unpadded packed video/action token length."""
+        batch_size, _, latent_frames, latent_height, latent_width = latent_shape
+        _, _, action_frames, action_height, action_width = action_shape
+        latent_tokens = (
+            int(batch_size)
+            * (int(latent_frames) // int(patch_size[0]))
+            * (int(latent_height) // int(patch_size[1]))
+            * (int(latent_width) // int(patch_size[2]))
+        )
+        action_tokens = (
+            int(batch_size)
+            * int(action_frames)
+            * int(action_height)
+            * int(action_width)
+        )
+        return 2 * (latent_tokens + action_tokens)
+
+    @staticmethod
+    def resolve_padded_length(total_length, *, attn_mode=None):
+        """Resolve physical attention padding for the selected backend."""
+        return _resolve_flex_attention_padded_length(
+            total_length, attn_mode=attn_mode
+        )
 
     @staticmethod
     @torch.no_grad()
@@ -120,12 +216,24 @@ class FlexAttnFunc(nn.Module):
         latent_shape[0]（即 B）可以是原始 batch_size，也可以是 2*batch_size
         （CFG 场景下 cond+uncond 拼接后的 batch 维度）。
         """
-        # --- cache lookup: skip create_block_mask if we already built one
-        # for the same (B, padded_length, fdm).  All other shape parameters
-        # (L_F, L_H, L_W, chunk_size, window_size, patch_size) are constant
-        # throughout a training run.
-        B = latent_shape[0]
-        cache_key = (B, padded_length, fdm)
+        FlexAttnFunc._logical_batch_size = int(latent_shape[0])
+        FlexAttnFunc._valid_query_length = FlexAttnFunc._packed_sequence_length(
+            latent_shape, action_shape, patch_size
+        )
+
+        # --- cache lookup: never alias a full-action teacher mask with the
+        # downsampled-action student mask, even if their batch and padding
+        # happen to match.
+        cache_key = FlexAttnFunc._mask_cache_key(
+            latent_shape,
+            action_shape,
+            padded_length,
+            chunk_size,
+            window_size,
+            patch_size,
+            device,
+            fdm,
+        )
         cached = FlexAttnFunc._mask_cache.get(cache_key)
         if cached is not None:
             FlexAttnFunc.attention_mask, FlexAttnFunc.cross_attention_mask = cached
@@ -796,7 +904,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         timestep_proj = torch.cat([latent_timestep_proj, action_timestep_proj], dim=1)
 
         total_length = hidden_states.shape[1]
-        padded_length = (128 - total_length % 128) % 128
+        padded_length = FlexAttnFunc.resolve_padded_length(
+            total_length,
+            attn_mode=getattr(self.config, "attn_mode", None),
+        )
         hidden_states = F.pad(hidden_states, (0, 0, 0, padded_length))
         rotary_emb = F.pad(rotary_emb, (0, 0, 0, 0, 0, padded_length))
         temb = F.pad(temb, (0, 0, 0, padded_length))

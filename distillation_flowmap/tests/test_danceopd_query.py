@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 from wan_va.utils.scheduler import FlowMatchScheduler
 
+from distillation_flowmap import danceopd_query
 from distillation_flowmap.danceopd_query import (
     denoised_endpoint_mse,
     direct_velocity_mse,
@@ -14,6 +15,81 @@ from distillation_flowmap.danceopd_query import (
 
 
 class DanceOPDQueryTest(unittest.TestCase):
+    def test_shifted_terminal_path_matches_video_inference_grid(self):
+        self.assertTrue(
+            hasattr(danceopd_query, "build_shifted_terminal_path"),
+            "deployment-shifted DanceOPD path helper is missing",
+        )
+        build_shifted_terminal_path = danceopd_query.build_shifted_terminal_path
+        scheduler = FlowMatchScheduler(
+            num_inference_steps=1000,
+            num_train_timesteps=1000,
+            shift=5.0,
+            sigma_min=0.0,
+            extra_one_step=True,
+        )
+
+        expected_by_steps = {
+            1: [1000.0, 0.0],
+            2: [1000.0, 833.3333333333, 0.0],
+            4: [1000.0, 937.5, 833.3333333333, 625.0, 0.0],
+        }
+        for steps, expected in expected_by_steps.items():
+            with self.subTest(steps=steps):
+                path = build_shifted_terminal_path(
+                    scheduler=scheduler,
+                    num_steps=steps,
+                    batch_size=2,
+                    num_frames=3,
+                    num_train_timesteps=1000,
+                    device=torch.device("cpu"),
+                    dtype=torch.float64,
+                )
+                self.assertEqual(path.shape, (steps + 1, 2, 3))
+                torch.testing.assert_close(
+                    path[:, 0, 0],
+                    torch.tensor(expected, dtype=torch.float64),
+                    rtol=1e-9,
+                    atol=1e-9,
+                )
+
+    def test_shifted_terminal_path_matches_action_inference_grid(self):
+        self.assertTrue(
+            hasattr(danceopd_query, "build_shifted_terminal_path"),
+            "deployment-shifted DanceOPD path helper is missing",
+        )
+        build_shifted_terminal_path = danceopd_query.build_shifted_terminal_path
+        scheduler = FlowMatchScheduler(
+            num_inference_steps=1000,
+            num_train_timesteps=1000,
+            shift=0.05,
+            sigma_min=0.0,
+            extra_one_step=True,
+        )
+
+        expected_by_steps = {
+            1: [1000.0, 0.0],
+            2: [1000.0, 47.6190476190, 0.0],
+            4: [1000.0, 130.4347826087, 47.6190476190, 16.3934426230, 0.0],
+        }
+        for steps, expected in expected_by_steps.items():
+            with self.subTest(steps=steps):
+                path = build_shifted_terminal_path(
+                    scheduler=scheduler,
+                    num_steps=steps,
+                    batch_size=1,
+                    num_frames=4,
+                    num_train_timesteps=1000,
+                    device=torch.device("cpu"),
+                    dtype=torch.float64,
+                )
+                torch.testing.assert_close(
+                    path[:, 0, 0],
+                    torch.tensor(expected, dtype=torch.float64),
+                    rtol=1e-9,
+                    atol=1e-9,
+                )
+
     def test_beta_query_indices_bias_toward_late_trajectory_states(self):
         torch.manual_seed(17)
 

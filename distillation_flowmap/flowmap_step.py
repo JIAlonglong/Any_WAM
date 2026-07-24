@@ -102,6 +102,7 @@ from distillation_flowmap.opd_rollout_grad import (
     rollout_step_requires_grad,
 )
 from distillation_flowmap.danceopd_query import (
+    build_shifted_terminal_path,
     denoised_endpoint_mse,
     direct_velocity_mse,
     sample_low_noise_query_indices,
@@ -5726,11 +5727,23 @@ class FlowMapStepMixin:
                 f"tolerance={terminal_prior_tolerance:.3e}"
             )
 
-        video_path = self._build_timestep_path(
-            terminal_video_t, zero_video_t, rollout_steps
+        video_path = build_shifted_terminal_path(
+            scheduler=self.train_scheduler_latent,
+            num_steps=rollout_steps,
+            batch_size=B,
+            num_frames=video_frames,
+            num_train_timesteps=self.config.num_train_timesteps,
+            device=self.device,
+            dtype=terminal_video_t.dtype,
         )
-        action_path = self._build_timestep_path(
-            terminal_action_t, zero_action_t, rollout_steps
+        action_path = build_shifted_terminal_path(
+            scheduler=self.train_scheduler_action,
+            num_steps=rollout_steps,
+            batch_size=B,
+            num_frames=action_frames,
+            num_train_timesteps=self.config.num_train_timesteps,
+            device=self.device,
+            dtype=terminal_action_t.dtype,
         )
 
         action_base = input_dict['action_dict']

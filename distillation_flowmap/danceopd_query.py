@@ -8,6 +8,38 @@ import torch
 import torch.nn.functional as F
 
 
+def build_shifted_terminal_path(
+    *,
+    scheduler,
+    num_steps: int,
+    batch_size: int,
+    num_frames: int,
+    num_train_timesteps: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build the exact shifted terminal-to-clean grid used at deployment."""
+    if num_steps <= 0:
+        raise ValueError("num_steps must be positive")
+    if batch_size <= 0 or num_frames <= 0:
+        raise ValueError("batch_size and num_frames must be positive")
+    if num_train_timesteps <= 0:
+        raise ValueError("num_train_timesteps must be positive")
+
+    raw_sigmas = torch.linspace(
+        1.0,
+        0.0,
+        num_steps + 1,
+        device=device,
+        dtype=dtype,
+    )
+    shifted_sigmas = scheduler.apply_shift(raw_sigmas)
+    if not bool(torch.isfinite(shifted_sigmas).all()):
+        raise ValueError("shifted terminal path must be finite")
+    path = shifted_sigmas * float(num_train_timesteps)
+    return path[:, None, None].expand(-1, batch_size, num_frames)
+
+
 def sample_low_noise_query_indices(
     *,
     n_states: int,

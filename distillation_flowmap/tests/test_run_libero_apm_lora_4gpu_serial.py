@@ -88,3 +88,27 @@ def test_arm_subset_is_validated_and_preserves_order(tmp_path):
     assert train_lines[0].startswith("TRAIN arm=anchor_only")
     assert train_lines[1].startswith("TRAIN arm=apm")
     assert len(train_lines) == 2
+
+
+def test_all_phase_wires_single_task_closed_loop_family(tmp_path):
+    result = run_dry(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    marker = (
+        "CLOSED_LOOP models="
+        "stage1,stage1_only,anchor_only,field_only,apm"
+    )
+    assert marker in result.stdout
+    jobs = [line for line in result.stdout.splitlines() if line.startswith("JOB ")]
+    assert len(jobs) == 15
+    assert all("suite=libero_10 task=0:1" in line for line in jobs)
+    positions = [
+        result.stdout.index("TRAIN arm=stage1_only"),
+        result.stdout.index("TRAIN arm=anchor_only"),
+        result.stdout.index("TRAIN arm=field_only"),
+        result.stdout.index("TRAIN arm=apm"),
+        result.stdout.index("OFFLINE_EVAL arm=stage1_only"),
+        result.stdout.index(marker),
+    ]
+    assert positions == sorted(positions)
+    assert not (tmp_path / "runs").exists()

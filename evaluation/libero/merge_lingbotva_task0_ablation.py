@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -53,6 +54,7 @@ def read_row(path: Path, model: str, steps: int, expected_episodes: int) -> dict
         )
     return {
         "model": model,
+        "steps": steps,
         "video_steps": steps,
         "action_steps": steps,
         "successes": successes,
@@ -106,7 +108,9 @@ def main() -> None:
     best_model = max(nonbaseline, key=lambda name: models[name]["mean_success_rate"])
     summary = {
         "benchmark": BENCHMARK,
+        "task_index": TASK_IDX,
         "task_idx": TASK_IDX,
+        "episodes_per_job": args.expected_episodes,
         "expected_episodes_per_job": args.expected_episodes,
         "num_jobs": len(rows),
         "budgets": list(BUDGETS),
@@ -121,6 +125,26 @@ def main() -> None:
         encoding="utf-8",
     )
     os.replace(temporary, args.output)
+    csv_path = args.output.with_suffix(".csv")
+    csv_temporary = csv_path.with_name(f".{csv_path.name}.tmp.{os.getpid()}")
+    with csv_temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "model",
+                "steps",
+                "video_steps",
+                "action_steps",
+                "successes",
+                "episodes",
+                "success_rate",
+                "delta_vs_stage1",
+                "source",
+            ),
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(csv_temporary, csv_path)
     print(
         f"Merged {len(rows)} task-0 jobs; "
         f"best ablation={best_model} "

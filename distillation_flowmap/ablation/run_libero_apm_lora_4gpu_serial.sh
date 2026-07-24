@@ -96,6 +96,7 @@ done
 
 PLANNER="${SCRIPT_DIR}/launch_libero_apm_ablation.py"
 OFFLINE_EVAL="${PROJECT_ROOT}/distillation_flowmap/rollout_eval_video_stage2.py"
+CLOSED_LOOP_EVAL="${PROJECT_ROOT}/evaluation/libero/run_lingbotva_task0_124_eval_4gpu.sh"
 PROTOCOL_ROOT="${OUTPUT_ROOT}/protocol"
 TRAIN_MANIFEST="${PROTOCOL_ROOT}/train_manifest.json"
 HELDOUT_MANIFEST="${PROTOCOL_ROOT}/heldout_manifest.json"
@@ -175,6 +176,27 @@ run_offline_eval() {
     "${command[@]}" > "${result_dir}/heldout.log" 2>&1
 }
 
+run_closed_loop() {
+  local eval_root="${OUTPUT_ROOT}/closed_loop_task0"
+  local -a command=(
+    bash "${CLOSED_LOOP_EVAL}"
+    --stage1-checkpoint "${STAGE1_CKPT}"
+    --ablation-root "${OUTPUT_ROOT}"
+    --train-steps "${STEPS}"
+    --episodes "${EPISODES}"
+    --gpu-ids "${GPU_IDS}"
+    --master-port-base "$(( MASTER_PORT_BASE + 100 ))"
+    --ws-port-base "$(( MASTER_PORT_BASE + 200 ))"
+    --output-root "${eval_root}"
+  )
+  echo "CLOSED_LOOP models=stage1,stage1_only,anchor_only,field_only,apm task=libero_10:0 episodes=${EPISODES} budgets=1,2,4"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    CHECK_ONLY=1 "${command[@]}"
+    return
+  fi
+  "${command[@]}"
+}
+
 cd "${PROJECT_ROOT}"
 if [[ "${PHASE}" == "train" || "${PHASE}" == "all" ]]; then
   for index in "${!ARMS[@]}"; do
@@ -189,5 +211,5 @@ if [[ "${PHASE}" == "offline-eval" || "${PHASE}" == "all" ]]; then
 fi
 
 if [[ "${PHASE}" == "closed-loop" || "${PHASE}" == "all" ]]; then
-  echo "CLOSED_LOOP_PENDING task=libero_10:0 episodes=${EPISODES} budgets=1,2,4"
+  run_closed_loop
 fi

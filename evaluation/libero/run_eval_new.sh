@@ -13,6 +13,7 @@
 #   OUTPUT_ROOT:      distillation 输出目录，默认 stage2 anyflow 输出
 #   STUDENT_CKPT:     任意待测 transformer 路径；设置后不再按 OUTPUT_ROOT/STEP/VARIANT 推导
 #   TEACHER_CKPT:     teacher transformer 路径，默认 /kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero/transformer
+#   WAN22_PRETRAINED_PATH: VAE/tokenizer/text-encoder/base-transformer 根目录
 #   LIBERO_BENCHMARK: libero_10 | libero_spatial | libero_object | libero_goal
 #   EVAL_MODE:        visualize | compare | success | all，默认 visualize
 #   NUM_STEPS:        视频推理步数，默认 20
@@ -91,6 +92,8 @@ fi
 
 STUDENT_CKPT="${STUDENT_CKPT:-${OUTPUT_ROOT}/checkpoints/${STEP}/${VARIANT}/transformer}"
 TEACHER_CKPT="${TEACHER_CKPT:-/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero/transformer}"
+WAN22_PRETRAINED_PATH="${WAN22_PRETRAINED_PATH:-/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero}"
+export WAN22_PRETRAINED_PATH
 SAVE_ROOT="${SAVE_ROOT:-${PROJECT_ROOT}/evaluation/outputs/libero_env_${STEP}_${VARIANT}}"
 VIDEO_DIR="${SAVE_ROOT}/videos"
 ACTION_DIR="${SAVE_ROOT}/actions"
@@ -123,6 +126,7 @@ log_header() {
     echo "  Master port:    ${MASTER_PORT}"
     echo "  Student:        ${STUDENT_CKPT}"
     echo "  Teacher:        ${TEACHER_CKPT}"
+    echo "  Base model:     ${WAN22_PRETRAINED_PATH}"
     echo "  Save root:      ${SAVE_ROOT}"
     echo "============================================"
 }
@@ -138,6 +142,12 @@ check_inputs() {
         echo "ERROR: Teacher checkpoint not found: $TEACHER_CKPT"
         exit 1
     fi
+    for component in transformer vae tokenizer text_encoder; do
+        if [ ! -d "${WAN22_PRETRAINED_PATH}/${component}" ]; then
+            echo "ERROR: Base model component not found: ${WAN22_PRETRAINED_PATH}/${component}"
+            exit 1
+        fi
+    done
 }
 
 start_server() {

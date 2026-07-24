@@ -53,6 +53,7 @@ def test_check_only_propagates_suite_joint_steps_and_gpu(tmp_path, suite):
     assert "Video steps:    2" in result.stdout
     assert "Action steps:   2" in result.stdout
     assert "Visible GPUs:   7" in result.stdout
+    assert "Base model:" in result.stdout
 
 
 def test_unknown_suite_is_rejected(tmp_path):

@@ -99,3 +99,47 @@ Main outputs:
 - `mini_ablation_per_task.csv`
 - `mini_ablation_video_assets.jsonl`
 - `mini_ablation_report.md`
+
+## LIBERO task-0 APM small-sample family
+
+`run_libero_apm_lora_4gpu_serial.sh` migrates the RobotWin APM mechanism
+ablation to `libero_10` task 0
+(`put both the alphabet soup and the tomato sauce in the basket`). It trains
+on dataset episodes 0--39 and reserves episodes 40--49 for offline rollout
+diagnostics. The four Stage-2 LoRA arms isolate no video OPD, endpoint anchor
+only, compositional field only, and their combination. Action OPD and joint
+action rollout are disabled in all four arms.
+
+The default four-GPU command runs the complete small-sample family:
+
+```bash
+cd /kpfs-intern/jialongliu/projects/Flash-WAM/.worktrees/libero-lingbotva-video-opd
+PYTHON=/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python \
+bash distillation_flowmap/ablation/run_libero_apm_lora_4gpu_serial.sh \
+  --phase all \
+  --gpu-ids 0,1,2,3 \
+  --steps 500 \
+  --episodes 20 \
+  --output-root /kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_apm_lora_ablation_20260724
+```
+
+The phases are resumable operational units:
+
+- `train`: four arms, serially, with four GPUs per arm.
+- `offline-eval`: the ten held-out episodes with student and teacher budgets
+  1, 2, and 4.
+- `closed-loop`: Stage-1 plus all four arms, only the trained task, 20
+  episodes per matched video/action budget 1/1, 2/2, and 4/4.
+- `all`: run the three phases in that order.
+
+Use a fresh `--output-root`; training refuses to reuse an existing arm
+directory. Before allocating GPUs, verify the exact 4 + 4 + 15 jobs without
+writing any output:
+
+```bash
+bash distillation_flowmap/ablation/run_libero_apm_lora_4gpu_serial.sh \
+  --phase all --gpu-ids 0,1,2,3 --dry-run
+```
+
+The final closed-loop comparison is written to
+`<output-root>/closed_loop_task0/summary.json`.

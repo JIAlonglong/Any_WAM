@@ -19,6 +19,7 @@ TRAIN_STEPS=500
 EPISODES=20
 MASTER_PORT_BASE=30670
 WS_PORT_BASE=31670
+BASE_MODEL_PATH="${BASE_MODEL_PATH:-/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero}"
 STAGE1_CHECKPOINT=""
 ABLATION_ROOT=""
 OUTPUT_ROOT=""
@@ -36,6 +37,7 @@ Options:
   --gpu-ids 0,1,2,3
   --master-port-base PORT
   --ws-port-base PORT
+  --base-model-path PATH
 
 Set CHECK_ONLY=1 to validate and print all 15 jobs without starting services.
 EOF
@@ -51,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     --gpu-ids) GPU_IDS="${2:?missing value}"; shift 2 ;;
     --master-port-base) MASTER_PORT_BASE="${2:?missing value}"; shift 2 ;;
     --ws-port-base) WS_PORT_BASE="${2:?missing value}"; shift 2 ;;
+    --base-model-path) BASE_MODEL_PATH="${2:?missing value}"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -79,14 +82,30 @@ for arm in stage1_only anchor_only field_only apm; do
   CHECKPOINTS["${arm}"]="${ABLATION_ROOT}/${arm}/seed_42/stage2/checkpoints/step_${TRAIN_STEPS}/target_student/transformer"
 done
 
-for model in "${MODELS[@]}"; do
-  [[ -d "${CHECKPOINTS[${model}]}" ]] \
-    || die "checkpoint not found for ${model}: ${CHECKPOINTS[${model}]}"
-done
+if [[ "${CHECK_ONLY:-0}" != "1" ]]; then
+  for component in transformer vae tokenizer text_encoder; do
+    [[ -d "${BASE_MODEL_PATH}/${component}" ]] \
+      || die "base model component not found: ${BASE_MODEL_PATH}/${component}"
+  done
+  for model in "${MODELS[@]}"; do
+    [[ -d "${CHECKPOINTS[${model}]}" ]] \
+      || die "checkpoint not found for ${model}: ${CHECKPOINTS[${model}]}"
+  done
+fi
 
 job_index=0
 wave_pids=()
 wave_labels=()
+
+cleanup_active_jobs() {
+  local pid
+  for pid in "${wave_pids[@]:-}"; do
+    [[ -n "${pid}" ]] || continue
+    pkill -TERM -P "${pid}" 2>/dev/null || true
+    kill "${pid}" 2>/dev/null || true
+  done
+}
+trap cleanup_active_jobs EXIT INT TERM
 
 wait_wave() {
   local index rc failed=0
@@ -114,8 +133,16 @@ launch_job() {
   local ws_port="$(( WS_PORT_BASE + job_index ))"
   local save_root="${OUTPUT_ROOT}/${model}/steps_${steps}"
   local log_path="${save_root}.log"
-  echo "JOB model=${model} steps=${steps} suite=libero_10 task=0:1 gpu=${gpu} video_steps=${steps} action_steps=${steps} master_port=${master_port} ws_port=${ws_port}"
+  local result_json="${save_root}/results/libero_eval/libero_10_0.json"
+  echo "JOB model=${model} steps=${steps} suite=libero_10 task=0:1 gpu=${gpu} video_steps=${steps} action_steps=${steps} master_port=${master_port} ws_port=${ws_port} base_model=${BASE_MODEL_PATH}"
   if [[ "${CHECK_ONLY:-0}" == "1" ]]; then
+    job_index=$(( job_index + 1 ))
+    return
+  fi
+  if [[ -f "${result_json}" ]] && "${SERVER_PYTHON}" -c \
+    'import json, sys; d=json.load(open(sys.argv[1])); n=int(float(d["total_num"])); s=float(d["succ_num"]); raise SystemExit(0 if n == int(sys.argv[2]) and 0 <= s <= n else 1)' \
+    "${result_json}" "${EPISODES}"; then
+    echo "SKIP model=${model} steps=${steps} validated=${result_json}"
     job_index=$(( job_index + 1 ))
     return
   fi
@@ -126,6 +153,7 @@ launch_job() {
     CLIENT_PYTHON="${CLIENT_PYTHON}" \
     STUDENT_CKPT="${CHECKPOINTS[${model}]}" \
     TEACHER_CKPT="${CHECKPOINTS[${model}]}" \
+    WAN22_PRETRAINED_PATH="${BASE_MODEL_PATH}" \
     LIBERO_BENCHMARK=libero_10 \
     EVAL_MODE=success \
     NUM_STEPS="${steps}" \

@@ -48,8 +48,11 @@ def test_merges_15_jobs_and_computes_matched_stage1_deltas(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     summary = json.loads(output.read_text())
     assert summary["benchmark"] == "libero_10"
+    assert summary["task_index"] == 0
     assert summary["task_idx"] == 0
+    assert summary["episodes_per_job"] == 20
     assert len(summary["rows"]) == 15
+    assert output.with_suffix(".csv").is_file()
     assert summary["models"]["anchor_only"]["steps"]["2"]["delta_vs_stage1"] == 2 / 20
     assert summary["models"]["stage1"]["steps"]["4"]["delta_vs_stage1"] == 0.0
 

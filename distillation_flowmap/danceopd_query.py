@@ -8,6 +8,22 @@ import torch
 import torch.nn.functional as F
 
 
+def sample_endpoint_sigmas(
+    *,
+    batch_size: int,
+    alpha: float,
+    beta: float,
+    max_sigma: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sample student endpoint times as ``(1 - Beta) * max_sigma``."""
+    distribution = torch.distributions.Beta(
+        torch.tensor(float(alpha), device=device),
+        torch.tensor(float(beta), device=device),
+    )
+    return (1.0 - distribution.sample((batch_size,))) * float(max_sigma)
+
+
 def sample_uniform_rollout_step_pair(
     rollout_step_pairs,
     *,
@@ -106,6 +122,35 @@ def direct_velocity_mse(
     if student_velocity.shape != teacher_velocity.shape:
         raise ValueError("student and teacher velocity shapes must match")
     return F.mse_loss(student_velocity.float(), teacher_velocity.detach().float())
+
+
+def masked_video_velocity_mse(
+    student_velocity: torch.Tensor,
+    teacher_velocity: torch.Tensor,
+    video_frame_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Match teacher velocity only on true video frames."""
+    if student_velocity.shape != teacher_velocity.shape:
+        raise ValueError("student and teacher velocity shapes must match")
+    if (
+        video_frame_mask.ndim != 2
+        or video_frame_mask.shape != (
+            student_velocity.shape[0],
+            student_velocity.shape[2],
+        )
+    ):
+        raise ValueError("video_frame_mask must have shape [B,T]")
+    mask = video_frame_mask.to(
+        device=student_velocity.device, dtype=torch.float32
+    )[:, None, :, None, None]
+    denom = (
+        mask.sum()
+        * student_velocity.shape[1]
+        * student_velocity.shape[3]
+        * student_velocity.shape[4]
+    ).clamp(min=1.0)
+    diff = student_velocity.float() - teacher_velocity.detach().float()
+    return (diff.square() * mask).sum() / denom
 
 
 def denoised_endpoint_mse(

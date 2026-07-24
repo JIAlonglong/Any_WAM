@@ -82,6 +82,26 @@ def _profile_enabled():
     )
 
 
+def _inject_normalized_action_chunk(query_latent, action_chunk, action_indices):
+    """Use Cosmos Policy's repeated action-frame layout on a cloned query."""
+    joint = query_latent.clone()
+    action = action_chunk.to(device=joint.device, dtype=joint.dtype)
+    if action.ndim != 3:
+        raise ValueError("action_chunk must have shape [B,16,7]")
+    indices = torch.as_tensor(action_indices, device=joint.device, dtype=torch.long)
+    if indices.shape != (joint.shape[0],):
+        raise ValueError("action_indices must have shape [B]")
+    flat = action.reshape(action.shape[0], -1)
+    latent_elements = joint.shape[1] * joint.shape[3] * joint.shape[4]
+    repeats = (latent_elements + flat.shape[1] - 1) // flat.shape[1]
+    packed = flat.repeat(1, repeats)[:, :latent_elements].reshape(
+        joint.shape[0], joint.shape[1], joint.shape[3], joint.shape[4]
+    )
+    batch_indices = torch.arange(joint.shape[0], device=joint.device)
+    joint[batch_indices, :, indices] = packed
+    return joint
+
+
 def _velocity_from_x0_fn(model, x0_fn, x_t, t):
     t = t.to(device=x_t.device, dtype=torch.float32).clamp(1e-6, 1.0 - 1e-6)
     sigma = t / (1.0 - t)
@@ -193,11 +213,13 @@ def main():
             include_latent_x0 = bool(request.get("include_latent_x0", False))
             include_latent_cdiff = bool(request.get("include_latent_cdiff", False))
             include_latent_velocity_query = bool(request.get("include_latent_velocity_query", False))
+            include_joint_action_query = bool(request.get("include_joint_action_query", False))
             latent_noise = data["cosmos_latent_noise"] if include_latent_cdiff else None
             latent_t = data["cosmos_latent_t"] if include_latent_cdiff else None
             latent_r = data["cosmos_latent_r"] if include_latent_cdiff else None
             latent_query_x = data["cosmos_latent_query_x"] if include_latent_velocity_query else None
             latent_query_t = data["cosmos_latent_query_t"] if include_latent_velocity_query else None
+            action_query_x = data["cosmos_action_query_x"] if include_joint_action_query else None
             latent_epsilon = float(request.get("cosmos_latent_epsilon", 0.001))
             latent_center_velocity_mode = request.get(
                 "cosmos_latent_center_velocity_mode", "exact")
@@ -209,6 +231,8 @@ def main():
             latent_cdiff_targets = []
             latent_velocities = []
             latent_query_velocities = []
+            joint_queries = []
+            video_frame_masks = []
             with torch.no_grad():
                 for idx, task in enumerate(tasks):
                     sample_t0 = time.perf_counter() if profile else None
@@ -287,6 +311,32 @@ def main():
                             device=result["generated_latent"].device,
                             dtype=torch.float32,
                         )
+                        if include_joint_action_query:
+                            query_action = torch.as_tensor(
+                                action_query_x[idx: idx + 1],
+                                device=result["generated_latent"].device,
+                                dtype=torch.float32,
+                            )
+                            action_index = result["data_batch"]["action_latent_idx"]
+                            query_x = _inject_normalized_action_chunk(
+                                query_x, query_action, action_index
+                            )
+                            mask = torch.zeros(
+                                (1, query_x.shape[2]), dtype=torch.bool
+                            )
+                            for key in (
+                                "future_wrist_image_latent_idx",
+                                "future_wrist_image2_latent_idx",
+                                "future_image_latent_idx",
+                                "future_image2_latent_idx",
+                            ):
+                                frame_index = result["latent_indices"].get(key, -1)
+                                if int(frame_index) >= 0:
+                                    mask[0, int(frame_index)] = True
+                            joint_queries.append(
+                                query_x.detach().cpu().numpy().astype(np.float32)
+                            )
+                            video_frame_masks.append(mask.numpy())
                         query_v = _velocity_from_x0_fn(model, x0_fn, query_x, query_t)
                         if profile:
                             print(
@@ -342,6 +392,11 @@ def main():
                 fields["cosmos_latent_x0"] = np.concatenate(latent_x0, axis=0)
             if include_latent_velocity_query:
                 fields["cosmos_latent_velocity"] = np.concatenate(latent_query_velocities, axis=0)
+            if include_joint_action_query:
+                fields["cosmos_joint_query"] = np.concatenate(joint_queries, axis=0)
+                fields["cosmos_video_frame_mask"] = np.concatenate(
+                    video_frame_masks, axis=0
+                )
             np.savez_compressed(actions_path, **fields)
             if profile:
                 print(

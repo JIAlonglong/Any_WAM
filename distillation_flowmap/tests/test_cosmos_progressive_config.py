@@ -186,7 +186,23 @@ def test_cosmos_danceopd_uses_pre_update_compositional_states_and_skips_s1_veloc
     )
     assert capture_position < update_position < query_position
     assert "return_action=False" in cosmos_dance_block
+    assert "predict_raw_joint_latent_velocity(" in cosmos_dance_block
+    assert "masked_video_velocity_mse(" in cosmos_dance_block
     assert "if velocity_weight > 0:" in cosmos_full_block
+
+
+def test_full_cosmos_anchor_separates_low_noise_student_from_supported_teacher():
+    source = (
+        Path(__file__).resolve().parents[1] / "flowmap_step.py"
+    ).read_text(encoding="utf-8")
+    full_cosmos_block = source.split(
+        "def _cosmos_latent_full_opd_aux_transition_step("
+    )[1].split("def _cosmos_latent_opd_aux_transition_step(")[0]
+
+    assert "sample_endpoint_sigmas(" in full_cosmos_block
+    assert "teacher_target_r" in full_cosmos_block
+    assert "student_x0 = student_x_r - sigma_r" in full_cosmos_block
+    assert "teacher_v_r" not in full_cosmos_block
 
 
 def test_progressive_exposes_chunk_stop_and_training_manifest(monkeypatch):

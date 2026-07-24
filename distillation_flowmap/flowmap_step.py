@@ -104,6 +104,8 @@ from distillation_flowmap.opd_rollout_grad import (
 from distillation_flowmap.danceopd_query import (
     denoised_endpoint_mse,
     direct_velocity_mse,
+    masked_video_velocity_mse,
+    sample_endpoint_sigmas,
     sample_low_noise_query_indices,
     sample_semantic_query_indices,
     sample_uniform_rollout_step_pair,
@@ -4186,13 +4188,6 @@ class FlowMapStepMixin:
         del video_velocity, action_velocity_seq, action_velocity
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        query_input = _build_joint_input(
-            query_video, query_video_t, query_action, query_action_t
-        )
-        _init_joint_mask(query_input)
-        student_velocity = _student_joint_forward(
-            query_input, query_video_t, query_action_t, return_action=False
-        )
         with torch.no_grad():
             teacher_query = query_video.detach().float()
             if teacher_crop_context is not None:
@@ -4209,19 +4204,38 @@ class FlowMapStepMixin:
                 teacher_query[
                     ..., teacher_crop_context['h_slice'], teacher_crop_context['w_slice']
                 ] = query_video.detach().float().to(teacher_query)
-            teacher_result = teacher.predict_raw_latent_velocity(
+            teacher_result = teacher.predict_raw_joint_latent_velocity(
                 batch,
                 query_latent=teacher_query,
+                query_action=query_action,
                 t=(query_video_t / self.config.num_train_timesteps).detach().float(),
             )
             teacher_velocity = teacher_result['cosmos_latent_velocity'].to(
-                device=student_velocity.device, dtype=student_velocity.dtype
+                device=query_video.device, dtype=query_video.dtype
+            )
+            student_query_video = teacher_result['cosmos_joint_query'].to(
+                device=query_video.device, dtype=query_video.dtype
+            )
+            video_frame_mask = teacher_result['cosmos_video_frame_mask'].to(
+                device=query_video.device, dtype=torch.bool
             )
             if teacher_crop_context is not None:
                 teacher_velocity = teacher_velocity[
                     ..., teacher_crop_context['h_slice'], teacher_crop_context['w_slice']
                 ]
-        velocity_loss = direct_velocity_mse(student_velocity, teacher_velocity)
+                student_query_video = student_query_video[
+                    ..., teacher_crop_context['h_slice'], teacher_crop_context['w_slice']
+                ]
+        query_input = _build_joint_input(
+            student_query_video, query_video_t, query_action, query_action_t
+        )
+        _init_joint_mask(query_input)
+        student_velocity = _student_joint_forward(
+            query_input, query_video_t, query_action_t, return_action=False
+        )
+        velocity_loss = masked_video_velocity_mse(
+            student_velocity, teacher_velocity, video_frame_mask
+        )
         diagnostics = {
             'query_index_mean': query_indices.float().mean().detach(),
             'query_sigma_mean': (
@@ -4424,6 +4438,7 @@ class FlowMapStepMixin:
         if not (
             hasattr(teacher, 'predict_raw_latent_target')
             and hasattr(teacher, 'predict_raw_latent_velocity')
+            and hasattr(teacher, 'predict_raw_joint_latent_velocity')
             and getattr(teacher, 'raw_inference_enabled', False)
         ):
             raise RuntimeError(
@@ -4463,8 +4478,23 @@ class FlowMapStepMixin:
             t_max=float(getattr(self.config, 'cosmos_latent_t_max', 80.0 / 81.0)),
             num_train_timesteps=self.config.num_train_timesteps,
         )
+        teacher_target_r = video_r
+        endpoint_sigma = sample_endpoint_sigmas(
+            batch_size=B,
+            alpha=5.0,
+            beta=2.0,
+            max_sigma=0.25,
+            device=self.device,
+        )
+        video_r = (
+            endpoint_sigma[:, None].expand(B, num_frames)
+            * self.config.num_train_timesteps
+        )
         video_t_norm = (video_t / self.config.num_train_timesteps).clamp(0.0, 1.0)
         video_r_norm = (video_r / self.config.num_train_timesteps).clamp(0.0, 1.0)
+        teacher_target_r_norm = (
+            teacher_target_r / self.config.num_train_timesteps
+        ).clamp(0.0, 1.0)
         video_noise_teacher = torch.randn(
             latent_shape, device=self.device, dtype=torch.float32
         )
@@ -4473,7 +4503,7 @@ class FlowMapStepMixin:
                 batch,
                 noise=video_noise_teacher,
                 t=video_t_norm,
-                r=video_r_norm,
+                r=teacher_target_r_norm,
                 epsilon=float(getattr(self.config, 'cosmos_latent_epsilon', 0.001)),
                 include_cdiff=False,
             )
@@ -4625,30 +4655,10 @@ class FlowMapStepMixin:
             student_x_r, student_v_r = rollout_out
             student_action_seq = student_action_x_r = None
 
-        def _teacher_velocity_field(state, t_norm):
-            result = teacher.predict_raw_latent_velocity(
-                batch,
-                query_latent=state.detach().float(),
-                t=t_norm.detach().float(),
-            )
-            return result['cosmos_latent_velocity'].to(
-                device=state.device, dtype=state.dtype
-            )
-
-        with torch.no_grad():
-            teacher_x_r, teacher_v_r, _ = rollout_velocity_field(
-                full_video_noisy_t.detach().float(),
-                video_t_norm,
-                video_r_norm,
-                num_steps=teacher_steps,
-                velocity_field=_teacher_velocity_field,
-            )
-        if teacher_crop_context is not None:
-            teacher_x_r = teacher_x_r[..., h_slice, w_slice].contiguous()
-            teacher_v_r = teacher_v_r[..., h_slice, w_slice].contiguous()
         sigma_r = video_r_norm[:, None, :, None, None]
-        video_endpoint_loss = denoised_endpoint_mse(
-            student_x_r, student_v_r, teacher_x_r, teacher_v_r, sigma_r
+        student_x0 = student_x_r - sigma_r.to(student_v_r) * student_v_r
+        video_endpoint_loss = F.mse_loss(
+            student_x0.float(), batch['latents'].detach().float()
         )
         action_endpoint_weight = float(getattr(
             self.config, 'opd_danceopd_action_endpoint_weight', 0.0

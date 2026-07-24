@@ -197,6 +197,157 @@ def test_cosmos_policy_action_teacher_returns_latent_velocity_query(tmp_path):
     assert torch.all(result["cosmos_latent_velocity"] == 2.0)
 
 
+def test_downsample_survivor_action_query_unpacks_to_native_cosmos_chunk():
+    from distillation_flowmap.cosmos_policy_adapter import (
+        unpack_flowmap_action_query,
+    )
+
+    normalized = torch.arange(16 * 7, dtype=torch.float32).reshape(1, 16, 7)
+    compact = torch.zeros(1, 30, 4, 4, 1)
+    compact[:, :7] = normalized.reshape(1, 4, 4, 7).permute(0, 3, 1, 2)[..., None]
+
+    unpacked = unpack_flowmap_action_query(
+        compact,
+        used_action_channel_ids=tuple(range(7)),
+        packing_schema="downsample_survivor_v2",
+        downsample_factor=4,
+    )
+
+    assert torch.equal(unpacked, normalized)
+
+
+def test_joint_query_injects_native_action_only_at_dynamic_carrier_frame():
+    from distillation_flowmap.cosmos_policy_raw_worker import (
+        _inject_normalized_action_chunk,
+    )
+
+    latent = torch.zeros(2, 3, 5, 2, 2)
+    action = torch.arange(2 * 4 * 2, dtype=torch.float32).reshape(2, 4, 2)
+    indices = torch.tensor([1, 3])
+
+    injected = _inject_normalized_action_chunk(latent, action, indices)
+
+    for batch_index, frame_index in enumerate((1, 3)):
+        expected = action[batch_index].flatten().repeat(2)[:12].reshape(3, 2, 2)
+        assert torch.equal(injected[batch_index, :, frame_index], expected)
+        untouched = injected[batch_index].clone()
+        untouched[:, frame_index] = 0
+        assert torch.count_nonzero(untouched) == 0
+    assert torch.count_nonzero(latent) == 0
+
+
+def test_joint_latent_velocity_provider_receives_unpacked_action_and_supported_time(
+    tmp_path,
+):
+    from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+    teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32)
+    teacher.config = type(
+        "Config",
+        (),
+        {
+            "used_action_channel_ids": tuple(range(7)),
+            "action_packing_schema": "downsample_survivor_v2",
+            "action_downsample_factor": 4,
+        },
+    )()
+    captured = {}
+
+    def provider(raw_batch, query_latent, query_action, t):
+        captured.update(
+            latent=query_latent.clone(),
+            action=query_action.clone(),
+            time=t.clone(),
+        )
+        return {
+            "actions": torch.zeros(1, 16, 7),
+            "cosmos_latent_velocity": torch.ones_like(query_latent),
+            "cosmos_joint_query": query_latent,
+            "cosmos_video_frame_mask": torch.tensor(
+                [[False, False, False, False, False, False, True, True, False]]
+            ),
+        }
+
+    teacher._raw_joint_latent_velocity_provider = provider
+    compact = torch.zeros(1, 30, 4, 4, 1)
+    compact[:, :7] = 0.25
+    query_t = torch.full((1, 9), 0.9)
+    result = teacher.predict_raw_joint_latent_velocity(
+        {"raw_task": ["pick up the cup"]},
+        query_latent=torch.zeros(1, 16, 9, 28, 28),
+        query_action=compact,
+        t=query_t,
+    )
+
+    assert captured["action"].shape == (1, 16, 7)
+    assert torch.all(captured["action"] == 0.25)
+    assert torch.equal(captured["time"], query_t)
+    assert result["cosmos_video_frame_mask"].tolist() == [
+        [False, False, False, False, False, False, True, True, False]
+    ]
+    with pytest.raises(ValueError, match="calibrated"):
+        teacher.predict_raw_joint_latent_velocity(
+            {"raw_task": ["pick up the cup"]},
+            query_latent=torch.zeros(1, 16, 9, 28, 28),
+            query_action=compact,
+            t=torch.full((1, 9), 0.5),
+        )
+
+
+def test_joint_velocity_subprocess_payload_carries_normalized_action(tmp_path):
+    from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+    teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32)
+    teacher._raw_worker_tmpdir = str(tmp_path)
+    teacher._raw_batch_to_numpy = lambda raw_batch: (
+        np.zeros((1, 2, 2, 3), np.uint8),
+        np.zeros((1, 2, 2, 3), np.uint8),
+        np.zeros((1, 9), np.float32),
+        ["task"],
+    )
+    captured = {}
+    response = {}
+
+    class FakeStdin:
+        def write(self, line):
+            payload = json.loads(line)
+            with np.load(payload["npz_path"]) as request:
+                captured["action"] = request["cosmos_action_query_x"].copy()
+            np.savez_compressed(
+                payload["actions_path"],
+                actions=np.zeros((1, 16, 7), np.float32),
+                cosmos_latent_velocity=np.zeros((1, 16, 9, 2, 2), np.float32),
+                cosmos_joint_query=np.zeros((1, 16, 9, 2, 2), np.float32),
+                cosmos_video_frame_mask=np.ones((1, 9), bool),
+            )
+            response["line"] = json.dumps(
+                {"ok": True, "actions_path": payload["actions_path"]}
+            )
+
+        def flush(self):
+            pass
+
+    class FakeStdout:
+        def readline(self):
+            return response["line"]
+
+    teacher._raw_worker = SimpleNamespace(stdin=FakeStdin(), stdout=FakeStdout())
+    teacher._ensure_raw_worker = lambda: None
+    action = torch.full((1, 16, 7), 0.375)
+    teacher._predict_raw_latent_velocity_subprocess(
+        {"raw_task": ["task"]},
+        torch.zeros(1, 16, 9, 2, 2),
+        torch.full((1, 9), 0.9),
+        query_action=action,
+    )
+
+    np.testing.assert_array_equal(captured["action"], action.numpy())
+
+
 def test_cosmos_latent_target_mode_controls_cdiff_requests():
     from distillation_flowmap.cosmos_policy_adapter import (
         cosmos_latent_should_request_cdiff,

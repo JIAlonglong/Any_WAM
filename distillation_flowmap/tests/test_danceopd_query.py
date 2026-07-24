@@ -15,6 +15,25 @@ from distillation_flowmap.danceopd_query import (
 
 
 class DanceOPDQueryTest(unittest.TestCase):
+    def test_endpoint_sigma_sampler_uses_exact_clean_region_formula(self):
+        original_sample = torch.distributions.Beta.sample
+        try:
+            torch.distributions.Beta.sample = lambda self, shape: torch.tensor(
+                [0.0, 0.2, 0.75, 1.0], device=self.concentration1.device
+            )
+            sigma = danceopd_query.sample_endpoint_sigmas(
+                batch_size=4,
+                alpha=5.0,
+                beta=2.0,
+                max_sigma=0.25,
+                device=torch.device("cpu"),
+            )
+        finally:
+            torch.distributions.Beta.sample = original_sample
+        self.assertTrue(torch.equal(
+            sigma, torch.tensor([0.25, 0.20, 0.0625, 0.0])
+        ))
+
     def test_uniform_rollout_pair_sampler_reaches_every_configured_pair(self):
         sampler = getattr(
             danceopd_query, "sample_uniform_rollout_step_pair", None
@@ -115,6 +134,22 @@ class DanceOPDQueryTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(loss, torch.tensor(2.5)))
         self.assertTrue(torch.allclose(student.grad, torch.tensor([-1.0, -2.0])))
+        self.assertIsNone(teacher.grad)
+
+    def test_masked_video_velocity_mse_uses_only_true_video_frames(self):
+        loss_fn = getattr(danceopd_query, "masked_video_velocity_mse", None)
+        self.assertIsNotNone(loss_fn, "masked Cosmos video velocity loss is missing")
+        student = torch.tensor(
+            [[[[[10.0]], [[1.0]], [[3.0]]]]], requires_grad=True
+        )
+        teacher = torch.zeros_like(student, requires_grad=True)
+        mask = torch.tensor([[False, True, True]])
+
+        loss = loss_fn(student, teacher, mask)
+        loss.backward()
+
+        self.assertTrue(torch.allclose(loss, torch.tensor(5.0)))
+        self.assertEqual(float(student.grad[0, 0, 0]), 0.0)
         self.assertIsNone(teacher.grad)
 
     def test_denoised_endpoint_mse_detaches_teacher_endpoint(self):

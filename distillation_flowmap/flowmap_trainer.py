@@ -1330,6 +1330,19 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 _set_video_channel_config_from_heads(config_dict, model, state_dict_bf16)
                 if persisted_contract is not None:
                     config_dict.update(persisted_contract)
+                for metadata_field in (
+                    "teacher_backend",
+                    "student_base_model_path",
+                    "teacher_model_path",
+                    "parent_stage1_path",
+                    "parent_stage1_contract_identity",
+                    "stage2_lineage_json",
+                ):
+                    metadata_value = getattr(
+                        self.config, metadata_field, None
+                    )
+                    if metadata_value is not None:
+                        config_dict[metadata_field] = metadata_value
                 # 保存 LoRA 元信息，方便恢复时重建 LoRA 结构
                 if self.use_lora:
                     config_dict['use_lora'] = True

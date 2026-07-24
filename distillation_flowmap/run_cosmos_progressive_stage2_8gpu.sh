@@ -169,6 +169,22 @@ master_port="${master_port:-$default_port}"
 validate_port "$master_port"
 MASTER_PORT="$master_port"
 output_dir="${OUTPUT_DIR:-$OUTPUT_ROOT/$stage}"
+output_dir="$(
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
+        "$PREFLIGHT_BIN" -c \
+        'import sys
+from pathlib import Path
+from distillation_flowmap.cosmos_stage2_lineage import validate_stage2_path_isolation
+raw_output = Path(sys.argv[1])
+validate_stage2_path_isolation(
+    stage1_root=Path(sys.argv[2]),
+    output_dir=raw_output,
+    resume_checkpoint=None,
+)
+print(raw_output.resolve(strict=False))' \
+        "$output_dir" "$STAGE1_ROOT"
+)" || die "failed to canonicalize OUTPUT_DIR"
 
 validate_devices CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES"
 validate_devices COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES \
@@ -309,6 +325,28 @@ export COSMOS_PREDICT25_LOCAL_MODEL_DIR
 export COSMOS_POLICY_EXTRA_PYTHONPATH
 export COSMOS_WORKER_CUDA_LIBRARY_PATH
 export LD_LIBRARY_PATH="${COSMOS_WORKER_CUDA_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+config_preflight_code='import os
+from importlib import import_module
+cfg = import_module(os.environ["CONFIG_FILE"]).cfg
+required = {
+    "student_base_model_path": os.environ["STUDENT_BASE_MODEL_PATH"],
+    "resume_from_path": os.environ["RESUME_FROM_PATH"],
+    "parent_stage1_path": os.environ["PARENT_STAGE1_PATH"],
+    "parent_stage1_contract_identity": os.environ["PARENT_STAGE1_CONTRACT_IDENTITY"],
+    "stage2_lineage_json": os.environ["STAGE2_LINEAGE_JSON"],
+}
+for field, expected in required.items():
+    actual = getattr(cfg, field, None)
+    if actual != expected:
+        raise RuntimeError(f"{field} must be exactly {expected!r}, got {actual!r}")
+print("Cosmos progressive Stage-2 config preflight passed")'
+(
+    cd "$PROJECT_ROOT"
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
+        "$PREFLIGHT_BIN" -c "$config_preflight_code"
+) || die "config preflight failed"
 
 train_cmd=(
     "$TORCHRUN_BIN"

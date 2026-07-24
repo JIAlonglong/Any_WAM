@@ -1,8 +1,10 @@
 """Progressive Cosmos-only Stage 2 for K=4 -> K=2 -> K=1 deployment."""
 
 import copy
+import json
 import math
 import os
+from pathlib import Path
 
 from distillation_flowmap.config_libero_cosmos_policy_stage2_cosmos_latent_cdiff import (
     cfg as _base_cfg,
@@ -11,6 +13,7 @@ from distillation_flowmap.cosmos_training_contract import (
     ACTION_PACKING_SCHEMA,
     CONTRACT_VERSION,
 )
+from distillation_flowmap.cosmos_stage2_lineage import validate_stage1_parent
 
 
 cfg = copy.deepcopy(_base_cfg)
@@ -103,11 +106,44 @@ if not os.environ.get("RESUME_FROM_PATH"):
     raise ValueError("RESUME_FROM_PATH must be explicitly set")
 cfg.student_base_model_path = os.environ["STUDENT_BASE_MODEL_PATH"]
 cfg.resume_from_path = os.environ["RESUME_FROM_PATH"]
-cfg.parent_stage1_path = os.environ.get("PARENT_STAGE1_PATH")
-cfg.parent_stage1_contract_identity = os.environ.get(
+for _lineage_name in (
+    "PARENT_STAGE1_PATH",
+    "PARENT_STAGE1_CONTRACT_IDENTITY",
+    "STAGE2_LINEAGE_JSON",
+):
+    if not os.environ.get(_lineage_name):
+        raise ValueError(f"{_lineage_name} must be explicitly set")
+cfg.parent_stage1_path = os.environ["PARENT_STAGE1_PATH"]
+cfg.parent_stage1_contract_identity = os.environ[
     "PARENT_STAGE1_CONTRACT_IDENTITY"
+]
+cfg.stage2_lineage_json = os.environ["STAGE2_LINEAGE_JSON"]
+_validated_parent = validate_stage1_parent(
+    Path(cfg.parent_stage1_path), expected_step=5000
 )
-cfg.stage2_lineage_json = os.environ.get("STAGE2_LINEAGE_JSON")
+if (
+    _validated_parent.contract_identity
+    != cfg.parent_stage1_contract_identity
+):
+    raise ValueError(
+        "PARENT_STAGE1_CONTRACT_IDENTITY does not match validated Stage-1"
+    )
+_expected_student_base = (
+    Path(_validated_parent.canonical_path) / "target_student"
+).resolve(strict=True)
+if Path(cfg.student_base_model_path).resolve(strict=True) != _expected_student_base:
+    raise ValueError(
+        "STUDENT_BASE_MODEL_PATH must identify validated Stage-1 target_student"
+    )
+try:
+    _lineage_payload = json.loads(cfg.stage2_lineage_json)
+except json.JSONDecodeError as exc:
+    raise ValueError("STAGE2_LINEAGE_JSON must be valid JSON") from exc
+if _lineage_payload != {
+    "parent_stage1_contract_identity": _validated_parent.contract_identity,
+    "parent_stage1_path": _validated_parent.canonical_path,
+}:
+    raise ValueError("STAGE2_LINEAGE_JSON does not match validated Stage-1")
 cfg.resume_online_from_target = _env_bool("RESUME_ONLINE_FROM_TARGET", False)
 cfg.reset_resume_step = _env_bool("RESET_RESUME_STEP", True)
 cfg.resume_optimizer_state = _env_bool("RESUME_OPTIMIZER_STATE", False)

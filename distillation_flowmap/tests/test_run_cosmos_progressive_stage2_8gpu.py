@@ -105,12 +105,13 @@ def _resume_checkpoint(env, output: Path, stage: str, step: int) -> Path:
     return checkpoint
 
 
-def _run(*args: str, env: dict[str, str]):
+def _run(*args: str, env: dict[str, str], cwd: Path | None = None):
     return subprocess.run(
         ["bash", str(SCRIPT), *args],
         text=True,
         capture_output=True,
         env=env,
+        cwd=cwd or ROOT,
         check=False,
     )
 
@@ -434,3 +435,64 @@ def test_dry_run_emits_lineage_and_writes_nothing(tmp_path):
     assert assignments["STAGE2_LINEAGE_JSON"].startswith("{")
     after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
     assert after == before
+
+
+def test_relative_output_is_canonical_for_preflight_claim_and_torchrun(tmp_path):
+    env, _ = _env(tmp_path)
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    relative_output = "relative-stage2"
+    expected = (caller / relative_output).resolve()
+    capture = tmp_path / "torchrun-output.txt"
+    fake_torchrun = tmp_path / "fake-torchrun"
+    fake_torchrun.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "printf '%s\\n%s\\n' \"$PWD\" \"$OUTPUT_DIR\" > \"$TORCHRUN_CAPTURE\"\n",
+        encoding="utf-8",
+    )
+    fake_torchrun.chmod(fake_torchrun.stat().st_mode | stat.S_IXUSR)
+    env.update(
+        {
+            "OUTPUT_DIR": relative_output,
+            "TORCHRUN_BIN": str(fake_torchrun),
+            "TORCHRUN_CAPTURE": str(capture),
+        }
+    )
+
+    result = _run("s4", env=env, cwd=caller)
+
+    assert result.returncode == 0, result.stderr
+    assignments = _assignments(result.stdout)
+    assert assignments["OUTPUT_DIR"] == str(expected)
+    assert expected.is_dir()
+    capture_lines = capture.read_text().splitlines()
+    assert capture_lines[0] == str(ROOT)
+    assert capture_lines[1] == str(expected)
+
+
+def test_config_preflight_failure_occurs_before_fresh_output_claim(tmp_path):
+    env, output = _env(tmp_path)
+    marker = tmp_path / "torchrun-called"
+    fake_torchrun = tmp_path / "fake-torchrun"
+    fake_torchrun.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "touch \"$TORCHRUN_MARKER\"\n",
+        encoding="utf-8",
+    )
+    fake_torchrun.chmod(fake_torchrun.stat().st_mode | stat.S_IXUSR)
+    env.update(
+        {
+            "TORCHRUN_BIN": str(fake_torchrun),
+            "TORCHRUN_MARKER": str(marker),
+            "OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE": "nan",
+        }
+    )
+
+    result = _run("s4", env=env)
+
+    assert result.returncode != 0
+    assert "config preflight" in result.stderr
+    assert not (output / "s4").exists()
+    assert not marker.exists()

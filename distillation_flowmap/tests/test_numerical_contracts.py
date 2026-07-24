@@ -1,4 +1,5 @@
 import importlib
+import json
 import math
 from pathlib import Path
 import sys
@@ -11,6 +12,7 @@ from distillation_flowmap.numerical_contracts import (
     compare_terminal_prior,
     validate_terminal_prior_sources,
 )
+from distillation_flowmap.cosmos_stage2_lineage import validate_stage1_parent
 
 
 def _config(*, atol=2e-6, warn_factor=0.5, verify=True, rank=0):
@@ -38,6 +40,43 @@ def _flowmap_step_module():
     import distillation_flowmap.flowmap_step as flowmap_step
 
     return flowmap_step
+
+
+def _set_progressive_lineage_env(monkeypatch, tmp_path):
+    stage1 = tmp_path / "stage1"
+    payload = {
+        "contract_version": 2,
+        "training_contract_stage": "raw_stage1",
+        "action_packing_schema": "downsample_survivor_v2",
+        "action_downsample_factor": 4,
+        "action_chunk_shape": [4, 4],
+        "checkpoint_step": 5000,
+        "teacher_backend": "cosmos_policy",
+    }
+    for variant in ("online_student", "target_student"):
+        transformer = stage1 / variant / "transformer"
+        transformer.mkdir(parents=True)
+        (transformer / "config.json").write_text(json.dumps(payload))
+        (transformer / "diffusion_pytorch_model.safetensors").write_bytes(
+            b"weights"
+        )
+    parent = validate_stage1_parent(stage1)
+    lineage = json.dumps(
+        {
+            "parent_stage1_contract_identity": parent.contract_identity,
+            "parent_stage1_path": parent.canonical_path,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    for name, value in {
+        "STUDENT_BASE_MODEL_PATH": str(stage1 / "target_student"),
+        "RESUME_FROM_PATH": str(stage1),
+        "PARENT_STAGE1_PATH": parent.canonical_path,
+        "PARENT_STAGE1_CONTRACT_IDENTITY": parent.contract_identity,
+        "STAGE2_LINEAGE_JSON": lineage,
+    }.items():
+        monkeypatch.setenv(name, value)
 
 
 def test_zero_reference_scheduler_residue_is_accepted_for_bfloat16():
@@ -299,11 +338,11 @@ def test_production_boundary_raises_for_corruption_and_is_rank_safe(monkeypatch)
     ],
 )
 def test_shared_configs_preserve_explicit_tolerance_override(
-    monkeypatch, module_name
+    monkeypatch, module_name, tmp_path
 ):
     _flowmap_step_module()
-    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/explicit/cosmos-base")
-    monkeypatch.setenv("RESUME_FROM_PATH", "/explicit/cosmos-stage1")
+    if module_name.endswith("cosmos_policy_stage2_progressive"):
+        _set_progressive_lineage_env(monkeypatch, tmp_path)
     monkeypatch.setenv("OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE", "4e-6")
     monkeypatch.setenv("OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR", "0.75")
     sys.modules.pop(module_name, None)
@@ -321,10 +360,12 @@ def test_shared_configs_preserve_explicit_tolerance_override(
         "distillation_flowmap.config_robotwin_fullfinetune_stage2_anyflow",
     ],
 )
-def test_shared_configs_reject_invalid_tolerance(monkeypatch, module_name):
+def test_shared_configs_reject_invalid_tolerance(
+    monkeypatch, module_name, tmp_path
+):
     _flowmap_step_module()
-    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/explicit/cosmos-base")
-    monkeypatch.setenv("RESUME_FROM_PATH", "/explicit/cosmos-stage1")
+    if module_name.endswith("cosmos_policy_stage2_progressive"):
+        _set_progressive_lineage_env(monkeypatch, tmp_path)
     monkeypatch.setenv("OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE", "nan")
     sys.modules.pop(module_name, None)
     with pytest.raises(ValueError, match="TERMINAL_PRIOR_TOLERANCE"):

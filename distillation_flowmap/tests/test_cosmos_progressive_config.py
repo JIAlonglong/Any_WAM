@@ -1,10 +1,13 @@
 import importlib
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from distillation_flowmap.cosmos_stage2_lineage import validate_stage1_parent
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -16,9 +19,61 @@ for path in (FLOWMAP_DIR, WANVA_DIR):
 
 
 @pytest.fixture(autouse=True)
-def _explicit_cosmos_paths(monkeypatch):
-    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/explicit/cosmos-base")
-    monkeypatch.setenv("RESUME_FROM_PATH", "/explicit/cosmos-stage1")
+def _explicit_cosmos_paths(monkeypatch, tmp_path):
+    stage1 = tmp_path / "stage1"
+    payload = {
+        "contract_version": 2,
+        "training_contract_stage": "raw_stage1",
+        "action_packing_schema": "downsample_survivor_v2",
+        "action_downsample_factor": 4,
+        "action_chunk_shape": [4, 4],
+        "checkpoint_step": 5000,
+        "teacher_backend": "cosmos_policy",
+    }
+    for variant in ("online_student", "target_student"):
+        transformer = stage1 / variant / "transformer"
+        transformer.mkdir(parents=True)
+        (transformer / "config.json").write_text(json.dumps(payload))
+        (transformer / "diffusion_pytorch_model.safetensors").write_bytes(
+            b"weights"
+        )
+    parent = validate_stage1_parent(stage1)
+    lineage = json.dumps(
+        {
+            "parent_stage1_contract_identity": parent.contract_identity,
+            "parent_stage1_path": parent.canonical_path,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    values = {
+        "STUDENT_BASE_MODEL_PATH": str(stage1 / "target_student"),
+        "RESUME_FROM_PATH": str(stage1),
+        "PARENT_STAGE1_PATH": parent.canonical_path,
+        "PARENT_STAGE1_CONTRACT_IDENTITY": parent.contract_identity,
+        "STAGE2_LINEAGE_JSON": lineage,
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    return {"stage1": stage1, "parent": parent, "env": values}
+
+
+def _import_progressive(env):
+    process_env = os.environ.copy()
+    process_env.update(env)
+    process_env["PYTHONPATH"] = REPO_ROOT
+    return subprocess.run(
+        [
+            "/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python",
+            "-c",
+            "import distillation_flowmap.config_libero_cosmos_policy_stage2_progressive",
+        ],
+        cwd=REPO_ROOT,
+        env=process_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 @pytest.mark.parametrize(
@@ -50,6 +105,49 @@ def test_progressive_config_requires_explicit_cosmos_paths(missing):
 
     assert result.returncode != 0
     assert missing in result.stderr
+
+
+def test_progressive_config_validates_lineage_outside_launcher(
+    _explicit_cosmos_paths,
+):
+    result = _import_progressive(_explicit_cosmos_paths["env"])
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("backend", "cosmos_policy"),
+        ("student_base", "STUDENT_BASE_MODEL_PATH"),
+        ("identity", "PARENT_STAGE1_CONTRACT_IDENTITY"),
+        ("lineage_json", "STAGE2_LINEAGE_JSON"),
+    ],
+)
+def test_progressive_config_rejects_invalid_lineage_outside_launcher(
+    _explicit_cosmos_paths, mutation, message
+):
+    env = dict(_explicit_cosmos_paths["env"])
+    stage1 = _explicit_cosmos_paths["stage1"]
+    if mutation == "backend":
+        for variant in ("online_student", "target_student"):
+            config = stage1 / variant / "transformer" / "config.json"
+            payload = json.loads(config.read_text())
+            payload["teacher_backend"] = "wanva"
+            config.write_text(json.dumps(payload))
+    elif mutation == "student_base":
+        env["STUDENT_BASE_MODEL_PATH"] = str(stage1 / "online_student")
+    elif mutation == "identity":
+        env["PARENT_STAGE1_CONTRACT_IDENTITY"] = "0" * 64
+    else:
+        env["STAGE2_LINEAGE_JSON"] = json.dumps(
+            {"parent_stage1_path": "/wrong"}
+        )
+
+    result = _import_progressive(env)
+
+    assert result.returncode != 0
+    assert message in result.stderr
 
 
 def test_progressive_sources_have_no_forbidden_legacy_path_fallbacks():

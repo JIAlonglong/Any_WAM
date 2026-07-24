@@ -698,3 +698,13 @@ def test_trainer_installs_all_rank_post_success_probe_with_failure_abort():
     assert "fatal_mechanism_process_exit(" in source
     assert "dist.destroy_process_group()" not in source
     assert "reduced = reduce_metric_stats(local_stats)" in source
+    runner_source = source[
+        source.index("def _run_cosmos_mechanism_diagnostics("):
+        source.index("def _maybe_run_mechanism_diagnostics(")
+    ]
+    assert (
+        runner_source.index("try:")
+        < runner_source.index("materialize_diagnostic_snapshot(")
+        < runner_source.index("self._validate_cosmos_mechanism_preflight(")
+        < runner_source.rindex("self._sync_cosmos_mechanism_preflight(")
+    )

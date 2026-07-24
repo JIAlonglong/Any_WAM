@@ -3536,11 +3536,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             rank,
         )
         student_steps = deployment_joint_step_for_update(diagnostic_index)
-        diagnostic_batch = materialize_diagnostic_snapshot(
-            self._mechanism_diagnostic_snapshot, device=self.device
-        )
         local_preflight_error = None
+        diagnostic_batch = None
         try:
+            diagnostic_batch = materialize_diagnostic_snapshot(
+                self._mechanism_diagnostic_snapshot, device=self.device
+            )
             self._validate_cosmos_mechanism_preflight(
                 diagnostic_batch,
                 teacher_steps=int(

@@ -24,16 +24,30 @@ def _reject_symlink_components(path: Path, *, label: str) -> None:
     absolute = path if path.is_absolute() else Path.cwd() / path
     anchor = Path(absolute.anchor)
     current = anchor
+    unresolved: list[str] = []
     if stat.S_ISLNK(os.lstat(anchor).st_mode):
         raise ValueError(f"{label} filesystem anchor must not be a symlink: {anchor}")
     for part in absolute.parts[1:]:
-        current /= part
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if unresolved:
+                unresolved.pop()
+            elif current != anchor:
+                current = current.parent
+            continue
+        if unresolved:
+            unresolved.append(part)
+            continue
+        candidate = current / part
         try:
-            component_stat = os.lstat(current)
+            component_stat = os.lstat(candidate)
         except FileNotFoundError:
-            break
+            unresolved.append(part)
+            continue
         if stat.S_ISLNK(component_stat.st_mode):
-            raise ValueError(f"{label} path contains a symlink component: {current}")
+            raise ValueError(f"{label} path contains a symlink component: {candidate}")
+        current = candidate
 
 
 def _require_plain_directory(path: Path, *, label: str) -> None:

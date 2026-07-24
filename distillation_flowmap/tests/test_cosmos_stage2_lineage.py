@@ -380,6 +380,24 @@ def test_stage2_path_isolation_rejects_output_and_parent_symlink_alias(tmp_path)
         )
 
 
+def test_stage2_path_walk_resumes_after_missing_component_is_popped(tmp_path):
+    stage1 = _stage1(tmp_path)
+    base = tmp_path / "base"
+    base.mkdir()
+    alias_target = tmp_path / "alias-target"
+    alias_target.mkdir()
+    alias = base / "alias"
+    alias.symlink_to(alias_target, target_is_directory=True)
+    prospective = base / "missing" / ".." / "alias" / "new"
+
+    with pytest.raises(ValueError, match="symlink"):
+        validate_stage2_path_isolation(
+            stage1_root=stage1,
+            output_dir=prospective,
+            resume_checkpoint=None,
+        )
+
+
 def test_stage2_path_isolation_requires_resume_in_own_output_arm(tmp_path):
     stage1 = _stage1(tmp_path)
     _, resume = _stage2(tmp_path)

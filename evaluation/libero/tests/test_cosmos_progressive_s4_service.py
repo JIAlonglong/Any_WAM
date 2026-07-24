@@ -244,7 +244,8 @@ def test_client_rejects_reset_and_infer_checkpoint_mismatches(tmp_path):
         )
         assert record["success"] is False
         assert record["server_failure"] is True
-        assert record["s4_checkpoint"] == "/expected/checkpoint"
+        assert record["s4_checkpoint"] == "/wrong/checkpoint"
+        assert record["expected_s4_checkpoint"] == "/expected/checkpoint"
         assert "checkpoint mismatch" in record["error"]
 
 

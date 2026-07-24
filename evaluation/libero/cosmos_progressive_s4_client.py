@@ -21,6 +21,18 @@ from evaluation.libero.cosmos_progressive_s4_server import (
 )
 
 
+class S4CheckpointMismatchError(ValueError):
+    """Preserve both observed and expected provenance on a service mismatch."""
+
+    def __init__(self, *, observed: Any, expected: str) -> None:
+        self.observed = observed
+        self.expected = expected
+        super().__init__(
+            "S4 service checkpoint mismatch: "
+            f"client={expected!r}, service={observed!r}"
+        )
+
+
 def _video_observation(obs: Mapping[str, Any]) -> dict[str, np.ndarray]:
     """Mirror rollout_cosmos_policy.extract_video_obs for pure-client tests."""
     return {
@@ -123,10 +135,9 @@ class CosmosProgressiveS4Client:
             return
         response_checkpoint = response.get("s4_checkpoint")
         if response_checkpoint != self.expected_s4_checkpoint:
-            raise ValueError(
-                "S4 service checkpoint mismatch: "
-                f"client={self.expected_s4_checkpoint!r}, "
-                f"service={response_checkpoint!r}"
+            raise S4CheckpointMismatchError(
+                observed=response_checkpoint,
+                expected=self.expected_s4_checkpoint,
             )
 
     def _server_failure_record(
@@ -140,13 +151,18 @@ class CosmosProgressiveS4Client:
         rollout_seed: int,
         exc: Exception,
     ) -> dict[str, Any]:
+        record_checkpoint = self.expected_s4_checkpoint
+        expected_checkpoint = None
+        if isinstance(exc, S4CheckpointMismatchError):
+            record_checkpoint = exc.observed
+            expected_checkpoint = exc.expected
         record = {
             "task_idx": int(task_idx),
             "episode_idx": int(episode_idx),
             "prompt": str(prompt),
             "seed": int(rollout_seed),
             "student_steps": self.student_steps,
-            "s4_checkpoint": self.expected_s4_checkpoint,
+            "s4_checkpoint": record_checkpoint,
             "done": False,
             "success": False,
             "server_failure": True,
@@ -156,6 +172,8 @@ class CosmosProgressiveS4Client:
             "num_chunks": int(chunks),
             "video_path": None,
         }
+        if expected_checkpoint is not None:
+            record["expected_s4_checkpoint"] = expected_checkpoint
         self._write_record(record)
         return record
 

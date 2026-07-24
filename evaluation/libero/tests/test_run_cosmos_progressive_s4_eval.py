@@ -29,6 +29,7 @@ def _launcher_env(tmp_path):
             "S4_DRY_RUN": "1",
             "S4_EVAL_CLASSIFICATION": "formal_verified",
             "S4_EVAL_IS_FORMAL": "1",
+            "S4_ALIGNMENT_VERIFIED": "1",
         }
     )
     return env
@@ -539,6 +540,100 @@ def test_formal_merge_counts_real_failure_setup_and_skip_records_as_unsuccessful
     )
     assert summary["num_records"] == 500
     assert summary["per_task_success"]["0"] == 47 / 50
+
+
+def test_formal_merge_rejects_real_checkpoint_mismatch_record(tmp_path):
+    import numpy as np
+
+    from evaluation.libero.cosmos_progressive_s4_client import (
+        CosmosProgressiveS4Client,
+    )
+    from evaluation.libero.tests.test_cosmos_progressive_s4_service import (
+        OBS,
+        _DoneEnv,
+    )
+
+    checkpoint = tmp_path / "expected checkpoint"
+    checkpoint.mkdir()
+    checkpoint_id = str(checkpoint.resolve())
+
+    class MismatchService:
+        checkpoint_identifier = checkpoint_id
+
+        def infer(self, _request):
+            return {
+                "ok": True,
+                "action": np.zeros((16, 7), dtype=np.float32),
+                "student_steps": 2,
+                "s4_checkpoint": "/observed/wrong-checkpoint",
+            }
+
+    output_root = tmp_path / "formal output"
+    client = CosmosProgressiveS4Client(
+        MismatchService(),
+        output_dir=output_root / "shard_0" / "seed_0",
+        student_steps=2,
+        expected_s4_checkpoint=checkpoint_id,
+    )
+    record = client.run_with_env(
+        env=_DoneEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=0,
+        episode_idx=0,
+        prompt="open the drawer",
+        max_env_steps=1,
+        init_env_fn=lambda *_args, **_kwargs: OBS,
+        rollout_seed=0,
+    )
+
+    assert record["s4_checkpoint"] == "/observed/wrong-checkpoint"
+    assert record["expected_s4_checkpoint"] == checkpoint_id
+    result = _run_formal_merge(output_root, checkpoint)
+    assert result.returncode != 0
+    assert "checkpoint mismatch" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("classification", "is_formal", "missing_control"),
+    [
+        ("formal_verified", "1", "S4_ALIGNMENT_VERIFIED=1"),
+        (
+            "diagnostic_known_alignment_mismatch",
+            "0",
+            "S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH=1",
+        ),
+        ("blocked_known_alignment_mismatch", "0", "blocked"),
+    ],
+)
+def test_live_formal_launcher_rejects_classification_gate_bypass(
+    tmp_path, classification, is_formal, missing_control
+):
+    env = _launcher_env(tmp_path)
+    env.update(
+        {
+            "S4_DRY_RUN": "0",
+            "S4_EVAL_CLASSIFICATION": classification,
+            "S4_EVAL_IS_FORMAL": is_formal,
+        }
+    )
+    env.pop("S4_ALIGNMENT_VERIFIED", None)
+    env.pop("S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH", None)
+    marker = tmp_path / "child-called"
+    sentinel = tmp_path / "python sentinel"
+    sentinel.write_text(
+        "#!/usr/bin/env python3\n"
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('called', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    sentinel.chmod(sentinel.stat().st_mode | stat.S_IXUSR)
+    env["PYTHON_BIN"] = str(sentinel)
+
+    result = run_launcher("formal", env=env)
+
+    assert result.returncode == 2
+    assert missing_control in result.stderr
+    assert not marker.exists()
 
 
 def test_formal_child_summary_is_published_atomically():

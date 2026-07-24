@@ -470,6 +470,31 @@ if [[ -n "${S4_VIDEO_SEEDS}" ]]; then
 fi
 DRY_RUN=0
 [[ "${MODE}" == "dry-run" || "${S4_DRY_RUN:-0}" == "1" ]] && DRY_RUN=1
+S4_ALIGNMENT_VERIFIED="${S4_ALIGNMENT_VERIFIED:-0}"
+S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH="${S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH:-0}"
+case "${S4_ALIGNMENT_VERIFIED}" in
+    0|1) ;;
+    *) die "S4_ALIGNMENT_VERIFIED must be 0 or 1" ;;
+esac
+case "${S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH}" in
+    0|1) ;;
+    *) die "S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH must be 0 or 1" ;;
+esac
+if (( ! DRY_RUN )); then
+    case "${S4_EVAL_CLASSIFICATION}" in
+        formal_verified)
+            [[ "${S4_ALIGNMENT_VERIFIED}" == "1" ]] || \
+                die "formal_verified requires S4_ALIGNMENT_VERIFIED=1"
+            ;;
+        diagnostic_known_alignment_mismatch)
+            [[ "${S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH}" == "1" ]] || \
+                die "diagnostic classification requires S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH=1"
+            ;;
+        blocked_known_alignment_mismatch)
+            die "blocked classification cannot run live"
+            ;;
+    esac
+fi
 
 emit_kv "MODE" "${MODE}"
 emit_kv "DRY_RUN" "${DRY_RUN}"

@@ -62,6 +62,10 @@ from distillation_flowmap.distributed_safety import (
     initialize_nonfinite_safety,
     record_nonfinite_origins,
 )
+from distillation_flowmap.mechanism_diagnostics import (
+    MechanismDiagnosticScheduler,
+    fan_out_mechanism_metrics,
+)
 
 try:
     import wandb
@@ -421,6 +425,20 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             tb_dir.mkdir(parents=True, exist_ok=True)
             self.tb_writer = SummaryWriter(log_dir=str(tb_dir))
             print(f"[TensorBoard] Logging to {tb_dir}")
+
+        self._mechanism_diagnostics_enabled = bool(getattr(
+            config, "mechanism_diagnostics", False
+        ))
+        self._mechanism_diagnostic_scheduler = MechanismDiagnosticScheduler(
+            int(getattr(config, "mechanism_diagnostic_interval", 100))
+        )
+        # Task 6 installs the backend-specific probe.  Keeping this callback
+        # explicit prevents this backend-neutral trainer hook from guessing at
+        # latent, scheduler, or action representations.
+        self._mechanism_diagnostic_runner = None
+        self._mechanism_metrics_path = (
+            Path(config.output_dir) / "diagnostics" / "mechanism_metrics.jsonl"
+        )
 
         # ==============================================================
         # 调度器初始化 — 与原始 FlashWAMDistiller 完全一致
@@ -3404,6 +3422,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
                 self.step += 1
 
+                self._maybe_run_mechanism_diagnostics(
+                    completed_step=self.step,
+                    optimizer_succeeded=not skipped_optimizer_step,
+                )
+
                 # Lightweight deterministic eval. All ranks run this because
                 # the student may be FSDP-wrapped; only rank 0 logs results.
                 light_eval_interval = int(getattr(config, "light_eval_interval", 0))
@@ -3467,3 +3490,38 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         if self.tb_writer is not None:
             self.tb_writer.flush()
             self.tb_writer.close()
+
+    def _maybe_run_mechanism_diagnostics(
+        self,
+        *,
+        completed_step: int,
+        optimizer_succeeded: bool,
+    ) -> None:
+        """Schedule an optional post-update backend probe and fan out its metrics.
+
+        The runner must execute on every rank and return already globally
+        reduced, finite ``mechanism/*`` metrics.  It is intentionally supplied
+        by the backend-specific Task 6 integration rather than inferred here.
+        """
+        if not self._mechanism_diagnostics_enabled:
+            return
+        if not self._mechanism_diagnostic_scheduler.observe(
+            completed_step=completed_step,
+            optimizer_succeeded=optimizer_succeeded,
+        ):
+            return
+        if self._mechanism_diagnostic_runner is None:
+            logger.warning(
+                "Mechanism diagnostic was due at step %s but no backend probe is installed",
+                completed_step,
+            )
+            return
+        metrics = self._mechanism_diagnostic_runner(completed_step=completed_step)
+        fan_out_mechanism_metrics(
+            metrics,
+            step=completed_step,
+            rank=self.config.rank,
+            tb_writer=self.tb_writer,
+            wandb_module=wandb if self.config.enable_wandb and HAS_WANDB else None,
+            jsonl_path=self._mechanism_metrics_path,
+        )

@@ -62,6 +62,72 @@ def test_formal_dry_run_assigns_two_student_worker_pairs_and_task_shards(tmp_pat
     assert "REQUESTED_SEEDS_PER_TASK=50" in output
     assert "REQUESTED_RECORDS=500" in output
     assert output.count("--env-seed") == 100
+    assert output.count("--student-steps 4") == 102
+    assert output.count("--episode-index-offset") == 100
+    assert "--save-video" not in output
+
+
+def _shard_records(output):
+    records = {}
+    for line in output.splitlines():
+        if not line.startswith("SHARD_"):
+            continue
+        key, value = line.split("=", 1)
+        _, shard, field = key.split("_", 2)
+        records.setdefault(int(shard), {})[field] = value
+    return [
+        (
+            shard,
+            int(values["STUDENT_GPU"]),
+            int(values["COSMOS_WORKER_GPU"]),
+            values["TASK_RANGE"],
+        )
+        for shard, values in sorted(records.items())
+    ]
+
+
+def test_formal_four_shards_use_all_eight_gpus_and_joint_k2(tmp_path):
+    env = _launcher_env(tmp_path)
+    env.update(
+        {
+            "S4_STUDENT_STEPS": "2",
+            "S4_FORMAL_NUM_SHARDS": "4",
+            "S4_VIDEO_SEEDS": "0,1",
+        }
+    )
+
+    result = run_launcher("formal", env=env)
+    _assert_success(result)
+
+    assert _shard_records(result.stdout) == [
+        (0, 0, 1, "0,3"),
+        (1, 2, 3, "3,6"),
+        (2, 4, 5, "6,8"),
+        (3, 6, 7, "8,10"),
+    ]
+    assert result.stdout.count("--student-steps 2") == 204
+    assert result.stdout.count("--save-video") == 8
+    assert result.stdout.count("--episode-index-offset") == 200
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "expected"),
+    [
+        ("S4_STUDENT_STEPS", "3", "S4_STUDENT_STEPS must be 1, 2, or 4"),
+        ("S4_FORMAL_NUM_SHARDS", "3", "S4_FORMAL_NUM_SHARDS must be 2 or 4"),
+        ("S4_VIDEO_SEEDS", "0,nope", "S4_VIDEO_SEEDS"),
+        ("S4_VIDEO_SEEDS", "0,", "S4_VIDEO_SEEDS"),
+        ("S4_VIDEO_SEEDS", "50", "S4_VIDEO_SEEDS"),
+    ],
+)
+def test_formal_controls_are_strictly_validated(tmp_path, name, value, expected):
+    env = _launcher_env(tmp_path)
+    env[name] = value
+
+    result = run_launcher("formal", env=env)
+
+    assert result.returncode == 2
+    assert expected in result.stderr
 
 
 def test_gate_dry_run_uses_one_pair_and_five_shared_seeds_per_task(tmp_path):
@@ -166,7 +232,8 @@ def test_smoke_dry_run_requires_prebuilt_cache_inputs_and_is_nonpaper(tmp_path):
 def _formal_merge_program():
     source = SCRIPT.read_text(encoding="utf-8")
     start_marker = (
-        '    "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" <<'
+        '    "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" '
+        '"${S4_STUDENT_STEPS}" "${shard_plan}" <<'
         "'PY'\n"
     )
     end_marker = "\nPY\n}\n\n\nprepare_prompt_table"
@@ -175,9 +242,17 @@ def _formal_merge_program():
     return source[start:end]
 
 
-def _run_formal_merge(root, checkpoint):
+def _run_formal_merge(root, checkpoint, *, steps=2, shard_plan="0:0:5;1:5:10"):
     return subprocess.run(
-        [sys.executable, "-", str(root), str(checkpoint), "50"],
+        [
+            sys.executable,
+            "-",
+            str(root),
+            str(checkpoint),
+            "50",
+            str(steps),
+            shard_plan,
+        ],
         cwd=ROOT,
         input=_formal_merge_program(),
         text=True,
@@ -205,6 +280,7 @@ def test_formal_merge_rejects_missing_or_mismatched_payload_seed(
         "task_idx": 0,
         "episode_idx": 0,
         "s4_checkpoint": str(checkpoint.resolve()),
+        "student_steps": 2,
         "success": False,
     }
     if payload_seed is not None:
@@ -215,6 +291,97 @@ def test_formal_merge_rejects_missing_or_mismatched_payload_seed(
 
     assert result.returncode != 0
     assert expected_error in result.stderr
+
+
+def test_formal_merge_rejects_step_mismatch(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    output_root = tmp_path / "formal output"
+    record_path = output_root / "shard_0" / "seed_0" / "records" / "task_0_episode_0.json"
+    record_path.parent.mkdir(parents=True)
+    record_path.write_text(
+        json.dumps(
+            {
+                "task_idx": 0,
+                "episode_idx": 0,
+                "seed": 0,
+                "s4_checkpoint": str(checkpoint.resolve()),
+                "student_steps": 4,
+                "success": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_formal_merge(output_root, checkpoint, steps=2)
+
+    assert result.returncode != 0
+    assert "step mismatch: expected=2 got=4" in result.stderr
+
+
+def test_formal_merge_rejects_episode_index_that_does_not_match_path_seed(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    output_root = tmp_path / "formal output"
+    record_path = output_root / "shard_0" / "seed_7" / "records" / "task_0_episode_0.json"
+    record_path.parent.mkdir(parents=True)
+    record_path.write_text(
+        json.dumps(
+            {
+                "task_idx": 0,
+                "episode_idx": 0,
+                "seed": 7,
+                "s4_checkpoint": str(checkpoint.resolve()),
+                "student_steps": 2,
+                "success": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_formal_merge(output_root, checkpoint, steps=2)
+
+    assert result.returncode != 0
+    assert "episode mismatch: expected episode_idx=7 got=0" in result.stderr
+
+
+def test_formal_merge_writes_joint_k_and_accepts_four_shard_plan(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    output_root = tmp_path / "formal output"
+    shard_ranges = ((0, 0, 3), (1, 3, 6), (2, 6, 8), (3, 8, 10))
+    for shard, task_start, task_end in shard_ranges:
+        for seed in range(50):
+            records_dir = output_root / f"shard_{shard}" / f"seed_{seed}" / "records"
+            records_dir.mkdir(parents=True, exist_ok=True)
+            for task in range(task_start, task_end):
+                (records_dir / f"task_{task}_episode_{seed}.json").write_text(
+                    json.dumps(
+                        {
+                            "task_idx": task,
+                            "episode_idx": seed,
+                            "seed": seed,
+                            "s4_checkpoint": str(checkpoint.resolve()),
+                            "student_steps": 2,
+                            "success": (task + seed) % 2 == 0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+    result = _run_formal_merge(
+        output_root,
+        checkpoint,
+        steps=2,
+        shard_plan="0:0:3;1:3:6;2:6:8;3:8:10",
+    )
+
+    _assert_success(result)
+    summary = json.loads(
+        (output_root / "formal_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["student_steps"] == 2
+    assert summary["num_records"] == 500
 
 
 def test_launcher_syntax_and_merge_guards_are_present():

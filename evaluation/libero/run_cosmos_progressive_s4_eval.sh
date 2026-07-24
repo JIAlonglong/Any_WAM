@@ -88,10 +88,12 @@ PY
 }
 
 verify_formal_results() {
-    local seed_count="$1"
-    emit_local_command "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" "<merge-formal-records>"
+    local seed_count="$1" shard_plan="$2"
+    emit_local_command \
+        "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" \
+        "${S4_STUDENT_STEPS}" "${shard_plan}" "<merge-formal-records>"
     (( DRY_RUN )) && return 0
-    "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" <<'PY'
+    "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" "${S4_STUDENT_STEPS}" "${shard_plan}" <<'PY'
 import json
 import random
 import re
@@ -102,7 +104,18 @@ from pathlib import Path
 root = Path(sys.argv[1])
 expected_checkpoint = str(Path(sys.argv[2]).resolve())
 seed_count = int(sys.argv[3])
-expected_tasks = tuple(range(10))
+requested_steps = int(sys.argv[4])
+shard_plan = {}
+for entry in sys.argv[5].split(";"):
+    shard_text, start_text, end_text = entry.split(":")
+    shard = int(shard_text)
+    task_start, task_end = int(start_text), int(end_text)
+    if shard in shard_plan or task_start < 0 or task_end < task_start:
+        raise SystemExit(f"invalid shard plan: {sys.argv[5]!r}")
+    shard_plan[shard] = range(task_start, task_end)
+expected_tasks = tuple(sorted({task for tasks in shard_plan.values() for task in tasks}))
+if expected_tasks != tuple(range(10)):
+    raise SystemExit(f"invalid shard plan coverage: {sys.argv[5]!r}")
 expected = {(task, seed) for task in expected_tasks for seed in range(seed_count)}
 seen = {}
 per_task = defaultdict(list)
@@ -114,15 +127,18 @@ for record_path in sorted(root.glob("shard_*/seed_*/records/task_*_episode_*.jso
     if shard_match is None or seed_match is None:
         raise SystemExit(f"seed mismatch: record path lacks shard/seed identity: {record_path}")
     shard, seed = int(shard_match.group(1)), int(seed_match.group(1))
-    if shard not in (0, 1) or seed not in range(seed_count):
+    if shard not in shard_plan or seed not in range(seed_count):
         raise SystemExit(f"seed mismatch: unexpected shard={shard} seed={seed} in {record_path}")
     record = json.loads(record_path.read_text(encoding="utf-8"))
     task = int(record.get("task_idx", -1))
-    allowed = range(0, 5) if shard == 0 else range(5, 10)
+    allowed = shard_plan[shard]
     if task not in allowed:
         raise SystemExit(f"seed mismatch: task {task} is not assigned to shard {shard}")
-    if int(record.get("episode_idx", -1)) != 0:
-        raise SystemExit(f"seed mismatch: expected episode_idx=0 for shared seed {seed}")
+    episode_idx = int(record.get("episode_idx", -1))
+    if episode_idx != seed:
+        raise SystemExit(
+            f"episode mismatch: expected episode_idx={seed} got={episode_idx}"
+        )
     if "seed" not in record:
         raise SystemExit(f"seed mismatch: missing record seed for task={task} path seed={seed}")
     try:
@@ -131,6 +147,11 @@ for record_path in sorted(root.glob("shard_*/seed_*/records/task_*_episode_*.jso
         raise SystemExit(f"seed mismatch: invalid record seed={record['seed']!r} path seed={seed}")
     if record_seed != seed:
         raise SystemExit(f"seed mismatch: record seed={record_seed} path seed={seed}")
+    if int(record.get("student_steps", -1)) != requested_steps:
+        raise SystemExit(
+            f"step mismatch: expected={requested_steps} "
+            f"got={record.get('student_steps')!r}"
+        )
     if record.get("s4_checkpoint") != expected_checkpoint:
         raise SystemExit(f"checkpoint mismatch: task={task} seed={seed} expected={expected_checkpoint!r} got={record.get('s4_checkpoint')!r}")
     key = (task, seed)
@@ -159,6 +180,7 @@ bootstrap.sort()
 summary = {
     "schema": "cosmos_progressive_s4_formal_eval_v1",
     "checkpoint": expected_checkpoint,
+    "student_steps": requested_steps,
     "num_records": len(seen),
     "seeds_per_task": seed_count,
     "per_task_success": task_means,
@@ -244,6 +266,7 @@ preflight_shard() {
         --empty-embedding "${S4_EMPTY_EMBEDDING}"
         --teacher-model-path "${COSMOS_POLICY_PATH}"
         --device cuda:0
+        --student-steps "${S4_STUDENT_STEPS}"
         --preflight
     )
     emit_kv "PREFLIGHT_SHARD" "${shard}"
@@ -272,7 +295,12 @@ launch_shard() {
             --task-range "${task_start}" "${task_end}"
             --episodes 1
             --env-seed "${seed}"
+            --episode-index-offset "${seed}"
+            --student-steps "${S4_STUDENT_STEPS}"
         )
+        if [[ -n "${S4_VIDEO_SEED_SET[${seed}]:-}" ]]; then
+            command+=(--save-video)
+        fi
         if [[ -n "${S4_INITIAL_STATES_JSON}" ]]; then
             command+=(--initial-states-json "${S4_INITIAL_STATES_JSON}")
         fi
@@ -295,21 +323,50 @@ run_live_evaluation() {
         return 0
     fi
 
-    # Formal uses the only four-GPU split: two non-overlapping task shards.
-    preflight_shard 0 0 1
-    preflight_shard 1 2 3
-    if (( DRY_RUN )); then
-        launch_shard 0 0 1 0 5 "${seed_count}"
-        launch_shard 1 2 3 5 10 "${seed_count}"
+    local -a shard_ids student_gpus worker_gpus task_starts task_ends
+    if [[ "${S4_FORMAL_NUM_SHARDS}" == "2" ]]; then
+        shard_ids=(0 1)
+        student_gpus=(0 2)
+        worker_gpus=(1 3)
+        task_starts=(0 5)
+        task_ends=(5 10)
     else
-        launch_shard 0 0 1 0 5 "${seed_count}" &
-        local pid0=$!
-        launch_shard 1 2 3 5 10 "${seed_count}" &
-        local pid1=$!
-        wait "${pid0}"
-        wait "${pid1}"
+        shard_ids=(0 1 2 3)
+        student_gpus=(0 2 4 6)
+        worker_gpus=(1 3 5 7)
+        task_starts=(0 3 6 8)
+        task_ends=(3 6 8 10)
     fi
-    verify_formal_results "${seed_count}"
+    local shard_plan="" index
+    for index in "${!shard_ids[@]}"; do
+        [[ -z "${shard_plan}" ]] || shard_plan+=";"
+        shard_plan+="${shard_ids[index]}:${task_starts[index]}:${task_ends[index]}"
+        preflight_shard \
+            "${shard_ids[index]}" "${student_gpus[index]}" "${worker_gpus[index]}"
+    done
+    if (( DRY_RUN )); then
+        for index in "${!shard_ids[@]}"; do
+            launch_shard \
+                "${shard_ids[index]}" "${student_gpus[index]}" "${worker_gpus[index]}" \
+                "${task_starts[index]}" "${task_ends[index]}" "${seed_count}"
+        done
+    else
+        local -a pids=()
+        for index in "${!shard_ids[@]}"; do
+            launch_shard \
+                "${shard_ids[index]}" "${student_gpus[index]}" "${worker_gpus[index]}" \
+                "${task_starts[index]}" "${task_ends[index]}" "${seed_count}" &
+            pids+=("$!")
+        done
+        local status=0 pid
+        for pid in "${pids[@]}"; do
+            if ! wait "${pid}"; then
+                status=1
+            fi
+        done
+        (( status == 0 )) || return "${status}"
+    fi
+    verify_formal_results "${seed_count}" "${shard_plan}"
 }
 
 run_smoke() {
@@ -363,6 +420,29 @@ S4_SMOKE_PAIRS="${S4_SMOKE_PAIRS:-}"
 S4_SMOKE_CACHE_DIR="${S4_SMOKE_CACHE_DIR:-}"
 S4_INITIAL_STATES_JSON="${S4_INITIAL_STATES_JSON:-}"
 S4_LIBERO_BENCHMARK="${S4_LIBERO_BENCHMARK:-libero_10}"
+S4_STUDENT_STEPS="${S4_STUDENT_STEPS:-4}"
+case "${S4_STUDENT_STEPS}" in
+    1|2|4) ;;
+    *) die "S4_STUDENT_STEPS must be 1, 2, or 4" ;;
+esac
+S4_FORMAL_NUM_SHARDS="${S4_FORMAL_NUM_SHARDS:-2}"
+case "${S4_FORMAL_NUM_SHARDS}" in
+    2|4) ;;
+    *) die "S4_FORMAL_NUM_SHARDS must be 2 or 4" ;;
+esac
+S4_VIDEO_SEEDS="${S4_VIDEO_SEEDS:-}"
+declare -A S4_VIDEO_SEED_SET=()
+if [[ -n "${S4_VIDEO_SEEDS}" ]]; then
+    [[ "${S4_VIDEO_SEEDS}" =~ ^[0-9]+(,[0-9]+)*$ ]] || \
+        die "S4_VIDEO_SEEDS must be comma-separated integers in 0..49"
+    IFS=',' read -r -a requested_video_seeds <<< "${S4_VIDEO_SEEDS}"
+    for video_seed in "${requested_video_seeds[@]}"; do
+        if [[ ! "${video_seed}" =~ ^[0-9]+$ ]] || (( video_seed > 49 )); then
+            die "S4_VIDEO_SEEDS must be comma-separated integers in 0..49"
+        fi
+        S4_VIDEO_SEED_SET["${video_seed}"]=1
+    done
+fi
 DRY_RUN=0
 [[ "${MODE}" == "dry-run" || "${S4_DRY_RUN:-0}" == "1" ]] && DRY_RUN=1
 
@@ -370,6 +450,9 @@ emit_kv "MODE" "${MODE}"
 emit_kv "DRY_RUN" "${DRY_RUN}"
 emit_kv "S4_CKPT_ROOT" "${S4_CKPT_ROOT}"
 emit_kv "EVAL_ROOT" "${EVAL_ROOT}"
+emit_kv "S4_STUDENT_STEPS" "${S4_STUDENT_STEPS}"
+emit_kv "S4_FORMAL_NUM_SHARDS" "${S4_FORMAL_NUM_SHARDS}"
+emit_kv "S4_VIDEO_SEEDS" "${S4_VIDEO_SEEDS}"
 
 case "${MODE}" in
     smoke)

@@ -897,6 +897,75 @@ def test_live_rollout_forwards_cli_video_choice_to_every_task_call(
     assert all(call["save_video"] is expected_save_video for call in calls)
 
 
+def test_live_rollout_applies_episode_index_offset(monkeypatch):
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    calls = []
+
+    class RecordingClient:
+        def __init__(self, _service, **_kwargs):
+            pass
+
+        def run_libero_task(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "task_idx": kwargs["task_idx"],
+                "episode_idx": kwargs["episode_idx"],
+            }
+
+    monkeypatch.setattr(
+        rollout,
+        "build_live_service",
+        lambda _args: (object(), SimpleNamespace(close=lambda: None)),
+    )
+    monkeypatch.setattr(rollout, "CosmosProgressiveS4Client", RecordingClient)
+
+    result = rollout.main(
+        [
+            "--checkpoint-transformer",
+            "/tmp/s4-transformer",
+            "--prompt-table",
+            "/tmp/training-prompt-table.pt",
+            "--env-seed",
+            "17",
+            "--episode-index-offset",
+            "17",
+            "--task-range",
+            "0",
+            "2",
+            "--episodes",
+            "1",
+        ]
+    )
+
+    assert result == 0
+    assert [call["episode_idx"] for call in calls] == [17, 17]
+
+
+def test_live_rollout_seed_helper_pairs_python_numpy_and_torch_noise_across_k():
+    import random
+
+    import torch
+
+    from evaluation.libero.rollout_cosmos_progressive_s4 import seed_live_rollout
+
+    draws = []
+    for _student_steps in (1, 2, 4):
+        seed_live_rollout(23)
+        draws.append(
+            (
+                random.random(),
+                np.random.standard_normal(4),
+                torch.randn(4),
+            )
+        )
+
+    for candidate in draws[1:]:
+        assert candidate[0] == draws[0][0]
+        np.testing.assert_array_equal(candidate[1], draws[0][1])
+        torch.testing.assert_close(candidate[2], draws[0][2], rtol=0, atol=0)
+
+
 def test_cli_defaults_joint_student_steps_to_four():
     from evaluation.libero.rollout_cosmos_progressive_s4 import parse_args
 
@@ -911,6 +980,7 @@ def test_cli_defaults_joint_student_steps_to_four():
 
     assert args.student_steps == 4
     assert args.save_video is False
+    assert args.episode_index_offset == 0
 
 
 @pytest.mark.parametrize("steps", [0, 3, 5])

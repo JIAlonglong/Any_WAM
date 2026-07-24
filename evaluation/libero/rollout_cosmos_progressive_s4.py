@@ -14,6 +14,7 @@ import argparse
 import importlib
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -196,6 +197,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--libero-benchmark", default="libero_10")
     parser.add_argument("--task-range", type=int, nargs=2, default=None)
     parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument(
+        "--episode-index-offset",
+        type=int,
+        default=0,
+        help="Add this offset to local episode indices for durable record identity.",
+    )
     parser.add_argument("--camera-size", type=int, default=128)
     parser.add_argument("--max-env-steps", type=int, default=800)
     parser.add_argument("--env-seed", type=int, default=None)
@@ -211,6 +218,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Serve reset/infer JSON lines only; no LIBERO environment is constructed here.",
     )
     return parser.parse_args(argv)
+
+
+def seed_live_rollout(seed: int) -> None:
+    """Pair all host/student random streams for the same closed-loop seed."""
+    import torch
+
+    resolved_seed = int(seed)
+    random.seed(resolved_seed)
+    np.random.seed(resolved_seed)
+    torch.manual_seed(resolved_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(resolved_seed)
 
 
 def _runtime_dependencies() -> dict[str, Any]:
@@ -543,6 +562,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.episodes <= 0:
         raise ValueError("--episodes must be positive")
+    if args.episode_index_offset < 0:
+        raise ValueError("--episode-index-offset must be non-negative")
     if args.preflight:
         require_live_s4_prerequisites(
             device=args.device,
@@ -565,6 +586,9 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(
             "--env-seed is required for live LIBERO rollout so every record has seed provenance"
         )
+
+    if not args.serve_stdio:
+        seed_live_rollout(args.env_seed)
 
     service, teacher = build_live_service(args)
     try:
@@ -593,7 +617,8 @@ def main(argv: list[str] | None = None) -> int:
             task_indices = range(start, end)
         records = []
         for task_idx in task_indices:
-            for episode_idx in range(args.episodes):
+            for local_episode_idx in range(args.episodes):
+                episode_idx = args.episode_index_offset + local_episode_idx
                 records.append(
                     client.run_libero_task(
                         libero_benchmark=args.libero_benchmark,

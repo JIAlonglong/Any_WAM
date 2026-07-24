@@ -1,0 +1,34 @@
+{
+  "defaults": {
+    "config": "distillation_flowmap.config_libero_apm_lora_ablation",
+    "steps": 500,
+    "save_interval": 100,
+    "seed": 42
+  },
+  "variants": [
+    {
+      "id": "l0",
+      "name": "stage1_only",
+      "endpoint_weight": "0.0",
+      "velocity_weight": "0.0"
+    },
+    {
+      "id": "l1",
+      "name": "anchor_only",
+      "endpoint_weight": "1.0",
+      "velocity_weight": "0.0"
+    },
+    {
+      "id": "l2",
+      "name": "field_only",
+      "endpoint_weight": "0.0",
+      "velocity_weight": "1.0"
+    },
+    {
+      "id": "l3",
+      "name": "apm",
+      "endpoint_weight": "1.0",
+      "velocity_weight": "1.0"
+    }
+  ]
+}

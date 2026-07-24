@@ -43,8 +43,12 @@ from modules.utils import WanVAEStreamingWrapper, load_transformer, load_vae
 from utils import logger, warmup_constant_lambda, FlowMatchScheduler
 from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
 from distillation_flowmap.cosmos_progressive_opd import (
-    should_run_standalone_opd,
     should_stop_training_at_step,
+)
+from distillation_flowmap.cosmos_deployment_rollout import (
+    deployment_joint_step_for_update,
+    should_run_deployment_joint_rollout,
+    should_run_raw_auxiliary,
 )
 from distillation_flowmap.cosmos_teacher_roles import resolve_teacher_roles
 from distillation_flowmap.ablation.robotwin_diagnostics import (
@@ -2470,6 +2474,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         acc_video_losses = []        # 累积的视频损失
         acc_cosmos_video_endpoint_losses = []
         acc_cosmos_video_cdiff_losses = []
+        acc_deployment_video_endpoint_losses = []
+        acc_deployment_action_endpoint_losses = []
+        acc_deployment_total_losses = []
+        acc_deployment_student_steps = []
+        acc_deployment_t_starts = []
+        acc_deployment_t_ends = []
         acc_video_local_fm_losses = []  # 累积的视频 local FM 损失
         acc_action_losses = []       # 累积的动作损失
         acc_action_local_fm_losses = []  # 累积的动作 local FM 损失
@@ -2552,34 +2562,82 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 and self.use_opd_aux
                 and not use_onpolicy_now
             )
-            if standalone_opd and self.gradient_accumulation_steps != 1:
+            deployment_enabled = (
+                bool(getattr(
+                    self.config, "deployment_joint_rollout_enabled", False
+                ))
+                and not use_onpolicy_now
+            )
+            if (
+                (standalone_opd or deployment_enabled)
+                and self.gradient_accumulation_steps != 1
+            ):
                 raise ValueError(
-                    'opd_aux_standalone_step requires gradient_accumulation_steps=1 '
-                    'so every scheduled OPD update starts from zero gradients.'
+                    'standalone progressive objectives require '
+                    'gradient_accumulation_steps=1 so every scheduled update '
+                    'starts from zero gradients.'
                 )
 
-            if standalone_opd:
-                opd_aux_interval = max(1, int(getattr(self.config, 'opd_aux_interval', 1)))
-                use_opd_aux_now = should_run_standalone_opd(
-                    step=self.step,
-                    warmup_steps=getattr(self.config, 'opd_aux_warmup_steps', 0),
-                    interval=opd_aux_interval,
-                )
+            if deployment_enabled and should_run_deployment_joint_rollout(
+                self.step,
+                int(self.config.deployment_joint_rollout_interval),
+            ):
+                scheduled_kind = "deployment"
+            elif standalone_opd and should_run_raw_auxiliary(
+                self.step,
+                warmup=int(getattr(self.config, "opd_aux_warmup_steps", 0)),
+                interval=int(getattr(self.config, "opd_aux_interval", 8)),
+                phase=int(getattr(self.config, "opd_aux_phase", 2)),
+            ):
+                scheduled_kind = "raw_auxiliary"
+            else:
+                scheduled_kind = "main"
+            use_opd_aux_now = scheduled_kind == "raw_auxiliary"
+            if use_opd_aux_now:
                 opd_aux_prob = float(getattr(self.config, 'opd_aux_prob', 1.0))
-                if use_opd_aux_now and opd_aux_prob < 1.0:
+                if opd_aux_prob < 1.0:
                     if dist.is_initialized():
                         aux_draw = torch.rand(1, device=self.device)
                         dist.broadcast(aux_draw, src=0)
                         use_opd_aux_now = aux_draw.item() < opd_aux_prob
                     else:
                         use_opd_aux_now = torch.rand(1).item() < opd_aux_prob
+                    if not use_opd_aux_now:
+                        scheduled_kind = "main"
 
             def _run_opd_aux():
                 if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
                     return self._opd_aux_transition_step_kto_paopd(batch, step_in_acc)
                 return self._opd_aux_transition_step(batch, step_in_acc)
 
-            if standalone_opd and use_opd_aux_now:
+            if scheduled_kind == "deployment":
+                if hasattr(self.student, 'set_requires_gradient_sync'):
+                    self.student.set_requires_gradient_sync(True)
+                update_index = (
+                    self.step
+                    // int(self.config.deployment_joint_rollout_interval)
+                )
+                student_steps = deployment_joint_step_for_update(update_index)
+                result = self._cosmos_deployment_joint_rollout_step(
+                    batch, step_in_acc, student_steps=student_steps
+                )
+                for metric_name in (
+                    'video_loss',
+                    'cosmos_video_endpoint_loss',
+                    'cosmos_video_cdiff_loss',
+                    'local_fm_loss',
+                    'action_loss',
+                    'action_local_fm_loss',
+                    'action_aware_loss',
+                    'gt_regression_loss',
+                    'raw_teacher_gt_mse',
+                    'raw_teacher_gt_l1',
+                    'raw_teacher_abs_mean',
+                    'raw_gt_abs_mean',
+                    'raw_teacher_enabled',
+                ):
+                    result.setdefault(metric_name, zero_tensor)
+            elif scheduled_kind == "raw_auxiliary":
                 if hasattr(self.student, 'set_requires_gradient_sync'):
                     self.student.set_requires_gradient_sync(True)
                 if (bool(getattr(self.config, 'opd_aux_empty_cache', False))
@@ -2653,6 +2711,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 "cosmos_video_endpoint_loss", zero_tensor))
             acc_cosmos_video_cdiff_losses.append(result.get(
                 "cosmos_video_cdiff_loss", zero_tensor))
+            acc_deployment_video_endpoint_losses.append(result.get(
+                "deployment_video_endpoint_loss", zero_tensor))
+            acc_deployment_action_endpoint_losses.append(result.get(
+                "deployment_action_endpoint_loss", zero_tensor))
+            acc_deployment_total_losses.append(result.get(
+                "deployment_total_loss", zero_tensor))
+            acc_deployment_student_steps.append(result.get(
+                "deployment_student_steps", zero_tensor))
+            acc_deployment_t_starts.append(result.get(
+                "deployment_t_start", zero_tensor))
+            acc_deployment_t_ends.append(result.get(
+                "deployment_t_end", zero_tensor))
             acc_video_local_fm_losses.append(result.get(
                 "local_fm_loss", zero_tensor))
             acc_action_losses.append(result["action_loss"])
@@ -2779,7 +2849,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                            and result["should_sync"]
                            and not skip_step
                            and not use_onpolicy_now
-                           and not use_opd_aux_now)
+                           and scheduled_kind == "main")
 
             if use_dmd_now:
                 if self.step >= dmd_warmup_steps + dmd_discriminator_warmup:
@@ -2861,6 +2931,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     torch.stack(acc_video_losses).sum(),
                     torch.stack(acc_cosmos_video_endpoint_losses).sum(),
                     torch.stack(acc_cosmos_video_cdiff_losses).sum(),
+                    torch.stack(acc_deployment_video_endpoint_losses).sum(),
+                    torch.stack(acc_deployment_action_endpoint_losses).sum(),
+                    torch.stack(acc_deployment_total_losses).sum(),
+                    torch.stack(acc_deployment_student_steps).sum(),
+                    torch.stack(acc_deployment_t_starts).sum(),
+                    torch.stack(acc_deployment_t_ends).sum(),
                     torch.stack(acc_video_local_fm_losses).sum(),
                     torch.stack(acc_action_losses).sum(),
                     torch.stack(acc_action_local_fm_losses).sum(),
@@ -2919,12 +2995,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     ])
                 metric_values = torch.stack(metric_tensors).float()
                 metric_results = dist_mean(metric_values).tolist()
-                base_metric_count = 41
+                base_metric_count = 47
                 (
                     avg_loss,
                     avg_video_loss,
                     avg_cosmos_video_endpoint_loss,
                     avg_cosmos_video_cdiff_loss,
+                    avg_deployment_video_endpoint_loss,
+                    avg_deployment_action_endpoint_loss,
+                    avg_deployment_total_loss,
+                    avg_deployment_student_steps,
+                    avg_deployment_t_start,
+                    avg_deployment_t_end,
                     avg_video_local_fm_loss,
                     avg_action_loss,
                     avg_action_local_fm_loss,
@@ -3011,6 +3093,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_video_losses = []
                 acc_cosmos_video_endpoint_losses = []
                 acc_cosmos_video_cdiff_losses = []
+                acc_deployment_video_endpoint_losses = []
+                acc_deployment_action_endpoint_losses = []
+                acc_deployment_total_losses = []
+                acc_deployment_student_steps = []
+                acc_deployment_t_starts = []
+                acc_deployment_t_ends = []
                 acc_video_local_fm_losses = []
                 acc_action_losses = []
                 acc_action_local_fm_losses = []
@@ -3086,6 +3174,22 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         log_dict["grad_norm/video_branch"] = grad_branch_norms["video"]
                         log_dict["grad_norm/action_branch"] = grad_branch_norms["action"]
                         log_dict["grad_norm/shared_branch"] = grad_branch_norms["shared"]
+                    if scheduled_kind == "deployment":
+                        postfix["dep"] = f"{avg_deployment_total_loss:.4f}"
+                        log_dict["deployment/video_endpoint_loss"] = (
+                            avg_deployment_video_endpoint_loss
+                        )
+                        log_dict["deployment/action_endpoint_loss"] = (
+                            avg_deployment_action_endpoint_loss
+                        )
+                        log_dict["deployment/total_loss"] = (
+                            avg_deployment_total_loss
+                        )
+                        log_dict["deployment/student_steps"] = (
+                            avg_deployment_student_steps
+                        )
+                        log_dict["deployment/t_start"] = avg_deployment_t_start
+                        log_dict["deployment/t_end"] = avg_deployment_t_end
                     if self.distill_video:
                         if use_onpolicy_now:
                             postfix["vt"] = f"{avg_video_loss:.4f}"

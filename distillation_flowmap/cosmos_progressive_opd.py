@@ -4,6 +4,11 @@ import math
 
 import torch
 
+from distillation_flowmap.cosmos_deployment_rollout import (
+    should_run_deployment_joint_rollout,
+    should_run_raw_auxiliary,
+)
+
 
 def _time_view(timesteps):
     return timesteps[:, None, :, None, None]
@@ -231,6 +236,31 @@ def should_run_standalone_opd(*, step, warmup_steps, interval):
     if int(interval) <= 0:
         raise ValueError("interval must be positive")
     return int(step) >= int(warmup_steps) and int(step) % int(interval) == 0
+
+
+def select_progressive_training_objective(
+    *,
+    step,
+    deployment_enabled,
+    deployment_interval,
+    raw_auxiliary_enabled,
+    raw_auxiliary_warmup,
+    raw_auxiliary_interval,
+    raw_auxiliary_phase,
+):
+    """Choose exactly one optimizer objective for a progressive training step."""
+    if deployment_enabled and should_run_deployment_joint_rollout(
+        int(step), int(deployment_interval)
+    ):
+        return "deployment"
+    if raw_auxiliary_enabled and should_run_raw_auxiliary(
+        int(step),
+        warmup=int(raw_auxiliary_warmup),
+        interval=int(raw_auxiliary_interval),
+        phase=int(raw_auxiliary_phase),
+    ):
+        return "raw_auxiliary"
+    return "main"
 
 
 def should_stop_training_at_step(*, step, stop_after_step):

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 
 from distillation_flowmap.cosmos_progressive_metrics import (
@@ -46,3 +48,24 @@ def test_paired_eval_timesteps_keep_video_and_action_horizons_separate():
     assert tuple(action_r.shape) == (1, 16)
     assert torch.equal(video_t, torch.full((1, 9), 1000.0))
     assert torch.equal(action_r, torch.zeros((1, 16)))
+
+
+def test_trainer_reduces_all_deployment_metrics_in_a_fixed_position():
+    source = (
+        Path(__file__).resolve().parents[1] / "flowmap_trainer.py"
+    ).read_text(encoding="utf-8")
+    metric_block = source.split("metric_tensors = [", 1)[1].split(
+        "kto_main_enabled =", 1
+    )[0]
+    expected = [
+        "acc_deployment_video_endpoint_losses",
+        "acc_deployment_action_endpoint_losses",
+        "acc_deployment_total_losses",
+        "acc_deployment_student_steps",
+        "acc_deployment_t_starts",
+        "acc_deployment_t_ends",
+    ]
+
+    positions = [metric_block.index(name) for name in expected]
+    assert positions == sorted(positions)
+    assert "base_metric_count = 47" in source

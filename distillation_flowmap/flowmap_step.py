@@ -116,6 +116,9 @@ from distillation_flowmap.cosmos_progressive_opd import (
     constrain_cosmos_teacher_timestep_pair,
     rollout_velocity_field,
 )
+from distillation_flowmap.cosmos_deployment_rollout import (
+    deployment_endpoint_losses,
+)
 
 
 class FlowMapStepMixin:
@@ -4232,6 +4235,172 @@ class FlowMapStepMixin:
             'terminal_prior_max_error': window_start_error.detach(),
         }
         return velocity_loss, diagnostics
+
+    def _cosmos_deployment_joint_rollout_step(
+        self, batch, batch_idx, *, student_steps
+    ):
+        """Train one full joint student rollout from deployment noise to x0."""
+        student_steps = int(student_steps)
+        if student_steps not in (1, 2, 4):
+            raise ValueError("deployment student_steps must be one of 1, 2, 4")
+        if self.gradient_accumulation_steps != 1:
+            raise ValueError(
+                "deployment joint rollout requires gradient_accumulation_steps=1"
+            )
+
+        batch = self.convert_input_format(batch)
+        teacher = self._action_teacher_model
+        if not (
+            hasattr(teacher, "predict_raw_latent_target")
+            and getattr(teacher, "raw_inference_enabled", False)
+        ):
+            raise RuntimeError(
+                "Cosmos deployment rollout requires raw latent endpoint inference."
+            )
+
+        B = int(batch["actions"].shape[0])
+        latent_shape = (
+            B,
+            int(getattr(self.config, "cosmos_latent_channels", 16)),
+            int(getattr(self.config, "cosmos_latent_frames", 9)),
+            int(getattr(self.config, "cosmos_latent_height", 28)),
+            int(getattr(self.config, "cosmos_latent_width", 28)),
+        )
+        video_frames = latent_shape[2]
+        anchor_t_norm = torch.full(
+            (B, video_frames),
+            float(getattr(self.config, "cosmos_latent_t_max", 80.0 / 81.0)),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        anchor_r_norm = torch.full(
+            (B, video_frames),
+            float(getattr(self.config, "cosmos_latent_t_min", 4.0 / 5.0)),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        anchor_noise = torch.randn(
+            latent_shape, device=self.device, dtype=batch["actions"].dtype
+        )
+        with torch.no_grad():
+            endpoint_result = teacher.predict_raw_latent_target(
+                batch,
+                noise=anchor_noise,
+                t=anchor_t_norm,
+                r=anchor_r_norm,
+                epsilon=float(self.config.cosmos_latent_epsilon),
+                include_cdiff=False,
+            )
+        video_x0 = endpoint_result["cosmos_latent_x0"].to(
+            device=self.device, dtype=batch["latents"].dtype
+        )
+        action_x0_full = cosmos_actions_to_flowmap_x0(
+            endpoint_result["actions"],
+            target_shape=tuple(batch["actions"].shape),
+            q01=self.config.norm_stat["q01"],
+            q99=self.config.norm_stat["q99"],
+            inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
+            device=self.device,
+            dtype=batch["actions"].dtype,
+            packing_schema=self.config.action_packing_schema,
+            downsample_factor=self.config.action_downsample_factor,
+        )
+
+        batch["latents"] = video_x0
+        ref_shape = video_x0.shape
+        video_t = torch.full(
+            (B, video_frames), 1000.0, device=self.device
+        )
+        video_r = torch.zeros_like(video_t)
+        action_t, action_r = broadcast_joint_action_timesteps(
+            video_t, video_r, action_frames=batch["actions"].shape[2]
+        )
+        video_noise = anchor_noise.to(device=self.device, dtype=video_x0.dtype)
+        action_noise = torch.randn_like(action_x0_full)
+
+        input_dict = self._prepare_base_dict(batch)
+        input_dict["latent_dict"]["noisy_latents"] = video_noise
+        input_dict["latent_dict"]["timesteps"] = video_t
+        input_dict["latent_dict"]["targets"] = (
+            self.train_scheduler_latent.training_target(
+                video_x0, video_noise, video_t
+            )
+        )
+        action_base = input_dict["action_dict"]
+        action_base["noisy_latents"] = action_noise
+        action_base["timesteps"] = action_t
+        action_base["targets"] = self.train_scheduler_action.training_target(
+            batch["actions"], action_noise, action_t
+        )
+        action_downsample = int(self.config.action_downsample_factor)
+        student_action_dict = {
+            "noisy_latents": action_noise[:, :, ::action_downsample],
+            "latent": action_base["latent"][:, :, ::action_downsample],
+            "timesteps": action_t[:, ::action_downsample],
+            "cond_timesteps": action_base["cond_timesteps"][
+                :, ::action_downsample
+            ],
+            "text_emb": action_base["text_emb"],
+            "grid_id": _downsample_action_grid_id(
+                action_base.get("grid_id"),
+                action_base["latent"],
+                action_downsample,
+            )
+            if action_base.get("grid_id") is not None
+            else None,
+            "actions_mask": batch["actions_mask"][:, :, ::action_downsample],
+        }
+        student_input = {
+            "latent_dict": input_dict["latent_dict"],
+            "action_dict": student_action_dict,
+            "chunk_size": input_dict["chunk_size"],
+            "window_size": input_dict["window_size"],
+        }
+        cfg_scale = self.config.cfg_min + torch.rand(1).item() * (
+            self.config.cfg_max - self.config.cfg_min
+        )
+        empty_emb = self.empty_emb.expand(B, -1, -1)
+        video_final, _, _, action_final = self._student_euler_integrate(
+            noisy_latents=video_noise,
+            timesteps=video_t,
+            target_r=video_r,
+            base_input_dict=student_input,
+            empty_emb=empty_emb,
+            cfg_scale=cfg_scale,
+            ref_shape=ref_shape,
+            B=B,
+            num_frames=video_frames,
+            K_steps=student_steps,
+            action_target_r=action_r,
+            return_final_action=True,
+            return_final_action_state=True,
+        )
+        endpoint_losses = deployment_endpoint_losses(
+            video_final,
+            video_x0,
+            action_final,
+            batch["actions"][:, :, ::action_downsample],
+            batch["actions_mask"][:, :, ::action_downsample],
+            action_weight=float(self.config.deployment_action_weight),
+        )
+        loss = endpoint_losses["total"]
+        is_finite = bool(torch.isfinite(loss.detach()).item())
+        zero = torch.zeros((), device=self.device, dtype=loss.dtype)
+        if is_finite:
+            loss.backward()
+        return {
+            "loss": loss.detach() if is_finite else zero,
+            "deployment_video_endpoint_loss": endpoint_losses["video"].detach(),
+            "deployment_action_endpoint_loss": endpoint_losses["action"].detach(),
+            "deployment_total_loss": loss.detach() if is_finite else zero,
+            "deployment_student_steps": torch.tensor(
+                float(student_steps), device=self.device
+            ),
+            "deployment_t_start": video_t[0, 0].detach(),
+            "deployment_t_end": video_r[0, 0].detach(),
+            "should_sync": True,
+            "skip_step": not is_finite,
+        }
 
     def _cosmos_latent_full_opd_aux_transition_step(self, batch, batch_idx, kto_paopd=False):
         """Cosmos full OPD: independent endpoint rollout plus DanceOPD field loss."""

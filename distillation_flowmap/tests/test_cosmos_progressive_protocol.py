@@ -1,3 +1,4 @@
+from pathlib import Path
 from distillation_flowmap.cosmos_progressive_protocol import (
     aligned_teacher_path_indices,
     build_dataset_manifest,
@@ -77,3 +78,38 @@ def test_cosmos_latent_shape_uses_official_prediction_horizon_not_dataset_cache(
     )
 
     assert cosmos_latent_shape(config, batch_size=2) == (2, 16, 9, 28, 28)
+
+
+def test_trainer_runs_deployment_and_raw_aux_on_disjoint_steps():
+    from distillation_flowmap.cosmos_progressive_opd import (
+        select_progressive_training_objective,
+    )
+
+    def scheduled_kind(step):
+        return select_progressive_training_objective(
+            step=step,
+            deployment_enabled=True,
+            deployment_interval=4,
+            raw_auxiliary_enabled=True,
+            raw_auxiliary_warmup=0,
+            raw_auxiliary_interval=8,
+            raw_auxiliary_phase=2,
+        )
+
+    assert scheduled_kind(step=8) == "deployment"
+    assert scheduled_kind(step=10) == "raw_auxiliary"
+    assert scheduled_kind(step=12) == "deployment"
+    assert scheduled_kind(step=11) == "main"
+
+
+def test_deployment_student_path_is_not_clamped_to_the_raw_teacher_window():
+    root = Path(__file__).resolve().parents[1]
+    step_source = (root / "flowmap_step.py").read_text(encoding="utf-8")
+    trainer_source = (root / "flowmap_trainer.py").read_text(encoding="utf-8")
+    deployment_method_source = step_source.split(
+        "def _cosmos_deployment_joint_rollout_step("
+    )[1].split("def _cosmos_latent_full_opd_aux_transition_step(")[0]
+
+    assert "constrain_cosmos_teacher_timestep_pair" not in deployment_method_source
+    assert "predict_raw_latent_velocity" not in deployment_method_source
+    assert "_cosmos_deployment_joint_rollout_step" in trainer_source

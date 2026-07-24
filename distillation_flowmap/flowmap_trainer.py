@@ -56,6 +56,12 @@ from distillation_flowmap.ablation.robotwin_diagnostics import (
     classify_parameter_branch,
     opd_diagnostic_aliases,
 )
+from distillation_flowmap.distributed_safety import (
+    accumulation_backward_allowed,
+    finish_accumulation_window,
+    initialize_nonfinite_safety,
+    record_nonfinite_origins,
+)
 
 try:
     import wandb
@@ -290,6 +296,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.dtype = config.param_dtype                        # 模型参数精度（bf16）
         self.patch_size = config.patch_size                    # 视频 patch 大小
         self.gradient_accumulation_steps = config.gradient_accumulation_steps  # 梯度累积步数
+        initialize_nonfinite_safety(self)
 
         # k: 在 1000 步 schedule 中的跳步数
         # 例如：1000 / 2 = 500，意味着每次跳 500 步
@@ -2711,10 +2718,15 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 else:
                     result = self._train_step(batch, step_in_acc)
 
+                record_nonfinite_origins(
+                    self,
+                    result.get("nonfinite_origins", {}),
+                    device=self.device,
+                )
                 if (not standalone_opd and self.use_opd_aux and not use_onpolicy_now and
                         result.get("should_sync", False) and
                         self.step >= getattr(self.config, 'opd_aux_warmup_steps', 0) and
-                        not result.get("skip_step", False)):
+                        accumulation_backward_allowed(self)):
                     opd_aux_interval = max(1, int(getattr(self.config, 'opd_aux_interval', 1)))
                     use_opd_aux_now = (self.step % opd_aux_interval == 0)
                     opd_aux_prob = float(getattr(self.config, 'opd_aux_prob', 1.0))
@@ -2734,11 +2746,24 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         self.config, 'opd_aux_gradient_checkpointing', False))
                     opd_aux_result = _call_with_student_checkpointing(
                         self.student, opd_aux_checkpointing, _run_opd_aux)
+                    record_nonfinite_origins(
+                        self,
+                        opd_aux_result.get("nonfinite_origins", {}),
+                        device=self.device,
+                    )
                     result["loss"] = result["loss"] + opd_aux_result.get("loss", zero_tensor)
                     result["skip_step"] = (
                         result.get("skip_step", False) or
                         opd_aux_result.get("skip_step", False)
                     )
+
+            if scheduled_kind in ("deployment", "raw_auxiliary"):
+                record_nonfinite_origins(
+                    self,
+                    result.get("nonfinite_origins", {}),
+                    device=self.device,
+                )
+            result["skip_step"] = self.skip_accumulation_window
 
             # 累积损失值
             acc_losses.append(result["loss"])
@@ -2886,7 +2911,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                            and self.distill_action
                            and self.step >= dmd_warmup_steps
                            and result["should_sync"]
-                           and not skip_step
+                           and accumulation_backward_allowed(self)
                            and not use_onpolicy_now
                            and scheduled_kind == "main")
 
@@ -2924,9 +2949,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     (self.step + 1 >= config.max_train_steps)
                 )
                 grad_branch_norms = {}
-                if skip_step:
-                    total_norm = torch.tensor(float("nan"), device=self.device)
-                    self.optimizer.zero_grad()
+                if self.skip_accumulation_window:
+                    total_norm = torch.zeros((), device=self.device)
                 else:
                     if (
                         bool(getattr(config, "enable_grad_branch_diagnostics", False))
@@ -2937,31 +2961,39 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     total_norm = torch.nn.utils.clip_grad_norm_(
                         self.student.parameters(), config.max_grad_norm)
 
-                    if not torch.isfinite(total_norm):
-                        # 梯度范数为 NaN/Inf，跳过这一步
-                        if config.rank == 0:
-                            logger.warning(f"[step {self.step}] NaN grad norm, skipping")
-                        self.optimizer.zero_grad()
-                    else:
-                        # 正常更新参数
-                        self.optimizer.step()
-                        self.lr_scheduler.step()
-                        self.optimizer.zero_grad()
-                        self._nofsdp_synced = False  # invalidate dirty flag after weight update
+                def _update_target_ema():
+                    # FSDP1 with use_orig_params=True preserves original names.
+                    ema_warmup_steps = int(getattr(
+                        config, 'ema_warmup_steps', 0
+                    ))
+                    ema_decay = (
+                        0.0 if self.step < ema_warmup_steps else config.ema_decay
+                    )
+                    self._last_ema_decay = float(ema_decay)
+                    if self.target_student is not None:
+                        update_ema(
+                            self.target_student.parameters(),
+                            self.student.parameters(),
+                            rate=ema_decay,
+                        )
 
-                        # EMA 更新只在正常参数更新后执行（跳过 NaN/Inf 梯度时不更新 EMA，
-                        # 避免将异常梯度产生的错误权重传播到目标学生）
-                        # FSDP1 with use_orig_params=True preserves original parameter names,
-                        # so model.parameters() works directly (no .module needed)
-                        ema_warmup_steps = int(getattr(config, 'ema_warmup_steps', 0))
-                        ema_decay = 0.0 if self.step < ema_warmup_steps else config.ema_decay
-                        self._last_ema_decay = float(ema_decay)
-                        if self.target_student is not None:
-                            update_ema(
-                                self.target_student.parameters(),
-                                self.student.parameters(),
-                                rate=ema_decay,
-                            )
+                skipped_optimizer_step, total_norm, grad_branch_norms = (
+                    finish_accumulation_window(
+                        self,
+                        total_norm=total_norm,
+                        grad_branch_norms=grad_branch_norms,
+                        update_ema_fn=_update_target_ema,
+                    )
+                )
+                skip_step = skipped_optimizer_step
+                if skipped_optimizer_step:
+                    if config.rank == 0:
+                        logger.warning(
+                            "[step %s] synchronized non-finite window skipped",
+                            self.step,
+                        )
+                else:
+                    self._nofsdp_synced = False
 
                 # 计算平均损失（跨所有进程）
                 lr = self.lr_scheduler.get_last_lr()[0]
@@ -3208,6 +3240,14 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         "train/grad_norm": total_norm.item(),
                         "train/lr": lr,
                         "train/ema_decay": getattr(self, '_last_ema_decay', config.ema_decay),
+                        "safety/nonfinite_skipped_windows": self.nonfinite_skipped_windows,
+                        "safety/nonfinite_video": self.nonfinite_origin_counters["video"],
+                        "safety/nonfinite_action": self.nonfinite_origin_counters["action"],
+                        "safety/nonfinite_teacher_or_gt": self.nonfinite_origin_counters["teacher_or_gt"],
+                        "safety/nonfinite_opd_endpoint": self.nonfinite_origin_counters["opd_endpoint"],
+                        "safety/nonfinite_opd_compositional": self.nonfinite_origin_counters["opd_compositional"],
+                        "safety/nonfinite_opd_action": self.nonfinite_origin_counters["opd_action"],
+                        "safety/nonfinite_gradient": self.nonfinite_origin_counters["gradient"],
                     }
                     if grad_branch_norms:
                         log_dict["grad_norm/video_branch"] = grad_branch_norms["video"]

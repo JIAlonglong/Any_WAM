@@ -79,6 +79,20 @@ def _same_state_velocity_loss(
         per_token = diff ** 2
     per_sample = per_token.mean(dim=[1, 2, 3, 4])
     return (per_sample * sample_weight.to(per_sample.device)).mean()
+
+
+def _synchronized_nonfinite_decision(*, loss, local_flags, device):
+    """Agree on named loss failures before any rank enters backward."""
+    flags = {
+        origin: bool(local_flags.get(origin, False))
+        for origin in NONFINITE_ORIGINS
+    }
+    if not bool(torch.isfinite(loss.detach()).all().item()) and not any(
+        flags.values()
+    ):
+        flags["teacher_or_gt"] = True
+    synchronized = reduce_nonfinite_origins(flags, device=device)
+    return not any(synchronized.values()), synchronized
 from einops import rearrange
 
 from utils import data_seq_to_patch, logger
@@ -100,6 +114,10 @@ from distillation_flowmap.opd_loss_composition import (
 from distillation_flowmap.opd_rollout_grad import (
     SUPPORTED_ROLLOUT_GRAD_MODES,
     rollout_step_requires_grad,
+)
+from distillation_flowmap.distributed_safety import (
+    NONFINITE_ORIGINS,
+    reduce_nonfinite_origins,
 )
 from distillation_flowmap.danceopd_query import (
     denoised_endpoint_mse,
@@ -2238,7 +2256,20 @@ class FlowMapStepMixin:
                 scale = (loss_clip_value / loss.detach().clamp(min=1e-12)).clamp(max=1.0)
                 loss = loss * scale
 
-        if not torch.isfinite(loss):
+        local_nonfinite_origins = {
+            "video": not bool(torch.isfinite(video_loss.detach()).all().item()),
+            "action": not bool(torch.isfinite(action_loss.detach()).all().item())
+            or not bool(torch.isfinite(action_aware_loss.detach()).all().item()),
+            "teacher_or_gt": not bool(
+                torch.isfinite(gt_regression_loss.detach()).all().item()
+            ),
+        }
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags=local_nonfinite_origins,
+            device=self.device,
+        )
+        if not is_finite:
             if self.config.rank == 0:
                 logger.warning(f"[step {self.step}] NaN/Inf loss, skipping")
             return {
@@ -2263,6 +2294,7 @@ class FlowMapStepMixin:
                 "kto_main_threshold": zero_metric,
                 "should_sync": should_sync,
                 "skip_step": True,
+                "nonfinite_origins": nonfinite_origins,
             }
 
         _profile_mark("loss_compute")
@@ -2303,6 +2335,7 @@ class FlowMapStepMixin:
             "kto_main_threshold": zero_metric,
             "should_sync": should_sync,
             "skip_step": False,
+            "nonfinite_origins": nonfinite_origins,
         }
 
     def _train_step(self, batch, batch_idx):
@@ -2969,9 +3002,21 @@ class FlowMapStepMixin:
                 scale = (loss_clip_value / loss.detach().clamp(min=1e-12)).clamp(max=1.0)
                 loss = loss * scale
 
-        # 检查损失是否为 NaN/Inf，如果是则跳过这一步
-
-        if not torch.isfinite(loss):
+        # Agree before backward so every rank follows the same collective path.
+        local_nonfinite_origins = {
+            "video": not bool(torch.isfinite(video_loss.detach()).all().item()),
+            "action": not bool(torch.isfinite(action_loss.detach()).all().item())
+            or not bool(torch.isfinite(action_aware_loss.detach()).all().item()),
+            "teacher_or_gt": not bool(
+                torch.isfinite(gt_regression_loss.detach()).all().item()
+            ),
+        }
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags=local_nonfinite_origins,
+            device=self.device,
+        )
+        if not is_finite:
             if self.config.rank == 0:
                 logger.warning(f"[step {self.step}] NaN/Inf loss, skipping")
             zero_loss = torch.zeros((), device=self.device)
@@ -2990,6 +3035,7 @@ class FlowMapStepMixin:
                 "kto_main_threshold": kto_main_threshold.detach(),
                 "should_sync": should_sync,
                 "skip_step": True,
+                "nonfinite_origins": nonfinite_origins,
             }
 
         loss.backward()
@@ -3010,6 +3056,7 @@ class FlowMapStepMixin:
             "kto_main_threshold": kto_main_threshold.detach(),
             "should_sync": should_sync,
             "skip_step": False,
+            "nonfinite_origins": nonfinite_origins,
         }
 
     # ==================================================================
@@ -3919,7 +3966,26 @@ class FlowMapStepMixin:
         loss_clip_value = getattr(self.config, 'loss_clip_value', None)
         if loss_clip_value is not None and getattr(self.config, 'loss_clip_enabled', True):
             loss = torch.clamp(loss, min=0.0, max=loss_clip_value)
-        if not torch.isfinite(loss):
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags={
+                "video": not bool(
+                    torch.isfinite(video_transition_loss.detach()).all().item()
+                )
+                or not bool(torch.isfinite(local_fm_loss.detach()).all().item()),
+                "action": not bool(
+                    torch.isfinite(action_loss.detach()).all().item()
+                )
+                or not bool(
+                    torch.isfinite(action_aware_loss.detach()).all().item()
+                ),
+                "teacher_or_gt": not bool(
+                    torch.isfinite(gt_regression_loss.detach()).all().item()
+                ),
+            },
+            device=self.device,
+        )
+        if not is_finite:
             if self.config.rank == 0:
                 logger.warning(f"[step {self.step}] NaN/Inf loss, skipping")
             zero_loss = torch.zeros((), device=self.device)
@@ -3933,6 +3999,7 @@ class FlowMapStepMixin:
                 'gt_regression_loss': gt_regression_loss.detach() if self.distill_action else gt_regression_loss,
                 'should_sync': should_sync,
                 'skip_step': True,
+                'nonfinite_origins': nonfinite_origins,
             }
 
         loss.backward()
@@ -3955,6 +4022,7 @@ class FlowMapStepMixin:
             'video_r_mean': video_r.mean().item(),
             'should_sync': should_sync,
             'skip_step': False,
+            'nonfinite_origins': nonfinite_origins,
         }
 
     def _opd_aux_transition_step_kto_paopd(self, batch, batch_idx):
@@ -4436,7 +4504,18 @@ class FlowMapStepMixin:
             action_weight=float(self.config.deployment_action_weight),
         )
         loss = endpoint_losses["total"]
-        is_finite = bool(torch.isfinite(loss.detach()).item())
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags={
+                "video": not bool(
+                    torch.isfinite(endpoint_losses["video"].detach()).all().item()
+                ),
+                "action": not bool(
+                    torch.isfinite(endpoint_losses["action"].detach()).all().item()
+                ),
+            },
+            device=self.device,
+        )
         zero = torch.zeros((), device=self.device, dtype=loss.dtype)
         if is_finite:
             loss.backward()
@@ -4459,6 +4538,7 @@ class FlowMapStepMixin:
             "deployment_t_end": video_r[0, 0].detach(),
             "should_sync": True,
             "skip_step": not is_finite,
+            "nonfinite_origins": nonfinite_origins,
         }
 
     def _cosmos_latent_full_opd_aux_transition_step(self, batch, batch_idx, kto_paopd=False):
@@ -4772,7 +4852,21 @@ class FlowMapStepMixin:
         contrib_denom = (
             endpoint_contrib.detach().abs() + velocity_contrib.detach().abs()
         ).clamp(min=1e-12)
-        is_finite = bool(torch.isfinite(loss.detach()).item())
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags={
+                "opd_endpoint": not bool(
+                    torch.isfinite(video_endpoint_loss.detach()).all().item()
+                ),
+                "opd_action": not bool(
+                    torch.isfinite(action_endpoint_loss.detach()).all().item()
+                ),
+                "opd_compositional": not bool(
+                    torch.isfinite(velocity_loss.detach()).all().item()
+                ),
+            },
+            device=self.device,
+        )
         result = {
             'loss': loss.detach() if is_finite else zero,
             'opd_aux_loss': loss.detach() if is_finite else zero,
@@ -4816,6 +4910,7 @@ class FlowMapStepMixin:
             'teacher_steps': teacher_steps,
             'should_sync': True,
             'skip_step': not is_finite,
+            'nonfinite_origins': nonfinite_origins,
         }
         if not is_finite:
             if getattr(self.config, 'rank', 0) == 0:
@@ -5127,8 +5222,27 @@ class FlowMapStepMixin:
                 scale = (loss_clip_value / loss.detach().clamp(min=1e-12)).clamp(max=1.0)
                 loss = loss * scale
 
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags={
+                "opd_endpoint": not bool(
+                    torch.isfinite(opd_endpoint_aux_loss.detach()).all().item()
+                ),
+                "opd_compositional": not bool(
+                    torch.isfinite(video_transition_loss.detach()).all().item()
+                )
+                or not bool(torch.isfinite(local_fm_loss.detach()).all().item()),
+                "opd_action": not bool(
+                    torch.isfinite(opd_action_transition_loss.detach()).all().item()
+                )
+                or not bool(
+                    torch.isfinite(opd_action_local_fm_loss.detach()).all().item()
+                ),
+            },
+            device=self.device,
+        )
         result = {
-            'loss': loss.detach() if torch.isfinite(loss) else zero,
+            'loss': loss.detach() if is_finite else zero,
             'opd_aux_loss': weighted_aux_loss.detach(),
             'opd_video_transition_loss': video_transition_loss.detach(),
             'opd_endpoint_aux_loss': opd_endpoint_aux_loss.detach(),
@@ -5154,10 +5268,11 @@ class FlowMapStepMixin:
             'rollout_steps': max(1, int(K_steps)),
             'teacher_steps': 1,
             'should_sync': should_sync,
-            'skip_step': not bool(torch.isfinite(loss)),
+            'skip_step': not is_finite,
+            'nonfinite_origins': nonfinite_origins,
         }
 
-        if not torch.isfinite(loss):
+        if not is_finite:
             if self.config.rank == 0:
                 logger.warning(f"[step {self.step}] NaN/Inf Cosmos OPD aux loss, skipping")
             return result
@@ -5657,6 +5772,18 @@ class FlowMapStepMixin:
         contrib_denom = (
             velocity_contrib.detach().abs() + endpoint_contrib.detach().abs()
         ).clamp(min=1e-12)
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags={
+                "opd_endpoint": not bool(
+                    torch.isfinite(endpoint_loss.detach()).all().item()
+                ),
+                "opd_compositional": not bool(
+                    torch.isfinite(velocity_loss.detach()).all().item()
+                ),
+            },
+            device=self.device,
+        )
         result = {
             'loss': loss.detach(),
             'opd_aux_loss': loss.detach(),
@@ -5701,7 +5828,8 @@ class FlowMapStepMixin:
             'rollout_steps': rollout_steps,
             'teacher_steps': endpoint_diagnostics.get('teacher_steps', 1),
             'should_sync': True,
-            'skip_step': not bool(torch.isfinite(loss.detach())),
+            'skip_step': not is_finite,
+            'nonfinite_origins': nonfinite_origins,
         }
         if result['skip_step']:
             if self.config.rank == 0:
@@ -6567,7 +6695,29 @@ class FlowMapStepMixin:
                 scale = (loss_clip_value / loss.detach().clamp(min=1e-12)).clamp(max=1.0)
                 loss = loss * scale
 
-        if not torch.isfinite(loss):
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags={
+                "opd_endpoint": not bool(
+                    torch.isfinite(opd_endpoint_aux_loss.detach()).all().item()
+                ),
+                "opd_compositional": not bool(
+                    torch.isfinite(video_transition_loss.detach()).all().item()
+                )
+                or not bool(
+                    torch.isfinite(opd_same_state_velocity_loss.detach()).all().item()
+                )
+                or not bool(torch.isfinite(local_fm_loss.detach()).all().item()),
+                "opd_action": not bool(
+                    torch.isfinite(opd_action_transition_loss.detach()).all().item()
+                )
+                or not bool(
+                    torch.isfinite(opd_action_local_fm_loss.detach()).all().item()
+                ),
+            },
+            device=self.device,
+        )
+        if not is_finite:
             if self.config.rank == 0:
                 logger.warning(f"[step {self.step}] NaN/Inf OPD aux loss, skipping")
             zero_loss = torch.zeros((), device=self.device)
@@ -6600,6 +6750,7 @@ class FlowMapStepMixin:
                 'opd_action_local_fm_ratio': (opd_action_local_fm_contrib.detach().abs() / contrib_denom),
                 'should_sync': should_sync,
                 'skip_step': True,
+                'nonfinite_origins': nonfinite_origins,
             }
             if kto_paopd:
                 result.update({
@@ -6652,6 +6803,7 @@ class FlowMapStepMixin:
             'teacher_steps': effective_teacher_steps,
             'should_sync': should_sync,
             'skip_step': False,
+            'nonfinite_origins': nonfinite_origins,
         }
         if kto_paopd:
             result.update({

@@ -15,51 +15,28 @@ from distillation_flowmap.danceopd_query import (
 
 
 class DanceOPDQueryTest(unittest.TestCase):
-    def test_endpoint_sigma_uses_clean_region_beta_formula(self):
-        sampler = getattr(danceopd_query, "sample_endpoint_sigmas", None)
-        self.assertIsNotNone(
-            sampler, "endpoint sigma sampler contract is missing"
+    def test_uniform_rollout_pair_sampler_reaches_every_configured_pair(self):
+        sampler = getattr(
+            danceopd_query, "sample_uniform_rollout_step_pair", None
         )
-        original_sample = torch.distributions.Beta.sample
+        self.assertIsNotNone(
+            sampler, "uniform rollout-pair sampler contract is missing"
+        )
+        pairs = ((8, 1), (8, 2), (8, 4))
+        original_randint = torch.randint
+        selected = []
         try:
-            torch.distributions.Beta.sample = lambda self, shape: torch.tensor(
-                [0.0, 0.2, 0.75, 1.0], device=self.concentration1.device
-            )
-            sigma = sampler(
-                batch_size=4,
-                alpha=5.0,
-                beta=2.0,
-                max_sigma=0.25,
-                device=torch.device("cpu"),
-            )
-        finally:
-            torch.distributions.Beta.sample = original_sample
-
-        self.assertTrue(torch.equal(
-            sigma, torch.tensor([0.25, 0.20, 0.0625, 0.0])
-        ))
-        self.assertGreaterEqual(float(sigma.min()), 0.0)
-        self.assertLessEqual(float(sigma.max()), 0.25)
-
-    def test_pre_update_candidate_sigmas_match_compositional_grids(self):
-        candidate_sigmas = getattr(
-            danceopd_query, "pre_update_candidate_sigmas", None
-        )
-        self.assertIsNotNone(
-            candidate_sigmas, "pre-update candidate sigma contract is missing"
-        )
-        expected = {
-            2: (1.0, 0.5),
-            4: (1.0, 0.75, 0.5, 0.25),
-        }
-        for rollout_steps, grid in expected.items():
-            with self.subTest(rollout_steps=rollout_steps):
-                actual = candidate_sigmas(
-                    rollout_steps=rollout_steps,
-                    device=torch.device("cpu"),
-                    dtype=torch.float32,
+            for index in range(len(pairs)):
+                torch.randint = lambda *args, _index=index, **kwargs: torch.tensor(
+                    [_index], device=kwargs.get("device")
                 )
-                self.assertEqual(tuple(actual.tolist()), grid)
+                selected.append(
+                    sampler(pairs, device=torch.device("cpu"))
+                )
+        finally:
+            torch.randint = original_randint
+
+        self.assertEqual(tuple(selected), pairs)
 
     def test_beta_query_indices_are_independent_per_batch_element(self):
         original_sample = torch.distributions.Beta.sample
@@ -139,33 +116,6 @@ class DanceOPDQueryTest(unittest.TestCase):
         self.assertTrue(torch.allclose(loss, torch.tensor(2.5)))
         self.assertTrue(torch.allclose(student.grad, torch.tensor([-1.0, -2.0])))
         self.assertIsNone(teacher.grad)
-
-    def test_shared_query_state_keeps_student_gradient_and_video_only_action_zero(self):
-        video = torch.tensor([1.0, 2.0])
-        action = torch.tensor([3.0, 4.0])
-        sigma = torch.tensor([0.75, 0.25])
-        calls = []
-
-        def student_field(query_video, query_action, query_sigma):
-            calls.append(("student", query_video, query_action, query_sigma))
-            return (query_video + query_action + query_sigma).requires_grad_()
-
-        def teacher_field(query_video, query_action, query_sigma):
-            calls.append(("teacher", query_video, query_action, query_sigma))
-            return query_video - query_action + query_sigma
-
-        student_velocity = student_field(video, action, sigma)
-        with torch.no_grad():
-            teacher_velocity = teacher_field(video, action, sigma).detach()
-        loss = direct_velocity_mse(student_velocity, teacher_velocity)
-        action_velocity_contribution = torch.zeros_like(loss)
-
-        self.assertIs(calls[0][1], calls[1][1])
-        self.assertIs(calls[0][2], calls[1][2])
-        self.assertIs(calls[0][3], calls[1][3])
-        self.assertTrue(student_velocity.requires_grad)
-        self.assertFalse(teacher_velocity.requires_grad)
-        self.assertEqual(float(action_velocity_contribution), 0.0)
 
     def test_denoised_endpoint_mse_detaches_teacher_endpoint(self):
         student_x = torch.tensor([2.0], requires_grad=True)

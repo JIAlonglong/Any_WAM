@@ -106,6 +106,7 @@ from distillation_flowmap.danceopd_query import (
     direct_velocity_mse,
     sample_low_noise_query_indices,
     sample_semantic_query_indices,
+    sample_uniform_rollout_step_pair,
     select_per_sample_trajectory_state,
 )
 from distillation_flowmap.cosmos_progressive_opd import (
@@ -4584,12 +4585,16 @@ class FlowMapStepMixin:
         rollout_step_pairs = getattr(self.config, 'opd_rollout_step_pairs', [[8, 4]])
         if not rollout_step_pairs:
             raise ValueError('opd_rollout_step_pairs must contain at least one (N, K) pair')
-        if dist.is_initialized():
-            pair_index = torch.randint(0, len(rollout_step_pairs), (1,), device=self.device)
-            dist.broadcast(pair_index, src=0)
-            teacher_steps, student_steps = rollout_step_pairs[pair_index.item()]
-        else:
-            teacher_steps, student_steps = rollout_step_pairs[0]
+        broadcast_index = (
+            (lambda index: dist.broadcast(index, src=0))
+            if dist.is_initialized()
+            else None
+        )
+        teacher_steps, student_steps = sample_uniform_rollout_step_pair(
+            rollout_step_pairs,
+            device=self.device,
+            broadcast_index=broadcast_index,
+        )
         teacher_steps = max(1, int(teacher_steps))
         student_steps = max(1, int(student_steps))
         cfg_scale = self.config.cfg_min + torch.rand(1).item() * (

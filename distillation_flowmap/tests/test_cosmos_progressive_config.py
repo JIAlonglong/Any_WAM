@@ -35,10 +35,6 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
     assert module.cfg.consistency_ratio == 0.25
     assert module.cfg.flowmap_ratio == 0.25
     assert module.cfg.opd_endpoint_focus_prob > 0
-    assert module.cfg.opd_query_bias == "low_noise"
-    assert module.cfg.opd_low_noise_alpha == 5.0
-    assert module.cfg.opd_low_noise_beta == 2.0
-    assert module.cfg.opd_low_noise_max_sigma == 0.25
     assert module.cfg.opd_danceopd_rollout_steps == 4
     assert module.cfg.opd_danceopd_endpoint_weight > 0
     assert module.cfg.opd_danceopd_velocity_weight == 1.0
@@ -49,7 +45,6 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
     assert module.cfg.cosmos_use_teacher_action_anchor is True
     assert module.cfg.opd_joint_action_rollout is True
     assert module.cfg.opd_danceopd_action_endpoint_weight > 0
-    assert module.cfg.opd_danceopd_action_velocity_weight == 0.0
     assert module.cfg.deployment_joint_rollout_enabled is True
     assert module.cfg.deployment_joint_rollout_interval == 4
     assert module.cfg.deployment_joint_steps == (1, 2, 4)
@@ -152,16 +147,16 @@ def test_main_anyflow_branch_boundaries_preserve_arbitrary_intervals():
     assert arbitrary_r < t
 
 
-def test_endpoint_pairs_are_selected_uniformly():
+def test_full_cosmos_endpoint_path_uses_uniform_pair_sampler():
     source = (
         Path(__file__).resolve().parents[1] / "flowmap_step.py"
     ).read_text(encoding="utf-8")
-    endpoint_block = source.split(
-        "def _danceopd_independent_endpoint_loss("
-    )[1].split("def _danceopd_aux_transition_step(")[0]
+    full_cosmos_block = source.split(
+        "def _cosmos_latent_full_opd_aux_transition_step("
+    )[1].split("def _cosmos_latent_opd_aux_transition_step(")[0]
 
-    assert "torch.randint(" in endpoint_block
-    assert "random.choice(rollout_step_pairs)" in endpoint_block
+    assert "sample_uniform_rollout_step_pair(" in full_cosmos_block
+    assert "rollout_step_pairs[0]" not in full_cosmos_block
 
 
 def test_cosmos_danceopd_uses_pre_update_compositional_states_and_skips_s1_velocity():

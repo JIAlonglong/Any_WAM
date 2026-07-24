@@ -8,43 +8,23 @@ import torch
 import torch.nn.functional as F
 
 
-def sample_endpoint_sigmas(
+def sample_uniform_rollout_step_pair(
+    rollout_step_pairs,
     *,
-    batch_size: int,
-    alpha: float,
-    beta: float,
-    max_sigma: float,
     device: torch.device,
-) -> torch.Tensor:
-    """Sample clean-region endpoint sigmas as ``(1 - Beta) * max_sigma``."""
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive")
-    if not math.isfinite(alpha) or alpha <= 0:
-        raise ValueError("alpha must be finite and positive")
-    if not math.isfinite(beta) or beta <= 0:
-        raise ValueError("beta must be finite and positive")
-    if not math.isfinite(max_sigma) or max_sigma < 0:
-        raise ValueError("max_sigma must be finite and non-negative")
+    broadcast_index=None,
+):
+    """Sample one configured ``(teacher_steps, student_steps)`` pair uniformly."""
+    pairs = tuple(tuple(int(value) for value in pair) for pair in rollout_step_pairs)
+    if not pairs:
+        raise ValueError("rollout_step_pairs must not be empty")
+    if any(len(pair) != 2 or pair[0] <= 0 or pair[1] <= 0 for pair in pairs):
+        raise ValueError("rollout_step_pairs must contain positive (N, K) pairs")
 
-    distribution = torch.distributions.Beta(
-        torch.tensor(float(alpha), device=device),
-        torch.tensor(float(beta), device=device),
-    )
-    return (1.0 - distribution.sample((batch_size,))) * float(max_sigma)
-
-
-def pre_update_candidate_sigmas(
-    *,
-    rollout_steps: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Return the uniform terminal-to-clean sigmas visited before each update."""
-    if rollout_steps <= 0:
-        raise ValueError("rollout_steps must be positive")
-    return torch.arange(
-        rollout_steps, 0, -1, device=device, dtype=dtype
-    ) / float(rollout_steps)
+    pair_index = torch.randint(0, len(pairs), (1,), device=device)
+    if broadcast_index is not None:
+        broadcast_index(pair_index)
+    return pairs[pair_index.item()]
 
 
 def sample_low_noise_query_indices(

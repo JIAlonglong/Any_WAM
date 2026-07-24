@@ -290,6 +290,34 @@ def test_mutated_training_batch_cannot_change_gt_action_context_forward():
     assert harness.captured[0][1].item() == 0.0
 
 
+def test_materialize_moves_model_tensors_but_keeps_raw_teacher_payload_on_cpu():
+    snapshot = {
+        "latents": torch.ones(1),
+        "actions": torch.ones(1),
+        "raw_images": torch.ones(1),
+        "raw_observation": {
+            "pixels": torch.ones(1),
+            "nested": [torch.ones(1)],
+        },
+    }
+    materialized = materialize_diagnostic_snapshot(
+        snapshot, device=torch.device("meta")
+    )
+    assert materialized["latents"].device.type == "meta"
+    assert materialized["actions"].device.type == "meta"
+    assert materialized["raw_images"].device.type == "cpu"
+    assert materialized["raw_observation"]["pixels"].device.type == "cpu"
+    assert materialized["raw_observation"]["nested"][0].device.type == "cpu"
+
+    class RawTeacher:
+        def predict(self, batch):
+            assert batch["raw_images"].device.type == "cpu"
+            assert batch["raw_observation"]["pixels"].device.type == "cpu"
+            return True
+
+    assert RawTeacher().predict(materialized) is True
+
+
 def test_three_context_action_errors_and_finite_counts_reach_log_mapping():
     samples = compute_mechanism_metric_samples(
         teacher_cont_video=torch.zeros(1, 1, 1),

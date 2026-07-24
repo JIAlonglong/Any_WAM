@@ -361,22 +361,38 @@ def capture_diagnostic_snapshot_if_due(
     return _clone_diagnostic_value_to_cpu(batch)
 
 
-def materialize_diagnostic_snapshot(snapshot, *, device):
-    """Move a previously captured snapshot to the probe device."""
+def materialize_diagnostic_snapshot(snapshot, *, device, _preserve_cpu=False):
+    """Move model inputs to ``device`` while preserving raw-worker payloads."""
     if torch.is_tensor(snapshot):
-        return snapshot.to(device=device)
+        return snapshot if _preserve_cpu else snapshot.to(device=device)
     if isinstance(snapshot, Mapping):
         return type(snapshot)(
-            (key, materialize_diagnostic_snapshot(item, device=device))
+            (
+                key,
+                materialize_diagnostic_snapshot(
+                    item,
+                    device=device,
+                    _preserve_cpu=(
+                        _preserve_cpu
+                        or (isinstance(key, str) and key.startswith("raw_"))
+                    ),
+                ),
+            )
             for key, item in snapshot.items()
         )
     if isinstance(snapshot, tuple):
         return tuple(
-            materialize_diagnostic_snapshot(item, device=device) for item in snapshot
+            materialize_diagnostic_snapshot(
+                item, device=device, _preserve_cpu=_preserve_cpu
+            )
+            for item in snapshot
         )
     if isinstance(snapshot, list):
         return [
-            materialize_diagnostic_snapshot(item, device=device) for item in snapshot
+            materialize_diagnostic_snapshot(
+                item, device=device, _preserve_cpu=_preserve_cpu
+            )
+            for item in snapshot
         ]
     return snapshot
 

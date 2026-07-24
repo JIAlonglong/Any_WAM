@@ -84,6 +84,7 @@ def test_dry_run_prints_full_eight_gpu_video_only_contract(tmp_path):
     assert "OPD_DANCEOPD_ACTION_VELOCITY_WEIGHT=0.0" in result.stdout
     assert "OPD_AUX_ACTION=0" in result.stdout
     assert "OPD_JOINT_ACTION_ROLLOUT=0" in result.stdout
+    assert "ACTION_DOWNSAMPLE_FACTOR=1" in result.stdout
     assert "VIDEO_ACTION_BRIDGE=1" in result.stdout
     assert "VIDEO_ACTION_BRIDGE_WEIGHT=1.0" in result.stdout
     assert "VIDEO_ACTION_BRIDGE_WARMUP_END=500" in result.stdout
@@ -97,6 +98,7 @@ def test_dry_run_prints_full_eight_gpu_video_only_contract(tmp_path):
     assert "--master_port=29659" in result.stdout
     assert 'import_module(os.environ["CONFIG_FILE"])' in log.read_text()
     assert "assert cfg.video_action_bridge" in log.read_text()
+    assert "assert cfg.action_downsample_factor == 1" in log.read_text()
     assert not Path(env["OUTPUT_DIR"]).exists()
 
 

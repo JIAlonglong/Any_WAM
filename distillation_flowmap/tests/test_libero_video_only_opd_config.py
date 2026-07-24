@@ -28,6 +28,7 @@ def load_config(**env):
         "VIDEO_ACTION_BRIDGE_START_PROB",
         "VIDEO_ACTION_BRIDGE_MID_PROB",
         "VIDEO_ACTION_BRIDGE_FINAL_PROB",
+        "ACTION_DOWNSAMPLE_FACTOR",
         *env,
     }
     old = {name: os.environ.get(name) for name in names}
@@ -59,6 +60,7 @@ def test_defaults_define_full_video_only_universal_contract():
     assert cfg.opd_aux_action is False
     assert cfg.opd_danceopd_action_velocity_weight == 0.0
     assert cfg.opd_joint_action_rollout is False
+    assert cfg.action_downsample_factor == 1
     assert cfg.video_action_bridge is True
     assert cfg.video_action_bridge_weight == 1.0
     assert cfg.video_action_bridge_warmup_end == 500
@@ -114,6 +116,12 @@ def test_action_opd_cannot_be_enabled_by_environment():
     assert cfg.opd_aux_action is False
     assert cfg.opd_danceopd_action_velocity_weight == 0.0
     assert cfg.opd_joint_action_rollout is False
+
+
+def test_action_downsampling_cannot_be_enabled_by_environment():
+    cfg = load_config(ACTION_DOWNSAMPLE_FACTOR=4)
+
+    assert cfg.action_downsample_factor == 1
 
 
 def test_rollout_choices_must_be_unique_positive_integers():

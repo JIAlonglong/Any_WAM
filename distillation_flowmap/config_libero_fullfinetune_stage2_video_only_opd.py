@@ -89,6 +89,9 @@ if (
 cfg.opd_aux_action = False
 cfg.opd_danceopd_action_velocity_weight = 0.0
 cfg.opd_joint_action_rollout = False
+# The continuous LIBERO client consumes all 16 actions in every chunk.
+# This training family therefore keeps every action frame in the joint model.
+cfg.action_downsample_factor = 1
 cfg.action_loss_weight = float(os.environ.get("ACTION_LOSS_WEIGHT", 1.0))
 if cfg.action_loss_weight <= 0:
     raise ValueError("ACTION_LOSS_WEIGHT must remain positive")

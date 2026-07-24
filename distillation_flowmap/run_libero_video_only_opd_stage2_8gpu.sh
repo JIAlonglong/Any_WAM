@@ -120,6 +120,7 @@ launch_env=(
     "OPD_DANCEOPD_ACTION_VELOCITY_WEIGHT=0.0"
     "OPD_AUX_ACTION=0"
     "OPD_JOINT_ACTION_ROLLOUT=0"
+    "ACTION_DOWNSAMPLE_FACTOR=1"
     "VIDEO_ACTION_BRIDGE=${VIDEO_ACTION_BRIDGE:-1}"
     "VIDEO_ACTION_BRIDGE_WEIGHT=${VIDEO_ACTION_BRIDGE_WEIGHT:-1.0}"
     "VIDEO_ACTION_BRIDGE_WARMUP_END=${VIDEO_ACTION_BRIDGE_WARMUP_END:-500}"
@@ -170,6 +171,7 @@ assert tuple(cfg.opd_danceopd_rollout_step_choices) == (2, 4)
 assert cfg.opd_rollout_step_pairs == [[8, 1], [8, 2], [8, 4]]
 assert not cfg.opd_aux_action
 assert cfg.opd_danceopd_action_velocity_weight == 0.0
+assert cfg.action_downsample_factor == 1
 assert cfg.video_action_bridge
 assert cfg.video_action_bridge_weight > 0
 assert cfg.attn_mode == os.environ["ATTN_MODE"].strip().lower()

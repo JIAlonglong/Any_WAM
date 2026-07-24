@@ -4,7 +4,7 @@
 
 **Goal:** Build a tested 8×A800 pipeline that trains LingBotVA LIBERO Stage-2 with video-only universal DanceOPD, records mechanism diagnostics, evaluates checkpoint video-to-action transfer, and runs 1/2/4-step closed-loop evaluation over all 40 standard LIBERO tasks.
 
-**Architecture:** A dedicated immutable Stage-2 config enforces video-only OPD while preserving the joint AnyFlow/action main objective. Training, offline checkpoint evaluation, and closed-loop evaluation are separate commands coordinated by a small phase-based pipeline; closed-loop workers use two GPUs per suite and split each 10-task suite into non-overlapping halves.
+**Architecture:** A dedicated immutable Stage-2 config enforces video-only OPD while preserving the original joint AnyFlow/action main objective. Every formal rollout predicts video and action from the same pre-update joint state and advances them together. Training, offline checkpoint evaluation, and closed-loop evaluation are separate commands coordinated by a small phase-based pipeline; closed-loop workers use two GPUs per suite and split each 10-task suite into non-overlapping halves.
 
 **Tech Stack:** Python 3.10, PyTorch/FSDP, pytest, Bash, LingBotVA/WanVA, LIBERO, TensorBoard, W&B offline.
 
@@ -17,7 +17,9 @@
 - OPD supervises video endpoint and video same-state velocity only; every action OPD contribution is zero.
 - Preserve the action main loss and feed it the detached student rollout video context.
 - Closed-loop formal evaluation covers all 40 tasks in `libero_10`, `libero_spatial`, `libero_object`, and `libero_goal`.
-- Evaluate matched joint 1/2/4-step deployment contracts.
+- Evaluate matched joint 1/1, 2/2, and 4/4-step deployment contracts for the
+  original teacher, Stage-1, and Stage-2. Do not add a post-video action
+  forward to the formal path.
 - Training and closed-loop evaluation run serially, never concurrently.
 
 ---
@@ -277,7 +279,7 @@ Commit with message `feat: parameterize LIBERO closed-loop worker`.
 - Consumes: checkpoint transformer path, output root, episode count, eight GPU IDs, and base ports.
 - Produces: eight workers per K, 40 complete task results, per-suite and overall macro success JSON, and a 1/2/4 matrix summary.
 
-- [ ] **Step 1: Write failing assignment and merger tests**
+- [x] **Step 1: Write failing assignment and merger tests**
 
 Assert the assignment is exactly:
 
@@ -294,15 +296,15 @@ GPU7 libero_goal 5:10
 
 For each K in 1, 2, 4, assert unique WebSocket/master ports, matched video/action steps, and no output creation in dry-run mode. Merger tests reject missing tasks and wrong episode counts.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Expected: scripts do not exist.
 
-- [ ] **Step 3: Implement orchestrator and atomic merger**
+- [x] **Step 3: Implement orchestrator and atomic merger**
 
 Workers run concurrently within one K; K values run serially. A failed worker terminates the K and prevents summary publication. The merger writes per-task, per-suite macro, and overall macro metrics via temporary file plus `os.replace`.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run both new test modules and dry-run against the real Stage-1 checkpoint.
 
@@ -354,16 +356,17 @@ Run unit tests, then a one-batch Stage-1 target smoke when GPU memory is availab
 
 Commit with message `feat: evaluate LIBERO video-to-action transfer`.
 
-### Task 8: Add phase-based train/eval pipeline and operator guide
+### Task 8: Add serial train/eval pipeline and operator guide
 
 **Files:**
-- Create: `distillation_flowmap/run_libero_video_only_opd_pipeline_8gpu.sh`
-- Create: `distillation_flowmap/tests/test_run_libero_video_only_opd_pipeline_8gpu.py`
+- Create: `distillation_flowmap/run_libero_video_opd_train_eval_8gpu.sh`
+- Create: `distillation_flowmap/tests/test_run_libero_video_opd_train_eval_8gpu.py`
 - Modify: `evaluation/libero/EVAL_PROMPT.md`
 
 **Interfaces:**
-- Consumes: `--phase train|offline|closed-loop|all`.
-- Produces: simple resumable commands for training, checkpoint offline evaluation, and full 40-task closed loop.
+- Consumes: `--phase train|eval|all`.
+- Produces: a serial training command followed by teacher, Stage-1, and
+  Stage-2 full 40-task closed-loop evaluation at identical joint budgets.
 
 - [ ] **Step 1: Write failing phase-order tests**
 

@@ -149,12 +149,23 @@ training job has released all GPUs.
 - Each worker runs its own LIBERO client and writes worker-local results.
 - A merger validates episode counts and produces per-task and aggregate success
   rates.
-- Evaluate 1-step, 2-step, and 4-step video inference budgets.
-- Action inference uses the explicitly configured matched deployment contract;
-  the launcher prints both video and action step counts before execution.
+- Evaluate the original AnyFlow joint rollout at matched video/action budgets
+  1/1, 2/2, and 4/4. Each joint step predicts both fields from the same
+  pre-update state `(x_t, a_t)` and advances them together; the formal path
+  never inserts an extra action forward after updating video.
+- Apply this identical matched-budget protocol to the original LingBotVA
+  teacher, the Stage-1 step-2000 target, and the final Stage-2 target. The
+  teacher's 8-step rollout remains training supervision only and is not used
+  as its formal same-NFE deployment result.
 - Stage-1 step-2000 target is evaluated on all four suites as a baseline using
   the identical server, client, normalization, task initialization, and action
   execution path.
+
+Video replacement is an offline mechanism intervention only. Student,
+teacher, and GT-derived video states must be compared at the same noise level
+and with the same action state. A sequential "generate x_r, then run action
+again" route is a distinct 2K-forward decoder and is excluded from the main
+AnyFlow results.
 
 Initial evaluation uses 10 episodes for every one of the 40 tasks to select
 checkpoints and budgets. The final selected configuration uses 50 episodes for

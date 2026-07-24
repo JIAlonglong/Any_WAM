@@ -59,7 +59,7 @@ SHARED_ROOT="$(cd "$(dirname "${GIT_COMMON}")" && pwd)"
 
 PYTHON="${PYTHON:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python}"
 STAGE1_CKPT="${STAGE1_CKPT:-${SHARED_ROOT}/distillation_flowmap/output_libero_fullft_stage1_warmup/checkpoints/step_2000}"
-TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-${SHARED_ROOT}/../lingbot-va/checkpoints/libero}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero}"
 DATASET_PATH="${DATASET_PATH:-${SHARED_ROOT}/training_data/libero-long-lerobot}"
 EMPTY_EMB_PATH="${EMPTY_EMB_PATH:-${DATASET_PATH}/empty_emb.pt}"
 DEFAULT_OUTPUT="${SHARED_ROOT}/distillation_flowmap/output_libero_lingbotva_stage2_video_only_opd_universal_from_stage1_step2000_steps${MAX_TRAIN_STEPS}"

@@ -11,7 +11,9 @@
 #
 # 环境变量：
 #   OUTPUT_ROOT:      distillation 输出目录，默认 stage2 anyflow 输出
+#   STUDENT_CKPT:     任意待测 transformer 路径；设置后不再按 OUTPUT_ROOT/STEP/VARIANT 推导
 #   TEACHER_CKPT:     teacher transformer 路径，默认 /kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero/transformer
+#   LIBERO_BENCHMARK: libero_10 | libero_spatial | libero_object | libero_goal
 #   EVAL_MODE:        visualize | compare | success | all，默认 visualize
 #   NUM_STEPS:        视频推理步数，默认 20
 #   ACTION_NUM_STEPS: action 推理步数，默认 50
@@ -43,6 +45,16 @@ ACTION_NUM_STEPS="${ACTION_NUM_STEPS:-50}"
 TEST_NUM="${TEST_NUM:-3}"
 PORT="${PORT:-29057}"
 TASK_START="${TASK_START:-0}"
+LIBERO_BENCHMARK="${LIBERO_BENCHMARK:-libero_10}"
+
+case "$LIBERO_BENCHMARK" in
+    libero_10|libero_spatial|libero_object|libero_goal)
+        ;;
+    *)
+        echo "Unsupported LIBERO_BENCHMARK: ${LIBERO_BENCHMARK}" >&2
+        exit 1
+        ;;
+esac
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DEFAULT_OUTPUT_ROOT="${PROJECT_ROOT}/distillation_flowmap/output_libero_fullft_stage2_anyflow"
@@ -68,16 +80,16 @@ latest_step() {
     printf '%s\n' "$best"
 }
 
-if [ -z "$STEP" ]; then
+if [ -z "$STEP" ] && [ -z "${STUDENT_CKPT:-}" ]; then
     STEP="$(latest_step)"
 fi
-if [ -z "$STEP" ] || [ "$STEP" = "step_" ]; then
+if { [ -z "$STEP" ] || [ "$STEP" = "step_" ]; } && [ -z "${STUDENT_CKPT:-}" ]; then
     echo "ERROR: Could not infer STEP because no checkpoints were found under ${OUTPUT_ROOT}/checkpoints"
     echo "Run training first, or set OUTPUT_ROOT to an existing distillation output dir, or pass a step explicitly."
     exit 1
 fi
 
-STUDENT_CKPT="${OUTPUT_ROOT}/checkpoints/${STEP}/${VARIANT}/transformer"
+STUDENT_CKPT="${STUDENT_CKPT:-${OUTPUT_ROOT}/checkpoints/${STEP}/${VARIANT}/transformer}"
 TEACHER_CKPT="${TEACHER_CKPT:-/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero/transformer}"
 SAVE_ROOT="${SAVE_ROOT:-${PROJECT_ROOT}/evaluation/outputs/libero_env_${STEP}_${VARIANT}}"
 VIDEO_DIR="${SAVE_ROOT}/videos"
@@ -101,8 +113,10 @@ log_header() {
     echo "  Step:           ${STEP} / ${VARIANT}"
     echo "  Output root:    ${OUTPUT_ROOT}"
     echo "  Eval mode:      ${EVAL_MODE}"
+    echo "  Benchmark:      ${LIBERO_BENCHMARK}"
     echo "  Video steps:    ${NUM_STEPS}"
     echo "  Action steps:   ${ACTION_NUM_STEPS}"
+    echo "  Visible GPUs:   ${CUDA_VISIBLE_DEVICES:-all}"
     echo "  Test num:       ${TEST_NUM}"
     echo "  Task range:     ${TASK_START}..${TASK_END}"
     echo "  Port:           ${PORT}"
@@ -168,7 +182,7 @@ trap stop_server EXIT
 run_client() {
     local out_dir="$1"
     $CLIENT_PYTHON evaluation/libero/client.py \
-        --libero-benchmark libero_10 \
+        --libero-benchmark "$LIBERO_BENCHMARK" \
         --port "$PORT" \
         --test-num "$TEST_NUM" \
         --task-range "$TASK_START" "$TASK_END" \

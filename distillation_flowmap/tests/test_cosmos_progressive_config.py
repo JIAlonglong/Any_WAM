@@ -40,6 +40,15 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
     assert module.cfg.cosmos_use_teacher_action_anchor is True
     assert module.cfg.opd_joint_action_rollout is True
     assert module.cfg.opd_danceopd_action_endpoint_weight > 0
+    assert module.cfg.deployment_joint_rollout_enabled is True
+    assert module.cfg.deployment_joint_rollout_interval == 4
+    assert module.cfg.deployment_joint_steps == (1, 2, 4)
+    assert module.cfg.deployment_timestep_start == 1000
+    assert module.cfg.deployment_timestep_end == 0
+    assert module.cfg.deployment_action_weight == 1.0
+    assert module.cfg.raw_teacher_window_is_auxiliary is True
+    assert module.cfg.opd_aux_interval == 8
+    assert module.cfg.opd_aux_phase == 2
 
 
 def test_progressive_k1_is_endpoint_only(monkeypatch):

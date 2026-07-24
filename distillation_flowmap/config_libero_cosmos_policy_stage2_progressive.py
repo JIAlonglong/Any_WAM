@@ -138,6 +138,7 @@ cfg.opd_teacher_target_mode = "cosmos_latent_full"
 cfg.opd_aux_weight = float(os.environ.get("OPD_AUX_WEIGHT", 0.10))
 cfg.opd_aux_warmup_steps = int(os.environ.get("OPD_AUX_WARMUP_STEPS", 8))
 cfg.opd_aux_interval = int(os.environ.get("OPD_AUX_INTERVAL", 8))
+cfg.opd_aux_phase = 2
 cfg.opd_aux_prob = float(os.environ.get("OPD_AUX_PROB", 1.0))
 cfg.opd_aux_gradient_checkpointing = _env_bool(
     "OPD_AUX_GRADIENT_CHECKPOINTING", True
@@ -201,6 +202,14 @@ cfg.opd_danceopd_velocity_weight = float(
     os.environ.get("OPD_DANCEOPD_VELOCITY_WEIGHT", _spec["velocity_weight"])
 )
 cfg.opd_joint_action_rollout = _env_bool("OPD_JOINT_ACTION_ROLLOUT", True)
+
+cfg.deployment_joint_rollout_enabled = True
+cfg.deployment_joint_rollout_interval = 4
+cfg.deployment_joint_steps = (1, 2, 4)
+cfg.deployment_timestep_start = 1000
+cfg.deployment_timestep_end = 0
+cfg.deployment_action_weight = 1.0
+cfg.raw_teacher_window_is_auxiliary = True
 
 # Legacy Cosmos OPD controls remain neutral. The progressive path reports its
 # endpoint and same-state velocity contributions directly.

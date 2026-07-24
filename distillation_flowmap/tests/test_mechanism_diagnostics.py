@@ -21,6 +21,7 @@ def _metric_samples(**overrides):
         "student_field_video": torch.tensor([[2.0, 0.0], [0.0, 2.0]]),
         "teacher_field_video": torch.zeros(2, 2),
         "teacher_endpoint_action": torch.zeros(2, 1),
+        "action_gt_video_context": torch.tensor([[2.0], [1.0]]),
         "action_student_context": torch.tensor([[3.0], [1.0]]),
         "action_teacher_video_context": torch.tensor([[1.0], [1.0]]),
         "action_teacher_joint_context": torch.zeros(2, 1),
@@ -46,6 +47,14 @@ def test_video_metrics_keep_exact_squared_l2_separate_from_normalized_mse():
         samples["mechanism/video_field_match_error"], torch.tensor([4.0, 4.0])
     )
     assert all(value.shape == (2,) for value in samples.values())
+    assert torch.equal(
+        samples["mechanism/action_error_gt_video_context"],
+        torch.tensor([4.0, 1.0]),
+    )
+    assert torch.equal(
+        samples["mechanism/video_to_action_student_condition_penalty"],
+        torch.tensor([5.0, 0.0]),
+    )
 
 
 @pytest.mark.parametrize(
@@ -61,6 +70,7 @@ def test_action_intervention_metrics_are_masked_and_keep_signed_gains(
 ):
     samples = _metric_samples(
         teacher_endpoint_action=torch.zeros(1, 2, 1),
+        action_gt_video_context=student,
         action_student_context=student,
         action_teacher_video_context=teacher_video,
         action_teacher_joint_context=torch.tensor([[[0.5], [77.0]]]),

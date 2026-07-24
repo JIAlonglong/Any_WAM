@@ -5081,6 +5081,8 @@ class FlowMapStepMixin:
         *,
         video_base,
         action_latent,
+        condition_video=None,
+        condition_action=None,
         action_cond_t,
         action_text,
         action_grid,
@@ -5089,6 +5091,10 @@ class FlowMapStepMixin:
         window_size,
     ):
         """Build the shared video-action model input for a joint state."""
+        if condition_video is not None:
+            video_base = {**video_base, 'latent': condition_video}
+        if condition_action is not None:
+            action_latent = condition_action
         action_dict = {
             'noisy_latents': action_x,
             'latent': action_latent,
@@ -5268,7 +5274,17 @@ class FlowMapStepMixin:
             ) / 2.0,
         }
 
-    def _mechanism_joint_input(self, video_x, action_x, video_t, action_t, context):
+    def _mechanism_joint_input(
+        self,
+        video_x,
+        action_x,
+        video_t,
+        action_t,
+        context,
+        *,
+        condition_video=None,
+        condition_action=None,
+    ):
         return self._build_joint_input(
             video_x,
             video_t,
@@ -5276,6 +5292,8 @@ class FlowMapStepMixin:
             action_t,
             video_base=context['video_base'],
             action_latent=context['action_latent'],
+            condition_video=condition_video,
+            condition_action=condition_action,
             action_cond_t=context['action_cond_t'],
             action_text=context['action_text'],
             action_grid=context['action_grid'],
@@ -5294,10 +5312,18 @@ class FlowMapStepMixin:
         action_r,
         *,
         context,
+        condition_video=None,
+        condition_action=None,
     ):
         """Apply one finite student joint map from ``t`` directly to ``r``."""
         joint_input = self._mechanism_joint_input(
-            video_x, action_x, video_t, action_t, context
+            video_x,
+            action_x,
+            video_t,
+            action_t,
+            context,
+            condition_video=condition_video,
+            condition_action=condition_action,
         )
         self._init_joint_mask(joint_input)
         video_velocity, action_velocity_seq = self._student_joint_forward(
@@ -5341,6 +5367,8 @@ class FlowMapStepMixin:
         *,
         num_steps,
         context,
+        self_condition_video=False,
+        self_condition_action=False,
     ):
         """Integrate the frozen teacher joint field over one reference segment."""
         video_path = self._build_timestep_path(video_t, video_r, num_steps)
@@ -5358,6 +5386,12 @@ class FlowMapStepMixin:
                 current_video_t,
                 current_action_t,
                 context,
+                condition_video=(
+                    current_video if self_condition_video else None
+                ),
+                condition_action=(
+                    current_action if self_condition_action else None
+                ),
             )
             self._init_joint_mask(joint_input)
             teacher_cond, teacher_uncond, action_velocity_seq = (
@@ -5391,11 +5425,25 @@ class FlowMapStepMixin:
         return current_video, current_action
 
     def _diagnostic_joint_fields(
-        self, video_x, action_x, video_t, action_t, *, context
+        self,
+        video_x,
+        action_x,
+        video_t,
+        action_t,
+        *,
+        context,
+        condition_video=None,
+        condition_action=None,
     ):
         """Query student and teacher video fields at the identical joint state."""
         joint_input = self._mechanism_joint_input(
-            video_x, action_x, video_t, action_t, context
+            video_x,
+            action_x,
+            video_t,
+            action_t,
+            context,
+            condition_video=condition_video,
+            condition_action=condition_action,
         )
         self._init_joint_mask(joint_input)
         student_video = self._student_joint_forward(
@@ -5507,6 +5555,8 @@ class FlowMapStepMixin:
             video_r_t,
             action_r_t,
             context=context,
+            condition_video=prior_video,
+            condition_action=prior_action,
         )
 
         y_r_video, y_r_action = self._diagnostic_teacher_joint_rollout(
@@ -5518,6 +5568,8 @@ class FlowMapStepMixin:
             action_r_t,
             num_steps=teacher_steps,
             context=context,
+            self_condition_video=True,
+            self_condition_action=True,
         )
         y_0_video, y_0_action = self._diagnostic_teacher_joint_rollout(
             y_r_video,
@@ -5528,6 +5580,8 @@ class FlowMapStepMixin:
             action_zero_t,
             num_steps=teacher_steps,
             context=context,
+            self_condition_video=True,
+            self_condition_action=True,
         )
         del prior_video, prior_action, video_noise, action_noise
 
@@ -5541,6 +5595,8 @@ class FlowMapStepMixin:
                 action_zero_t,
                 num_steps=teacher_steps,
                 context=context,
+                self_condition_video=True,
+                self_condition_action=True,
             )
         )
         del teacher_cont_action
@@ -5554,6 +5610,8 @@ class FlowMapStepMixin:
                 video_zero_t,
                 action_zero_t,
                 context=context,
+                condition_video=z_r_video,
+                condition_action=z_r_action,
             )
         )
         composed_mid_video, composed_mid_action, _, _ = (
@@ -5565,6 +5623,8 @@ class FlowMapStepMixin:
                 video_s_t,
                 action_s_t,
                 context=context,
+                condition_video=z_r_video,
+                condition_action=z_r_action,
             )
         )
         student_composed_video, student_composed_action, _, _ = (
@@ -5576,11 +5636,24 @@ class FlowMapStepMixin:
                 video_zero_t,
                 action_zero_t,
                 context=context,
+                condition_video=composed_mid_video,
+                condition_action=composed_mid_action,
             )
         )
         del student_direct_action, student_composed_action
         del composed_mid_video, composed_mid_action
 
+        _, action_gt_video_context, _, _ = self._diagnostic_student_joint_map(
+            z_r_video,
+            z_r_action,
+            video_r_t,
+            action_r_t,
+            video_zero_t,
+            action_zero_t,
+            context=context,
+            condition_video=video_clean,
+            condition_action=action_clean,
+        )
         _, action_student_context, _, _ = self._diagnostic_student_joint_map(
             z_r_video,
             z_r_action,
@@ -5589,6 +5662,8 @@ class FlowMapStepMixin:
             video_zero_t,
             action_zero_t,
             context=context,
+            condition_video=z_r_video,
+            condition_action=action_clean,
         )
         _, action_teacher_video_context, _, _ = (
             self._diagnostic_student_joint_map(
@@ -5599,6 +5674,8 @@ class FlowMapStepMixin:
                 video_zero_t,
                 action_zero_t,
                 context=context,
+                condition_video=y_r_video,
+                condition_action=action_clean,
             )
         )
         _, action_teacher_joint_context, _, _ = (
@@ -5610,6 +5687,8 @@ class FlowMapStepMixin:
                 video_zero_t,
                 action_zero_t,
                 context=context,
+                condition_video=y_r_video,
+                condition_action=y_r_action,
             )
         )
 
@@ -5619,6 +5698,8 @@ class FlowMapStepMixin:
             video_r_t,
             action_r_t,
             context=context,
+            condition_video=z_r_video,
+            condition_action=z_r_action,
         )
         samples = compute_mechanism_metric_samples(
             teacher_cont_video=teacher_cont_video,
@@ -5628,6 +5709,7 @@ class FlowMapStepMixin:
             student_field_video=student_field_video,
             teacher_field_video=teacher_field_video,
             teacher_endpoint_action=y_0_action,
+            action_gt_video_context=action_gt_video_context,
             action_student_context=action_student_context,
             action_teacher_video_context=action_teacher_video_context,
             action_teacher_joint_context=action_teacher_joint_context,

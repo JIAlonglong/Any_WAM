@@ -67,6 +67,8 @@ class _DiagnosticHarness:
         action_r,
         *,
         context,
+        condition_video=None,
+        condition_action=None,
     ):
         del context
         torch.rand(1)
@@ -74,6 +76,12 @@ class _DiagnosticHarness:
             {
                 "video": video_x.clone(),
                 "action": action_x.clone(),
+                "condition_video": (
+                    None if condition_video is None else condition_video.clone()
+                ),
+                "condition_action": (
+                    None if condition_action is None else condition_action.clone()
+                ),
                 "from": float(video_t[0, 0]),
                 "to": float(video_r[0, 0]),
             }
@@ -103,6 +111,8 @@ class _DiagnosticHarness:
         *,
         num_steps,
         context,
+        self_condition_video=False,
+        self_condition_action=False,
     ):
         del context
         torch.rand(1)
@@ -110,6 +120,8 @@ class _DiagnosticHarness:
             {
                 "video": video_x.clone(),
                 "action": action_x.clone(),
+                "self_condition_video": self_condition_video,
+                "self_condition_action": self_condition_action,
                 "from": float(video_t[0, 0]),
                 "to": float(video_r[0, 0]),
                 "steps": num_steps,
@@ -123,9 +135,19 @@ class _DiagnosticHarness:
         return video_x - 4 * scale, action_x - 5 * action_scale
 
     def _diagnostic_joint_fields(
-        self, video_x, action_x, video_t, action_t, *, context
+        self,
+        video_x,
+        action_x,
+        video_t,
+        action_t,
+        *,
+        context,
+        condition_video=None,
+        condition_action=None,
     ):
         del action_x, video_t, action_t, context
+        self.field_condition_video = condition_video
+        self.field_condition_action = condition_action
         return torch.ones_like(video_x) * self.parameter, torch.ones_like(video_x) * 4
 
 
@@ -783,7 +805,17 @@ def test_action_interventions_replace_only_the_requested_joint_state():
     host = _host()
     host._compute_mechanism_diagnostic_stats(_batch(), diagnostic_index=0)
 
-    student_context, teacher_video_context, teacher_joint_context = host.student_calls[-3:]
+    (
+        gt_video_context,
+        student_context,
+        teacher_video_context,
+        teacher_joint_context,
+    ) = host.student_calls[-4:]
+    assert torch.equal(gt_video_context["video"], student_context["video"])
+    assert not torch.equal(
+        gt_video_context["condition_video"],
+        student_context["condition_video"],
+    )
     assert torch.equal(student_context["action"], teacher_video_context["action"])
     assert not torch.equal(student_context["video"], teacher_video_context["video"])
     assert torch.equal(
@@ -791,6 +823,41 @@ def test_action_interventions_replace_only_the_requested_joint_state():
     )
     assert not torch.equal(
         teacher_video_context["action"], teacher_joint_context["action"]
+    )
+
+
+def test_action_interventions_replace_condition_streams_with_the_route_state():
+    host = _host()
+    host._compute_mechanism_diagnostic_stats(_batch(), diagnostic_index=0)
+
+    (
+        gt_video_context,
+        student_context,
+        teacher_video_context,
+        teacher_joint_context,
+    ) = host.student_calls[-4:]
+    assert gt_video_context["condition_video"] is not None
+    assert not torch.equal(
+        gt_video_context["condition_video"], gt_video_context["video"]
+    )
+    assert torch.equal(
+        student_context["condition_video"], student_context["video"]
+    )
+    assert torch.equal(
+        teacher_video_context["condition_video"],
+        teacher_video_context["video"],
+    )
+    assert torch.equal(
+        teacher_joint_context["condition_video"],
+        teacher_joint_context["video"],
+    )
+    assert torch.equal(
+        teacher_joint_context["condition_action"],
+        teacher_joint_context["action"],
+    )
+    assert torch.equal(
+        student_context["condition_action"],
+        teacher_video_context["condition_action"],
     )
 
 
@@ -808,5 +875,9 @@ def test_routes_are_faithful_and_statistics_are_no_grad():
     assert (250.0, 0.0) in student_routes
     assert (1000.0, 500.0, 8) in teacher_routes
     assert (500.0, 0.0, 8) in teacher_routes
+    assert all(call["self_condition_video"] for call in host.teacher_calls)
+    assert all(call["self_condition_action"] for call in host.teacher_calls)
+    assert torch.equal(host.field_condition_video, host.student_calls[0]["video"] - 1)
+    assert torch.equal(host.field_condition_action, host.student_calls[0]["action"] - 1.5)
     assert all(not value.requires_grad for value in stats.values())
     assert host.parameter.grad is None

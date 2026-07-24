@@ -37,12 +37,16 @@ def compute_mechanism_metric_samples(
     student_field_video: torch.Tensor,
     teacher_field_video: torch.Tensor,
     teacher_endpoint_action: torch.Tensor,
+    action_gt_video_context: torch.Tensor,
     action_student_context: torch.Tensor,
     action_teacher_video_context: torch.Tensor,
     action_teacher_joint_context: torch.Tensor,
     action_mask: torch.Tensor | None,
     eps: float = 1e-8,
 ) -> dict[str, torch.Tensor]:
+    action_error_gt_video = masked_action_mse_per_sample(
+        action_gt_video_context, teacher_endpoint_action, action_mask
+    )
     action_error_student = masked_action_mse_per_sample(
         action_student_context, teacher_endpoint_action, action_mask
     )
@@ -73,10 +77,13 @@ def compute_mechanism_metric_samples(
         "mechanism/video_field_match_error": squared_l2_per_sample(
             student_field_video, teacher_field_video
         ),
+        "mechanism/action_error_gt_video_context": action_error_gt_video,
         "mechanism/action_error_student_context": action_error_student,
         "mechanism/action_error_teacher_video_context": action_error_teacher_video,
         "mechanism/action_error_teacher_joint_context": action_error_teacher_joint,
         "mechanism/video_to_action_oracle_gain": oracle_gain,
+        "mechanism/video_to_action_student_condition_penalty":
+        action_error_student - action_error_gt_video,
         "mechanism/video_to_action_recoverable_fraction": oracle_gain.clamp_min(0)
         / action_error_student.clamp_min(eps),
         "mechanism/video_to_action_full_joint_gain": action_error_student

@@ -1,0 +1,24 @@
+{
+  "variants": [
+    {
+      "name": "stage1_only",
+      "endpoint": 0,
+      "velocity": 0
+    },
+    {
+      "name": "anchor_only",
+      "endpoint": 1,
+      "velocity": 0
+    },
+    {
+      "name": "field_only",
+      "endpoint": 0,
+      "velocity": 1
+    },
+    {
+      "name": "apm",
+      "endpoint": 1,
+      "velocity": 1
+    }
+  ]
+}

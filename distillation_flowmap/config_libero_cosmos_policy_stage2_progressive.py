@@ -18,6 +18,7 @@ from distillation_flowmap.cosmos_stage2_lineage import (
     validate_stage1_parent,
     validate_stage2_resume,
 )
+from distillation_flowmap.cosmos_libero_variants import canonical_variant_json
 
 
 cfg = copy.deepcopy(_base_cfg)
@@ -122,6 +123,22 @@ cfg.parent_stage1_contract_identity = os.environ[
     "PARENT_STAGE1_CONTRACT_IDENTITY"
 ]
 cfg.stage2_lineage_json = os.environ["STAGE2_LINEAGE_JSON"]
+cfg.cosmos_libero_variant_json = os.environ.get("COSMOS_LIBERO_VARIANT_JSON")
+_cosmos_libero_variant_payload = None
+if cfg.cosmos_libero_variant_json is not None:
+    try:
+        _cosmos_libero_variant_payload = json.loads(
+            cfg.cosmos_libero_variant_json
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError("COSMOS_LIBERO_VARIANT_JSON must be valid JSON") from exc
+    if not isinstance(_cosmos_libero_variant_payload, dict):
+        raise ValueError("COSMOS_LIBERO_VARIANT_JSON must contain an object")
+    if (
+        canonical_variant_json(_cosmos_libero_variant_payload)
+        != cfg.cosmos_libero_variant_json
+    ):
+        raise ValueError("COSMOS_LIBERO_VARIANT_JSON must be canonical JSON")
 _validated_parent = validate_stage1_parent(
     Path(cfg.parent_stage1_path), expected_step=5000
 )
@@ -305,6 +322,30 @@ cfg.opd_danceopd_velocity_weight = float(
     os.environ.get("OPD_DANCEOPD_VELOCITY_WEIGHT", _spec["velocity_weight"])
 )
 cfg.opd_joint_action_rollout = _env_bool("OPD_JOINT_ACTION_ROLLOUT", True)
+
+if _cosmos_libero_variant_payload is not None:
+    _variant_expected = {
+        "progressive_stage": _stage,
+        "max_train_steps": cfg.max_train_steps,
+        "save_interval": cfg.save_interval,
+        "output_dir": str(Path(cfg.output_dir).resolve(strict=False)),
+        "rollout_step_pairs": cfg.opd_rollout_step_pairs,
+        "danceopd_rollout_steps": list(cfg.opd_danceopd_rollout_step_choices),
+        "video_endpoint_weight": cfg.opd_danceopd_endpoint_weight,
+        "video_velocity_weight": cfg.opd_danceopd_velocity_weight,
+        "action_endpoint_weight": cfg.opd_danceopd_action_endpoint_weight,
+        "use_opd_aux": cfg.use_opd_aux,
+        "opd_aux_standalone_step": cfg.opd_aux_standalone_step,
+    }
+    for _variant_field, _variant_value in _variant_expected.items():
+        if (
+            _cosmos_libero_variant_payload.get(_variant_field)
+            != _variant_value
+        ):
+            raise ValueError(
+                "COSMOS_LIBERO_VARIANT_JSON field "
+                f"{_variant_field!r} does not match resolved config"
+            )
 
 cfg.deployment_joint_rollout_enabled = True
 cfg.deployment_joint_rollout_interval = 4

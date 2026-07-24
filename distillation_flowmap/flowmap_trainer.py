@@ -1370,6 +1370,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     "parent_stage1_path",
                     "parent_stage1_contract_identity",
                     "stage2_lineage_json",
+                    "cosmos_libero_variant_json",
                 ):
                     metadata_value = getattr(
                         self.config, metadata_field, None

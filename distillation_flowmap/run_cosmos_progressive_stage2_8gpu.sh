@@ -314,7 +314,11 @@ export MECHANISM_COSMOS_T_MAX="${MECHANISM_COSMOS_T_MAX:-0.9876543209876543}"
 if [[ -n "$train_seed" ]]; then
     export TRAIN_SEED="$train_seed"
 fi
-export ENABLE_WANDB=0
+export ENABLE_WANDB="${ENABLE_WANDB:-1}"
+case "$ENABLE_WANDB" in
+    0|1) ;;
+    *) die "ENABLE_WANDB must be 0 or 1 (got: $ENABLE_WANDB)" ;;
+esac
 export WANDB_MODE=offline
 export ATTN_MODE="${ATTN_MODE:-flex}"
 export COSMOS_POLICY_INFERENCE_MODE="${COSMOS_POLICY_INFERENCE_MODE:-subprocess}"
@@ -390,6 +394,8 @@ for key in \
     MECHANISM_DIAGNOSTIC_TEACHER_STEPS \
     MECHANISM_COSMOS_T_MIN \
     MECHANISM_COSMOS_T_MAX \
+    ENABLE_WANDB \
+    WANDB_MODE \
     STUDENT_BASE_MODEL_PATH \
     PARENT_STAGE1_PATH \
     PARENT_STAGE1_CONTRACT_IDENTITY \

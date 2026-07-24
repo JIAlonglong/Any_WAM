@@ -16,6 +16,7 @@ from distillation_flowmap.opd_rollout_grad import (
     rollout_step_requires_grad,
 )
 from distillation_flowmap.run_cosmos_progressive_stage2 import build_stage_chunk_plan
+from distillation_flowmap.flowmap_step import _synchronized_nonfinite_decision
 
 
 def _plan(tmp_path, **overrides):
@@ -117,6 +118,7 @@ def _flowmap_method(name, **overrides):
         "SUPPORTED_ROLLOUT_GRAD_MODES": SUPPORTED_ROLLOUT_GRAD_MODES,
         "rollout_step_requires_grad": rollout_step_requires_grad,
         "contextlib": contextlib,
+        "_synchronized_nonfinite_decision": _synchronized_nonfinite_decision,
     }
     namespace.update(overrides)
     exec(compile(module, "<deployment-method>", "exec"), namespace)

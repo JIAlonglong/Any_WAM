@@ -380,7 +380,7 @@ def test_flowmap_step_cosmos_latent_opd_queries_velocity_at_student_state():
     assert distiller.student_velocity.grad is not None
 
 
-def test_full_cosmos_opd_focus_never_queries_raw_teacher_outside_supported_window():
+def test_full_cosmos_endpoint_focus_never_queries_raw_teacher_outside_supported_window():
     repo_root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(repo_root))
     sys.path.insert(0, str(repo_root / "wan_va"))
@@ -410,6 +410,24 @@ def test_full_cosmos_opd_focus_never_queries_raw_teacher_outside_supported_windo
             assert raw_batch["raw_task"] == ["open drawer"]
             self.velocity_timesteps.append(t.detach().clone())
             return {"cosmos_latent_velocity": torch.zeros_like(query_latent)}
+
+        def predict_raw_joint_latent_velocity(
+            self, raw_batch, query_latent, query_action, t
+        ):
+            del query_action
+            result = self.predict_raw_latent_velocity(
+                raw_batch, query_latent, t
+            )
+            return {
+                **result,
+                "cosmos_joint_query": query_latent,
+                "cosmos_video_frame_mask": torch.ones(
+                    query_latent.shape[0],
+                    query_latent.shape[2],
+                    dtype=torch.bool,
+                    device=query_latent.device,
+                ),
+            }
 
     class DummyDistiller(FlowMapStepMixin):
         def convert_input_format(self, batch):
@@ -487,7 +505,7 @@ def test_full_cosmos_opd_focus_never_queries_raw_teacher_outside_supported_windo
 
     assert result["skip_step"] is False
     assert teacher.target_pairs
-    assert teacher.velocity_timesteps
+    assert not teacher.velocity_timesteps
     for t, r in teacher.target_pairs:
         assert bool((t >= 0.8).all())
         assert bool((t <= 80.0 / 81.0).all())

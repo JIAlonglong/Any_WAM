@@ -64,9 +64,12 @@ from distillation_flowmap.distributed_safety import (
 )
 from distillation_flowmap.mechanism_diagnostics import (
     MechanismDiagnosticScheduler,
+    capture_diagnostic_snapshot_if_due,
     diagnostic_seed,
     diagnostic_runtime,
+    fatal_mechanism_process_exit,
     fan_out_mechanism_metrics,
+    materialize_diagnostic_snapshot,
     means_from_reduced_stats,
     reduce_metric_stats,
 )
@@ -436,7 +439,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self._mechanism_diagnostic_scheduler = MechanismDiagnosticScheduler(
             int(getattr(config, "mechanism_diagnostic_interval", 100))
         )
-        self._mechanism_diagnostic_batch = None
+        self._mechanism_diagnostic_snapshot = None
         self._mechanism_diagnostic_index = 0
         self._mechanism_diagnostic_runner = (
             self._run_cosmos_mechanism_diagnostics
@@ -2646,6 +2649,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         ):
             # 获取下一个数据批次
             batch = self._get_next_batch()
+            if self._mechanism_diagnostics_enabled:
+                # Capture before any training route can replace dataset GT fields.
+                # The retained copy is immutable and CPU-only.
+                self._mechanism_diagnostic_snapshot = (
+                    capture_diagnostic_snapshot_if_due(
+                        self._mechanism_diagnostic_scheduler,
+                        batch,
+                        completed_step=self.step + 1,
+                    )
+                )
 
             # ---- 训练步：FlowMap 主目标始终优先；旧 on-policy replacement 仅作 legacy ablation ----
             use_onpolicy = self.use_onpolicy_transition
@@ -3427,11 +3440,6 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         if self.step % tb_flush_interval == 0:
                             self.tb_writer.flush()
 
-                if not skipped_optimizer_step:
-                    # Keep the exact successful training sample for the
-                    # observation-only all-rank mechanism probe.
-                    self._mechanism_diagnostic_batch = batch
-
                 self.step += 1
 
                 self._maybe_run_mechanism_diagnostics(
@@ -3514,20 +3522,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 "Cosmos mechanism preflight failed on at least one rank"
             )
 
-    def _abort_cosmos_mechanism_forward_failure(self, error):
-        if dist.is_initialized():
-            try:
-                dist.destroy_process_group()
-            except Exception:
-                pass
-        raise RuntimeError(
-            "Cosmos mechanism forward failed; distributed group aborted"
-        ) from error
-
     def _run_cosmos_mechanism_diagnostics(self, *, completed_step: int):
         del completed_step
         self._sync_cosmos_mechanism_preflight(
-            self._mechanism_diagnostic_batch is not None
+            self._mechanism_diagnostic_snapshot is not None
         )
         diagnostic_index = self._mechanism_diagnostic_index
         rank = int(getattr(self.config, "rank", 0))
@@ -3538,6 +3536,25 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             rank,
         )
         student_steps = deployment_joint_step_for_update(diagnostic_index)
+        diagnostic_batch = materialize_diagnostic_snapshot(
+            self._mechanism_diagnostic_snapshot, device=self.device
+        )
+        local_preflight_error = None
+        try:
+            self._validate_cosmos_mechanism_preflight(
+                diagnostic_batch,
+                teacher_steps=int(
+                    self.config.mechanism_diagnostic_teacher_steps
+                ),
+                student_steps=student_steps,
+            )
+        except Exception as error:
+            local_preflight_error = error
+        self._sync_cosmos_mechanism_preflight(local_preflight_error is None)
+        if local_preflight_error is not None:
+            raise RuntimeError(
+                "Cosmos mechanism deterministic preflight failed locally"
+            ) from local_preflight_error
         models = []
         seen = set()
         for name in ("student", "_student_nofsdp", "target_student"):
@@ -3551,7 +3568,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         try:
             with diagnostic_runtime(seed=seed, models=tuple(models)):
                 local_stats = self._run_cosmos_mechanism_probe(
-                    self._mechanism_diagnostic_batch,
+                    diagnostic_batch,
                     seed=seed,
                     teacher_steps=int(
                         self.config.mechanism_diagnostic_teacher_steps
@@ -3559,7 +3576,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     student_steps=student_steps,
                 )
         except Exception as error:
-            self._abort_cosmos_mechanism_forward_failure(error)
+            fatal_mechanism_process_exit(
+                error, distributed=dist.is_initialized()
+            )
         reduced = reduce_metric_stats(local_stats)
         self._mechanism_diagnostic_index += 1
         return means_from_reduced_stats(reduced)
@@ -3577,19 +3596,28 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         by the backend-specific Task 6 integration rather than inferred here.
         """
         if not self._mechanism_diagnostics_enabled:
+            self._mechanism_diagnostic_snapshot = None
             return
         if not self._mechanism_diagnostic_scheduler.observe(
             completed_step=completed_step,
             optimizer_succeeded=optimizer_succeeded,
         ):
+            self._mechanism_diagnostic_snapshot = None
             return
         if self._mechanism_diagnostic_runner is None:
+            self._mechanism_diagnostic_snapshot = None
             logger.warning(
                 "Mechanism diagnostic was due at step %s but no backend probe is installed",
                 completed_step,
             )
             return
-        metrics = self._mechanism_diagnostic_runner(completed_step=completed_step)
+        try:
+            metrics = self._mechanism_diagnostic_runner(
+                completed_step=completed_step
+            )
+        finally:
+            # Never retain a GPU batch (or a stale CPU snapshot) past the probe.
+            self._mechanism_diagnostic_snapshot = None
         fan_out_mechanism_metrics(
             metrics,
             step=completed_step,

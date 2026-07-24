@@ -3147,7 +3147,10 @@ class FlowMapStepMixin:
             if not getattr(self, '_nofsdp_synced', False):
                 self._sync_student_nofsdp()
                 self._nofsdp_synced = True
-            _rollout_model.train()
+            # Observation-only probes enter ``diagnostic_runtime`` in eval mode.
+            # Do not silently undo that contract on the no-FSDP rollout copy.
+            if not force_no_grad:
+                _rollout_model.train()
             _rt_latent = {k: _to_regular_tensor(v) if isinstance(v, torch.Tensor) else v
                           for k, v in base_input_dict['latent_dict'].items()}
             _rt_action = {k: _to_regular_tensor(v) if isinstance(v, torch.Tensor) else v
@@ -4386,6 +4389,48 @@ class FlowMapStepMixin:
             )
         return t_min, t_max
 
+    @staticmethod
+    def _cosmos_calibrated_noisy_state(*, teacher_x0, noise, normalized_t):
+        """Construct a calibrated-band state from the official teacher endpoint."""
+        normalized_t = torch.as_tensor(
+            normalized_t, device=teacher_x0.device, dtype=teacher_x0.dtype
+        )
+        return (1.0 - normalized_t) * teacher_x0 + normalized_t * noise
+
+    def _validate_cosmos_mechanism_preflight(
+        self, batch, *, teacher_steps, student_steps
+    ):
+        """Validate deterministic local contracts before entering model forwards."""
+        teacher_steps = int(teacher_steps)
+        student_steps = int(student_steps)
+        if teacher_steps != 8:
+            raise ValueError(
+                "Cosmos official mechanism teacher budget is fixed at 8 steps"
+            )
+        if student_steps not in (1, 2, 4):
+            raise ValueError("mechanism student_steps must be one of 1, 2, 4")
+        if not isinstance(batch, dict):
+            raise TypeError("Cosmos mechanism diagnostic batch must be a mapping")
+        for key in ("latents", "actions"):
+            value = batch.get(key)
+            if not torch.is_tensor(value) or value.ndim < 3 or value.shape[0] <= 0:
+                raise ValueError(
+                    f"Cosmos mechanism diagnostic requires a non-empty {key} tensor"
+                )
+        teacher = getattr(self, "_action_teacher_model", None)
+        if not (
+            getattr(teacher, "raw_inference_enabled", False)
+            and hasattr(teacher, "predict_raw_latent_target")
+            and hasattr(teacher, "predict_raw_joint_latent_velocity")
+        ):
+            raise RuntimeError(
+                "Cosmos mechanism diagnostics require the official raw teacher"
+            )
+        self._validate_cosmos_mechanism_teacher_band(
+            getattr(self.config, "mechanism_cosmos_t_min", 4.0 / 5.0),
+            getattr(self.config, "mechanism_cosmos_t_max", 80.0 / 81.0),
+        )
+
     def _cosmos_teacher_field_probe(
         self,
         *,
@@ -4496,6 +4541,20 @@ class FlowMapStepMixin:
             )
         return current
 
+    def _cosmos_teacher_direct_endpoint(
+        self,
+        *,
+        start_video,
+        teacher_field_video,
+        t_min,
+        t_max,
+    ):
+        """Take the direct teacher Euler route over the same calibrated interval."""
+        t_min, t_max = self._validate_cosmos_mechanism_teacher_band(
+            t_min, t_max
+        )
+        return start_video + teacher_field_video * (t_min - t_max)
+
     @torch.no_grad()
     def _run_cosmos_mechanism_probe(
         self, batch, *, seed, teacher_steps, student_steps
@@ -4503,12 +4562,10 @@ class FlowMapStepMixin:
         """Return additive Cosmos-native mechanism statistics without training."""
         teacher_steps = int(teacher_steps)
         student_steps = int(student_steps)
-        if teacher_steps != 8:
-            raise ValueError(
-                "Cosmos official mechanism teacher budget is fixed at 8 steps"
-            )
-        if student_steps not in (1, 2, 4):
-            raise ValueError("mechanism student_steps must be one of 1, 2, 4")
+        self._validate_cosmos_mechanism_preflight(
+            batch, teacher_steps=teacher_steps, student_steps=student_steps
+        )
+        dataset_gt_video = batch["latents"].detach().clone()
         context = self._prepare_cosmos_mechanism_context(batch)
         batch = context["batch"]
         teacher = self._action_teacher_model
@@ -4553,7 +4610,7 @@ class FlowMapStepMixin:
             epsilon=float(self.config.cosmos_latent_epsilon),
             include_cdiff=False,
         )
-        teacher_endpoint_video = endpoint_result["cosmos_latent_x0"].to(
+        teacher_clean_video = endpoint_result["cosmos_latent_x0"].to(
             device=self.device, dtype=batch["latents"].dtype
         )
         teacher_endpoint_action_full = cosmos_actions_to_flowmap_x0(
@@ -4623,7 +4680,11 @@ class FlowMapStepMixin:
         student_deployment_video = deployment_result[0].detach()
 
         # Teacher-supervised geometry is a separate calibrated-band route.
-        band_video = (1.0 - t_max) * batch["latents"] + t_max * video_noise
+        band_video = self._cosmos_calibrated_noisy_state(
+            teacher_x0=teacher_clean_video,
+            noise=video_noise,
+            normalized_t=t_max,
+        )
         band_action = (
             (1.0 - t_max) * teacher_endpoint_action + t_max * action_noise
         )
@@ -4654,6 +4715,12 @@ class FlowMapStepMixin:
         video_frame_mask = field_result["video_frame_mask"]
         student_direct_video = field_result["student_direct_video"]
         student_field_video = field_result["student_field_video"]
+        teacher_direct_video = self._cosmos_teacher_direct_endpoint(
+            start_video=joint_video,
+            teacher_field_video=teacher_field_video,
+            t_min=t_min,
+            t_max=t_max,
+        )
         midpoint = (t_min + t_max) / 2.0
         raw_mid_video = torch.full_like(
             raw_t_max, midpoint * self.config.num_train_timesteps
@@ -4704,9 +4771,9 @@ class FlowMapStepMixin:
         )
         action_predictions = self._cosmos_action_context_predictions(
             {
-                "gt": batch["latents"],
+                "gt": dataset_gt_video,
                 "student": student_deployment_video,
-                "teacher_video": teacher_endpoint_video,
+                "teacher_video": teacher_clean_video,
             },
             common_action=common_action,
             action_t=action_t,
@@ -4715,13 +4782,14 @@ class FlowMapStepMixin:
         )
         samples = compute_mechanism_metric_samples(
             teacher_cont_video=teacher_cont_video,
-            teacher_endpoint_video=teacher_endpoint_video,
+            teacher_endpoint_video=teacher_direct_video,
             student_direct_video=student_direct_video,
             student_composed_video=student_composed_video,
             student_field_video=student_field_video,
             teacher_field_video=teacher_field_video,
             video_frame_mask=video_frame_mask,
             teacher_endpoint_action=teacher_endpoint_action,
+            action_gt_context=action_predictions["gt"],
             action_student_context=action_predictions["student"],
             action_teacher_video_context=action_predictions["teacher_video"],
             action_teacher_joint_context=None,

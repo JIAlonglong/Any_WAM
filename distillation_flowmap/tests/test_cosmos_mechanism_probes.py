@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,7 +20,11 @@ for _path in (
 
 from distillation_flowmap.flowmap_step import FlowMapStepMixin
 from distillation_flowmap.mechanism_diagnostics import (
+    capture_diagnostic_snapshot_if_due,
+    diagnostic_runtime,
     compute_mechanism_metric_samples,
+    fatal_mechanism_process_exit,
+    materialize_diagnostic_snapshot,
     means_from_reduced_stats,
     pack_finite_metric_stats,
 )
@@ -173,11 +179,12 @@ def test_g_metrics_are_route_geometry_and_not_opd_weight_aliases():
     )
     samples = compute_mechanism_metric_samples(**common)
 
-    assert samples["mechanism/g_anchor"].item() == 10.0
-    assert samples["mechanism/g_anchor_mse"].item() == 5.0
-    assert samples["mechanism/g_comp"].item() == 5.0
-    assert samples["mechanism/g_comp_mse"].item() == 2.5
-    assert samples["mechanism/video_endpoint_error"].item() == 52.0
+    # Every video metric honors the worker frame mask, not only field error.
+    assert samples["mechanism/g_anchor"].item() == 1.0
+    assert samples["mechanism/g_anchor_mse"].item() == 1.0
+    assert samples["mechanism/g_comp"].item() == 1.0
+    assert samples["mechanism/g_comp_mse"].item() == 1.0
+    assert samples["mechanism/video_endpoint_error"].item() == 16.0
     # The mask keeps only the first temporal element: (9 - 8)^2.
     assert samples["mechanism/video_field_match_error"].item() == 1.0
 
@@ -188,6 +195,321 @@ def test_g_metrics_are_route_geometry_and_not_opd_weight_aliases():
     assert stats["mechanism/teacher_joint_available_sum"].item() == 0
     assert stats["mechanism/teacher_joint_available_count"].item() == 1
     assert means_from_reduced_stats(stats)["mechanism/diagnostic_valid"] == 1.0
+
+
+def test_all_video_metrics_ignore_worker_excluded_frames():
+    mask = torch.tensor([[True, False]])
+    common = dict(
+        teacher_cont_video=torch.tensor([[[[2.0]], [[9999.0]]]]).permute(0, 2, 1, 3),
+        teacher_endpoint_video=torch.tensor([[[[1.0]], [[-9999.0]]]]).permute(0, 2, 1, 3),
+        student_direct_video=torch.tensor([[[[3.0]], [[7777.0]]]]).permute(0, 2, 1, 3),
+        student_composed_video=torch.tensor([[[[1.0]], [[-7777.0]]]]).permute(0, 2, 1, 3),
+        student_field_video=torch.tensor([[[[4.0]], [[5555.0]]]]).permute(0, 2, 1, 3),
+        teacher_field_video=torch.tensor([[[[1.0]], [[-5555.0]]]]).permute(0, 2, 1, 3),
+        video_frame_mask=mask,
+        teacher_endpoint_action=torch.zeros(1, 1, 1, 1, 1),
+        action_gt_context=torch.zeros(1, 1, 1, 1, 1),
+        action_student_context=torch.zeros(1, 1, 1, 1, 1),
+        action_teacher_video_context=torch.zeros(1, 1, 1, 1, 1),
+        action_teacher_joint_context=None,
+        action_mask=None,
+        teacher_joint_available=False,
+    )
+    samples = compute_mechanism_metric_samples(**common)
+    assert samples["mechanism/g_anchor"].item() == 1.0
+    assert samples["mechanism/g_anchor_mse"].item() == 1.0
+    assert samples["mechanism/g_comp"].item() == 4.0
+    assert samples["mechanism/g_comp_mse"].item() == 4.0
+    assert samples["mechanism/video_endpoint_error"].item() == 4.0
+    assert samples["mechanism/video_field_match_error"].item() == 9.0
+
+
+def test_calibrated_noisy_state_uses_teacher_endpoint_not_dataset_gt():
+    harness = _BuilderHarness()
+    dataset_gt = torch.full((1, 1, 1, 1, 1), -100.0)
+    teacher_x0 = torch.full_like(dataset_gt, 4.0)
+    noise = torch.full_like(dataset_gt, 10.0)
+    state = harness._cosmos_calibrated_noisy_state(
+        teacher_x0=teacher_x0, noise=noise, normalized_t=0.8
+    )
+    assert torch.allclose(state, torch.full_like(state, 8.8))
+    assert not torch.equal(state, (1 - 0.8) * dataset_gt + 0.8 * noise)
+
+
+def test_diagnostic_snapshot_is_due_only_and_survives_training_mutation():
+    from distillation_flowmap.mechanism_diagnostics import MechanismDiagnosticScheduler
+
+    scheduler = MechanismDiagnosticScheduler(interval=100)
+    original = {
+        "latents": torch.tensor([1.0], device="cpu"),
+        "actions": torch.tensor([2.0], device="cpu"),
+        "nested": {"mask": torch.tensor([True])},
+        "task": ["pick"],
+    }
+    assert capture_diagnostic_snapshot_if_due(
+        scheduler, original, completed_step=99
+    ) is None
+    snapshot = capture_diagnostic_snapshot_if_due(
+        scheduler, original, completed_step=100
+    )
+    assert snapshot is not None
+    original["latents"].fill_(101)
+    original["actions"].fill_(202)
+    original["nested"]["mask"].fill_(False)
+    assert snapshot["latents"].item() == 1
+    assert snapshot["actions"].item() == 2
+    assert snapshot["nested"]["mask"].item() is True
+    assert snapshot["latents"].device.type == "cpu"
+
+
+def test_mutated_training_batch_cannot_change_gt_action_context_forward():
+    from distillation_flowmap.mechanism_diagnostics import MechanismDiagnosticScheduler
+
+    harness = _BuilderHarness()
+    scheduler = MechanismDiagnosticScheduler(interval=1)
+    training_batch = {
+        "latents": torch.full((1, 1, 1, 1, 1), 3.0),
+        "actions": torch.zeros(1, 1, 1, 1, 1),
+    }
+    snapshot = capture_diagnostic_snapshot_if_due(
+        scheduler, training_batch, completed_step=1
+    )
+    # Mirror the in-place teacher-target replacement in the main Cosmos step.
+    training_batch["latents"].fill_(99.0)
+    training_batch["actions"].fill_(88.0)
+    diagnostic_batch = materialize_diagnostic_snapshot(
+        snapshot, device=torch.device("cpu")
+    )
+    harness._cosmos_action_context_predictions(
+        {"gt": diagnostic_batch["latents"]},
+        common_action=diagnostic_batch["actions"],
+        action_t=torch.full((1, 1), 500.0),
+        context=_joint_context(),
+    )
+    assert harness.captured[0][0].item() == 3.0
+    assert harness.captured[0][1].item() == 0.0
+
+
+def test_three_context_action_errors_and_finite_counts_reach_log_mapping():
+    samples = compute_mechanism_metric_samples(
+        teacher_cont_video=torch.zeros(1, 1, 1),
+        teacher_endpoint_video=torch.zeros(1, 1, 1),
+        student_direct_video=torch.zeros(1, 1, 1),
+        student_composed_video=torch.zeros(1, 1, 1),
+        teacher_endpoint_action=torch.zeros(1, 1, 1, 1, 1),
+        action_gt_context=torch.full((1, 1, 1, 1, 1), 0.25),
+        action_student_context=torch.ones(1, 1, 1, 1, 1),
+        action_teacher_video_context=torch.full((1, 1, 1, 1, 1), 0.5),
+        action_teacher_joint_context=None,
+        action_mask=None,
+        teacher_joint_available=False,
+    )
+    logged = means_from_reduced_stats(pack_finite_metric_stats(samples))
+    assert logged["mechanism/action_error_gt_context"] == pytest.approx(0.0625)
+    assert logged["mechanism/action_error_student_context"] == pytest.approx(1.0)
+    assert logged["mechanism/action_error_teacher_video_context"] == pytest.approx(0.25)
+    assert logged["mechanism/action_error_gt_context_finite_count"] == 1.0
+    assert logged["mechanism/action_error_student_context_finite_count"] == 1.0
+    assert logged["mechanism/action_error_teacher_joint_context_finite_count"] == 0.0
+    assert logged["mechanism/action_error_teacher_joint_context_available"] == 0.0
+
+
+def test_force_no_grad_routes_stay_eval_and_restore_modes(monkeypatch):
+    import types
+
+    class FakeFlexAttn:
+        attention_mask = None
+        cross_attention_mask = None
+
+        @staticmethod
+        def init_mask(*args, **kwargs):
+            return None
+
+    fake_model_module = types.ModuleType("modules.model")
+    fake_model_module.FlexAttnFunc = FakeFlexAttn
+    monkeypatch.setitem(sys.modules, "modules.model", fake_model_module)
+
+    class ModeModel(torch.nn.Module):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+    class Harness(FlowMapStepMixin):
+        patch_size = (1, 1, 1)
+        device = torch.device("cpu")
+        distill_action = True
+        action_aware = False
+
+        def __init__(self):
+            self.config = SimpleNamespace(
+                action_downsample_factor=1,
+                opd_joint_action_rollout=True,
+                opd_rollout_grad_mode="endpoint",
+                opd_rollout_grad_steps=1,
+                offline_eval_force_gradient_checkpointing=False,
+                offline_eval_force_cfg=False,
+                num_train_timesteps=1000,
+                attn_mode="flex",
+            )
+            self.student = ModeModel("student")
+            self._student_nofsdp = ModeModel("nofsdp")
+            self._student_blocks_compiled = False
+            self._nofsdp_synced = True
+            self.mode_observations = []
+
+        def _timestep_to_sigma_5d(self, timesteps):
+            return timesteps[:, None, :, None, None] / 1000
+
+        def _student_cfg_forward(
+            self,
+            model,
+            input_dict,
+            empty_emb,
+            cfg_scale,
+            B,
+            ref_shape,
+            r_timestep,
+            action_r_timestep,
+            force_cfg=False,
+            return_action=False,
+        ):
+            del empty_emb, cfg_scale, r_timestep, action_r_timestep, force_cfg
+            self.mode_observations.append((model.name, model.training))
+            video = torch.zeros(
+                ref_shape,
+                dtype=input_dict["latent_dict"]["noisy_latents"].dtype,
+            )
+            if not return_action:
+                return video
+            action = input_dict["action_dict"]["noisy_latents"]
+            tokens = action.squeeze(-1).permute(0, 2, 3, 1).flatten(1, 2)
+            return video, torch.zeros_like(tokens)
+
+    harness = Harness()
+    video = torch.zeros(1, 1, 1, 1, 1)
+    action = torch.zeros(1, 1, 1, 1, 1)
+    video_t = torch.full((1, 1), 1000.0)
+    action_t = torch.full((1, 1), 1000.0)
+    zero_t = torch.zeros_like(video_t)
+    base = {
+        "latent_dict": {
+            "latent": video,
+            "noisy_latents": video,
+            "timesteps": video_t,
+            "text_emb": torch.zeros(1, 1, 1),
+        },
+        "action_dict": {
+            "latent": action,
+            "noisy_latents": action,
+            "timesteps": action_t,
+            "cond_timesteps": torch.zeros(1, 1),
+            "text_emb": torch.zeros(1, 1, 1),
+        },
+        "chunk_size": 1,
+        "window_size": 1,
+    }
+    context = {
+        "video_base": base["latent_dict"],
+        "action_latent": action,
+        "action_cond_t": torch.zeros(1, 1),
+        "action_text": torch.zeros(1, 1, 1),
+        "action_grid": None,
+        "action_mask": None,
+        "chunk_size": 1,
+        "window_size": 1,
+        "student_model": harness.student,
+        "empty_emb": torch.zeros(1, 1, 1),
+        "cfg_scale": 1.0,
+        "batch_size": 1,
+        "ref_shape": tuple(video.shape),
+        "action_frames": 1,
+    }
+
+    assert harness.student.training and harness._student_nofsdp.training
+    with diagnostic_runtime(
+        seed=42, models=(harness.student, harness._student_nofsdp)
+    ):
+        harness._student_euler_integrate(
+            noisy_latents=video,
+            timesteps=video_t,
+            target_r=zero_t,
+            base_input_dict=base,
+            empty_emb=torch.zeros(1, 1, 1),
+            cfg_scale=1.0,
+            ref_shape=tuple(video.shape),
+            B=1,
+            num_frames=1,
+            K_steps=1,
+            action_target_r=zero_t,
+            return_final_action=True,
+            return_final_action_state=True,
+            force_no_grad=True,
+        )
+        harness._cosmos_student_joint_map(
+            video,
+            action,
+            video_t,
+            action_t,
+            zero_t,
+            zero_t,
+            context=context,
+        )
+        harness._cosmos_action_context_predictions(
+            {"gt": video},
+            common_action=action,
+            action_t=action_t,
+            context=context,
+        )
+    assert harness.mode_observations
+    assert all(training is False for _, training in harness.mode_observations)
+    assert harness.student.training and harness._student_nofsdp.training
+
+
+def test_torchrun_supervisor_terminates_peer_on_asymmetric_probe_failure(tmp_path):
+    worker = tmp_path / "mechanism_failure_worker.py"
+    marker = tmp_path / "rank1_reached_collective"
+    worker.write_text(
+        "\n".join(
+            [
+                "import os, time",
+                "import torch.distributed as dist",
+                "from distillation_flowmap.mechanism_diagnostics import fatal_mechanism_process_exit",
+                "dist.init_process_group('gloo')",
+                "rank = dist.get_rank()",
+                "if rank == 0:",
+                "    fatal_mechanism_process_exit(RuntimeError('asymmetric raw worker failure'), distributed=True)",
+                "time.sleep(60)",
+                f"open({str(marker)!r}, 'w').write('reached')",
+                "dist.barrier()",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = REPO_ROOT
+    started = time.monotonic()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            str(worker),
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    elapsed = time.monotonic() - started
+    assert result.returncode != 0
+    assert elapsed < 20
+    assert "MECHANISM_FATAL_EXIT" in result.stderr
+    assert not marker.exists()
 
 
 def test_teacher_band_rejects_out_of_contract_values_and_never_uses_r_s():
@@ -314,6 +636,48 @@ def test_teacher_continuation_uses_eight_in_band_video_steps_and_held_action():
     )
 
 
+def test_teacher_direct_and_composed_routes_share_start_and_endpoint_time():
+    class ConstantTeacher:
+        raw_inference_enabled = True
+
+        def predict_raw_joint_latent_velocity(
+            self, batch, *, query_latent, query_action, t
+        ):
+            del batch, query_action, t
+            return {
+                "cosmos_joint_query": query_latent,
+                "cosmos_latent_velocity": torch.ones_like(query_latent),
+            }
+
+    harness = _BuilderHarness()
+    start = torch.full((1, 1, 2, 1, 1), 7.0)
+    field = torch.ones_like(start)
+    t_min, t_max = 4.0 / 5.0, 80.0 / 81.0
+    direct = harness._cosmos_teacher_direct_endpoint(
+        start_video=start,
+        teacher_field_video=field,
+        t_min=t_min,
+        t_max=t_max,
+    )
+    composed = harness._cosmos_teacher_video_continuation(
+        teacher=ConstantTeacher(),
+        batch={},
+        start_video=start,
+        held_action=torch.zeros(1, 1, 1, 1, 1),
+        t_min=t_min,
+        t_max=t_max,
+        teacher_steps=8,
+    )
+    assert torch.allclose(direct, composed)
+    mismatched_endpoint = harness._cosmos_teacher_direct_endpoint(
+        start_video=start,
+        teacher_field_video=field,
+        t_min=t_min + 0.01,
+        t_max=t_max,
+    )
+    assert not torch.allclose(mismatched_endpoint, composed)
+
+
 def test_probe_interface_is_observation_only_and_capability_gates_teacher_joint():
     assert hasattr(FlowMapStepMixin, "_run_cosmos_mechanism_probe")
     assert getattr(
@@ -325,10 +689,12 @@ def test_trainer_installs_all_rank_post_success_probe_with_failure_abort():
     source = (
         Path(__file__).resolve().parents[1] / "flowmap_trainer.py"
     ).read_text(encoding="utf-8")
-    assert "self._mechanism_diagnostic_batch = batch" in source
-    assert "if not skipped_optimizer_step:" in source
+    assert "capture_diagnostic_snapshot_if_due(" in source
+    assert "completed_step=self.step + 1" in source
+    assert "self._mechanism_diagnostic_snapshot = None" in source
     assert "def _sync_cosmos_mechanism_preflight(" in source
     assert "dist.all_reduce(status, op=dist.ReduceOp.MIN)" in source
-    assert "def _abort_cosmos_mechanism_forward_failure(" in source
-    assert "dist.destroy_process_group()" in source
+    assert "self._validate_cosmos_mechanism_preflight(" in source
+    assert "fatal_mechanism_process_exit(" in source
+    assert "dist.destroy_process_group()" not in source
     assert "reduced = reduce_metric_stats(local_stats)" in source

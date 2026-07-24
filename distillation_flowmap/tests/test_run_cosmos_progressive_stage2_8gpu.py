@@ -159,6 +159,8 @@ def test_dry_run_prints_independent_stage_contract_without_creating_output(
     assert "MECHANISM_DIAGNOSTIC_TEACHER_STEPS=8" in result.stdout
     assert "MECHANISM_COSMOS_T_MIN=0.8" in result.stdout
     assert "MECHANISM_COSMOS_T_MAX=0.9876543209876543" in result.stdout
+    assert "ENABLE_WANDB=1" in result.stdout
+    assert "WANDB_MODE=offline" in result.stdout
     assert f"--master_port={port}" in result.stdout
     assert not (output / stage).exists()
 
@@ -443,6 +445,29 @@ def test_dry_run_emits_lineage_and_writes_nothing(tmp_path):
     assert assignments["STAGE2_LINEAGE_JSON"].startswith("{")
     after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
     assert after == before
+
+
+def test_dry_run_allows_explicit_wandb_opt_out_but_keeps_offline_mode(tmp_path):
+    env, _ = _env(tmp_path)
+    env["ENABLE_WANDB"] = "0"
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assignments = _assignments(result.stdout)
+    assert assignments["ENABLE_WANDB"] == "0"
+    assert assignments["WANDB_MODE"] == "offline"
+
+
+def test_launcher_rejects_invalid_wandb_toggle(tmp_path):
+    env, output = _env(tmp_path)
+    env["ENABLE_WANDB"] = "sometimes"
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "ENABLE_WANDB must be 0 or 1" in result.stderr
+    assert not output.exists()
 
 
 def test_relative_output_is_canonical_for_preflight_claim_and_torchrun(tmp_path):

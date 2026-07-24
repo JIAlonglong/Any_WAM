@@ -493,6 +493,9 @@ if (( ! DRY_RUN )); then
         blocked_known_alignment_mismatch)
             die "blocked classification cannot run live"
             ;;
+        *)
+            die "live evaluation classification is not authorized: ${S4_EVAL_CLASSIFICATION}"
+            ;;
     esac
 fi
 

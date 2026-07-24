@@ -636,6 +636,37 @@ def test_live_formal_launcher_rejects_classification_gate_bypass(
     assert not marker.exists()
 
 
+@pytest.mark.parametrize("classification", [None, "unknown_foo"])
+def test_live_formal_launcher_rejects_unclassified_or_unknown_before_child(
+    tmp_path, classification
+):
+    env = _launcher_env(tmp_path)
+    env["S4_DRY_RUN"] = "0"
+    env["S4_EVAL_IS_FORMAL"] = "0"
+    env.pop("S4_ALIGNMENT_VERIFIED", None)
+    env.pop("S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH", None)
+    if classification is None:
+        env.pop("S4_EVAL_CLASSIFICATION", None)
+    else:
+        env["S4_EVAL_CLASSIFICATION"] = classification
+    marker = tmp_path / "child-called"
+    sentinel = tmp_path / "python sentinel"
+    sentinel.write_text(
+        "#!/usr/bin/env python3\n"
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('called', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    sentinel.chmod(sentinel.stat().st_mode | stat.S_IXUSR)
+    env["PYTHON_BIN"] = str(sentinel)
+
+    result = run_launcher("formal", env=env)
+
+    assert result.returncode == 2
+    assert "live evaluation classification is not authorized" in result.stderr
+    assert not marker.exists()
+
+
 def test_formal_child_summary_is_published_atomically():
     source = SCRIPT.read_text(encoding="utf-8")
 

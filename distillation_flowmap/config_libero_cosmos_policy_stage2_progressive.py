@@ -4,6 +4,7 @@ import copy
 import json
 import math
 import os
+import re
 from pathlib import Path
 
 from distillation_flowmap.config_libero_cosmos_policy_stage2_cosmos_latent_cdiff import (
@@ -13,7 +14,10 @@ from distillation_flowmap.cosmos_training_contract import (
     ACTION_PACKING_SCHEMA,
     CONTRACT_VERSION,
 )
-from distillation_flowmap.cosmos_stage2_lineage import validate_stage1_parent
+from distillation_flowmap.cosmos_stage2_lineage import (
+    validate_stage1_parent,
+    validate_stage2_resume,
+)
 
 
 cfg = copy.deepcopy(_base_cfg)
@@ -148,6 +152,43 @@ cfg.resume_online_from_target = _env_bool("RESUME_ONLINE_FROM_TARGET", False)
 cfg.reset_resume_step = _env_bool("RESET_RESUME_STEP", True)
 cfg.resume_optimizer_state = _env_bool("RESUME_OPTIMIZER_STATE", False)
 cfg.output_dir = os.environ.get("OUTPUT_DIR", os.path.join(_output_root, _stage))
+_resume_path = Path(cfg.resume_from_path)
+_canonical_parent = Path(_validated_parent.canonical_path)
+_resolved_resume = _resume_path.resolve(strict=True)
+if _resolved_resume == _canonical_parent:
+    _fresh_flags = {
+        "RESUME_ONLINE_FROM_TARGET": cfg.resume_online_from_target,
+        "RESET_RESUME_STEP": cfg.reset_resume_step,
+        "RESUME_OPTIMIZER_STATE": not cfg.resume_optimizer_state,
+    }
+    for _flag_name, _is_valid in _fresh_flags.items():
+        if not _is_valid:
+            raise ValueError(
+                f"{_flag_name} is inconsistent with fresh Stage-2 launch"
+            )
+elif re.fullmatch(r"step_([1-9][0-9]*)", _resume_path.name):
+    _expected_resume_step = int(_resume_path.name.removeprefix("step_"))
+    validate_stage2_resume(
+        _resume_path,
+        arm_root=Path(cfg.output_dir),
+        expected_step=_expected_resume_step,
+        expected_parent=_validated_parent,
+    )
+    _resume_flags = {
+        "RESUME_ONLINE_FROM_TARGET": not cfg.resume_online_from_target,
+        "RESET_RESUME_STEP": not cfg.reset_resume_step,
+        "RESUME_OPTIMIZER_STATE": cfg.resume_optimizer_state,
+    }
+    for _flag_name, _is_valid in _resume_flags.items():
+        if not _is_valid:
+            raise ValueError(
+                f"{_flag_name} is inconsistent with Stage-2 resume"
+            )
+else:
+    raise ValueError(
+        "fresh RESUME_FROM_PATH must equal the canonical validated Stage-1 "
+        "parent; Stage-2 resume must be a step_N checkpoint"
+    )
 cfg.wandb_name_prefix = f"cosmos_progressive_{_stage}"
 cfg.enable_wandb = _env_bool("ENABLE_WANDB", False)
 

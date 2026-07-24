@@ -1284,13 +1284,14 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         注意：保存的模型已经包含 Flow Map 改造（delta_embedder 等），
         恢复时可以直接加载，无需再次调用 setup_flowmap_model。
         """
-        model = self.student if which == "online_student" else self.target_student
-        if model is None:
-            if self.config.rank == 0:
-                logger.info(f"  Skipped {which} checkpoint because target student is disabled.")
-            if dist.is_initialized():
-                dist.barrier(device_ids=[torch.cuda.current_device()])
-            return
+        target_is_online_snapshot = (
+            which == "target_student" and self.target_student is None
+        )
+        model = (
+            self.student
+            if which == "online_student" or target_is_online_snapshot
+            else self.target_student
+        )
         stage_name = getattr(self.config, "training_contract_stage", None)
         persisted_contract = None
         if stage_name is not None:
@@ -1330,6 +1331,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 _set_video_channel_config_from_heads(config_dict, model, state_dict_bf16)
                 if persisted_contract is not None:
                     config_dict.update(persisted_contract)
+                if self.target_student is None:
+                    config_dict["target_student_source"] = (
+                        "online_student_snapshot"
+                    )
                 for metadata_field in (
                     "teacher_backend",
                     "student_base_model_path",
@@ -3444,8 +3449,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 # 定期保存检查点（保留最近 3 个 + 最佳 loss 的）
                 if self.step % config.save_interval == 0:
                     self._save_checkpoint("online_student")
-                    if self.target_student is not None:
-                        self._save_checkpoint("target_student")
+                    self._save_checkpoint("target_student")
 
 
             # 常规训练不需要每个 microbatch barrier；仅保留可选 debug barrier。
@@ -3458,8 +3462,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         logger.info("Flow Map distillation completed!")
         # 保存最终检查点
         self._save_checkpoint("online_student")
-        if self.target_student is not None:
-            self._save_checkpoint("target_student")
+        self._save_checkpoint("target_student")
         # 关闭 TensorBoard writer
         if self.tb_writer is not None:
             self.tb_writer.flush()

@@ -52,6 +52,10 @@ def _explicit_cosmos_paths(monkeypatch, tmp_path):
         "PARENT_STAGE1_PATH": parent.canonical_path,
         "PARENT_STAGE1_CONTRACT_IDENTITY": parent.contract_identity,
         "STAGE2_LINEAGE_JSON": lineage,
+        "OUTPUT_DIR": str(tmp_path / "stage2-arm"),
+        "RESUME_ONLINE_FROM_TARGET": "1",
+        "RESET_RESUME_STEP": "1",
+        "RESUME_OPTIMIZER_STATE": "0",
     }
     for key, value in values.items():
         monkeypatch.setenv(key, value)
@@ -113,6 +117,168 @@ def test_progressive_config_validates_lineage_outside_launcher(
     result = _import_progressive(_explicit_cosmos_paths["env"])
 
     assert result.returncode == 0, result.stderr
+
+
+def _write_stage2_resume(
+    root, *, step, parent, missing=None, parent_identity=None
+):
+    checkpoint = root / "checkpoints" / f"step_{step}"
+    payload = {
+        "contract_version": 2,
+        "training_contract_stage": "progressive_stage2",
+        "action_packing_schema": "downsample_survivor_v2",
+        "action_downsample_factor": 4,
+        "action_chunk_shape": [4, 4],
+        "checkpoint_step": step,
+        "deployment_timestep_start": 1000,
+        "deployment_timestep_end": 0,
+        "joint_student_steps": [1, 2, 4],
+        "deployment_joint_rollout_interval": 4,
+        "deployment_action_weight": 1.0,
+        "raw_teacher_window_is_auxiliary": True,
+        "parent_stage1_path": parent.canonical_path,
+        "parent_stage1_contract_identity": (
+            parent_identity or parent.contract_identity
+        ),
+    }
+    for variant in ("online_student", "target_student"):
+        if missing == variant:
+            continue
+        transformer = checkpoint / variant / "transformer"
+        transformer.mkdir(parents=True)
+        (transformer / "config.json").write_text(json.dumps(payload))
+        (transformer / "diffusion_pytorch_model.safetensors").write_bytes(
+            b"weights"
+        )
+    if missing != "optimizer.pt":
+        (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
+    if missing != "lr_scheduler.pt":
+        (checkpoint / "lr_scheduler.pt").write_bytes(b"scheduler")
+    return checkpoint
+
+
+def _resume_env(paths, checkpoint, output_dir):
+    env = dict(paths["env"])
+    env.update(
+        {
+            "OUTPUT_DIR": str(output_dir),
+            "RESUME_FROM_PATH": str(checkpoint),
+            "RESUME_ONLINE_FROM_TARGET": "0",
+            "RESET_RESUME_STEP": "0",
+            "RESUME_OPTIMIZER_STATE": "1",
+        }
+    )
+    return env
+
+
+def test_progressive_config_rejects_foreign_fresh_resume(
+    _explicit_cosmos_paths, tmp_path
+):
+    foreign = tmp_path / "foreign-stage1"
+    foreign.mkdir()
+    env = dict(_explicit_cosmos_paths["env"])
+    env["RESUME_FROM_PATH"] = str(foreign)
+
+    result = _import_progressive(env)
+
+    assert result.returncode != 0
+    assert "fresh RESUME_FROM_PATH" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("RESUME_ONLINE_FROM_TARGET", "0"),
+        ("RESET_RESUME_STEP", "0"),
+        ("RESUME_OPTIMIZER_STATE", "1"),
+    ],
+)
+def test_progressive_config_rejects_inconsistent_fresh_flags(
+    _explicit_cosmos_paths, flag, value
+):
+    env = dict(_explicit_cosmos_paths["env"])
+    env[flag] = value
+
+    result = _import_progressive(env)
+
+    assert result.returncode != 0
+    assert flag in result.stderr
+
+
+def test_progressive_config_accepts_valid_stage2_resume(
+    _explicit_cosmos_paths, tmp_path
+):
+    arm = tmp_path / "resume-arm"
+    checkpoint = _write_stage2_resume(
+        arm,
+        step=1000,
+        parent=_explicit_cosmos_paths["parent"],
+    )
+    result = _import_progressive(
+        _resume_env(_explicit_cosmos_paths, checkpoint, arm)
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "missing", ["target_student", "optimizer.pt", "lr_scheduler.pt"]
+)
+def test_progressive_config_rejects_incomplete_stage2_resume(
+    _explicit_cosmos_paths, tmp_path, missing
+):
+    arm = tmp_path / f"resume-arm-{missing}"
+    checkpoint = _write_stage2_resume(
+        arm,
+        step=1000,
+        parent=_explicit_cosmos_paths["parent"],
+        missing=missing,
+    )
+
+    result = _import_progressive(
+        _resume_env(_explicit_cosmos_paths, checkpoint, arm)
+    )
+
+    assert result.returncode != 0
+    assert missing in result.stderr
+
+
+def test_progressive_config_rejects_resume_from_foreign_arm(
+    _explicit_cosmos_paths, tmp_path
+):
+    own_arm = tmp_path / "own-arm"
+    foreign_arm = tmp_path / "foreign-arm"
+    checkpoint = _write_stage2_resume(
+        foreign_arm,
+        step=1000,
+        parent=_explicit_cosmos_paths["parent"],
+    )
+
+    result = _import_progressive(
+        _resume_env(_explicit_cosmos_paths, checkpoint, own_arm)
+    )
+
+    assert result.returncode != 0
+    assert "checkpoints" in result.stderr
+
+
+def test_progressive_config_rejects_resume_parent_identity_mismatch(
+    _explicit_cosmos_paths, tmp_path
+):
+    arm = tmp_path / "resume-arm"
+    checkpoint = _write_stage2_resume(
+        arm,
+        step=1000,
+        parent=_explicit_cosmos_paths["parent"],
+        parent_identity="0" * 64,
+    )
+
+    result = _import_progressive(
+        _resume_env(_explicit_cosmos_paths, checkpoint, arm)
+    )
+
+    assert result.returncode != 0
+    assert "parent_stage1_contract_identity" in result.stderr
 
 
 @pytest.mark.parametrize(

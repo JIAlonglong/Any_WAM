@@ -75,6 +75,9 @@ def _set_progressive_lineage_env(monkeypatch, tmp_path):
         "PARENT_STAGE1_PATH": parent.canonical_path,
         "PARENT_STAGE1_CONTRACT_IDENTITY": parent.contract_identity,
         "STAGE2_LINEAGE_JSON": lineage,
+        "RESUME_ONLINE_FROM_TARGET": "1",
+        "RESET_RESUME_STEP": "1",
+        "RESUME_OPTIMIZER_STATE": "0",
     }.items():
         monkeypatch.setenv(name, value)
 

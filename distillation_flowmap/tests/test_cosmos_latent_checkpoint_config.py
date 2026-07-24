@@ -152,10 +152,10 @@ def _patch_checkpoint_io(monkeypatch):
     )
 
 
-def _checkpoint_trainer(save_dir, *, step, config):
+def _checkpoint_trainer(save_dir, *, step, config, target_student=True):
     trainer = FlowMapDistiller.__new__(FlowMapDistiller)
     trainer.student = _CheckpointModel()
-    trainer.target_student = _CheckpointModel()
+    trainer.target_student = _CheckpointModel() if target_student else None
     trainer.use_lora = False
     trainer.use_dmd = False
     trainer.discriminator = None
@@ -233,8 +233,12 @@ def test_real_checkpoint_writer_persists_stage1_backend_and_stage2_lineage(
         stage2_lineage_json=lineage_json,
     )
     stage2_trainer = _checkpoint_trainer(
-        arm_root / "checkpoints", step=1000, config=stage2_config
+        arm_root / "checkpoints",
+        step=1000,
+        config=stage2_config,
+        target_student=False,
     )
+    assert stage2_trainer.target_student is None
     stage2_trainer._save_checkpoint("online_student")
     stage2_trainer._save_checkpoint("target_student")
     stage2_checkpoint = arm_root / "checkpoints" / "step_1000"
@@ -257,6 +261,28 @@ def test_real_checkpoint_writer_persists_stage1_backend_and_stage2_lineage(
             == parent.contract_identity
         )
         assert payload["stage2_lineage_json"] == lineage_json
+    target_payload = json.loads(
+        (
+            stage2_checkpoint
+            / "target_student"
+            / "transformer"
+            / "config.json"
+        ).read_text()
+    )
+    assert target_payload["target_student_source"] == "online_student_snapshot"
+    online_weight = (
+        stage2_checkpoint
+        / "online_student"
+        / "transformer"
+        / "diffusion_pytorch_model.safetensors"
+    )
+    target_weight = (
+        stage2_checkpoint
+        / "target_student"
+        / "transformer"
+        / "diffusion_pytorch_model.safetensors"
+    )
+    assert online_weight.stat().st_ino != target_weight.stat().st_ino
 
 
 def test_checkpoint_config_persists_stage2_contract_atomically(tmp_path, monkeypatch):

@@ -266,6 +266,7 @@ def resolve_variant(
     cosmos_policy_extra_pythonpath: str | None = None,
     cosmos_policy_local_model_dir: str | Path | None = None,
     attention_mode: str = "flex",
+    provenance: Mapping[str, Any] | None = None,
 ) -> FrozenVariant:
     """Resolve one arm without creating, modifying, or probing output paths."""
 
@@ -385,6 +386,7 @@ def resolve_variant(
         ),
         "cosmos_policy_inference_mode": "subprocess",
         "attention_mode": attention_mode,
+        "provenance": _jsonable(provenance) if provenance is not None else None,
         "train_seed": 42,
         "tensorboard_enabled": True,
         "enable_wandb": False,

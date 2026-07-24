@@ -10,11 +10,17 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from distillation_flowmap.cosmos_libero_variants import canonical_variant_json, resolve_variant
+from distillation_flowmap.cosmos_libero_provenance import (
+    build_artifact_lock,
+    canonical_json,
+    resolve_formal_provenance,
+)
 from distillation_flowmap.cosmos_stage2_lineage import validate_stage1_parent
 
 
@@ -59,22 +65,175 @@ def _layout(tmp_path: Path):
     for variant in ("online_student", "target_student"):
         _transformer(stage1 / variant / "transformer", RAW_CONTRACT)
     dataset = tmp_path / "dataset"
-    dataset.mkdir()
+    (dataset / "meta").mkdir(parents=True)
+    for name in (
+        "info.json",
+        "tasks.jsonl",
+        "episodes.jsonl",
+        "episodes_ori.jsonl",
+        "episodes_stats.jsonl",
+    ):
+        (dataset / "meta" / name).write_text(
+            json.dumps({"path": name, "revision": 1}) + "\n",
+            encoding="utf-8",
+        )
+    (dataset / "data" / "chunk-000").mkdir(parents=True)
+    (dataset / "data" / "chunk-000" / "episode_000000.parquet").write_bytes(
+        b"parquet"
+    )
     (dataset / "empty_emb.pt").write_bytes(b"test")
     policy = tmp_path / "policy"
     policy.mkdir()
+    (policy / "config.json").write_text('{"revision":1}', encoding="utf-8")
+    (policy / "libero_dataset_statistics.json").write_text(
+        '{"revision":1}', encoding="utf-8"
+    )
+    (policy / "Cosmos-Policy-LIBERO-Predict2-2B.pt").write_bytes(b"policy")
+    (policy / "libero_t5_embeddings.pkl").write_bytes(b"embeddings")
     repo = tmp_path / "cosmos-predict2.5"
     repo.mkdir()
+    (repo / "packages" / "cosmos-cuda").mkdir(parents=True)
+    (repo / "packages" / "cosmos-oss").mkdir(parents=True)
+    (repo / "source.py").write_text("REVISION = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "fixture@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
     local_model = tmp_path / "local-model"
-    local_model.mkdir()
+    for relative in (
+        "config.json",
+        "model_index.json",
+        "scheduler/scheduler_config.json",
+        "tokenizer/tokenizer_config.json",
+    ):
+        path = local_model / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"revision":1}', encoding="utf-8")
+    (local_model / "model-480p-16fps.pt").write_bytes(b"video-model")
+    (local_model / "tokenizer" / "tokenizer.pth").write_bytes(b"tokenizer")
     worker_python = tmp_path / "cosmos-python"
-    worker_python.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    worker_python.write_text(
+        "#!"
+        + sys.executable
+        + "\n"
+        + "import json, os, sys\n"
+        + "print(json.dumps({'executable': os.path.realpath(sys.argv[0]),"
+        + "'python_version':'fixture','implementation':'CPython',"
+        + "'prefix':'/fixture','base_prefix':'/fixture',"
+        + "'torch':{'version':'2.7.0','cuda':'12.8','git_version':'fixture'}},"
+        + "sort_keys=True,separators=(',',':')))\n",
+        encoding="utf-8",
+    )
     worker_python.chmod(worker_python.stat().st_mode | stat.S_IXUSR)
-    return stage1, dataset, policy, repo, local_model, worker_python
+    site_packages = tmp_path / "site-packages"
+    metadata = site_packages / "torch-2.7.0.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("Name: torch\nVersion: 2.7.0\n", encoding="utf-8")
+
+    flashwam_repo = tmp_path / "flashwam-source"
+    flashwam_repo.mkdir()
+    (flashwam_repo / "source.py").write_text("REVISION = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(flashwam_repo)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(flashwam_repo),
+            "config",
+            "user.email",
+            "fixture@example.com",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(flashwam_repo), "config", "user.name", "Fixture"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(flashwam_repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(flashwam_repo), "commit", "-qm", "fixture"], check=True
+    )
+
+    lock_root = tmp_path / "provenance-locks"
+    lock_root.mkdir()
+    lock_specs = {
+        "dataset": (
+            dataset,
+            (
+                "meta/info.json",
+                "meta/tasks.jsonl",
+                "meta/episodes.jsonl",
+                "meta/episodes_ori.jsonl",
+                "meta/episodes_stats.jsonl",
+                "empty_emb.pt",
+            ),
+            ("data/chunk-000/episode_000000.parquet",),
+        ),
+        "teacher": (
+            policy,
+            ("config.json", "libero_dataset_statistics.json"),
+            (
+                "Cosmos-Policy-LIBERO-Predict2-2B.pt",
+                "libero_t5_embeddings.pkl",
+            ),
+        ),
+        "video_vae": (
+            stage1 / "target_student",
+            ("transformer/config.json",),
+            ("transformer/diffusion_pytorch_model.safetensors",),
+        ),
+        "local_model": (
+            local_model,
+            (
+                "config.json",
+                "model_index.json",
+                "scheduler/scheduler_config.json",
+                "tokenizer/tokenizer_config.json",
+            ),
+            ("model-480p-16fps.pt", "tokenizer/tokenizer.pth"),
+        ),
+    }
+    for name, (root, compact, large) in lock_specs.items():
+        payload = build_artifact_lock(
+            root,
+            compact_paths=compact,
+            large_paths=large,
+            immutable_store=False,
+        )
+        (lock_root / f"{name}.lock.json").write_text(
+            canonical_json(payload) + "\n", encoding="utf-8"
+        )
+    return (
+        stage1,
+        dataset,
+        policy,
+        repo,
+        local_model,
+        worker_python,
+        site_packages,
+        flashwam_repo,
+        lock_root,
+    )
 
 
 def _env(tmp_path: Path):
-    stage1, dataset, policy, repo, local_model, worker_python = _layout(tmp_path)
+    (
+        stage1,
+        dataset,
+        policy,
+        repo,
+        local_model,
+        worker_python,
+        site_packages,
+        flashwam_repo,
+        lock_root,
+    ) = _layout(tmp_path)
     env = os.environ.copy()
     env.update(
         {
@@ -85,6 +244,11 @@ def _env(tmp_path: Path):
             "COSMOS_POLICY_PYTHON": str(worker_python),
             "COSMOS_PREDICT2_REPO": str(repo),
             "COSMOS_PREDICT25_LOCAL_MODEL_DIR": str(local_model),
+            "COSMOS_WORKER_SITE_PACKAGES": str(site_packages),
+            "COSMOS_PROVENANCE_LOCK_ROOT": str(lock_root),
+            "VERIFY_LARGE_ARTIFACT_DIGESTS": "1",
+            "COSMOS_PROVENANCE_TEST_FIXTURE": "1",
+            "COSMOS_PROVENANCE_TEST_FLASHWAM_REPO": str(flashwam_repo),
             "CUDA_VISIBLE_DEVICES": DEVICES,
             "COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES": DEVICES,
         }
@@ -105,6 +269,26 @@ def _run(*args: str, env: dict[str, str], cwd: Path | None = None):
 
 def _resolve_for_launcher(env, name, *, output_root, run_tag, **overrides):
     repo = Path(env["COSMOS_PREDICT2_REPO"])
+    lock_root = Path(env["COSMOS_PROVENANCE_LOCK_ROOT"])
+    provenance = resolve_formal_provenance(
+        dataset_root=env["DATASET_PATH"],
+        dataset_lock=lock_root / "dataset.lock.json",
+        teacher_root=env["COSMOS_POLICY_PATH"],
+        teacher_lock=lock_root / "teacher.lock.json",
+        video_vae_root=env["STUDENT_BASE_MODEL_PATH"],
+        video_vae_lock=lock_root / "video_vae.lock.json",
+        local_model_root=env["COSMOS_PREDICT25_LOCAL_MODEL_DIR"],
+        local_model_lock=lock_root / "local_model.lock.json",
+        flashwam_repo=env["COSMOS_PROVENANCE_TEST_FLASHWAM_REPO"],
+        cosmos_repo=repo,
+        worker_python=env["COSMOS_POLICY_PYTHON"],
+        worker_site_packages=env["COSMOS_WORKER_SITE_PACKAGES"],
+        extra_pythonpath=(
+            repo / "packages/cosmos-cuda",
+            repo / "packages/cosmos-oss",
+        ),
+        verify_large_artifact_digests=True,
+    )
     return resolve_variant(
         name,
         output_root=output_root,
@@ -119,6 +303,7 @@ def _resolve_for_launcher(env, name, *, output_root, run_tag, **overrides):
         ),
         cosmos_policy_local_model_dir=env["COSMOS_PREDICT25_LOCAL_MODEL_DIR"],
         attention_mode="flex",
+        provenance=provenance,
         **overrides,
     )
 
@@ -131,6 +316,31 @@ def _assignments(stdout: str) -> dict[str, str]:
         for key, value in [line.split("=", 1)]
         if key.isupper()
     }
+
+
+def test_dry_run_embeds_read_only_provenance_in_canonical_identity(tmp_path):
+    env, _ = _env(tmp_path)
+    output_root = tmp_path / "out"
+    result = _run(
+        "apm",
+        "--output-root",
+        str(output_root),
+        "--run-tag",
+        "provenance",
+        "--dry-run",
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    values = _assignments(result.stdout)
+    provenance = json.loads(values["PROVENANCE_IDENTITY_JSON"])
+    variant = json.loads(values["COSMOS_LIBERO_VARIANT_JSON"])
+    actions = json.loads(values["ENV_CONTRACT_ACTIONS_JSON"])
+    assert provenance["schema"] == "flashwam_cosmos_provenance_v1"
+    assert variant["provenance"] == provenance
+    assert actions["DATASET_PATH"] == "set_canonical"
+    assert actions["USE_FSDP1"] == "set_pinned"
+    assert actions["DISTILL_MODE"] == "unset_legacy"
+    assert not output_root.exists()
 
 
 @pytest.mark.parametrize("arm", ARMS)
@@ -262,6 +472,10 @@ def test_formal_fresh_run_claims_one_arm_and_persists_canonical_manifest_before_
     assert (
         output / "cosmos_libero_variant.json"
     ).read_text(encoding="utf-8").strip() == expected
+    variant_payload = json.loads(expected)
+    assert json.loads(
+        (output / "cosmos_libero_provenance.json").read_text(encoding="utf-8")
+    ) == variant_payload["provenance"]
     assert not (output_root / "formal" / "apm").exists()
 
 
@@ -633,18 +847,86 @@ def test_dry_run_rejects_a_symlinked_output_root_instead_of_canonicalizing_alias
 
 def _write_resume_checkpoint(output: Path, *, arm: str, step: int, parent, variant_json: str):
     checkpoint = output / "checkpoints" / f"step_{step}"
+    provenance_json = canonical_json(json.loads(variant_json)["provenance"])
     payload = {
         **STAGE2_CONTRACT,
         "checkpoint_step": step,
         "parent_stage1_path": parent.canonical_path,
         "parent_stage1_contract_identity": parent.contract_identity,
         "cosmos_libero_variant_json": variant_json,
+        "cosmos_libero_provenance_json": provenance_json,
     }
     for student in ("online_student", "target_student"):
         _transformer(checkpoint / student / "transformer", payload)
     (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
     (checkpoint / "lr_scheduler.pt").write_bytes(b"scheduler")
     return checkpoint
+
+
+def _refresh_dataset_lock(env):
+    root = Path(env["DATASET_PATH"])
+    payload = build_artifact_lock(
+        root,
+        compact_paths=(
+            "meta/info.json",
+            "meta/tasks.jsonl",
+            "meta/episodes.jsonl",
+            "meta/episodes_ori.jsonl",
+            "meta/episodes_stats.jsonl",
+            "empty_emb.pt",
+        ),
+        large_paths=("data/chunk-000/episode_000000.parquet",),
+        immutable_store=False,
+    )
+    (Path(env["COSMOS_PROVENANCE_LOCK_ROOT"]) / "dataset.lock.json").write_text(
+        canonical_json(payload) + "\n", encoding="utf-8"
+    )
+
+
+def test_resume_recomputes_provenance_and_rejects_same_path_content_change(
+    tmp_path,
+):
+    env, stage1 = _env(tmp_path)
+    output_root = tmp_path / "out"
+    own = output_root / "resume" / "apm"
+    parent = validate_stage1_parent(stage1)
+    record = _resolve_for_launcher(
+        env, "apm", output_root=output_root, run_tag="resume"
+    )
+    _write_resume_checkpoint(
+        own,
+        arm="apm",
+        step=100,
+        parent=parent,
+        variant_json=canonical_variant_json(record),
+    )
+    (own / "cosmos_libero_variant.json").write_text(
+        canonical_variant_json(record) + "\n", encoding="utf-8"
+    )
+    (own / "cosmos_libero_provenance.json").write_text(
+        canonical_json(
+            json.loads(canonical_variant_json(record))["provenance"]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    metadata = Path(env["DATASET_PATH"]) / "meta" / "info.json"
+    metadata.write_text('{"revision":2}\n', encoding="utf-8")
+    _refresh_dataset_lock(env)
+    result = _run(
+        "apm",
+        "--output-root",
+        str(output_root),
+        "--run-tag",
+        "resume",
+        "--resume-step",
+        "100",
+        "--dry-run",
+        env=env,
+    )
+    assert result.returncode != 0
+    assert "provenance" in result.stderr.lower() or "variant" in result.stderr.lower()
 
 
 def test_resume_is_allowed_only_from_same_arm_with_same_parent_and_variant_record(tmp_path):
@@ -751,6 +1033,16 @@ def test_missing_explicit_stage1_or_base_path_has_no_fallback(tmp_path):
     assert "STUDENT_BASE_MODEL_PATH" in result.stderr
 
 
+def test_pytest_provenance_fixture_override_cannot_reach_formal_launcher(
+    tmp_path,
+):
+    env, _ = _env(tmp_path)
+    env.pop("PYTEST_CURRENT_TEST", None)
+    result = _run("apm", "--dry-run", env=env)
+    assert result.returncode != 0
+    assert "pytest-only" in result.stderr
+
+
 def test_launcher_accepts_task4_validated_sharded_stage1_weights(tmp_path):
     env, stage1 = _env(tmp_path)
     for student in ("online_student", "target_student"):
@@ -762,6 +1054,21 @@ def test_launcher_accepts_task4_validated_sharded_stage1_weights(tmp_path):
             json.dumps({"weight_map": {"weight": shard}}),
             encoding="utf-8",
         )
+    target = stage1 / "target_student"
+    video_vae_lock = build_artifact_lock(
+        target,
+        compact_paths=(
+            "transformer/config.json",
+            "transformer/diffusion_pytorch_model.safetensors.index.json",
+        ),
+        large_paths=(
+            "transformer/diffusion_pytorch_model-00001-of-00001.safetensors",
+        ),
+        immutable_store=False,
+    )
+    (
+        Path(env["COSMOS_PROVENANCE_LOCK_ROOT"]) / "video_vae.lock.json"
+    ).write_text(canonical_json(video_vae_lock) + "\n", encoding="utf-8")
 
     result = _run(
         "universal",

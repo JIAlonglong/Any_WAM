@@ -225,6 +225,14 @@ def test_real_checkpoint_writer_persists_stage1_backend_and_stage2_lineage(
         sort_keys=True,
         separators=(",", ":"),
     )
+    provenance_json = json.dumps(
+        {
+            "schema": "flashwam_cosmos_provenance_v1",
+            "identity_sha256": "fixture-provenance",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     stage2_config = SimpleNamespace(
         rank=0,
         training_contract_stage="progressive_stage2",
@@ -245,6 +253,7 @@ def test_real_checkpoint_writer_persists_stage1_backend_and_stage2_lineage(
         parent_stage1_contract_identity=parent.contract_identity,
         stage2_lineage_json=lineage_json,
         cosmos_libero_variant_json=variant_json,
+        cosmos_libero_provenance_json=provenance_json,
     )
     stage2_trainer = _checkpoint_trainer(
         arm_root / "checkpoints",
@@ -276,6 +285,7 @@ def test_real_checkpoint_writer_persists_stage1_backend_and_stage2_lineage(
         )
         assert payload["stage2_lineage_json"] == lineage_json
         assert payload["cosmos_libero_variant_json"] == variant_json
+        assert payload["cosmos_libero_provenance_json"] == provenance_json
     target_payload = json.loads(
         (
             stage2_checkpoint

@@ -125,6 +125,7 @@ cfg.parent_stage1_contract_identity = os.environ[
 cfg.stage2_lineage_json = os.environ["STAGE2_LINEAGE_JSON"]
 cfg.cosmos_libero_variant_json = os.environ.get("COSMOS_LIBERO_VARIANT_JSON")
 _cosmos_libero_variant_payload = None
+_cosmos_libero_provenance_payload = None
 if cfg.cosmos_libero_variant_json is not None:
     try:
         _cosmos_libero_variant_payload = json.loads(
@@ -139,6 +140,40 @@ if cfg.cosmos_libero_variant_json is not None:
         != cfg.cosmos_libero_variant_json
     ):
         raise ValueError("COSMOS_LIBERO_VARIANT_JSON must be canonical JSON")
+    cfg.cosmos_libero_provenance_json = os.environ.get(
+        "COSMOS_LIBERO_PROVENANCE_JSON"
+    )
+    if _cosmos_libero_variant_payload.get("provenance") is not None:
+        if not cfg.cosmos_libero_provenance_json:
+            raise ValueError(
+                "COSMOS_LIBERO_PROVENANCE_JSON is required by the variant"
+            )
+        try:
+            _cosmos_libero_provenance_payload = json.loads(
+                cfg.cosmos_libero_provenance_json
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "COSMOS_LIBERO_PROVENANCE_JSON must be valid JSON"
+            ) from exc
+        if (
+            json.dumps(
+                _cosmos_libero_provenance_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            != cfg.cosmos_libero_provenance_json
+        ):
+            raise ValueError(
+                "COSMOS_LIBERO_PROVENANCE_JSON must be canonical JSON"
+            )
+        if (
+            _cosmos_libero_variant_payload["provenance"]
+            != _cosmos_libero_provenance_payload
+        ):
+            raise ValueError(
+                "COSMOS_LIBERO provenance does not match the variant"
+            )
 _validated_parent = validate_stage1_parent(
     Path(cfg.parent_stage1_path), expected_step=5000
 )
@@ -449,6 +484,7 @@ if _cosmos_libero_variant_payload is not None:
         "cosmos_policy_wrist_image_key": cfg.raw_wrist_image_key,
         "cosmos_policy_inference_mode": cfg.cosmos_policy_inference_mode,
         "attention_mode": os.environ["ATTN_MODE"],
+        "provenance": _cosmos_libero_provenance_payload,
         "train_seed": int(os.environ["TRAIN_SEED"]),
         "tensorboard_enabled": _env_bool("ENABLE_TENSORBOARD", True),
         "enable_wandb": cfg.enable_wandb,

@@ -49,6 +49,11 @@ validate_devices() {
 }
 
 
+validate_binary_flag() {
+    [[ "$2" == "0" || "$2" == "1" ]] || die "$1 must be 0 or 1: $2"
+}
+
+
 print_assignment() {
     printf '%s=%s\n' "$1" "$2"
 }
@@ -68,6 +73,22 @@ COSMOS_PREDICT2_REPO="${COSMOS_PREDICT2_REPO:-/kpfs-intern/jialongliu/projects/c
 COSMOS_PREDICT25_LOCAL_MODEL_DIR="${COSMOS_PREDICT25_LOCAL_MODEL_DIR:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/local_hf/Cosmos-Predict2-2B-Video2World}"
 COSMOS_WORKER_SITE_PACKAGES="${COSMOS_WORKER_SITE_PACKAGES:-${COSMOS_WORKER_ENV_ROOT}/lib/python3.10/site-packages}"
 COSMOS_POLICY_EXTRA_PYTHONPATH="$COSMOS_PREDICT2_REPO/packages/cosmos-cuda:$COSMOS_PREDICT2_REPO/packages/cosmos-oss"
+[[ -n "${COSMOS_PROVENANCE_LOCK_ROOT:-}" ]] || die \
+    "COSMOS_PROVENANCE_LOCK_ROOT must be explicitly set"
+VERIFY_LARGE_ARTIFACT_DIGESTS="${VERIFY_LARGE_ARTIFACT_DIGESTS:-0}"
+validate_binary_flag VERIFY_LARGE_ARTIFACT_DIGESTS \
+    "$VERIFY_LARGE_ARTIFACT_DIGESTS"
+if [[ "${COSMOS_PROVENANCE_TEST_FIXTURE:-0}" == "1" ]]; then
+    [[ -n "${PYTEST_CURRENT_TEST:-}" ]] || die \
+        "COSMOS_PROVENANCE_TEST_FIXTURE is pytest-only"
+    [[ -n "${COSMOS_PROVENANCE_TEST_FLASHWAM_REPO:-}" ]] || die \
+        "COSMOS_PROVENANCE_TEST_FLASHWAM_REPO is required in fixture mode"
+    FLASHWAM_PROVENANCE_REPO="$COSMOS_PROVENANCE_TEST_FLASHWAM_REPO"
+else
+    [[ -z "${COSMOS_PROVENANCE_TEST_FLASHWAM_REPO:-}" ]] || die \
+        "test Flash-WAM provenance override is forbidden in formal mode"
+    FLASHWAM_PROVENANCE_REPO="$PROJECT_ROOT"
+fi
 
 arm="${1:-}"
 [[ -n "$arm" ]] || die "an experiment arm is required"
@@ -115,7 +136,60 @@ validate_positive_integer "save interval" "$save_interval"
 [[ -z "$master_port" ]] || validate_port "$master_port"
 [[ -z "$resume_step" ]] || validate_positive_integer "resume step" "$resume_step"
 
+provenance_code='import sys
+from distillation_flowmap.cosmos_libero_provenance import (
+    canonical_json,
+    resolve_formal_provenance,
+)
+(
+    dataset, teacher, video_vae, local_model, lock_root,
+    flashwam_repo, cosmos_repo, worker_python, worker_site_packages,
+    extra_pythonpath, verify_large,
+) = sys.argv[1:]
+payload = resolve_formal_provenance(
+    dataset_root=dataset,
+    dataset_lock=f"{lock_root}/dataset.lock.json",
+    teacher_root=teacher,
+    teacher_lock=f"{lock_root}/teacher.lock.json",
+    video_vae_root=video_vae,
+    video_vae_lock=f"{lock_root}/video_vae.lock.json",
+    local_model_root=local_model,
+    local_model_lock=f"{lock_root}/local_model.lock.json",
+    flashwam_repo=flashwam_repo,
+    cosmos_repo=cosmos_repo,
+    worker_python=worker_python,
+    worker_site_packages=worker_site_packages,
+    extra_pythonpath=tuple(part for part in extra_pythonpath.split(":") if part),
+    verify_large_artifact_digests=verify_large == "1",
+)
+print("PROVENANCE_IDENTITY_JSON=" + canonical_json(payload))
+print("PROVENANCE_IDENTITY_SHA256=" + payload["identity_sha256"])'
+provenance_output="$(
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
+        "$PREFLIGHT_BIN" -c "$provenance_code" \
+        "$DATASET_PATH" "$COSMOS_POLICY_PATH" "$STUDENT_BASE_MODEL_PATH" \
+        "$COSMOS_PREDICT25_LOCAL_MODEL_DIR" "$COSMOS_PROVENANCE_LOCK_ROOT" \
+        "$FLASHWAM_PROVENANCE_REPO" "$COSMOS_PREDICT2_REPO" \
+        "$COSMOS_POLICY_PYTHON" "$COSMOS_WORKER_SITE_PACKAGES" \
+        "$COSMOS_POLICY_EXTRA_PYTHONPATH" "$VERIFY_LARGE_ARTIFACT_DIGESTS"
+)" || die "formal provenance preflight failed"
+while IFS='=' read -r key value; do
+    case "$key" in
+        PROVENANCE_IDENTITY_JSON|PROVENANCE_IDENTITY_SHA256)
+            printf -v "$key" '%s' "$value"; export "$key" ;;
+        *) die "unexpected provenance preflight output: $key" ;;
+    esac
+done <<< "$provenance_output"
+[[ -n "${PROVENANCE_IDENTITY_JSON:-}" ]] || die \
+    "provenance preflight omitted canonical JSON"
+[[ -n "${PROVENANCE_IDENTITY_SHA256:-}" ]] || die \
+    "provenance preflight omitted identity digest"
+COSMOS_LIBERO_PROVENANCE_JSON="$PROVENANCE_IDENTITY_JSON"
+export COSMOS_LIBERO_PROVENANCE_JSON
+
 resolver_code='import sys
+import json
 from distillation_flowmap.cosmos_libero_variants import (
     VariantError, canonical_variant_json, resolve_variant,
 )
@@ -123,6 +197,7 @@ from distillation_flowmap.cosmos_libero_variants import (
     name, output_root, run_tag, steps_raw, save_raw, port_raw,
     dataset_path, teacher_path, vae_path, repo, worker_python,
     worker_pythonpath, local_model,
+    provenance_json,
 ) = sys.argv[1:]
 try:
     record = resolve_variant(
@@ -140,6 +215,7 @@ try:
         cosmos_policy_extra_pythonpath=worker_pythonpath,
         cosmos_policy_local_model_dir=local_model,
         attention_mode="flex",
+        provenance=json.loads(provenance_json),
     )
 except (VariantError, ValueError) as exc:
     raise SystemExit(str(exc))
@@ -257,7 +333,8 @@ resolved="$(
         "$arm" "$output_root" "$run_tag" "$steps" "$save_interval" "$master_port" \
         "$DATASET_PATH" "$COSMOS_POLICY_PATH" "$STUDENT_BASE_MODEL_PATH" \
         "$COSMOS_PREDICT2_REPO" "$COSMOS_POLICY_PYTHON" \
-        "$COSMOS_POLICY_EXTRA_PYTHONPATH" "$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
+        "$COSMOS_POLICY_EXTRA_PYTHONPATH" "$COSMOS_PREDICT25_LOCAL_MODEL_DIR" \
+        "$COSMOS_LIBERO_PROVENANCE_JSON"
 )" || die "variant resolution failed"
 declare -A seen_resolver_keys=()
 while IFS='=' read -r key value; do
@@ -365,11 +442,24 @@ if resume is not None:
             raise ValueError(
                 f"{student} canonical Cosmos LIBERO variant does not match selected arm"
             )
+        if payload.get("cosmos_libero_provenance_json") != os.environ[
+            "COSMOS_LIBERO_PROVENANCE_JSON"
+        ]:
+            raise ValueError(
+                f"{student} Cosmos LIBERO provenance does not match current inputs"
+            )
     manifest = output / "cosmos_libero_variant.json"
     if manifest.exists():
         actual = manifest.read_text(encoding="utf-8").strip()
         if actual != expected_variant:
             raise ValueError("run-level canonical variant manifest does not match selected arm")
+    provenance_manifest = output / "cosmos_libero_provenance.json"
+    if provenance_manifest.exists():
+        actual = provenance_manifest.read_text(encoding="utf-8").strip()
+        if actual != os.environ["COSMOS_LIBERO_PROVENANCE_JSON"]:
+            raise ValueError(
+                "run-level provenance manifest does not match current inputs"
+            )
 payload = {
     "parent_stage1_path": parent.canonical_path,
     "parent_stage1_contract_identity": parent.contract_identity,
@@ -383,6 +473,7 @@ lineage_output="$(
         COSMOS_STAGE1_ROOT="$STAGE1_ROOT" \
         OUTPUT_DIR="$OUTPUT_DIR" \
         COSMOS_LIBERO_VARIANT_JSON="$COSMOS_LIBERO_VARIANT_JSON" \
+        COSMOS_LIBERO_PROVENANCE_JSON="$COSMOS_LIBERO_PROVENANCE_JSON" \
         STAGE2_RESUME_CHECKPOINT="${resume_step:+$RESUME_FROM_PATH}" \
         STAGE2_RESUME_STEP="${resume_step:-0}" \
         PYTHONDONTWRITEBYTECODE=1 \
@@ -412,6 +503,7 @@ export COSMOS_PROGRESSIVE_STAGE
 export COSMOS_PROGRESSIVE_OUTPUT_ROOT="$output_root"
 export OUTPUT_ROOT="$output_root"
 export STUDENT_BASE_MODEL_PATH COSMOS_LIBERO_VARIANT_JSON
+export COSMOS_LIBERO_PROVENANCE_JSON
 export USE_FSDP1=1
 export GRADIENT_CHECKPOINTING=1
 export OPD_AUX_GRADIENT_CHECKPOINTING=1
@@ -470,6 +562,32 @@ export COSMOS_POLICY_EXTRA_PYTHONPATH="${COSMOS_POLICY_EXTRA_PYTHONPATH:-$COSMOS
 export COSMOS_WORKER_CUDA_LIBRARY_PATH="${COSMOS_WORKER_CUDA_LIBRARY_PATH:-${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cublas/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_cupti/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_nvrtc/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_runtime/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cudnn/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cufft/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cufile/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/curand/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusolver/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusparse/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusparselt/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/nccl/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/nvjitlink/lib}"
 export LD_LIBRARY_PATH="${COSMOS_WORKER_CUDA_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
+env_contract_code='import json, os
+from distillation_flowmap.cosmos_progressive_env_schema import (
+    launcher_action_manifest,
+    validate_launcher_environment,
+)
+validate_launcher_environment(os.environ)
+print(
+    "ENV_CONTRACT_ACTIONS_JSON="
+    + json.dumps(
+        launcher_action_manifest(), sort_keys=True, separators=(",", ":")
+    )
+)'
+env_contract_output="$(
+    cd "$PROJECT_ROOT"
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
+        "$PREFLIGHT_BIN" -c "$env_contract_code"
+)" || die "launcher environment contract preflight failed"
+while IFS='=' read -r key value; do
+    case "$key" in
+        ENV_CONTRACT_ACTIONS_JSON)
+            printf -v "$key" '%s' "$value"; export "$key" ;;
+        *) die "unexpected environment contract output: $key" ;;
+    esac
+done <<< "$env_contract_output"
+
 config_preflight_code='import json, os
 from importlib import import_module
 cfg = import_module(os.environ["CONFIG_FILE"]).cfg
@@ -480,6 +598,7 @@ required = {
     "parent_stage1_contract_identity": os.environ["PARENT_STAGE1_CONTRACT_IDENTITY"],
     "stage2_lineage_json": os.environ["STAGE2_LINEAGE_JSON"],
     "cosmos_libero_variant_json": os.environ["COSMOS_LIBERO_VARIANT_JSON"],
+    "cosmos_libero_provenance_json": os.environ["COSMOS_LIBERO_PROVENANCE_JSON"],
 }
 for field, expected in required.items():
     actual = getattr(cfg, field, None)
@@ -532,9 +651,13 @@ for key in \
     STUDENT_BASE_MODEL_PATH PARENT_STAGE1_PATH \
     PARENT_STAGE1_CONTRACT_IDENTITY STAGE2_LINEAGE_JSON \
     COSMOS_LIBERO_VARIANT_JSON CUDA_VISIBLE_DEVICES \
-    COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES; do
+    COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES \
+    PROVENANCE_IDENTITY_JSON PROVENANCE_IDENTITY_SHA256 \
+    COSMOS_LIBERO_PROVENANCE_JSON COSMOS_PROVENANCE_LOCK_ROOT \
+    VERIFY_LARGE_ARTIFACT_DIGESTS; do
     print_assignment "$key" "${!key}"
 done
+print_assignment ENV_CONTRACT_ACTIONS_JSON "$ENV_CONTRACT_ACTIONS_JSON"
 for key in \
     MECHANISM_DIAGNOSTICS MECHANISM_DIAGNOSTIC_INTERVAL \
     MECHANISM_DIAGNOSTIC_SEED MECHANISM_DIAGNOSTIC_R \
@@ -606,12 +729,16 @@ if [[ -z "$resume_step" ]]; then
     manifest_code='import os
 from pathlib import Path
 output = Path(os.environ["OUTPUT_DIR"])
-destination = output / "cosmos_libero_variant.json"
-fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-with os.fdopen(fd, "w", encoding="utf-8") as handle:
-    handle.write(os.environ["COSMOS_LIBERO_VARIANT_JSON"] + "\n")
-    handle.flush()
-    os.fsync(handle.fileno())'
+for filename, variable in (
+    ("cosmos_libero_variant.json", "COSMOS_LIBERO_VARIANT_JSON"),
+    ("cosmos_libero_provenance.json", "COSMOS_LIBERO_PROVENANCE_JSON"),
+):
+    destination = output / filename
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(os.environ[variable] + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())'
     "$PREFLIGHT_BIN" -c "$manifest_code" || die \
         "failed to persist canonical variant manifest"
 fi

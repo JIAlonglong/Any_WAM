@@ -11,6 +11,7 @@ the LIBERO client keeps all environment ownership.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
@@ -230,6 +231,14 @@ def seed_live_rollout(seed: int) -> None:
     torch.manual_seed(resolved_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(resolved_seed)
+
+
+def derive_episode_seed(env_seed: int, task_idx: int, episode_idx: int) -> int:
+    """Derive a stable K-independent RNG seed for one durable episode."""
+    material = (
+        f"cosmos-progressive-s4:{int(env_seed)}:{int(task_idx)}:{int(episode_idx)}"
+    ).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(material).digest()[:4], "big")
 
 
 def _runtime_dependencies() -> dict[str, Any]:
@@ -599,6 +608,7 @@ def main(argv: list[str] | None = None) -> int:
             service,
             output_dir=args.output_dir,
             student_steps=args.student_steps,
+            expected_s4_checkpoint=str(Path(args.checkpoint_transformer).resolve()),
             warmup_steps=args.warmup_steps,
             warmup_gripper=args.warmup_gripper,
             skip_first_action=args.skip_first_action,
@@ -619,6 +629,9 @@ def main(argv: list[str] | None = None) -> int:
         for task_idx in task_indices:
             for local_episode_idx in range(args.episodes):
                 episode_idx = args.episode_index_offset + local_episode_idx
+                seed_live_rollout(
+                    derive_episode_seed(args.env_seed, task_idx, episode_idx)
+                )
                 records.append(
                     client.run_libero_task(
                         libero_benchmark=args.libero_benchmark,

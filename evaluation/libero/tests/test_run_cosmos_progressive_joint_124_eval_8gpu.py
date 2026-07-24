@@ -30,6 +30,7 @@ def _base_env(tmp_path):
             "S4_DATASET_PATH": str(dataset),
             "S4_EMPTY_EMBEDDING": str(empty_embedding),
             "PYTHON_BIN": sys.executable,
+            "S4_ALIGNMENT_VERIFIED": "1",
         }
     )
     env.pop("S4_PROMPT_TABLE", None)
@@ -37,6 +38,7 @@ def _base_env(tmp_path):
     env.pop("S4_FORMAL_NUM_SHARDS", None)
     env.pop("S4_STUDENT_STEPS", None)
     env.pop("S4_DRY_RUN", None)
+    env.pop("S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH", None)
     return env
 
 
@@ -127,11 +129,15 @@ def _write_child_sentinel(path, *, fail_step=None, corrupt_step=None):
         "    'checkpoint': str(pathlib.Path(os.environ['S4_CKPT_ROOT']).resolve()),\n"
         "    'student_steps': reported_step,\n"
         "    'num_records': 500,\n"
+        "    'evaluation_classification': os.environ['S4_EVAL_CLASSIFICATION'],\n"
+        "    'is_formal': os.environ['S4_EVAL_IS_FORMAL'] == '1',\n"
         "}\n"
         "if step == 2 and os.environ.get('CORRUPTION') == 'records':\n"
         "    summary['num_records'] = 499\n"
         "if step == 2 and os.environ.get('CORRUPTION') == 'checkpoint':\n"
         "    summary['checkpoint'] = '/wrong/checkpoint'\n"
+        "if step == 2 and os.environ.get('CORRUPTION') == 'classification':\n"
+        "    summary['evaluation_classification'] = 'wrong'\n"
         "(root / 'formal_summary.json').write_text(json.dumps(summary), encoding='utf-8')\n",
         encoding="utf-8",
     )
@@ -160,6 +166,8 @@ def test_live_matrix_runs_serially_reuses_k1_prompt_and_writes_summary(tmp_path)
     assert payload == {
         "schema": "cosmos_progressive_joint_124_matrix_v1",
         "checkpoint": str(Path(env["S4_CKPT_ROOT"]).resolve()),
+        "evaluation_classification": "formal_verified",
+        "is_formal": True,
         "steps": [1, 2, 4],
         "summaries": {
             "1": str(root / "k1" / "formal_summary.json"),
@@ -167,6 +175,74 @@ def test_live_matrix_runs_serially_reuses_k1_prompt_and_writes_summary(tmp_path)
             "4": str(root / "k4" / "formal_summary.json"),
         },
     }
+
+
+def test_unverified_run_stops_before_any_child(tmp_path):
+    env = _base_env(tmp_path)
+    env.pop("S4_ALIGNMENT_VERIFIED")
+    marker = tmp_path / "child-called"
+    child = tmp_path / "child.sh"
+    child.write_text(
+        "#!/usr/bin/env bash\n"
+        f"touch {str(marker)!r}\n",
+        encoding="utf-8",
+    )
+    child.chmod(child.stat().st_mode | stat.S_IXUSR)
+    env["S4_FORMAL_LAUNCHER"] = str(child)
+
+    result = _run("run", env=env)
+
+    assert result.returncode == 2
+    assert "S4_ALIGNMENT_VERIFIED=1" in result.stderr
+    assert "S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH=1" in result.stderr
+    assert not marker.exists()
+    assert not Path(env["MATRIX_ROOT"]).exists()
+
+
+def test_unverified_dry_run_is_planned_as_blocked_and_creates_nothing(tmp_path):
+    env = _base_env(tmp_path)
+    env.pop("S4_ALIGNMENT_VERIFIED")
+
+    result = _run("dry-run", env=env)
+    _assert_success(result)
+
+    assert "ALIGNMENT_BLOCKED=1" in result.stdout
+    assert "EVALUATION_CLASSIFICATION=blocked_known_alignment_mismatch" in result.stdout
+    assert "EVALUATION_IS_FORMAL=0" in result.stdout
+    assert not Path(env["MATRIX_ROOT"]).exists()
+
+
+def test_explicit_known_mismatch_override_marks_every_summary_nonformal(tmp_path):
+    env = _base_env(tmp_path)
+    env.pop("S4_ALIGNMENT_VERIFIED")
+    env["S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH"] = "1"
+    child = tmp_path / "diagnostic-child.py"
+    log = tmp_path / "child.log"
+    _write_child_sentinel(child)
+    env.update(
+        {
+            "S4_FORMAL_LAUNCHER": str(child),
+            "SENTINEL_LOG": str(log),
+        }
+    )
+
+    result = _run("run", env=env)
+    _assert_success(result)
+
+    root = Path(env["MATRIX_ROOT"])
+    for step in (1, 2, 4):
+        child_summary = json.loads(
+            (root / f"k{step}" / "formal_summary.json").read_text(encoding="utf-8")
+        )
+        assert child_summary["evaluation_classification"] == (
+            "diagnostic_known_alignment_mismatch"
+        )
+        assert child_summary["is_formal"] is False
+    matrix = json.loads((root / "matrix_summary.json").read_text(encoding="utf-8"))
+    assert matrix["evaluation_classification"] == (
+        "diagnostic_known_alignment_mismatch"
+    )
+    assert matrix["is_formal"] is False
 
 
 def test_child_failure_stops_before_later_k_and_publishes_no_summary(tmp_path):
@@ -232,6 +308,25 @@ def test_record_count_and_checkpoint_must_match_before_publish(tmp_path):
         assert result.returncode != 0
         assert message in result.stderr
         assert not (Path(env["MATRIX_ROOT"]) / "matrix_summary.json").exists()
+
+
+def test_child_classification_must_match_before_matrix_publish(tmp_path):
+    env = _base_env(tmp_path)
+    child = tmp_path / "corrupt-child.py"
+    _write_child_sentinel(child)
+    env.update(
+        {
+            "S4_FORMAL_LAUNCHER": str(child),
+            "SENTINEL_LOG": str(tmp_path / "child.log"),
+            "CORRUPTION": "classification",
+        }
+    )
+
+    result = _run("run", env=env)
+
+    assert result.returncode != 0
+    assert "evaluation classification mismatch" in result.stderr
+    assert not (Path(env["MATRIX_ROOT"]) / "matrix_summary.json").exists()
 
 
 def test_caller_prompt_table_is_reused_for_all_children(tmp_path):

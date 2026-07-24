@@ -91,10 +91,14 @@ verify_formal_results() {
     local seed_count="$1" shard_plan="$2"
     emit_local_command \
         "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" \
-        "${S4_STUDENT_STEPS}" "${shard_plan}" "<merge-formal-records>"
+        "${S4_STUDENT_STEPS}" "${shard_plan}" "${S4_EVAL_CLASSIFICATION}" \
+        "${S4_EVAL_IS_FORMAL}" "<merge-formal-records>"
     (( DRY_RUN )) && return 0
-    "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" "${S4_STUDENT_STEPS}" "${shard_plan}" <<'PY'
+    "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" \
+        "${S4_STUDENT_STEPS}" "${shard_plan}" "${S4_EVAL_CLASSIFICATION}" \
+        "${S4_EVAL_IS_FORMAL}" <<'PY'
 import json
+import os
 import random
 import re
 import sys
@@ -105,6 +109,8 @@ root = Path(sys.argv[1])
 expected_checkpoint = str(Path(sys.argv[2]).resolve())
 seed_count = int(sys.argv[3])
 requested_steps = int(sys.argv[4])
+evaluation_classification = sys.argv[6]
+is_formal = sys.argv[7] == "1"
 shard_plan = {}
 for entry in sys.argv[5].split(";"):
     shard_text, start_text, end_text = entry.split(":")
@@ -181,6 +187,8 @@ summary = {
     "schema": "cosmos_progressive_s4_formal_eval_v1",
     "checkpoint": expected_checkpoint,
     "student_steps": requested_steps,
+    "evaluation_classification": evaluation_classification,
+    "is_formal": is_formal,
     "num_records": len(seen),
     "seeds_per_task": seed_count,
     "per_task_success": task_means,
@@ -188,7 +196,12 @@ summary = {
     "bootstrap_ci_95": [bootstrap[int(0.025 * len(bootstrap))], bootstrap[int(0.975 * len(bootstrap))]],
 }
 path = root / "formal_summary.json"
-path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+temporary_path = root / ".formal_summary.json.tmp"
+temporary_path.write_text(
+    json.dumps(summary, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+os.replace(temporary_path, path)
 print(f"MERGE_SUMMARY={path}")
 PY
 }
@@ -425,6 +438,18 @@ case "${S4_STUDENT_STEPS}" in
     1|2|4) ;;
     *) die "S4_STUDENT_STEPS must be 1, 2, or 4" ;;
 esac
+S4_EVAL_CLASSIFICATION="${S4_EVAL_CLASSIFICATION:-unclassified}"
+S4_EVAL_IS_FORMAL="${S4_EVAL_IS_FORMAL:-0}"
+case "${S4_EVAL_IS_FORMAL}" in
+    0|1) ;;
+    *) die "S4_EVAL_IS_FORMAL must be 0 or 1" ;;
+esac
+if [[ "${S4_EVAL_CLASSIFICATION}" == "formal_verified" ]]; then
+    [[ "${S4_EVAL_IS_FORMAL}" == "1" ]] || \
+        die "formal_verified classification requires S4_EVAL_IS_FORMAL=1"
+elif [[ "${S4_EVAL_IS_FORMAL}" == "1" ]]; then
+    die "S4_EVAL_IS_FORMAL=1 requires formal_verified classification"
+fi
 S4_FORMAL_NUM_SHARDS="${S4_FORMAL_NUM_SHARDS:-2}"
 case "${S4_FORMAL_NUM_SHARDS}" in
     2|4) ;;
@@ -453,6 +478,8 @@ emit_kv "EVAL_ROOT" "${EVAL_ROOT}"
 emit_kv "S4_STUDENT_STEPS" "${S4_STUDENT_STEPS}"
 emit_kv "S4_FORMAL_NUM_SHARDS" "${S4_FORMAL_NUM_SHARDS}"
 emit_kv "S4_VIDEO_SEEDS" "${S4_VIDEO_SEEDS}"
+emit_kv "EVALUATION_CLASSIFICATION" "${S4_EVAL_CLASSIFICATION}"
+emit_kv "EVALUATION_IS_FORMAL" "${S4_EVAL_IS_FORMAL}"
 
 case "${MODE}" in
     smoke)

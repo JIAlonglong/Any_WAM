@@ -41,6 +41,22 @@ S4_FORMAL_LAUNCHER="${S4_FORMAL_LAUNCHER:-${SCRIPT_DIR}/run_cosmos_progressive_s
 [[ -x "${S4_FORMAL_LAUNCHER}" ]] || die "formal launcher is not executable: ${S4_FORMAL_LAUNCHER}"
 
 readonly STEPS=(1 2 4)
+S4_ALIGNMENT_VERIFIED="${S4_ALIGNMENT_VERIFIED:-0}"
+S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH="${S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH:-0}"
+case "${S4_ALIGNMENT_VERIFIED}" in 0|1) ;; *) die "S4_ALIGNMENT_VERIFIED must be 0 or 1" ;; esac
+case "${S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH}" in 0|1) ;; *) die "S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH must be 0 or 1" ;; esac
+ALIGNMENT_BLOCKED=0
+if [[ "${S4_ALIGNMENT_VERIFIED}" == "1" ]]; then
+    export S4_EVAL_CLASSIFICATION="formal_verified"
+    export S4_EVAL_IS_FORMAL=1
+elif [[ "${S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH}" == "1" ]]; then
+    export S4_EVAL_CLASSIFICATION="diagnostic_known_alignment_mismatch"
+    export S4_EVAL_IS_FORMAL=0
+else
+    export S4_EVAL_CLASSIFICATION="blocked_known_alignment_mismatch"
+    export S4_EVAL_IS_FORMAL=0
+    ALIGNMENT_BLOCKED=1
+fi
 export S4_FORMAL_NUM_SHARDS=4
 export S4_VIDEO_SEEDS="${S4_VIDEO_SEEDS:-0,1}"
 
@@ -52,6 +68,12 @@ fi
 
 emit_kv "MATRIX_MODE" "${MODE}"
 emit_kv "MATRIX_ROOT" "${MATRIX_ROOT}"
+emit_kv "ALIGNMENT_BLOCKED" "${ALIGNMENT_BLOCKED}"
+emit_kv "EVALUATION_CLASSIFICATION" "${S4_EVAL_CLASSIFICATION}"
+emit_kv "EVALUATION_IS_FORMAL" "${S4_EVAL_IS_FORMAL}"
+if [[ "${MODE}" == "run" && "${ALIGNMENT_BLOCKED}" == "1" ]]; then
+    die "known training/action alignment mismatch: set S4_ALIGNMENT_VERIFIED=1 only after verification, or S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH=1 for a non-formal diagnostic run"
+fi
 
 caller_prompt_table="${S4_PROMPT_TABLE:-}"
 for k in "${STEPS[@]}"; do
@@ -73,7 +95,8 @@ if [[ "${MODE}" == "dry-run" ]]; then
     exit 0
 fi
 
-"${PYTHON_BIN}" - "${MATRIX_ROOT}" "${S4_CKPT_ROOT}" <<'PY'
+"${PYTHON_BIN}" - "${MATRIX_ROOT}" "${S4_CKPT_ROOT}" \
+    "${S4_EVAL_CLASSIFICATION}" "${S4_EVAL_IS_FORMAL}" <<'PY'
 import json
 import os
 import sys
@@ -81,6 +104,8 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 expected_checkpoint = str(Path(sys.argv[2]).resolve())
+expected_classification = sys.argv[3]
+expected_is_formal = sys.argv[4] == "1"
 steps = (1, 2, 4)
 summary_paths = {
     str(step): root / f"k{step}" / "formal_summary.json" for step in steps
@@ -111,10 +136,23 @@ for step in steps:
             f"checkpoint mismatch for K={step}: expected={expected_checkpoint!r} "
             f"got={reported_checkpoint!r}"
         )
+    if payload.get("evaluation_classification") != expected_classification:
+        raise SystemExit(
+            f"evaluation classification mismatch for K={step}: "
+            f"expected={expected_classification!r} "
+            f"got={payload.get('evaluation_classification')!r}"
+        )
+    if payload.get("is_formal") is not expected_is_formal:
+        raise SystemExit(
+            f"is_formal mismatch for K={step}: expected={expected_is_formal!r} "
+            f"got={payload.get('is_formal')!r}"
+        )
 
 matrix_summary = {
     "schema": "cosmos_progressive_joint_124_matrix_v1",
     "checkpoint": expected_checkpoint,
+    "evaluation_classification": expected_classification,
+    "is_formal": expected_is_formal,
     "steps": list(steps),
     "summaries": {key: str(path) for key, path in summary_paths.items()},
 }

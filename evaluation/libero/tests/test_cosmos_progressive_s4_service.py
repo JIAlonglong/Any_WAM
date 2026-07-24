@@ -177,7 +177,11 @@ class _WarmupEnv:
 
 def test_client_records_server_failure_as_unsuccessful_trial(tmp_path):
     client = CosmosProgressiveS4Client(
-        _FailingService(), output_dir=tmp_path, student_steps=2, warmup_steps=1
+        _FailingService(),
+        output_dir=tmp_path,
+        student_steps=2,
+        expected_s4_checkpoint="/resolved/s4-checkpoint",
+        warmup_steps=1,
     )
 
     record = client.run_with_env(
@@ -195,11 +199,53 @@ def test_client_records_server_failure_as_unsuccessful_trial(tmp_path):
     assert record["server_failure"] is True
     assert record["seed"] == 17
     assert record["student_steps"] == 2
+    assert record["s4_checkpoint"] == "/resolved/s4-checkpoint"
     record_path = tmp_path / "records" / "task_2_episode_5.json"
     persisted = json.loads(record_path.read_text(encoding="utf-8"))
     assert persisted["success"] is False
     assert persisted["seed"] == 17
     assert persisted["student_steps"] == 2
+    assert persisted["s4_checkpoint"] == "/resolved/s4-checkpoint"
+
+
+def test_client_rejects_reset_and_infer_checkpoint_mismatches(tmp_path):
+    class MismatchService:
+        checkpoint_identifier = "/expected/checkpoint"
+
+        def __init__(self, *, mismatch_on_reset):
+            self.mismatch_on_reset = mismatch_on_reset
+
+        def infer(self, request):
+            mismatch = bool(request.get("reset")) is self.mismatch_on_reset
+            return {
+                "ok": True,
+                "action": np.zeros((16, 7), dtype=np.float32),
+                "student_steps": 2,
+                "s4_checkpoint": (
+                    "/wrong/checkpoint" if mismatch else "/expected/checkpoint"
+                ),
+            }
+
+    for mismatch_on_reset in (True, False):
+        client = CosmosProgressiveS4Client(
+            MismatchService(mismatch_on_reset=mismatch_on_reset),
+            output_dir=tmp_path / str(mismatch_on_reset),
+            student_steps=2,
+        )
+        record = client.run_with_env(
+            env=_DoneEnv(),
+            initial_state=np.zeros(1, dtype=np.float32),
+            task_idx=0,
+            episode_idx=int(mismatch_on_reset),
+            prompt="open the drawer",
+            max_env_steps=1,
+            init_env_fn=lambda *_args, **_kwargs: OBS,
+            rollout_seed=7,
+        )
+        assert record["success"] is False
+        assert record["server_failure"] is True
+        assert record["s4_checkpoint"] == "/expected/checkpoint"
+        assert "checkpoint mismatch" in record["error"]
 
 
 class _SuccessfulService:
@@ -584,7 +630,10 @@ def _install_fake_libero(monkeypatch, *, skipped):
 def test_run_libero_task_persists_env_seed_for_skipped_record_without_libero(tmp_path, monkeypatch):
     _install_fake_libero(monkeypatch, skipped=True)
     client = CosmosProgressiveS4Client(
-        _SuccessfulService(), output_dir=tmp_path, student_steps=2
+        _SuccessfulService(),
+        output_dir=tmp_path,
+        student_steps=2,
+        expected_s4_checkpoint="s4-checkpoint",
     )
 
     record = client.run_libero_task(
@@ -599,11 +648,13 @@ def test_run_libero_task_persists_env_seed_for_skipped_record_without_libero(tmp
     assert record["skipped"] is True
     assert record["seed"] == 31
     assert record["student_steps"] == 2
+    assert record["s4_checkpoint"] == "s4-checkpoint"
     persisted = json.loads(
         (tmp_path / "records" / "task_6_episode_0.json").read_text(encoding="utf-8")
     )
     assert persisted["seed"] == 31
     assert persisted["student_steps"] == 2
+    assert persisted["s4_checkpoint"] == "s4-checkpoint"
 
 
 def test_run_libero_task_forwards_env_seed_to_run_with_env_without_libero(tmp_path, monkeypatch):
@@ -964,6 +1015,68 @@ def test_live_rollout_seed_helper_pairs_python_numpy_and_torch_noise_across_k():
         assert candidate[0] == draws[0][0]
         np.testing.assert_array_equal(candidate[1], draws[0][1])
         torch.testing.assert_close(candidate[2], draws[0][2], rtol=0, atol=0)
+
+
+def test_live_main_reseeds_each_episode_after_k_dependent_prior_consumption(monkeypatch):
+    import random
+
+    import torch
+
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    draws_by_k = {}
+
+    def run_for_k(student_steps):
+        draws = []
+
+        class RecordingClient:
+            def __init__(self, _service, **_kwargs):
+                pass
+
+            def run_libero_task(self, **kwargs):
+                draws.append(
+                    (
+                        kwargs["task_idx"],
+                        random.random(),
+                        np.random.standard_normal(),
+                        torch.randn(()).item(),
+                    )
+                )
+                if kwargs["task_idx"] == 0:
+                    for _ in range(student_steps * 7):
+                        random.random()
+                        np.random.standard_normal()
+                        torch.randn(())
+                return {"task_idx": kwargs["task_idx"]}
+
+        monkeypatch.setattr(
+            rollout,
+            "build_live_service",
+            lambda _args: (object(), SimpleNamespace(close=lambda: None)),
+        )
+        monkeypatch.setattr(rollout, "CosmosProgressiveS4Client", RecordingClient)
+        rollout.main(
+            [
+                "--checkpoint-transformer",
+                "/tmp/s4-transformer",
+                "--prompt-table",
+                "/tmp/training-prompt-table.pt",
+                "--student-steps",
+                str(student_steps),
+                "--env-seed",
+                "41",
+                "--task-range",
+                "0",
+                "2",
+            ]
+        )
+        draws_by_k[student_steps] = draws
+
+    for student_steps in (1, 2, 4):
+        run_for_k(student_steps)
+
+    next_task_draws = [draws_by_k[k][1][1:] for k in (1, 2, 4)]
+    assert next_task_draws[0] == next_task_draws[1] == next_task_draws[2]
 
 
 def test_live_main_seeds_before_building_service(monkeypatch):

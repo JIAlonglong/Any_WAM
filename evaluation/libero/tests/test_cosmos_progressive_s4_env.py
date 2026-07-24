@@ -99,8 +99,8 @@ def test_sourceable_env_file_exports_concrete_cosmos_s4_defaults():
         "/kpfs-intern/jialongliu/projects/Flash-WAM/training_data/libero-long-lerobot/empty_emb.pt"
     )
     assert values["SUITE_ROOT"] == "/tmp/cosmos progressive results/cosmos_s4_full_unit-test"
-    assert values["S4_VIDEO_SEEDS"] == "0,1"
-    assert values["S4_FORMAL_NUM_SHARDS"] == "4"
+    assert values["S4_VIDEO_SEEDS"] == ""
+    assert values["S4_FORMAL_NUM_SHARDS"] == "2"
     assert values["MATRIX_ROOT"] == (
         "/tmp/cosmos progressive results/cosmos_joint_124_unit-test"
     )

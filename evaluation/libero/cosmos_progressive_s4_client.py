@@ -52,6 +52,7 @@ class CosmosProgressiveS4Client:
         *,
         output_dir: str | Path,
         student_steps: int = 4,
+        expected_s4_checkpoint: str | None = None,
         warmup_steps: int = 5,
         warmup_gripper: float = 0.0,
         skip_first_action: bool = False,
@@ -61,6 +62,15 @@ class CosmosProgressiveS4Client:
         self.service = service
         self.output_dir = Path(output_dir)
         self.student_steps = normalize_student_steps(student_steps)
+        service_checkpoint = getattr(service, "checkpoint_identifier", None)
+        checkpoint = (
+            expected_s4_checkpoint
+            if expected_s4_checkpoint is not None
+            else service_checkpoint
+        )
+        self.expected_s4_checkpoint = (
+            str(checkpoint) if checkpoint is not None else None
+        )
         self.warmup_steps = int(warmup_steps)
         self.warmup_gripper = float(warmup_gripper)
         self.skip_first_action = bool(skip_first_action)
@@ -108,6 +118,17 @@ class CosmosProgressiveS4Client:
                 f"client={self.student_steps}, service={response_steps}"
             )
 
+    def _validate_service_checkpoint(self, response: Mapping[str, Any]) -> None:
+        if self.expected_s4_checkpoint is None:
+            return
+        response_checkpoint = response.get("s4_checkpoint")
+        if response_checkpoint != self.expected_s4_checkpoint:
+            raise ValueError(
+                "S4 service checkpoint mismatch: "
+                f"client={self.expected_s4_checkpoint!r}, "
+                f"service={response_checkpoint!r}"
+            )
+
     def _server_failure_record(
         self,
         *,
@@ -125,6 +146,7 @@ class CosmosProgressiveS4Client:
             "prompt": str(prompt),
             "seed": int(rollout_seed),
             "student_steps": self.student_steps,
+            "s4_checkpoint": self.expected_s4_checkpoint,
             "done": False,
             "success": False,
             "server_failure": True,
@@ -183,6 +205,7 @@ class CosmosProgressiveS4Client:
             try:
                 reset_response = self.service.infer({"reset": True, "prompt": prompt})
                 self._validate_service_student_steps(reset_response)
+                self._validate_service_checkpoint(reset_response)
             except Exception as exc:
                 return self._server_failure_record(
                     task_idx=task_idx,
@@ -197,6 +220,7 @@ class CosmosProgressiveS4Client:
                 try:
                     response = self.service.infer({"obs": obs, "prompt": prompt})
                     self._validate_service_student_steps(response)
+                    self._validate_service_checkpoint(response)
                     actions = self._validate_service_action(response)
                 except Exception as exc:
                     return self._server_failure_record(
@@ -210,8 +234,16 @@ class CosmosProgressiveS4Client:
                     )
                 service_metadata = {
                     key: response[key]
-                    for key in ("s4_checkpoint", "decision_duration_s", "raw_anchor_record")
+                    for key in (
+                        "s4_checkpoint",
+                        "decision_duration_s",
+                        "raw_anchor_record",
+                    )
                     if key in response
+                    and not (
+                        key == "s4_checkpoint"
+                        and self.expected_s4_checkpoint is not None
+                    )
                 }
                 start_idx = 1 if self.skip_first_action and chunks == 0 else 0
                 for action in actions[start_idx:]:
@@ -230,6 +262,7 @@ class CosmosProgressiveS4Client:
                 "prompt": str(prompt),
                 "seed": int(rollout_seed),
                 "student_steps": self.student_steps,
+                "s4_checkpoint": self.expected_s4_checkpoint,
                 "done": bool(done),
                 "success": bool(done),
                 "server_failure": False,
@@ -249,6 +282,7 @@ class CosmosProgressiveS4Client:
                 "prompt": str(prompt),
                 "seed": int(rollout_seed),
                 "student_steps": self.student_steps,
+                "s4_checkpoint": self.expected_s4_checkpoint,
                 "done": False,
                 "success": False,
                 "server_failure": False,
@@ -316,6 +350,7 @@ class CosmosProgressiveS4Client:
                 "prompt": prompt,
                 "seed": rollout_seed,
                 "student_steps": self.student_steps,
+                "s4_checkpoint": self.expected_s4_checkpoint,
                 "done": False,
                 "success": False,
                 "server_failure": False,

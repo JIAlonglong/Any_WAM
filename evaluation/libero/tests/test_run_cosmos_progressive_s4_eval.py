@@ -27,6 +27,8 @@ def _launcher_env(tmp_path):
             "S4_SMOKE_CACHE_DIR": str(tmp_path / "teacher cache with spaces"),
             "PYTHON_BIN": sys.executable,
             "S4_DRY_RUN": "1",
+            "S4_EVAL_CLASSIFICATION": "formal_verified",
+            "S4_EVAL_IS_FORMAL": "1",
         }
     )
     return env
@@ -267,9 +269,7 @@ def test_smoke_dry_run_requires_prebuilt_cache_inputs_and_is_nonpaper(tmp_path):
 def _formal_merge_program():
     source = SCRIPT.read_text(encoding="utf-8")
     start_marker = (
-        '    "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" '
-        '"${S4_STUDENT_STEPS}" "${shard_plan}" <<'
-        "'PY'\n"
+        '        "${S4_EVAL_IS_FORMAL}" <<\'PY\'\n'
     )
     end_marker = "\nPY\n}\n\n\nprepare_prompt_table"
     start = source.index(start_marker) + len(start_marker)
@@ -277,7 +277,15 @@ def _formal_merge_program():
     return source[start:end]
 
 
-def _run_formal_merge(root, checkpoint, *, steps=2, shard_plan="0:0:5;1:5:10"):
+def _run_formal_merge(
+    root,
+    checkpoint,
+    *,
+    steps=2,
+    shard_plan="0:0:5;1:5:10",
+    classification="formal_verified",
+    is_formal="1",
+):
     return subprocess.run(
         [
             sys.executable,
@@ -287,6 +295,8 @@ def _run_formal_merge(root, checkpoint, *, steps=2, shard_plan="0:0:5;1:5:10"):
             "50",
             str(steps),
             shard_plan,
+            classification,
+            is_formal,
         ],
         cwd=ROOT,
         input=_formal_merge_program(),
@@ -417,6 +427,167 @@ def test_formal_merge_writes_joint_k_and_accepts_four_shard_plan(tmp_path):
     )
     assert summary["student_steps"] == 2
     assert summary["num_records"] == 500
+    assert summary["evaluation_classification"] == "formal_verified"
+    assert summary["is_formal"] is True
+    assert not (output_root / ".formal_summary.json.tmp").exists()
+
+
+def test_formal_merge_counts_real_failure_setup_and_skip_records_as_unsuccessful(
+    tmp_path, monkeypatch
+):
+    import numpy as np
+
+    from evaluation.libero.cosmos_progressive_s4_client import (
+        CosmosProgressiveS4Client,
+    )
+    from evaluation.libero.tests.test_cosmos_progressive_s4_service import (
+        OBS,
+        _FailingService,
+        _SuccessfulService,
+        _WarmupEnv,
+        _install_fake_libero,
+    )
+
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    checkpoint_id = str(checkpoint.resolve())
+    scratch = tmp_path / "constructed records"
+
+    failure_client = CosmosProgressiveS4Client(
+        _FailingService(),
+        output_dir=scratch / "failure",
+        student_steps=2,
+        expected_s4_checkpoint=checkpoint_id,
+        warmup_steps=0,
+    )
+    failure = failure_client.run_with_env(
+        env=_WarmupEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=0,
+        episode_idx=0,
+        prompt="open the drawer",
+        max_env_steps=1,
+        rollout_seed=0,
+    )
+
+    setup_client = CosmosProgressiveS4Client(
+        _SuccessfulService(),
+        output_dir=scratch / "setup",
+        student_steps=2,
+        expected_s4_checkpoint=checkpoint_id,
+    )
+    setup = setup_client.run_with_env(
+        env=_WarmupEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=0,
+        episode_idx=1,
+        prompt="open the drawer",
+        max_env_steps=1,
+        rollout_seed=1,
+        init_env_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("setup failed")
+        ),
+    )
+
+    _install_fake_libero(monkeypatch, skipped=True)
+    skipped_client = CosmosProgressiveS4Client(
+        _SuccessfulService(),
+        output_dir=scratch / "skip",
+        student_steps=2,
+        expected_s4_checkpoint=checkpoint_id,
+    )
+    skipped = skipped_client.run_libero_task(
+        libero_benchmark="libero_10",
+        task_idx=0,
+        episode_idx=2,
+        camera_size=128,
+        max_env_steps=1,
+        env_seed=2,
+    )
+
+    output_root = tmp_path / "formal output"
+    constructed = {(0, 0): failure, (0, 1): setup, (0, 2): skipped}
+    for task in range(10):
+        shard = 0 if task < 5 else 1
+        for seed in range(50):
+            record = constructed.get(
+                (task, seed),
+                {
+                    "task_idx": task,
+                    "episode_idx": seed,
+                    "seed": seed,
+                    "s4_checkpoint": checkpoint_id,
+                    "student_steps": 2,
+                    "success": True,
+                },
+            )
+            record_path = (
+                output_root
+                / f"shard_{shard}"
+                / f"seed_{seed}"
+                / "records"
+                / f"task_{task}_episode_{seed}.json"
+            )
+            record_path.parent.mkdir(parents=True, exist_ok=True)
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    result = _run_formal_merge(output_root, checkpoint)
+
+    _assert_success(result)
+    summary = json.loads(
+        (output_root / "formal_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["num_records"] == 500
+    assert summary["per_task_success"]["0"] == 47 / 50
+
+
+def test_formal_child_summary_is_published_atomically():
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert 'temporary_path = root / ".formal_summary.json.tmp"' in source
+    assert "os.replace(temporary_path, path)" in source
+
+
+def test_formal_waits_for_every_shard_and_skips_merge_when_one_shard_fails(tmp_path):
+    env = _launcher_env(tmp_path)
+    env.update(
+        {
+            "S4_DRY_RUN": "0",
+            "S4_FORMAL_NUM_SHARDS": "4",
+            "S4_STUDENT_STEPS": "2",
+        }
+    )
+    log = tmp_path / "sentinel.log"
+    sentinel = tmp_path / "multi shard sentinel.py"
+    sentinel.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, sys\n"
+        f"log = pathlib.Path({str(log)!r})\n"
+        "with log.open('a', encoding='utf-8') as stream:\n"
+        "    if '--preflight' in sys.argv:\n"
+        "        stream.write(f'preflight:{os.environ.get(\"CUDA_VISIBLE_DEVICES\")}\\n')\n"
+        "        raise SystemExit(0)\n"
+        "    if sys.argv[1:2] == ['-']:\n"
+        "        stream.write('MERGE\\n')\n"
+        "        raise SystemExit(0)\n"
+        "    seed = sys.argv[sys.argv.index('--env-seed') + 1]\n"
+        "    gpu = os.environ['CUDA_VISIBLE_DEVICES']\n"
+        "    stream.write(f'rollout:{gpu}:{seed}\\n')\n"
+        "if gpu == '0' and seed == '0':\n"
+        "    raise SystemExit(17)\n",
+        encoding="utf-8",
+    )
+    sentinel.chmod(sentinel.stat().st_mode | stat.S_IXUSR)
+    env["PYTHON_BIN"] = str(sentinel)
+
+    result = run_launcher("formal", env=env)
+
+    assert result.returncode != 0
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert "rollout:2:49" in lines
+    assert "rollout:4:49" in lines
+    assert "rollout:6:49" in lines
+    assert "MERGE" not in lines
 
 
 def test_launcher_syntax_and_merge_guards_are_present():

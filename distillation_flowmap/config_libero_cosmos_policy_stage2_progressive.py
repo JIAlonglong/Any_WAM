@@ -191,8 +191,8 @@ cfg.opd_danceopd_query_beta = float(
 cfg.opd_danceopd_verify_terminal_prior = _env_bool(
     "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR", True
 )
-cfg.opd_danceopd_terminal_prior_tolerance = float(
-    os.environ.get("OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE", 1e-6)
+cfg.opd_danceopd_terminal_prior_warn_factor = float(
+    os.environ.get("OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR", 0.5)
 )
 cfg.opd_danceopd_endpoint_weight = float(
     os.environ.get("OPD_DANCEOPD_ENDPOINT_WEIGHT", 1.0)

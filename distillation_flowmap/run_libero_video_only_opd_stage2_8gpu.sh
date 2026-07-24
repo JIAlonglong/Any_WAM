@@ -155,6 +155,22 @@ command=(
     --gradient-accumulation-steps 2
 )
 
+preflight_code='import importlib, os
+cfg = importlib.import_module(os.environ["CONFIG_FILE"]).cfg
+assert tuple(cfg.opd_danceopd_rollout_step_choices) == (2, 4)
+assert cfg.opd_rollout_step_pairs == [[8, 1], [8, 2], [8, 4]]
+assert not cfg.opd_aux_action
+assert cfg.opd_danceopd_action_velocity_weight == 0.0
+print("LIBERO Stage-2 config preflight passed")'
+if ! (
+    cd "${PROJECT_ROOT}"
+    env "${launch_env[@]}" \
+        PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/wan_va:${PROJECT_ROOT}/distillation_flowmap:${PYTHONPATH:-}" \
+        "${PYTHON}" -c "${preflight_code}"
+); then
+    die "LIBERO Stage-2 config preflight failed"
+fi
+
 for item in "${launch_env[@]}"; do printf '%s\n' "${item}"; done
 printf 'MASTER_PORT=%s\n' "${MASTER_PORT}"
 printf 'COMMAND='

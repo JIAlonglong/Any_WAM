@@ -28,15 +28,24 @@ def _positive_unique_steps(value, *, name):
 
 
 # The legacy LIBERO Stage-2 module accepts only one integer for this variable.
-# Preserve the public variable while hiding it during the base import, then
-# parse the universal curriculum here.
-_rollout_steps_text = os.environ.pop("OPD_DANCEOPD_ROLLOUT_STEPS", None)
+# Preserve the public list while exposing one valid scalar during the fresh
+# base import. Removing the variable entirely makes the base config reject a
+# mixed 1/2/4 curriculum before this wrapper can parse it.
+_rollout_steps_text = os.environ.get("OPD_DANCEOPD_ROLLOUT_STEPS")
+_rollout_steps_for_base = (
+    _rollout_steps_text.split(",", 1)[0].strip()
+    if _rollout_steps_text is not None
+    else "2"
+)
+os.environ["OPD_DANCEOPD_ROLLOUT_STEPS"] = _rollout_steps_for_base
 try:
     from distillation_flowmap.config_libero_fullfinetune_stage2_anyflow import (
         cfg as _base_cfg,
     )
 finally:
-    if _rollout_steps_text is not None:
+    if _rollout_steps_text is None:
+        os.environ.pop("OPD_DANCEOPD_ROLLOUT_STEPS", None)
+    else:
         os.environ["OPD_DANCEOPD_ROLLOUT_STEPS"] = _rollout_steps_text
 
 

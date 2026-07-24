@@ -9,7 +9,10 @@ SCRIPT = ROOT / "distillation_flowmap" / "run_libero_video_only_opd_stage2_8gpu.
 
 
 def _write_executable(path: Path):
-    path.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    path.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "${FAKE_PYTHON_LOG:-/dev/null}"\nexit 0\n',
+        encoding="utf-8",
+    )
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
@@ -65,6 +68,8 @@ def _run(*args, env):
 
 def test_dry_run_prints_full_eight_gpu_video_only_contract(tmp_path):
     env = _env(tmp_path)
+    log = tmp_path / "python.log"
+    env["FAKE_PYTHON_LOG"] = str(log)
     result = _run("--dry-run", env=env)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -82,6 +87,7 @@ def test_dry_run_prints_full_eight_gpu_video_only_contract(tmp_path):
     assert "MECHANISM_DIAGNOSTIC_INTERVAL=50" in result.stdout
     assert "--nproc_per_node=8" in result.stdout
     assert "--master_port=29659" in result.stdout
+    assert 'import_module(os.environ["CONFIG_FILE"])' in log.read_text()
     assert not Path(env["OUTPUT_DIR"]).exists()
 
 

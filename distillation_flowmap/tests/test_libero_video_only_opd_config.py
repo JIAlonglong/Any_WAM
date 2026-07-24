@@ -4,6 +4,7 @@ import sys
 
 
 MODULE = "distillation_flowmap.config_libero_fullfinetune_stage2_video_only_opd"
+BASE_MODULE = "distillation_flowmap.config_libero_fullfinetune_stage2_anyflow"
 
 
 def load_config(**env):
@@ -11,6 +12,8 @@ def load_config(**env):
         "MAX_TRAIN_STEPS",
         "SAVE_INTERVAL",
         "OPD_DANCEOPD_ROLLOUT_STEPS",
+        "OPD_QUERY_MODE",
+        "OPD_ROLLOUT_STEP_PAIRS",
         "OPD_DANCEOPD_ACTION_VELOCITY_WEIGHT",
         "OPD_AUX_ACTION",
         "OPD_JOINT_ACTION_ROLLOUT",
@@ -24,9 +27,11 @@ def load_config(**env):
             os.environ.pop(name, None)
         os.environ.update({key: str(value) for key, value in env.items()})
         sys.modules.pop(MODULE, None)
+        sys.modules.pop(BASE_MODULE, None)
         return importlib.import_module(MODULE).cfg
     finally:
         sys.modules.pop(MODULE, None)
+        sys.modules.pop(BASE_MODULE, None)
         for name, value in old.items():
             if value is None:
                 os.environ.pop(name, None)
@@ -52,6 +57,17 @@ def test_defaults_define_full_video_only_universal_contract():
     assert cfg.max_train_steps == 10000
     assert cfg.save_interval == 1000
     assert cfg.seed == 42
+
+
+def test_explicit_mixed_query_grid_survives_fresh_base_import():
+    cfg = load_config(
+        OPD_QUERY_MODE="danceopd",
+        OPD_ROLLOUT_STEP_PAIRS="8,1;8,2;8,4",
+        OPD_DANCEOPD_ROLLOUT_STEPS="2,4",
+    )
+
+    assert cfg.opd_danceopd_rollout_step_choices == (2, 4)
+    assert cfg.opd_rollout_step_pairs == [[8, 1], [8, 2], [8, 4]]
 
 
 def test_action_opd_cannot_be_enabled_by_environment():

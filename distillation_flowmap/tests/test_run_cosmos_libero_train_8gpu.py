@@ -163,6 +163,7 @@ def _layout(tmp_path: Path):
         ROOT / "distillation_flowmap",
         target_is_directory=True,
     )
+    (flashwam_repo / "wan_va").mkdir()
     subprocess.run(
         ["git", "-C", str(flashwam_repo), "add", "distillation_flowmap"],
         check=True,
@@ -301,6 +302,11 @@ def _resolve_for_launcher(env, name, *, output_root, run_tag, **overrides):
         flashwam_repo=env["_TEST_COSMOS_PROJECT_ROOT"],
         cosmos_repo=repo,
         preflight_python=Path(sys.executable),
+        preflight_import_roots=(
+            env["_TEST_COSMOS_PROJECT_ROOT"],
+            Path(env["_TEST_COSMOS_PROJECT_ROOT"]) / "wan_va",
+            Path(sys.prefix) / "lib/python3.10/site-packages",
+        ),
         worker_python=env["COSMOS_POLICY_PYTHON"],
         worker_site_packages=env["COSMOS_WORKER_SITE_PACKAGES"],
         extra_pythonpath=(
@@ -1223,6 +1229,49 @@ def test_ambient_preflight_binary_cannot_reach_output_claim_or_torchrun(
 def test_production_launcher_does_not_accept_preflight_bin_override():
     source = SCRIPT.read_text(encoding="utf-8")
     assert 'PREFLIGHT_BIN="${PREFLIGHT_BIN:-' not in source
+
+
+@pytest.mark.parametrize("injection", ("pythonpath", "cwd"))
+def test_formal_preflight_does_not_execute_ambient_sitecustomize(
+    tmp_path, injection
+):
+    env, _ = _env(tmp_path)
+    hostile = tmp_path / "hostile-python"
+    hostile.mkdir()
+    marker = tmp_path / "sitecustomize-called"
+    (hostile / "sitecustomize.py").write_text(
+        "import os\n"
+        "open(os.environ['SITECUSTOMIZE_MARKER'], 'w').write('called')\n",
+        encoding="utf-8",
+    )
+    env["SITECUSTOMIZE_MARKER"] = str(marker)
+    if injection == "pythonpath":
+        env["PYTHONPATH"] = str(hostile)
+        cwd = ROOT
+    else:
+        env.pop("PYTHONPATH", None)
+        cwd = hostile
+
+    result = _run(
+        "apm",
+        "--output-root",
+        str(tmp_path / "out"),
+        "--run-tag",
+        "isolated",
+        "--dry-run",
+        env=env,
+        cwd=cwd,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+    assert not (tmp_path / "out").exists()
+
+
+def test_production_preflights_never_append_ambient_pythonpath():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "${PYTHONPATH:-}" not in source
+    assert " -I " in source or " -I" in source
 
 
 def test_formal_default_hashes_same_size_large_artifact_mutation(tmp_path):

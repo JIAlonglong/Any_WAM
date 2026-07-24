@@ -69,6 +69,64 @@ PREFLIGHT_REALPATH="/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python3
 [[ "$(/usr/bin/readlink -f -- "$PREFLIGHT_BIN")" == "$PREFLIGHT_REALPATH" ]] || die \
     "fixed formal preflight Python resolves to an unexpected interpreter"
 PREFLIGHT_BIN="$PREFLIGHT_REALPATH"
+PREFLIGHT_SITE_PACKAGES="/kpfs-intern/jialongliu/miniforge3/envs/flashwam/lib/python3.10/site-packages"
+[[ -d "$PREFLIGHT_SITE_PACKAGES" && ! -L "$PREFLIGHT_SITE_PACKAGES" ]] || die \
+    "fixed formal preflight site-packages is not a plain directory"
+FORMAL_PREFLIGHT_DRIVER='import base64, os, sys, sysconfig
+project, wan_va, site_packages, payload = sys.argv[1:5]
+payload_args = sys.argv[5:]
+approved = [os.path.realpath(value) for value in (project, wan_va, site_packages)]
+if any(not os.path.isabs(value) or not os.path.isdir(value) for value in approved):
+    raise SystemExit("formal preflight import root is invalid")
+paths = sysconfig.get_paths()
+candidates = [
+    paths.get("stdlib"),
+    paths.get("platstdlib"),
+    os.path.join(paths["stdlib"], "lib-dynload"),
+    *approved,
+]
+resolved = []
+for value in candidates:
+    if not value:
+        continue
+    value = os.path.realpath(value)
+    if os.path.isdir(value) and value not in resolved:
+        resolved.append(value)
+sys.path[:] = resolved
+if any(name in sys.modules for name in ("site", "sitecustomize", "usercustomize")):
+    raise SystemExit("formal preflight imported site customization")
+sys.argv[:] = ["-c", *payload_args]
+source = base64.b64decode(payload, validate=True).decode("utf-8")
+exec(compile(source, "<formal-preflight>", "exec"), {"__name__": "__main__"})'
+
+run_formal_preflight() {
+    local source="$1"
+    shift
+    local encoded
+    local entry
+    local name
+    local -a clean_environment=()
+    encoded="$(printf '%s' "$source" | /usr/bin/base64 -w0)" || die \
+        "failed to encode formal preflight payload"
+    while IFS= read -r -d '' entry; do
+        name="${entry%%=*}"
+        case "$name" in
+            PYTHON*|LD_*|DYLD_*|PATH|HOME|BASH_ENV|ENV)
+                ;;
+            *)
+                clean_environment+=("$entry")
+                ;;
+        esac
+    done < <(/usr/bin/env -0)
+    /usr/bin/env -i \
+        "${clean_environment[@]}" \
+        PATH=/usr/bin:/bin HOME=/nonexistent \
+        LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+        PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0 PYTHONNOUSERSITE=1 \
+        "$PREFLIGHT_BIN" -I -E -s -S -c "$FORMAL_PREFLIGHT_DRIVER" \
+        "$PROJECT_ROOT" "$PROJECT_ROOT/wan_va" "$PREFLIGHT_SITE_PACKAGES" \
+        "$encoded" "$@"
+}
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 [[ -n "${COSMOS_STAGE1_ROOT:-}" ]] || die "COSMOS_STAGE1_ROOT must be explicitly set"
 [[ -n "${STUDENT_BASE_MODEL_PATH:-}" ]] || die "STUDENT_BASE_MODEL_PATH must be explicitly set"
@@ -146,7 +204,8 @@ from distillation_flowmap.cosmos_libero_provenance import (
 )
 (
     dataset, teacher, video_vae, local_model, lock_root,
-    flashwam_repo, cosmos_repo, preflight_python, worker_python, worker_site_packages,
+    flashwam_repo, cosmos_repo, preflight_python, preflight_roots,
+    worker_python, worker_site_packages,
     extra_pythonpath, verify_large,
 ) = sys.argv[1:]
 payload = resolve_formal_provenance(
@@ -161,6 +220,7 @@ payload = resolve_formal_provenance(
     flashwam_repo=flashwam_repo,
     cosmos_repo=cosmos_repo,
     preflight_python=preflight_python,
+    preflight_import_roots=tuple(preflight_roots.split(":")),
     worker_python=worker_python,
     worker_site_packages=worker_site_packages,
     extra_pythonpath=tuple(part for part in extra_pythonpath.split(":") if part),
@@ -169,13 +229,12 @@ payload = resolve_formal_provenance(
 print("PROVENANCE_IDENTITY_JSON=" + canonical_json(payload))
 print("PROVENANCE_IDENTITY_SHA256=" + payload["identity_sha256"])'
 provenance_output="$(
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
-        "$PREFLIGHT_BIN" -c "$provenance_code" \
+    run_formal_preflight "$provenance_code" \
         "$DATASET_PATH" "$COSMOS_POLICY_PATH" "$STUDENT_BASE_MODEL_PATH" \
         "$COSMOS_PREDICT25_LOCAL_MODEL_DIR" "$COSMOS_PROVENANCE_LOCK_ROOT" \
         "$FLASHWAM_PROVENANCE_REPO" "$COSMOS_PREDICT2_REPO" \
         "$PREFLIGHT_BIN" \
+        "$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PREFLIGHT_SITE_PACKAGES" \
         "$COSMOS_POLICY_PYTHON" "$COSMOS_WORKER_SITE_PACKAGES" \
         "$COSMOS_POLICY_EXTRA_PYTHONPATH" "$VERIFY_LARGE_ARTIFACT_DIGESTS"
 )" || die "formal provenance preflight failed"
@@ -326,9 +385,7 @@ for env_name, field in identity_exports.items():
 for key, value in values.items():
     print(f"{key}={value}")'
 resolved="$(
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
-        "$PREFLIGHT_BIN" -c "$resolver_code" \
+    run_formal_preflight "$resolver_code" \
         "$arm" "$output_root" "$run_tag" "$steps" "$save_interval" "$master_port" \
         "$DATASET_PATH" "$COSMOS_POLICY_PATH" "$STUDENT_BASE_MODEL_PATH" \
         "$COSMOS_PREDICT2_REPO" "$COSMOS_POLICY_PYTHON" \
@@ -366,9 +423,7 @@ validate_stage2_path_isolation(
     output_dir=Path(sys.argv[2]) / sys.argv[3] / sys.argv[4],
     resume_checkpoint=None,
 )'
-PYTHONDONTWRITEBYTECODE=1 \
-PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
-    "$PREFLIGHT_BIN" -c "$raw_output_preflight_code" \
+run_formal_preflight "$raw_output_preflight_code" \
     "$STAGE1_ROOT" "$output_root" "$run_tag" "$arm" || die \
     "raw Stage-2 output path preflight failed"
 DATASET_PATH="${DATASET_PATH:-/kpfs-intern/jialongliu/projects/Flash-WAM/training_data/libero-long-lerobot}"
@@ -483,16 +538,13 @@ print("PARENT_STAGE1_CONTRACT_IDENTITY=" + parent.contract_identity)
 print("STAGE2_LINEAGE_JSON=" + json.dumps(payload, sort_keys=True, separators=(",", ":")))'
 lineage_output="$(
     cd "$PROJECT_ROOT"
-    env \
-        COSMOS_STAGE1_ROOT="$STAGE1_ROOT" \
-        OUTPUT_DIR="$OUTPUT_DIR" \
-        COSMOS_LIBERO_VARIANT_JSON="$COSMOS_LIBERO_VARIANT_JSON" \
-        COSMOS_LIBERO_PROVENANCE_JSON="$COSMOS_LIBERO_PROVENANCE_JSON" \
-        STAGE2_RESUME_CHECKPOINT="${resume_step:+$RESUME_FROM_PATH}" \
-        STAGE2_RESUME_STEP="${resume_step:-0}" \
-        PYTHONDONTWRITEBYTECODE=1 \
-        PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
-        "$PREFLIGHT_BIN" -c "$lineage_code"
+    export COSMOS_STAGE1_ROOT="$STAGE1_ROOT"
+    export OUTPUT_DIR="$OUTPUT_DIR"
+    export COSMOS_LIBERO_VARIANT_JSON="$COSMOS_LIBERO_VARIANT_JSON"
+    export COSMOS_LIBERO_PROVENANCE_JSON="$COSMOS_LIBERO_PROVENANCE_JSON"
+    export STAGE2_RESUME_CHECKPOINT="${resume_step:+$RESUME_FROM_PATH}"
+    export STAGE2_RESUME_STEP="${resume_step:-0}"
+    run_formal_preflight "$lineage_code"
 )" || die "Stage-2 lineage/variant preflight failed"
 while IFS='=' read -r key value; do
     case "$key" in
@@ -559,9 +611,7 @@ for name in sorted(CLEARED_LEGACY_ENV):
     print(f"UNSET_LEGACY\t{name}\t")'
 schema_actions_output="$(
     cd "$PROJECT_ROOT"
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
-        "$PREFLIGHT_BIN" -c "$schema_actions_code"
+    run_formal_preflight "$schema_actions_code"
 )" || die "failed to resolve schema-owned launcher actions"
 while IFS=$'\t' read -r action key value; do
     [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die \
@@ -595,9 +645,7 @@ print(
 )'
 env_contract_output="$(
     cd "$PROJECT_ROOT"
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
-        "$PREFLIGHT_BIN" -c "$env_contract_code"
+    run_formal_preflight "$env_contract_code"
 )" || die "launcher environment contract preflight failed"
 while IFS='=' read -r key value; do
     case "$key" in
@@ -633,9 +681,7 @@ print(
 )'
 (
     cd "$PROJECT_ROOT"
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
-        "$PREFLIGHT_BIN" -c "$config_preflight_code"
+    run_formal_preflight "$config_preflight_code"
 ) || die "config preflight failed"
 
 train_cmd=(
@@ -758,7 +804,7 @@ for filename, variable in (
         handle.write(os.environ[variable] + "\n")
         handle.flush()
         os.fsync(handle.fileno())'
-    "$PREFLIGHT_BIN" -c "$manifest_code" || die \
+    run_formal_preflight "$manifest_code" || die \
         "failed to persist canonical variant manifest"
 fi
 cd "$PROJECT_ROOT"

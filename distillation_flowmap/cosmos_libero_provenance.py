@@ -17,6 +17,8 @@ PROVENANCE_SCHEMA = "flashwam_cosmos_provenance_v1"
 _SHA256_HEX_LENGTH = 64
 _MAX_PACKAGE_METADATA_FILES = 4096
 _MAX_PACKAGE_METADATA_BYTES = 64 << 20
+_GIT_BINARY = Path("/usr/bin/git")
+_GIT_EXEC_PATH = Path("/usr/lib/git-core")
 
 
 class ProvenanceError(ValueError):
@@ -210,25 +212,16 @@ def verify_artifact_lock(
 
 
 def fingerprint_git_repository(
-    path: str | Path, *, purpose: str
+    path: str | Path,
+    *,
+    purpose: str,
+    git_executor: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     root = _canonical_root(path, label=f"{purpose} repository")
-    git_environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_")
-    }
-    git_environment.update(
-        {
-            "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_SYSTEM": os.devnull,
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0",
-        }
-    )
+    executor = dict(git_executor or _git_executor_identity())
+    git_environment = _git_environment(executor["exec_path"])
     git_prefix = [
-        "git",
+        executor["binary_realpath"],
         "-c",
         "core.refreshIndex=false",
         "-c",
@@ -258,6 +251,64 @@ def fingerprint_git_repository(
             f"{purpose} repository is dirty; formal provenance requires a clean tree"
         )
     return {"kind": "git-clean", "head": head, "root": str(root)}
+
+
+def _git_environment(exec_path: str) -> dict[str, str]:
+    return {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/nonexistent",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_EXEC_PATH": exec_path,
+    }
+
+
+def _git_executor_identity() -> dict[str, Any]:
+    if (
+        _GIT_BINARY.is_symlink()
+        or not _GIT_BINARY.is_file()
+        or not os.access(_GIT_BINARY, os.X_OK)
+        or _GIT_BINARY.resolve(strict=True) != _GIT_BINARY
+    ):
+        raise ProvenanceError("fixed Git binary is not the reviewed executable")
+    if (
+        _GIT_EXEC_PATH.is_symlink()
+        or not _GIT_EXEC_PATH.is_dir()
+        or _GIT_EXEC_PATH.resolve(strict=True) != _GIT_EXEC_PATH
+    ):
+        raise ProvenanceError("fixed Git exec path is not the reviewed directory")
+    environment = _git_environment(str(_GIT_EXEC_PATH))
+    try:
+        version = subprocess.run(
+            [str(_GIT_BINARY), "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        ).stdout.strip()
+        exec_path = subprocess.run(
+            [str(_GIT_BINARY), "--exec-path"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ProvenanceError("fixed Git executor probe failed") from exc
+    if not version.startswith("git version ") or exec_path != str(_GIT_EXEC_PATH):
+        raise ProvenanceError("fixed Git executor returned an unexpected identity")
+    return {
+        "binary_realpath": str(_GIT_BINARY),
+        "binary_sha256": _sha256_file(_GIT_BINARY),
+        "size_bytes": _GIT_BINARY.stat().st_size,
+        "version": version,
+        "exec_path": exec_path,
+    }
 
 
 _WORKER_PROBE = r"""
@@ -350,7 +401,10 @@ def _worker_identity(
     return payload
 
 
-def _preflight_identity(python: str | Path) -> dict[str, Any]:
+def _preflight_identity(
+    python: str | Path,
+    import_roots: Iterable[str | Path],
+) -> dict[str, Any]:
     requested = Path(python)
     if not requested.is_file() or not os.access(requested, os.X_OK):
         raise ProvenanceError(
@@ -362,6 +416,12 @@ def _preflight_identity(python: str | Path) -> dict[str, Any]:
         raise ProvenanceError(
             "formal preflight Python does not match the running interpreter"
         )
+    roots = [
+        str(_canonical_root(root, label="formal preflight import root"))
+        for root in import_roots
+    ]
+    if not roots or len(set(roots)) != len(roots):
+        raise ProvenanceError("formal preflight import roots must be unique")
     payload = {
         "python_realpath": str(executable),
         "python_sha256": _sha256_file(executable),
@@ -370,6 +430,7 @@ def _preflight_identity(python: str | Path) -> dict[str, Any]:
         "implementation": platform.python_implementation(),
         "prefix": str(Path(sys.prefix).resolve(strict=True)),
         "base_prefix": str(Path(sys.base_prefix).resolve(strict=True)),
+        "import_roots": roots,
     }
     payload["identity_sha256"] = _sha256_bytes(canonical_json(payload).encode())
     return payload
@@ -388,6 +449,7 @@ def resolve_formal_provenance(
     flashwam_repo: str | Path,
     cosmos_repo: str | Path,
     preflight_python: str | Path,
+    preflight_import_roots: Iterable[str | Path],
     worker_python: str | Path,
     worker_site_packages: str | Path,
     extra_pythonpath: Iterable[str | Path],
@@ -395,8 +457,10 @@ def resolve_formal_provenance(
 ) -> dict[str, Any]:
     """Resolve formal provenance without writing or recursively walking artifacts."""
 
+    git_executor = _git_executor_identity()
     payload = {
         "schema": PROVENANCE_SCHEMA,
+        "git": git_executor,
         "dataset": verify_artifact_lock(
             dataset_root,
             dataset_lock,
@@ -418,12 +482,15 @@ def resolve_formal_provenance(
             verify_large_artifact_digests=verify_large_artifact_digests,
         ),
         "flashwam_repo": fingerprint_git_repository(
-            flashwam_repo, purpose="Flash-WAM"
+            flashwam_repo, purpose="Flash-WAM", git_executor=git_executor
         ),
         "cosmos_repo": fingerprint_git_repository(
-            cosmos_repo, purpose="Cosmos"
+            cosmos_repo, purpose="Cosmos", git_executor=git_executor
         ),
-        "preflight": _preflight_identity(preflight_python),
+        "preflight": _preflight_identity(
+            preflight_python,
+            preflight_import_roots,
+        ),
         "worker": _worker_identity(
             worker_python,
             worker_site_packages,

@@ -114,6 +114,10 @@ def _resolve(fixture, *, verify_large=True):
         flashwam_repo=fixture["flashwam_repo"],
         cosmos_repo=fixture["cosmos_repo"],
         preflight_python=Path(sys.executable),
+        preflight_import_roots=(
+            fixture["flashwam_repo"],
+            fixture["worker_site_packages"],
+        ),
         worker_python=fixture["worker_python"],
         worker_site_packages=fixture["worker_site_packages"],
         extra_pythonpath=fixture["extra_pythonpath"],
@@ -230,6 +234,9 @@ def test_dry_run_resolver_is_read_only_and_returns_bounded_identity(tmp_path):
     assert payload["teacher"]["tree_digest"]
     assert payload["flashwam_repo"]["kind"] == "git-clean"
     assert payload["cosmos_repo"]["kind"] == "git-clean"
+    assert payload["git"]["binary_realpath"] == "/usr/bin/git"
+    assert payload["git"]["binary_sha256"]
+    assert payload["git"]["version"].startswith("git version ")
     assert payload["preflight"]["python_realpath"] == str(
         Path(sys.executable).resolve()
     )
@@ -307,7 +314,7 @@ def test_git_fingerprint_disables_optional_locks_and_index_refresh(
     original = subprocess.run
 
     def recording_run(*args, **kwargs):
-        if args and isinstance(args[0], list) and args[0][:1] == ["git"]:
+        if args and isinstance(args[0], list) and args[0][:1] == ["/usr/bin/git"]:
             calls.append((tuple(args[0]), dict(kwargs.get("env") or {})))
         return original(*args, **kwargs)
 
@@ -324,8 +331,9 @@ def test_git_fingerprint_disables_optional_locks_and_index_refresh(
         assert "GIT_CONFIG_COUNT" not in environment
         assert "GIT_CONFIG_KEY_0" not in environment
         assert "GIT_CONFIG_VALUE_0" not in environment
-        assert ("-c", "core.refreshIndex=false") == command[1:3]
-        assert ("-c", "core.fsmonitor=false") == command[3:5]
+        if command[1:] not in (("--version",), ("--exec-path",)):
+            assert ("-c", "core.refreshIndex=false") == command[1:3]
+            assert ("-c", "core.fsmonitor=false") == command[3:5]
 
 
 def test_git_fingerprint_rejects_repository_selection_environment_redirect(
@@ -339,3 +347,24 @@ def test_git_fingerprint_rejects_repository_selection_environment_redirect(
 
     with pytest.raises(ProvenanceError, match="dirty|environment|redirect"):
         fingerprint_git_repository(real_repo, purpose="real")
+
+
+def test_git_fingerprint_never_executes_a_path_injected_git(
+    tmp_path, monkeypatch
+):
+    repo = _git_repo(tmp_path / "repo")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "fake-git-called"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\nprintf called > " + repr(str(marker)) + "\n"
+        "exec /usr/bin/git \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+    fingerprint_git_repository(repo, purpose="fixture")
+
+    assert not marker.exists()

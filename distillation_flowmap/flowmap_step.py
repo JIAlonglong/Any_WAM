@@ -123,6 +123,10 @@ from distillation_flowmap.mechanism_diagnostics import (
     diagnostic_seed,
     pack_finite_metric_stats,
 )
+from distillation_flowmap.video_action_bridge import (
+    bridge_probability,
+    masked_action_teacher_forcing_loss,
+)
 
 
 class FlowMapStepMixin:
@@ -5882,6 +5886,8 @@ class FlowMapStepMixin:
                     current_video, video_t, current_action, action_t,
                     video_base=rollout_video_base,
                     action_latent=rollout_action_latent,
+                    condition_video=current_video.detach(),
+                    condition_action=action_clean,
                     action_cond_t=rollout_action_cond_t,
                     action_text=rollout_action_text,
                     action_grid=action_grid_id,
@@ -5970,6 +5976,8 @@ class FlowMapStepMixin:
             query_video, query_video_t, query_action, query_action_t,
             video_base=input_dict['latent_dict'],
             action_latent=action_base['latent'][:, :, ::action_downsample],
+            condition_video=query_video.detach(),
+            condition_action=action_clean,
             action_cond_t=action_base['cond_timesteps'][:, ::action_downsample],
             action_text=action_base['text_emb'],
             action_grid=_downsample_action_grid_id(
@@ -6007,6 +6015,97 @@ class FlowMapStepMixin:
         velocity_loss = direct_velocity_mse(
             student_video_velocity, teacher_video_velocity
         )
+        bridge_enabled = bool(getattr(
+            self.config, 'video_action_bridge', False
+        ))
+        bridge_weight = float(getattr(
+            self.config, 'video_action_bridge_weight', 0.0
+        ))
+        bridge_active_probability = bridge_probability(
+            int(getattr(self, 'step', 0)),
+            warmup_end=int(getattr(
+                self.config, 'video_action_bridge_warmup_end', 500
+            )),
+            mid_end=int(getattr(
+                self.config, 'video_action_bridge_mid_end', 1500
+            )),
+            start_probability=float(getattr(
+                self.config, 'video_action_bridge_start_probability', 0.25
+            )),
+            mid_probability=float(getattr(
+                self.config, 'video_action_bridge_mid_probability', 0.50
+            )),
+            final_probability=float(getattr(
+                self.config, 'video_action_bridge_final_probability', 0.75
+            )),
+        )
+        bridge_active_tensor = torch.zeros((), device=self.device, dtype=torch.int64)
+        if bridge_enabled and bridge_weight > 0:
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                bridge_active_tensor.copy_(
+                    torch.rand((), device=self.device)
+                    < bridge_active_probability
+                )
+            if dist.is_initialized():
+                dist.broadcast(bridge_active_tensor, src=0)
+        bridge_active = bool(bridge_active_tensor.item())
+        bridge_loss = torch.zeros(
+            (), device=self.device, dtype=velocity_loss.dtype
+        )
+        if bridge_active:
+            # Preserve direct action teacher forcing at the selected deployment
+            # time while replacing only the video condition with the detached
+            # student rollout.  This remains distinct from action OPD.
+            bridge_action_state = self.train_scheduler_action.add_noise(
+                action_clean, action_noise, query_action_t, t_dim=2
+            )
+            bridge_action_target = self.train_scheduler_action.training_target(
+                action_clean, action_noise, query_action_t
+            )
+            bridge_input = self._build_joint_input(
+                query_video,
+                query_video_t,
+                bridge_action_state,
+                query_action_t,
+                video_base=input_dict['latent_dict'],
+                action_latent=action_base['latent'][:, :, ::action_downsample],
+                condition_video=query_video.detach(),
+                condition_action=action_clean,
+                action_cond_t=action_base['cond_timesteps'][:, ::action_downsample],
+                action_text=action_base['text_emb'],
+                action_grid=_downsample_action_grid_id(
+                    action_base.get('grid_id'),
+                    action_base['latent'],
+                    action_downsample,
+                ),
+                action_valid_mask=action_mask,
+                chunk_size=input_dict['chunk_size'],
+                window_size=input_dict['window_size'],
+            )
+            self._init_joint_mask(bridge_input)
+            _, bridge_action_velocity_seq = self._student_joint_forward(
+                self.student,
+                bridge_input,
+                empty_emb,
+                query_video_t,
+                query_action_t,
+                cfg_scale=cfg_scale,
+                batch_size=B,
+                ref_shape=ref_shape,
+                require_action=True,
+            )
+            if bridge_action_velocity_seq is None:
+                raise RuntimeError(
+                    "video-to-action bridge requires a student action output"
+                )
+            bridge_action_velocity = self._extract_action_v(
+                bridge_action_velocity_seq, action_frames
+            )
+            bridge_loss = masked_action_teacher_forcing_loss(
+                bridge_action_velocity,
+                bridge_action_target,
+                action_mask,
+            )
         velocity_weight = float(getattr(
             self.config, 'opd_danceopd_velocity_weight', 1.0
         ))
@@ -6032,11 +6131,17 @@ class FlowMapStepMixin:
         raw_velocity_contrib = velocity_weight * velocity_loss
         raw_endpoint_contrib = endpoint_weight * endpoint_loss
         aux_weight = float(getattr(self.config, 'opd_aux_weight', 1.0))
-        loss = (raw_velocity_contrib + raw_endpoint_contrib) * aux_weight
+        raw_bridge_contrib = bridge_weight * bridge_loss
+        loss = (
+            raw_velocity_contrib + raw_endpoint_contrib
+        ) * aux_weight + raw_bridge_contrib
         velocity_contrib = raw_velocity_contrib * aux_weight
         endpoint_contrib = raw_endpoint_contrib * aux_weight
+        bridge_contrib = raw_bridge_contrib
         contrib_denom = (
-            velocity_contrib.detach().abs() + endpoint_contrib.detach().abs()
+            velocity_contrib.detach().abs()
+            + endpoint_contrib.detach().abs()
+            + bridge_contrib.detach().abs()
         ).clamp(min=1e-12)
         result = {
             'loss': loss.detach(),
@@ -6063,6 +6168,17 @@ class FlowMapStepMixin:
             'opd_local_fm_ratio': zero,
             'opd_action_transition_ratio': zero,
             'opd_action_local_fm_ratio': zero,
+            'video_action_bridge_loss': bridge_loss.detach(),
+            'video_action_bridge_contrib': bridge_contrib.detach(),
+            'video_action_bridge_ratio': (
+                bridge_contrib.detach().abs() / contrib_denom
+            ),
+            'video_action_bridge_probability': torch.as_tensor(
+                bridge_active_probability,
+                device=self.device,
+                dtype=velocity_loss.dtype,
+            ),
+            'video_action_bridge_active': bridge_active_tensor.detach(),
             'danceopd_query_index_mean': danceopd_query_index_mean,
             'danceopd_query_sigma_mean': danceopd_query_sigma_mean,
             'danceopd_terminal_prior_max_error': danceopd_terminal_prior_max_error.detach(),

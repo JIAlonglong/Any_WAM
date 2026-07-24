@@ -2737,6 +2737,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         acc_opd_local_fm_ratios = []
         acc_opd_action_transition_ratios = []
         acc_opd_action_local_fm_ratios = []
+        acc_video_action_bridge_losses = []
+        acc_video_action_bridge_contribs = []
+        acc_video_action_bridge_probabilities = []
+        acc_video_action_bridge_actives = []
         acc_opd_transition_group_scaled = []
         acc_opd_anchor_group_scaled = []
         acc_opd_transition_scales = []
@@ -2981,6 +2985,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             acc_opd_action_local_fm_ratios.append(
                 opd_aux_result.get("opd_action_local_fm_ratio", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
+            acc_video_action_bridge_losses.append(
+                opd_aux_result.get("video_action_bridge_loss", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_video_action_bridge_contribs.append(
+                opd_aux_result.get("video_action_bridge_contrib", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_video_action_bridge_probabilities.append(
+                opd_aux_result.get("video_action_bridge_probability", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
+            acc_video_action_bridge_actives.append(
+                opd_aux_result.get("video_action_bridge_active", zero_tensor)
+                if opd_aux_result is not None else zero_tensor)
             acc_opd_transition_group_scaled.append(
                 opd_aux_result.get("opd_transition_group_scaled", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
@@ -3152,6 +3168,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     torch.stack(acc_opd_local_fm_ratios).sum(),
                     torch.stack(acc_opd_action_transition_ratios).sum(),
                     torch.stack(acc_opd_action_local_fm_ratios).sum(),
+                    torch.stack(acc_video_action_bridge_losses).sum(),
+                    torch.stack(acc_video_action_bridge_contribs).sum(),
+                    torch.stack(acc_video_action_bridge_probabilities).sum(),
+                    torch.stack(acc_video_action_bridge_actives).sum(),
                     torch.stack(acc_opd_transition_group_scaled).sum(),
                     torch.stack(acc_opd_anchor_group_scaled).sum(),
                     torch.stack(acc_opd_transition_scales).sum(),
@@ -3184,7 +3204,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     metric_values, nan=0.0, posinf=0.0, neginf=0.0
                 )
                 metric_results = dist_mean(metric_values).tolist()
-                base_metric_count = 41
+                base_metric_count = 45
                 (
                     avg_loss,
                     avg_video_loss,
@@ -3221,6 +3241,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     avg_opd_local_fm_ratio,
                     avg_opd_action_transition_ratio,
                     avg_opd_action_local_fm_ratio,
+                    avg_video_action_bridge_loss,
+                    avg_video_action_bridge_contrib,
+                    avg_video_action_bridge_probability,
+                    avg_video_action_bridge_active,
                     avg_opd_transition_group_scaled,
                     avg_opd_anchor_group_scaled,
                     avg_opd_transition_scale,
@@ -3307,6 +3331,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_opd_local_fm_ratios = []
                 acc_opd_action_transition_ratios = []
                 acc_opd_action_local_fm_ratios = []
+                acc_video_action_bridge_losses = []
+                acc_video_action_bridge_contribs = []
+                acc_video_action_bridge_probabilities = []
+                acc_video_action_bridge_actives = []
                 acc_opd_transition_group_scaled = []
                 acc_opd_anchor_group_scaled = []
                 acc_opd_transition_scales = []
@@ -3398,6 +3426,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         postfix["ovt"] = f"{avg_opd_video_transition_loss:.2e}"
                         postfix["oep"] = f"{avg_opd_endpoint_aux_loss:.2e}"
                         postfix["ossv"] = f"{avg_opd_same_state_velocity_loss:.2e}"
+                        postfix["vab"] = f"{avg_video_action_bridge_loss:.2e}"
                         postfix["ovlfm"] = f"{avg_opd_local_fm_loss:.2e}"
                         postfix["wovt"] = f"{avg_opd_video_transition_contrib:.2e}"
                         postfix["rat"] = f"{avg_opd_video_transition_ratio:.2f}/{avg_opd_action_transition_ratio:.2f}/{avg_opd_action_local_fm_ratio:.2f}"
@@ -3408,6 +3437,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         log_dict["loss/opd_endpoint_aux"] = avg_opd_endpoint_aux_loss
                         log_dict["loss/opd_same_state_velocity"] = avg_opd_same_state_velocity_loss
                         log_dict["loss/opd_local_fm"] = avg_opd_local_fm_loss
+                        log_dict["loss/video_action_bridge"] = avg_video_action_bridge_loss
+                        log_dict["loss_weighted/video_action_bridge"] = avg_video_action_bridge_contrib
+                        log_dict["video_action_bridge/probability"] = avg_video_action_bridge_probability
+                        log_dict["video_action_bridge/active"] = avg_video_action_bridge_active
                         log_dict["loss_weighted/opd_video_transition"] = avg_opd_video_transition_contrib
                         log_dict["loss_weighted/opd_endpoint_aux"] = avg_opd_endpoint_aux_contrib
                         log_dict["loss_weighted/opd_same_state_velocity"] = avg_opd_same_state_velocity_contrib

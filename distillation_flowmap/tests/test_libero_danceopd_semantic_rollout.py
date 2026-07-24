@@ -3,6 +3,7 @@ from pathlib import Path
 
 
 FLOWMAP_STEP = Path(__file__).resolve().parents[1] / "flowmap_step.py"
+FLOWMAP_TRAINER = Path(__file__).resolve().parents[1] / "flowmap_trainer.py"
 
 
 def _danceopd_function():
@@ -60,3 +61,37 @@ def test_danceopd_releases_full_rollout_before_trainable_query():
     query_position = block.index("student_query_input = self._build_joint_input(")
 
     assert release_position < query_position
+
+
+def test_danceopd_conditions_action_on_detached_generated_video():
+    source = FLOWMAP_STEP.read_text(encoding="utf-8")
+    block = source.split("def _danceopd_aux_transition_step(", 1)[1].split(
+        "def _opd_aux_transition_step(", 1
+    )[0]
+
+    assert "condition_video=current_video.detach()" in block
+    assert "condition_video=query_video.detach()" in block
+    assert "condition_action=action_clean" in block
+    assert "masked_action_teacher_forcing_loss(" in block
+    assert "self.train_scheduler_action.training_target(" in block
+    assert "'video_action_bridge_loss': bridge_loss.detach()" in block
+
+
+def test_video_action_bridge_does_not_reenable_action_opd():
+    source = FLOWMAP_STEP.read_text(encoding="utf-8")
+    block = source.split("def _danceopd_aux_transition_step(", 1)[1].split(
+        "def _opd_aux_transition_step(", 1
+    )[0]
+
+    assert "'opd_action_transition_loss': zero" in block
+    assert "'opd_action_local_fm_loss': zero" in block
+
+
+def test_video_action_bridge_metrics_are_forwarded_to_training_logs():
+    source = FLOWMAP_TRAINER.read_text(encoding="utf-8")
+
+    assert 'opd_aux_result.get("video_action_bridge_loss"' in source
+    assert 'log_dict["loss/video_action_bridge"]' in source
+    assert 'log_dict["loss_weighted/video_action_bridge"]' in source
+    assert 'log_dict["video_action_bridge/active"]' in source
+    assert 'log_dict["video_action_bridge/probability"]' in source

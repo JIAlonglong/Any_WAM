@@ -95,6 +95,51 @@ if cfg.action_loss_weight <= 0:
 if cfg.gt_regression_weight <= 0:
     raise ValueError("GT regression must remain enabled for the action anchor")
 
+# The auxiliary action anchor reads the detached student-generated video while
+# retaining the clean action condition and direct x0 supervision.  This is not
+# action OPD: no teacher action field or action transition target is introduced.
+cfg.video_action_bridge = _env_bool("VIDEO_ACTION_BRIDGE", True)
+cfg.video_action_bridge_weight = float(
+    os.environ.get("VIDEO_ACTION_BRIDGE_WEIGHT", 1.0)
+)
+cfg.video_action_bridge_warmup_end = int(
+    os.environ.get("VIDEO_ACTION_BRIDGE_WARMUP_END", 500)
+)
+cfg.video_action_bridge_mid_end = int(
+    os.environ.get("VIDEO_ACTION_BRIDGE_MID_END", 1500)
+)
+cfg.video_action_bridge_start_probability = float(
+    os.environ.get("VIDEO_ACTION_BRIDGE_START_PROB", 0.25)
+)
+cfg.video_action_bridge_mid_probability = float(
+    os.environ.get("VIDEO_ACTION_BRIDGE_MID_PROB", 0.50)
+)
+cfg.video_action_bridge_final_probability = float(
+    os.environ.get("VIDEO_ACTION_BRIDGE_FINAL_PROB", 0.75)
+)
+if (
+    not math.isfinite(cfg.video_action_bridge_weight)
+    or cfg.video_action_bridge_weight < 0
+):
+    raise ValueError("VIDEO_ACTION_BRIDGE_WEIGHT must be finite and non-negative")
+if (
+    cfg.video_action_bridge_warmup_end < 0
+    or cfg.video_action_bridge_mid_end < cfg.video_action_bridge_warmup_end
+):
+    raise ValueError(
+        "video action bridge curriculum must satisfy "
+        "0 <= warmup_end <= mid_end"
+    )
+if any(
+    not math.isfinite(value) or value < 0 or value > 1
+    for value in (
+        cfg.video_action_bridge_start_probability,
+        cfg.video_action_bridge_mid_probability,
+        cfg.video_action_bridge_final_probability,
+    )
+):
+    raise ValueError("video action bridge probabilities must lie in [0, 1]")
+
 cfg.opd_aux_interval = int(os.environ.get("OPD_AUX_INTERVAL", 4))
 cfg.opd_aux_prob = float(os.environ.get("OPD_AUX_PROB", 1.0))
 cfg.opd_danceopd_diagnostic_interval = int(

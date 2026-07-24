@@ -966,6 +966,124 @@ def test_live_rollout_seed_helper_pairs_python_numpy_and_torch_noise_across_k():
         torch.testing.assert_close(candidate[2], draws[0][2], rtol=0, atol=0)
 
 
+def test_live_main_seeds_before_building_service(monkeypatch):
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    events = []
+
+    class RecordingClient:
+        def __init__(self, _service, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        rollout,
+        "seed_live_rollout",
+        lambda seed: events.append(("seed", seed)),
+    )
+    monkeypatch.setattr(
+        rollout,
+        "build_live_service",
+        lambda _args: (
+            events.append(("build", None)) or object(),
+            SimpleNamespace(close=lambda: None),
+        ),
+    )
+    monkeypatch.setattr(rollout, "CosmosProgressiveS4Client", RecordingClient)
+
+    result = rollout.main(
+        [
+            "--checkpoint-transformer",
+            "/tmp/s4-transformer",
+            "--prompt-table",
+            "/tmp/training-prompt-table.pt",
+            "--env-seed",
+            "41",
+            "--task-range",
+            "0",
+            "0",
+        ]
+    )
+
+    assert result == 0
+    assert events == [("seed", 41), ("build", None)]
+
+
+def test_preflight_neither_seeds_nor_builds_live_service(monkeypatch):
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    events = []
+    monkeypatch.setattr(
+        rollout,
+        "require_live_s4_prerequisites",
+        lambda **_kwargs: events.append(("preflight", None)),
+    )
+    monkeypatch.setattr(
+        rollout,
+        "seed_live_rollout",
+        lambda seed: events.append(("seed", seed)),
+    )
+    monkeypatch.setattr(
+        rollout,
+        "build_live_service",
+        lambda _args: events.append(("build", None)),
+    )
+
+    result = rollout.main(
+        [
+            "--checkpoint-transformer",
+            "/tmp/s4-transformer",
+            "--prompt-table",
+            "/tmp/training-prompt-table.pt",
+            "--preflight",
+        ]
+    )
+
+    assert result == 0
+    assert events == [("preflight", None)]
+
+
+def test_stdio_builds_service_without_seeding(monkeypatch):
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    events = []
+    service = object()
+    monkeypatch.setattr(
+        rollout,
+        "seed_live_rollout",
+        lambda seed: events.append(("seed", seed)),
+    )
+    monkeypatch.setattr(
+        rollout,
+        "build_live_service",
+        lambda _args: (
+            events.append(("build", None)) or service,
+            SimpleNamespace(close=lambda: events.append(("close", None))),
+        ),
+    )
+    monkeypatch.setattr(
+        rollout,
+        "serve_json_lines",
+        lambda received, **_kwargs: events.append(("serve", received)),
+    )
+
+    result = rollout.main(
+        [
+            "--checkpoint-transformer",
+            "/tmp/s4-transformer",
+            "--prompt-table",
+            "/tmp/training-prompt-table.pt",
+            "--serve-stdio",
+        ]
+    )
+
+    assert result == 0
+    assert events == [
+        ("build", None),
+        ("serve", service),
+        ("close", None),
+    ]
+
+
 def test_cli_defaults_joint_student_steps_to_four():
     from evaluation.libero.rollout_cosmos_progressive_s4 import parse_args
 

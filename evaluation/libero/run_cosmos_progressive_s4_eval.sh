@@ -433,7 +433,7 @@ esac
 S4_VIDEO_SEEDS="${S4_VIDEO_SEEDS:-}"
 declare -A S4_VIDEO_SEED_SET=()
 if [[ -n "${S4_VIDEO_SEEDS}" ]]; then
-    [[ "${S4_VIDEO_SEEDS}" =~ ^[0-9]+(,[0-9]+)*$ ]] || \
+    [[ "${S4_VIDEO_SEEDS}" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] || \
         die "S4_VIDEO_SEEDS must be comma-separated integers in 0..49"
     IFS=',' read -r -a requested_video_seeds <<< "${S4_VIDEO_SEEDS}"
     for video_seed in "${requested_video_seeds[@]}"; do

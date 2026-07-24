@@ -109,6 +109,38 @@ def test_formal_four_shards_use_all_eight_gpus_and_joint_k2(tmp_path):
     assert result.stdout.count("--save-video") == 8
     assert result.stdout.count("--episode-index-offset") == 200
 
+    rollout_commands = []
+    for line in result.stdout.splitlines():
+        if not line.startswith("COMMAND="):
+            continue
+        tokens = shlex.split(line.partition("=")[2])
+        if "--env-seed" in tokens:
+            rollout_commands.append(tokens)
+    assert len(rollout_commands) == 200
+    for tokens in rollout_commands:
+        seed = int(tokens[tokens.index("--env-seed") + 1])
+        assert ("--save-video" in tokens) is (seed in {0, 1})
+
+
+def test_formal_joint_k1_reaches_every_preflight_and_rollout(tmp_path):
+    env = _launcher_env(tmp_path)
+    env["S4_STUDENT_STEPS"] = "1"
+
+    result = run_launcher("formal", env=env)
+    _assert_success(result)
+
+    command_lines = [
+        shlex.split(line.partition("=")[2])
+        for line in result.stdout.splitlines()
+        if line.startswith("COMMAND=")
+        and "evaluation.libero.rollout_cosmos_progressive_s4" in line
+    ]
+    assert len(command_lines) == 102
+    assert all(
+        tokens[tokens.index("--student-steps") + 1] == "1"
+        for tokens in command_lines
+    )
+
 
 @pytest.mark.parametrize(
     ("name", "value", "expected"),
@@ -117,6 +149,9 @@ def test_formal_four_shards_use_all_eight_gpus_and_joint_k2(tmp_path):
         ("S4_FORMAL_NUM_SHARDS", "3", "S4_FORMAL_NUM_SHARDS must be 2 or 4"),
         ("S4_VIDEO_SEEDS", "0,nope", "S4_VIDEO_SEEDS"),
         ("S4_VIDEO_SEEDS", "0,", "S4_VIDEO_SEEDS"),
+        ("S4_VIDEO_SEEDS", "01", "S4_VIDEO_SEEDS"),
+        ("S4_VIDEO_SEEDS", "08", "S4_VIDEO_SEEDS"),
+        ("S4_VIDEO_SEEDS", "09", "S4_VIDEO_SEEDS"),
         ("S4_VIDEO_SEEDS", "50", "S4_VIDEO_SEEDS"),
     ],
 )

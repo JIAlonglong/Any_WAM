@@ -85,30 +85,24 @@ error summaries.
 Evaluation uses the existing LingBotVA LIBERO server/client path so training
 and inference share the same joint AnyFlow conditioning semantics.
 
-Each final arm checkpoint and the shared Stage-1 baseline are evaluated with
+Each final arm checkpoint and the shared Stage-1 baseline are evaluated only
+on the task used for small-sample training, with
 matched video/action budgets:
 
 - 1 video step / 1 action step;
 - 2 video steps / 2 action steps;
 - 4 video steps / 4 action steps.
 
-The default formal evaluation runs 10 episodes per task on all 40 standard
-tasks:
+The default closed-loop evaluation runs 20 episodes for
+`put both the alphabet soup and the tomato sauce in the basket`. It does not
+evaluate the other 39 standard LIBERO tasks. With four GPUs, a scheduler runs
+up to four model-budget jobs concurrently, with one inference server per GPU.
+This keeps the comparison in-domain and minimizes turnaround time.
 
-- LIBERO-Long (`libero_10`);
-- LIBERO-Spatial;
-- LIBERO-Object;
-- LIBERO-Goal.
-
-With four GPUs, one worker owns one suite and evaluates its ten tasks
-sequentially. Models and sampling budgets run serially so each GPU hosts only
-one inference server. The selected training task is also reported explicitly
-as the in-domain result.
-
-The evaluator writes worker logs, raw episode records, per-suite summaries,
-per-budget summaries, and a final matrix indexed by model and sampling budget.
-The matrix includes successes, attempts, success rate, and selected-task
-success rate.
+The evaluator writes worker logs, raw episode records, per-budget summaries,
+and a final matrix indexed by model and sampling budget.
+The matrix includes successes, attempts, success rate, and change relative to
+the shared Stage-1 baseline.
 
 ## User Interface
 
@@ -124,7 +118,8 @@ Supported phases are:
 
 - `train`: build manifests and train the four arms;
 - `offline-eval`: run held-out diagnostics;
-- `closed-loop`: evaluate Stage-1 and all completed arms at 1/2/4 steps;
+- `closed-loop`: evaluate the trained task for Stage-1 and all completed arms
+  at 1/2/4 steps;
 - `all`: run the three phases serially.
 
 The launcher also accepts `--steps`, `--save-interval`, `--episodes`,
@@ -153,7 +148,7 @@ Implementation uses test-first coverage for:
 - four unique GPUs and noncolliding ports;
 - dry-run commands using four processes and the shared Stage-1 checkpoint;
 - matched 1/1, 2/2, and 4/4 inference budgets;
-- all four LIBERO suites and all 40 tasks;
+- exactly the selected LIBERO-Long training task with 20 episodes per job;
 - resumable worker detection and strict result aggregation.
 
 A one-GPU, one-step smoke of one arm verifies config loading, dataset

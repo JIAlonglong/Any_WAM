@@ -19,6 +19,7 @@ _this_dir = os.path.dirname(os.path.abspath(__file__))
 cfg.contract_version = CONTRACT_VERSION
 cfg.action_packing_schema = ACTION_PACKING_SCHEMA
 cfg.action_downsample_factor = 4
+cfg.action_chunk_shape = [4, 4]
 cfg.training_contract_stage = "raw_stage1"
 
 

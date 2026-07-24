@@ -12,6 +12,7 @@ _COMMON_CONTRACT = {
     "contract_version": CONTRACT_VERSION,
     "action_packing_schema": ACTION_PACKING_SCHEMA,
     "action_downsample_factor": ACTION_DOWNSAMPLE_FACTOR,
+    "action_chunk_shape": [4, 4],
 }
 _PROGRESSIVE_STAGE2_CONTRACT = {
     "deployment_timestep_start": 1000,
@@ -77,6 +78,7 @@ def contract_metadata(config, *, stage: str) -> dict[str, object]:
         "training_contract_stage": stage,
         "action_packing_schema": getattr(config, "action_packing_schema", None),
         "action_downsample_factor": getattr(config, "action_downsample_factor", None),
+        "action_chunk_shape": getattr(config, "action_chunk_shape", None),
     }
     if stage == PROGRESSIVE_STAGE2:
         deployment_steps = getattr(config, "deployment_joint_steps", None)

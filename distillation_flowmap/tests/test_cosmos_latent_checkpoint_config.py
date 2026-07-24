@@ -72,6 +72,8 @@ def test_stage_configs_identify_their_persisted_training_contract():
 
     assert stage1.cfg.training_contract_stage == "raw_stage1"
     assert stage2.cfg.training_contract_stage == "progressive_stage2"
+    assert stage1.cfg.action_chunk_shape == [4, 4]
+    assert stage2.cfg.action_chunk_shape == [4, 4]
 
 
 class _CheckpointModel(torch.nn.Module):
@@ -105,6 +107,7 @@ def test_checkpoint_config_persists_stage2_contract_atomically(tmp_path, monkeyp
         contract_version=2,
         action_packing_schema="downsample_survivor_v2",
         action_downsample_factor=4,
+        action_chunk_shape=[4, 4],
         deployment_timestep_start=1000,
         deployment_timestep_end=0,
         deployment_joint_steps=(1, 2, 4),
@@ -135,6 +138,7 @@ def test_checkpoint_config_persists_stage2_contract_atomically(tmp_path, monkeyp
     )
     payload = json.loads(config_path.read_text())
     assert payload["training_contract_stage"] == "progressive_stage2"
+    assert payload["action_chunk_shape"] == [4, 4]
     assert payload["joint_student_steps"] == [1, 2, 4]
     assert payload["deployment_action_weight"] == 1.0
     source, destination = replacements[-1]
@@ -205,6 +209,7 @@ def test_invalid_contract_prevents_all_checkpoint_writes(tmp_path, monkeypatch):
         contract_version=2,
         action_packing_schema="downsample_survivor_v2",
         action_downsample_factor=4,
+        action_chunk_shape=[4, 4],
         deployment_timestep_start=1000,
         deployment_timestep_end=0,
         deployment_joint_steps=(1, 2, 4),

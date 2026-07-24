@@ -28,6 +28,7 @@ def _stage1_config(**overrides):
         "contract_version": CONTRACT_VERSION,
         "action_packing_schema": ACTION_PACKING_SCHEMA,
         "action_downsample_factor": 4,
+        "action_chunk_shape": [4, 4],
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -55,6 +56,7 @@ def test_stage1_contract_contains_packing_but_not_stage2_attestation():
         "training_contract_stage": "raw_stage1",
         "action_packing_schema": "downsample_survivor_v2",
         "action_downsample_factor": 4,
+        "action_chunk_shape": [4, 4],
     }
     assert "joint_student_steps" not in payload
 
@@ -76,6 +78,10 @@ def test_stage2_contract_contains_full_deployment_attestation():
     [
         ({"action_packing_schema": "legacy_dense_v1"}, "action_packing_schema"),
         ({"action_downsample_factor": True}, "action_downsample_factor"),
+        ({"action_chunk_shape": (4, 4)}, "action_chunk_shape"),
+        ({"action_chunk_shape": [True, 4]}, "action_chunk_shape"),
+        ({"action_chunk_shape": [4, 3]}, "action_chunk_shape"),
+        ({"action_chunk_shape": [3, 4]}, "action_chunk_shape"),
         ({"deployment_joint_steps": (1, 4, 2)}, "joint_student_steps"),
         ({"deployment_action_weight": 1}, "deployment_action_weight"),
         ({"raw_teacher_window_is_auxiliary": 1}, "raw_teacher_window_is_auxiliary"),
@@ -94,10 +100,22 @@ def test_validate_contract_metadata_rejects_missing_stage2_field():
         validate_contract_metadata(payload, required_stage="progressive_stage2")
 
 
+def test_validate_contract_metadata_rejects_missing_action_chunk_shape():
+    payload = contract_metadata(_stage1_config(), stage="raw_stage1")
+    del payload["action_chunk_shape"]
+
+    with pytest.raises(ValueError, match="action_chunk_shape"):
+        validate_contract_metadata(payload, required_stage="raw_stage1")
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("contract_version", True),
+        ("action_chunk_shape", (4, 4)),
+        ("action_chunk_shape", [True, 4]),
+        ("action_chunk_shape", [3, 4]),
+        ("action_chunk_shape", [4, 3]),
         ("deployment_timestep_start", 1000.0),
         ("joint_student_steps", (1, 2, 4)),
         ("joint_student_steps", [True, 2, 4]),

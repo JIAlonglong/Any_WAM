@@ -113,6 +113,7 @@ def _resolve(fixture, *, verify_large=True):
         local_model_lock=artifacts["local_model"]["lock"],
         flashwam_repo=fixture["flashwam_repo"],
         cosmos_repo=fixture["cosmos_repo"],
+        preflight_python=Path(sys.executable),
         worker_python=fixture["worker_python"],
         worker_site_packages=fixture["worker_site_packages"],
         extra_pythonpath=fixture["extra_pythonpath"],
@@ -229,6 +230,10 @@ def test_dry_run_resolver_is_read_only_and_returns_bounded_identity(tmp_path):
     assert payload["teacher"]["tree_digest"]
     assert payload["flashwam_repo"]["kind"] == "git-clean"
     assert payload["cosmos_repo"]["kind"] == "git-clean"
+    assert payload["preflight"]["python_realpath"] == str(
+        Path(sys.executable).resolve()
+    )
+    assert payload["preflight"]["python_sha256"]
     assert payload["worker"]["identity_sha256"]
 
 
@@ -294,6 +299,10 @@ def test_git_fingerprint_disables_optional_locks_and_index_refresh(
     tmp_path, monkeypatch
 ):
     repo = _git_repo(tmp_path / "repo")
+    monkeypatch.setenv("GIT_ATTACK_SENTINEL", "hostile")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.bare")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
     calls = []
     original = subprocess.run
 
@@ -308,5 +317,25 @@ def test_git_fingerprint_disables_optional_locks_and_index_refresh(
     assert calls
     for command, environment in calls:
         assert environment["GIT_OPTIONAL_LOCKS"] == "0"
+        assert environment["GIT_CONFIG_GLOBAL"] == "/dev/null"
+        assert environment["GIT_CONFIG_SYSTEM"] == "/dev/null"
+        assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert "GIT_ATTACK_SENTINEL" not in environment
+        assert "GIT_CONFIG_COUNT" not in environment
+        assert "GIT_CONFIG_KEY_0" not in environment
+        assert "GIT_CONFIG_VALUE_0" not in environment
         assert ("-c", "core.refreshIndex=false") == command[1:3]
         assert ("-c", "core.fsmonitor=false") == command[3:5]
+
+
+def test_git_fingerprint_rejects_repository_selection_environment_redirect(
+    tmp_path, monkeypatch
+):
+    real_repo = _git_repo(tmp_path / "real-dirty")
+    (real_repo / "source.py").write_text("REVISION = dirty\n", encoding="utf-8")
+    fake_repo = _git_repo(tmp_path / "fake-clean")
+    monkeypatch.setenv("GIT_DIR", str(fake_repo / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(fake_repo))
+
+    with pytest.raises(ProvenanceError, match="dirty|environment|redirect"):
+        fingerprint_git_repository(real_repo, purpose="real")

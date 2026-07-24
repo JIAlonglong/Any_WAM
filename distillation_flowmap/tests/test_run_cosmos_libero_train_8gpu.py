@@ -300,6 +300,7 @@ def _resolve_for_launcher(env, name, *, output_root, run_tag, **overrides):
         local_model_lock=lock_root / "local_model.lock.json",
         flashwam_repo=env["_TEST_COSMOS_PROJECT_ROOT"],
         cosmos_repo=repo,
+        preflight_python=Path(sys.executable),
         worker_python=env["COSMOS_POLICY_PYTHON"],
         worker_site_packages=env["COSMOS_WORKER_SITE_PACKAGES"],
         extra_pythonpath=(
@@ -1174,6 +1175,54 @@ def test_production_launcher_has_no_pytest_fixture_override_surface():
         "PYTEST_CURRENT_TEST",
     ):
         assert forbidden not in source
+
+
+def test_ambient_preflight_binary_cannot_reach_output_claim_or_torchrun(
+    tmp_path,
+):
+    env, _ = _env(tmp_path)
+    preflight = tmp_path / "forged-preflight"
+    preflight_marker = tmp_path / "preflight-called"
+    preflight.write_text(
+        "#!/bin/sh\nprintf called > \"$PREFLIGHT_MARKER\"\nexec "
+        + repr(sys.executable)
+        + " \"$@\"\n",
+        encoding="utf-8",
+    )
+    preflight.chmod(preflight.stat().st_mode | stat.S_IXUSR)
+    env["PREFLIGHT_BIN"] = str(preflight)
+    env["PREFLIGHT_MARKER"] = str(preflight_marker)
+    marker = tmp_path / "torchrun-called"
+    torchrun = tmp_path / "torchrun"
+    torchrun.write_text(
+        "#!/bin/sh\nprintf called > \"$TORCHRUN_MARKER\"\n",
+        encoding="utf-8",
+    )
+    torchrun.chmod(torchrun.stat().st_mode | stat.S_IXUSR)
+    env["TORCHRUN_BIN"] = str(torchrun)
+    env["TORCHRUN_MARKER"] = str(marker)
+    output_root = tmp_path / "formal-output"
+
+    result = _run(
+        "apm",
+        "--steps",
+        "1",
+        "--output-root",
+        str(output_root),
+        "--run-tag",
+        "forged-preflight",
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert not preflight_marker.exists()
+    assert not marker.exists()
+    assert not output_root.exists()
+
+
+def test_production_launcher_does_not_accept_preflight_bin_override():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert 'PREFLIGHT_BIN="${PREFLIGHT_BIN:-' not in source
 
 
 def test_formal_default_hashes_same_size_large_artifact_mutation(tmp_path):

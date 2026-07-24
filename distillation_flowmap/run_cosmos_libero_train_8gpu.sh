@@ -60,7 +60,15 @@ print_assignment() {
 
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-PREFLIGHT_BIN="${PREFLIGHT_BIN:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python}"
+[[ -z "${PREFLIGHT_BIN+x}" ]] || die \
+    "PREFLIGHT_BIN is fixed by the production launcher and cannot be overridden"
+PREFLIGHT_BIN="/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python"
+PREFLIGHT_REALPATH="/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python3.10"
+[[ -x "$PREFLIGHT_BIN" ]] || die \
+    "fixed formal preflight Python is not executable: $PREFLIGHT_BIN"
+[[ "$(/usr/bin/readlink -f -- "$PREFLIGHT_BIN")" == "$PREFLIGHT_REALPATH" ]] || die \
+    "fixed formal preflight Python resolves to an unexpected interpreter"
+PREFLIGHT_BIN="$PREFLIGHT_REALPATH"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 [[ -n "${COSMOS_STAGE1_ROOT:-}" ]] || die "COSMOS_STAGE1_ROOT must be explicitly set"
 [[ -n "${STUDENT_BASE_MODEL_PATH:-}" ]] || die "STUDENT_BASE_MODEL_PATH must be explicitly set"
@@ -138,7 +146,7 @@ from distillation_flowmap.cosmos_libero_provenance import (
 )
 (
     dataset, teacher, video_vae, local_model, lock_root,
-    flashwam_repo, cosmos_repo, worker_python, worker_site_packages,
+    flashwam_repo, cosmos_repo, preflight_python, worker_python, worker_site_packages,
     extra_pythonpath, verify_large,
 ) = sys.argv[1:]
 payload = resolve_formal_provenance(
@@ -152,6 +160,7 @@ payload = resolve_formal_provenance(
     local_model_lock=f"{lock_root}/local_model.lock.json",
     flashwam_repo=flashwam_repo,
     cosmos_repo=cosmos_repo,
+    preflight_python=preflight_python,
     worker_python=worker_python,
     worker_site_packages=worker_site_packages,
     extra_pythonpath=tuple(part for part in extra_pythonpath.split(":") if part),
@@ -166,6 +175,7 @@ provenance_output="$(
         "$DATASET_PATH" "$COSMOS_POLICY_PATH" "$STUDENT_BASE_MODEL_PATH" \
         "$COSMOS_PREDICT25_LOCAL_MODEL_DIR" "$COSMOS_PROVENANCE_LOCK_ROOT" \
         "$FLASHWAM_PROVENANCE_REPO" "$COSMOS_PREDICT2_REPO" \
+        "$PREFLIGHT_BIN" \
         "$COSMOS_POLICY_PYTHON" "$COSMOS_WORKER_SITE_PACKAGES" \
         "$COSMOS_POLICY_EXTRA_PYTHONPATH" "$VERIFY_LARGE_ARTIFACT_DIGESTS"
 )" || die "formal provenance preflight failed"

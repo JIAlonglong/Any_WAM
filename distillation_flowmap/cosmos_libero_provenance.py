@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import subprocess
+import sys
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
@@ -212,9 +214,19 @@ def fingerprint_git_repository(
 ) -> dict[str, str]:
     root = _canonical_root(path, label=f"{purpose} repository")
     git_environment = {
-        **os.environ,
-        "GIT_OPTIONAL_LOCKS": "0",
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_")
     }
+    git_environment.update(
+        {
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
     git_prefix = [
         "git",
         "-c",
@@ -338,6 +350,31 @@ def _worker_identity(
     return payload
 
 
+def _preflight_identity(python: str | Path) -> dict[str, Any]:
+    requested = Path(python)
+    if not requested.is_file() or not os.access(requested, os.X_OK):
+        raise ProvenanceError(
+            f"formal preflight Python is not executable: {requested}"
+        )
+    executable = requested.resolve(strict=True)
+    running = Path(sys.executable).resolve(strict=True)
+    if executable != running:
+        raise ProvenanceError(
+            "formal preflight Python does not match the running interpreter"
+        )
+    payload = {
+        "python_realpath": str(executable),
+        "python_sha256": _sha256_file(executable),
+        "size_bytes": executable.stat().st_size,
+        "python_version": sys.version,
+        "implementation": platform.python_implementation(),
+        "prefix": str(Path(sys.prefix).resolve(strict=True)),
+        "base_prefix": str(Path(sys.base_prefix).resolve(strict=True)),
+    }
+    payload["identity_sha256"] = _sha256_bytes(canonical_json(payload).encode())
+    return payload
+
+
 def resolve_formal_provenance(
     *,
     dataset_root: str | Path,
@@ -350,6 +387,7 @@ def resolve_formal_provenance(
     local_model_lock: str | Path,
     flashwam_repo: str | Path,
     cosmos_repo: str | Path,
+    preflight_python: str | Path,
     worker_python: str | Path,
     worker_site_packages: str | Path,
     extra_pythonpath: Iterable[str | Path],
@@ -385,6 +423,7 @@ def resolve_formal_provenance(
         "cosmos_repo": fingerprint_git_repository(
             cosmos_repo, purpose="Cosmos"
         ),
+        "preflight": _preflight_identity(preflight_python),
         "worker": _worker_identity(
             worker_python,
             worker_site_packages,

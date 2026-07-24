@@ -601,6 +601,37 @@ def test_preflight_failure_is_fail_closed_and_does_not_create_output(tmp_path):
     assert not Path(env["STAGE1_OUTPUT"]).exists()
 
 
+def test_optimized_python_cannot_bypass_invalid_config_preflight(tmp_path):
+    env = _env(tmp_path)
+    module = tmp_path / "invalid_stage1_config.py"
+    module.write_text(
+        "from distillation_flowmap.config_libero_cosmos_policy_stage1 import cfg\n"
+        'cfg.teacher_backend = "invalid-backend"\n',
+        encoding="utf-8",
+    )
+    wrapper = tmp_path / "optimized-preflight"
+    _write_executable(
+        wrapper,
+        'export CONFIG_FILE="invalid_stage1_config"\n'
+        'exec "$REAL_PREFLIGHT_PYTHON" "$@"\n',
+    )
+    env.update(
+        {
+            "PREFLIGHT_BIN": str(wrapper),
+            "REAL_PREFLIGHT_PYTHON": str(PYTHON),
+            "PYTHONOPTIMIZE": "2",
+            "PYTHONPATH": str(tmp_path),
+        }
+    )
+
+    result = _run("dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "teacher_backend" in result.stderr
+    assert "config preflight failed" in result.stderr
+    assert not Path(env["STAGE1_OUTPUT"]).exists()
+
+
 def test_run_loses_atomic_output_claim_without_starting_torchrun(tmp_path):
     env = _env(tmp_path)
     env["CLAIM_OUTPUT_DURING_PREFLIGHT"] = "1"
@@ -645,3 +676,29 @@ def test_resume_run_executes_fake_torchrun_with_exact_restore_contract(tmp_path)
     assert "RESUME_ONLINE_FROM_TARGET=0" in log
     assert "RESET_RESUME_STEP=0" in log
     assert "RESUME_OPTIMIZER_STATE=1" in log
+
+
+def test_resume_run_atomically_replaces_launch_artifact_symlinks(tmp_path):
+    env = _env(tmp_path)
+    output = Path(env["STAGE1_OUTPUT"])
+    _checkpoint(output, 10)
+    env_sentinel = tmp_path / "outside-env-sentinel"
+    command_sentinel = tmp_path / "outside-command-sentinel"
+    env_sentinel.write_text("outside env stays unchanged\n", encoding="utf-8")
+    command_sentinel.write_text("outside command stays unchanged\n", encoding="utf-8")
+    (output / "launch_env.txt").symlink_to(env_sentinel)
+    (output / "launch_command.txt").symlink_to(command_sentinel)
+
+    result = _run("run", "--steps", "20", "--resume-step", "10", env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert env_sentinel.read_text(encoding="utf-8") == "outside env stays unchanged\n"
+    assert (
+        command_sentinel.read_text(encoding="utf-8")
+        == "outside command stays unchanged\n"
+    )
+    for name in ("launch_env.txt", "launch_command.txt"):
+        artifact = output / name
+        assert artifact.is_file()
+        assert not artifact.is_symlink()
+    assert Path(env["TORCHRUN_LOG"]).is_file()

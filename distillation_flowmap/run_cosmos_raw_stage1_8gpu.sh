@@ -398,17 +398,25 @@ cfg = import_module(os.environ["CONFIG_FILE"]).cfg
 metadata = contract_metadata(cfg, stage="raw_stage1")
 validate_contract_metadata(metadata, required_stage="raw_stage1")
 resume_path = os.environ["RESUME_FROM_PATH"] or None
-assert cfg.teacher_backend == "cosmos_policy"
-assert cfg.training_contract_stage == "raw_stage1"
-assert cfg.student_base_model_path == os.environ["STUDENT_BASE_MODEL_PATH"]
-assert cfg.teacher_model_path == os.environ["COSMOS_POLICY_PATH"]
-assert cfg.resume_from_path == resume_path
-assert cfg.resume_online_from_target is False
-assert cfg.reset_resume_step is False
-assert cfg.resume_optimizer_state is (resume_path is not None)
-assert cfg.seed == int(os.environ["TRAIN_SEED"])
-assert cfg.max_train_steps == int(os.environ["MAX_TRAIN_STEPS"])
-assert cfg.save_interval == int(os.environ["SAVE_INTERVAL"])
+expected = {
+    "teacher_backend": "cosmos_policy",
+    "training_contract_stage": "raw_stage1",
+    "student_base_model_path": os.environ["STUDENT_BASE_MODEL_PATH"],
+    "teacher_model_path": os.environ["COSMOS_POLICY_PATH"],
+    "resume_from_path": resume_path,
+    "resume_online_from_target": False,
+    "reset_resume_step": False,
+    "resume_optimizer_state": resume_path is not None,
+    "seed": int(os.environ["TRAIN_SEED"]),
+    "max_train_steps": int(os.environ["MAX_TRAIN_STEPS"]),
+    "save_interval": int(os.environ["SAVE_INTERVAL"]),
+}
+for field, expected_value in expected.items():
+    actual_value = getattr(cfg, field, None)
+    if type(actual_value) is not type(expected_value) or actual_value != expected_value:
+        raise RuntimeError(
+            f"{field} must be exactly {expected_value!r}, got {actual_value!r}"
+        )
 print("corrected Cosmos raw Stage-1 config preflight passed")'
 if ! (
     cd "$PROJECT_ROOT"
@@ -440,8 +448,42 @@ if [[ -z "$RESUME_STEP" ]]; then
     mkdir "$OUTPUT_DIR" || die \
         "failed to atomically claim OUTPUT_DIR: $OUTPUT_DIR"
 fi
-printf '%s\n' "${launch_env[@]}" > "$OUTPUT_DIR/launch_env.txt"
-printf '%q ' "${command[@]}" > "$OUTPUT_DIR/launch_command.txt"
-printf '\n' >> "$OUTPUT_DIR/launch_command.txt"
+launch_env_text=""
+for item in "${launch_env[@]}"; do
+    launch_env_text+="${item}"$'\n'
+done
+printf -v launch_command_text '%q ' "${command[@]}"
+launch_command_text+=$'\n'
+artifact_write_code='import os, sys, tempfile
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+def atomic_write(name, content):
+    destination = root / name
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=root, prefix=f".{name}.", suffix=".tmp"
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, destination)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+atomic_write("launch_env.txt", sys.argv[2])
+atomic_write("launch_command.txt", sys.argv[3])
+directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)'
+if ! PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -c "$artifact_write_code" \
+    "$OUTPUT_DIR" "$launch_env_text" "$launch_command_text"; then
+    die "failed to atomically write launch artifacts in OUTPUT_DIR: $OUTPUT_DIR"
+fi
 cd "$PROJECT_ROOT"
 exec env "${launch_env[@]}" "${command[@]}"

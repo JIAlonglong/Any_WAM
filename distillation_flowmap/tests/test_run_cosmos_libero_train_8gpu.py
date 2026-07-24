@@ -159,6 +159,18 @@ def _layout(tmp_path: Path):
     subprocess.run(
         ["git", "-C", str(flashwam_repo), "commit", "-qm", "fixture"], check=True
     )
+    (flashwam_repo / "distillation_flowmap").symlink_to(
+        ROOT / "distillation_flowmap",
+        target_is_directory=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(flashwam_repo), "add", "distillation_flowmap"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(flashwam_repo), "commit", "-qm", "test launcher seam"],
+        check=True,
+    )
 
     lock_root = tmp_path / "provenance-locks"
     lock_root.mkdir()
@@ -247,22 +259,29 @@ def _env(tmp_path: Path):
             "COSMOS_WORKER_SITE_PACKAGES": str(site_packages),
             "COSMOS_PROVENANCE_LOCK_ROOT": str(lock_root),
             "VERIFY_LARGE_ARTIFACT_DIGESTS": "1",
-            "COSMOS_PROVENANCE_TEST_FIXTURE": "1",
-            "COSMOS_PROVENANCE_TEST_FLASHWAM_REPO": str(flashwam_repo),
             "CUDA_VISIBLE_DEVICES": DEVICES,
             "COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES": DEVICES,
+            "_TEST_COSMOS_LAUNCHER_SCRIPT": str(
+                flashwam_repo
+                / "distillation_flowmap"
+                / "run_cosmos_libero_train_8gpu.sh"
+            ),
+            "_TEST_COSMOS_PROJECT_ROOT": str(flashwam_repo),
         }
     )
     return env, stage1
 
 
 def _run(*args: str, env: dict[str, str], cwd: Path | None = None):
+    launch_env = dict(env)
+    launcher = launch_env.pop("_TEST_COSMOS_LAUNCHER_SCRIPT", str(SCRIPT))
+    launch_env.pop("_TEST_COSMOS_PROJECT_ROOT", None)
     return subprocess.run(
-        ["bash", str(SCRIPT), *args],
+        ["bash", launcher, *args],
         text=True,
         capture_output=True,
         cwd=cwd or ROOT,
-        env=env,
+        env=launch_env,
         check=False,
     )
 
@@ -279,7 +298,7 @@ def _resolve_for_launcher(env, name, *, output_root, run_tag, **overrides):
         video_vae_lock=lock_root / "video_vae.lock.json",
         local_model_root=env["COSMOS_PREDICT25_LOCAL_MODEL_DIR"],
         local_model_lock=lock_root / "local_model.lock.json",
-        flashwam_repo=env["COSMOS_PROVENANCE_TEST_FLASHWAM_REPO"],
+        flashwam_repo=env["_TEST_COSMOS_PROJECT_ROOT"],
         cosmos_repo=repo,
         worker_python=env["COSMOS_POLICY_PYTHON"],
         worker_site_packages=env["COSMOS_WORKER_SITE_PACKAGES"],
@@ -337,9 +356,12 @@ def test_dry_run_embeds_read_only_provenance_in_canonical_identity(tmp_path):
     actions = json.loads(values["ENV_CONTRACT_ACTIONS_JSON"])
     assert provenance["schema"] == "flashwam_cosmos_provenance_v1"
     assert variant["provenance"] == provenance
-    assert actions["DATASET_PATH"] == "set_canonical"
-    assert actions["USE_FSDP1"] == "set_pinned"
-    assert actions["DISTILL_MODE"] == "unset_legacy"
+    assert actions["DATASET_PATH"]["action"] == "set_canonical"
+    assert actions["USE_FSDP1"] == {
+        "action": "set_pinned",
+        "value": "1",
+    }
+    assert actions["DISTILL_MODE"] == {"action": "unset_legacy"}
     assert not output_root.exists()
 
 
@@ -845,7 +867,15 @@ def test_dry_run_rejects_a_symlinked_output_root_instead_of_canonicalizing_alias
     assert not (real_root / "alias").exists()
 
 
-def _write_resume_checkpoint(output: Path, *, arm: str, step: int, parent, variant_json: str):
+def _write_resume_checkpoint(
+    output: Path,
+    *,
+    arm: str,
+    step: int,
+    parent,
+    variant_json: str,
+    write_manifests: bool = True,
+):
     checkpoint = output / "checkpoints" / f"step_{step}"
     provenance_json = canonical_json(json.loads(variant_json)["provenance"])
     payload = {
@@ -860,6 +890,14 @@ def _write_resume_checkpoint(output: Path, *, arm: str, step: int, parent, varia
         _transformer(checkpoint / student / "transformer", payload)
     (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
     (checkpoint / "lr_scheduler.pt").write_bytes(b"scheduler")
+    if write_manifests:
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "cosmos_libero_variant.json").write_text(
+            variant_json + "\n", encoding="utf-8"
+        )
+        (output / "cosmos_libero_provenance.json").write_text(
+            provenance_json + "\n", encoding="utf-8"
+        )
     return checkpoint
 
 
@@ -965,6 +1003,65 @@ def test_resume_is_allowed_only_from_same_arm_with_same_parent_and_variant_recor
     assert "variant" in result.stderr.lower()
 
 
+@pytest.mark.parametrize(
+    ("manifest_name", "corruption"),
+    (
+        ("cosmos_libero_variant.json", "missing"),
+        ("cosmos_libero_variant.json", "symlink"),
+        ("cosmos_libero_variant.json", "malformed"),
+        ("cosmos_libero_variant.json", "mismatch"),
+        ("cosmos_libero_provenance.json", "missing"),
+        ("cosmos_libero_provenance.json", "symlink"),
+        ("cosmos_libero_provenance.json", "malformed"),
+        ("cosmos_libero_provenance.json", "mismatch"),
+    ),
+)
+def test_resume_requires_both_exact_plain_canonical_manifests(
+    tmp_path, manifest_name, corruption
+):
+    env, stage1 = _env(tmp_path)
+    output_root = tmp_path / "out"
+    own = output_root / "resume" / "apm"
+    parent = validate_stage1_parent(stage1)
+    record = _resolve_for_launcher(
+        env, "apm", output_root=output_root, run_tag="resume"
+    )
+    _write_resume_checkpoint(
+        own,
+        arm="apm",
+        step=100,
+        parent=parent,
+        variant_json=canonical_variant_json(record),
+    )
+    manifest = own / manifest_name
+    if corruption == "missing":
+        manifest.unlink()
+    elif corruption == "symlink":
+        target = own / ("target-" + manifest_name)
+        target.write_text(manifest.read_text(encoding="utf-8"), encoding="utf-8")
+        manifest.unlink()
+        manifest.symlink_to(target)
+    elif corruption == "malformed":
+        manifest.write_text("{not-json}\n", encoding="utf-8")
+    else:
+        manifest.write_text("{}\n", encoding="utf-8")
+
+    result = _run(
+        "apm",
+        "--output-root",
+        str(output_root),
+        "--run-tag",
+        "resume",
+        "--resume-step",
+        "100",
+        "--dry-run",
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "manifest" in result.stderr.lower()
+
+
 def test_resume_rejects_a_changed_supported_scientific_identity(tmp_path):
     env, stage1 = _env(tmp_path)
     output_root = tmp_path / "out"
@@ -1033,14 +1130,124 @@ def test_missing_explicit_stage1_or_base_path_has_no_fallback(tmp_path):
     assert "STUDENT_BASE_MODEL_PATH" in result.stderr
 
 
-def test_pytest_provenance_fixture_override_cannot_reach_formal_launcher(
+def test_forged_pytest_fixture_cannot_reach_formal_launcher_or_torchrun(
     tmp_path,
 ):
     env, _ = _env(tmp_path)
-    env.pop("PYTEST_CURRENT_TEST", None)
-    result = _run("apm", "--dry-run", env=env)
+    fake_repo = env["_TEST_COSMOS_PROJECT_ROOT"]
+    env.pop("_TEST_COSMOS_LAUNCHER_SCRIPT")
+    env.pop("_TEST_COSMOS_PROJECT_ROOT")
+    env["PYTEST_CURRENT_TEST"] = "forged"
+    env["COSMOS_PROVENANCE_TEST_FIXTURE"] = "1"
+    env["COSMOS_PROVENANCE_TEST_FLASHWAM_REPO"] = fake_repo
+    marker = tmp_path / "torchrun-called"
+    torchrun = tmp_path / "torchrun"
+    torchrun.write_text(
+        "#!/bin/sh\nprintf called > \"$TORCHRUN_MARKER\"\n",
+        encoding="utf-8",
+    )
+    torchrun.chmod(torchrun.stat().st_mode | stat.S_IXUSR)
+    env["TORCHRUN_BIN"] = str(torchrun)
+    env["TORCHRUN_MARKER"] = str(marker)
+    output_root = tmp_path / "formal-output"
+    result = _run(
+        "apm",
+        "--steps",
+        "1",
+        "--output-root",
+        str(output_root),
+        "--run-tag",
+        "forged",
+        env=env,
+    )
+
     assert result.returncode != 0
-    assert "pytest-only" in result.stderr
+    assert not marker.exists()
+    assert not output_root.exists()
+
+
+def test_production_launcher_has_no_pytest_fixture_override_surface():
+    source = SCRIPT.read_text(encoding="utf-8")
+    for forbidden in (
+        "COSMOS_PROVENANCE_TEST_FIXTURE",
+        "COSMOS_PROVENANCE_TEST_FLASHWAM_REPO",
+        "PYTEST_CURRENT_TEST",
+    ):
+        assert forbidden not in source
+
+
+def test_formal_default_hashes_same_size_large_artifact_mutation(tmp_path):
+    env, _ = _env(tmp_path)
+    env.pop("VERIFY_LARGE_ARTIFACT_DIGESTS")
+    lock_root = Path(env["COSMOS_PROVENANCE_LOCK_ROOT"])
+    for lock_path in lock_root.glob("*.lock.json"):
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        payload["immutable_store"] = True
+        lock_path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
+    large = (
+        Path(env["DATASET_PATH"])
+        / "data"
+        / "chunk-000"
+        / "episode_000000.parquet"
+    )
+    original = large.read_bytes()
+    large.write_bytes(bytes((value ^ 0xFF) for value in original))
+
+    result = _run(
+        "apm",
+        "--output-root",
+        str(tmp_path / "out"),
+        "--run-tag",
+        "large-mutation",
+        "--dry-run",
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "digest" in result.stderr.lower()
+
+
+@pytest.mark.parametrize("mode", ("--dry-run", "--check-only"))
+def test_launcher_preflight_preserves_git_index_bytes_and_metadata(
+    tmp_path, mode
+):
+    env, _ = _env(tmp_path)
+    project = Path(env["_TEST_COSMOS_PROJECT_ROOT"])
+    git_dir = subprocess.run(
+        ["git", "-C", str(project), "rev-parse", "--git-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    git_dir = Path(git_dir)
+    if not git_dir.is_absolute():
+        git_dir = project / git_dir
+    index = git_dir.resolve() / "index"
+    before = (
+        index.read_bytes(),
+        index.stat().st_size,
+        index.stat().st_mtime_ns,
+        index.stat().st_ctime_ns,
+    )
+
+    result = _run(
+        "apm",
+        "--output-root",
+        str(tmp_path / "out"),
+        "--run-tag",
+        "read-only",
+        mode,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    after_stat = index.stat()
+    assert index.read_bytes() == before[0]
+    assert after_stat.st_size == before[1]
+    assert after_stat.st_mtime_ns == before[2]
+    assert after_stat.st_ctime_ns == before[3]
+    assert not index.with_name("index.lock").exists()
+    assert not (tmp_path / "out").exists()
 
 
 def test_launcher_accepts_task4_validated_sharded_stage1_weights(tmp_path):

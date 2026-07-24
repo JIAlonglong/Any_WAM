@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import distillation_flowmap.cosmos_progressive_env_schema as env_schema
 from distillation_flowmap.cosmos_libero_variants import (
     canonical_variant_json,
     resolve_variant,
@@ -17,6 +18,7 @@ from distillation_flowmap.cosmos_progressive_env_schema import (
     PINNED_OPERATIONAL_ENV,
     EnvSchemaError,
     extract_config_env_reads,
+    launcher_action_manifest,
     validate_config_chain,
     validate_environment_contract,
     validate_launcher_environment,
@@ -143,15 +145,92 @@ def test_every_canonical_read_has_an_identity_mapping():
 
 
 def test_launcher_runtime_validator_requires_set_and_unset_actions():
+    expected_values = getattr(env_schema, "PINNED_ENV_EXPECTED_VALUES", {})
     environment = {
-        name: "sealed" for name in CANONICAL_ENV | PINNED_OPERATIONAL_ENV
+        name: "sealed" for name in CANONICAL_ENV
     }
+    environment.update(
+        {
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+            "SAVE_INTERVAL": "1000",
+        }
+    )
+    for name, expected in expected_values.items():
+        environment[name] = (
+            environment[expected[1]]
+            if expected[0] == "environment"
+            else expected[1]
+        )
     validate_launcher_environment(environment)
+    actions = launcher_action_manifest(environment)
+    assert actions["USE_FSDP1"] == {
+        "action": "set_pinned",
+        "value": "1",
+    }
+    assert actions["WANDB_MODE"] == {
+        "action": "set_pinned",
+        "value": "offline",
+    }
+    assert actions["DISTILL_MODE"] == {"action": "unset_legacy"}
     missing = dict(environment)
     missing.pop(next(iter(CANONICAL_ENV)))
     with pytest.raises(EnvSchemaError, match="missing"):
         validate_launcher_environment(missing)
+    hostile = dict(environment)
+    hostile["USE_FSDP1"] = "0"
+    with pytest.raises(EnvSchemaError, match="USE_FSDP1|pinned|expected"):
+        validate_launcher_environment(hostile)
     leaked = dict(environment)
     leaked[next(iter(CLEARED_LEGACY_ENV))] = "hostile"
     with pytest.raises(EnvSchemaError, match="cleared|legacy"):
         validate_launcher_environment(leaked)
+
+
+def test_newly_classified_pinned_read_requires_an_exact_action_spec(
+    tmp_path, monkeypatch
+):
+    expected_values = getattr(env_schema, "PINNED_ENV_EXPECTED_VALUES", {})
+    source = tmp_path / "synthetic.py"
+    source.write_text(
+        'import os\nvalue = os.environ.get("NEW_PINNED", "1")\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        env_schema,
+        "PINNED_OPERATIONAL_ENV",
+        PINNED_OPERATIONAL_ENV | {"NEW_PINNED"},
+    )
+    validate_environment_contract(
+        ROOT,
+        files=[ROOT / relative for relative in CONFIG_CHAIN] + [source],
+        check_chain=False,
+    )
+    hostile = {
+        name: "sealed" for name in CANONICAL_ENV
+    }
+    hostile.update(
+        {
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+            "SAVE_INTERVAL": "1000",
+            "NEW_PINNED": "1",
+        }
+    )
+    for name, expected in expected_values.items():
+        hostile[name] = (
+            hostile[expected[1]]
+            if expected[0] == "environment"
+            else expected[1]
+        )
+    with pytest.raises(EnvSchemaError, match="NEW_PINNED|action|spec"):
+        launcher_action_manifest(hostile)
+
+    monkeypatch.setattr(
+        env_schema,
+        "PINNED_ENV_EXPECTED_VALUES",
+        {**expected_values, "NEW_PINNED": ("literal", "1")},
+        raising=False,
+    )
+    assert launcher_action_manifest(hostile)["NEW_PINNED"] == {
+        "action": "set_pinned",
+        "value": "1",
+    }

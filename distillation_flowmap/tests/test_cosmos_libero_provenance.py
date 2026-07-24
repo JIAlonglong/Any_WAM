@@ -9,7 +9,9 @@ from distillation_flowmap.cosmos_libero_provenance import (
     ProvenanceError,
     build_artifact_lock,
     canonical_json,
+    fingerprint_git_repository,
     resolve_formal_provenance,
+    verify_artifact_lock,
 )
 
 
@@ -190,10 +192,38 @@ def test_worker_package_metadata_mutation_changes_identity(tmp_path):
 
 def test_dry_run_resolver_is_read_only_and_returns_bounded_identity(tmp_path):
     fixture = _fixture(tmp_path)
+    indexes = []
+    for key in ("flashwam_repo", "cosmos_repo"):
+        git_dir = subprocess.run(
+            ["git", "-C", str(fixture[key]), "rev-parse", "--git-dir"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        git_dir = Path(git_dir)
+        if not git_dir.is_absolute():
+            git_dir = fixture[key] / git_dir
+        index = git_dir.resolve() / "index"
+        indexes.append(
+            (
+                index,
+                index.read_bytes(),
+                index.stat().st_size,
+                index.stat().st_mtime_ns,
+                index.stat().st_ctime_ns,
+            )
+        )
     before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
     payload = json.loads(canonical_json(_resolve(fixture)))
     after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
     assert before == after
+    for index, contents, size, mtime_ns, ctime_ns in indexes:
+        stat_result = index.stat()
+        assert index.read_bytes() == contents
+        assert stat_result.st_size == size
+        assert stat_result.st_mtime_ns == mtime_ns
+        assert stat_result.st_ctime_ns == ctime_ns
+        assert not index.with_name("index.lock").exists()
     assert payload["schema"] == "flashwam_cosmos_provenance_v1"
     assert payload["dataset"]["tree_digest"]
     assert payload["teacher"]["tree_digest"]
@@ -208,3 +238,75 @@ def test_large_artifact_lock_requires_immutable_store_or_explicit_verification(
     fixture = _fixture(tmp_path)
     with pytest.raises(ProvenanceError, match="large|immutable|verify"):
         _resolve(fixture, verify_large=False)
+
+
+@pytest.mark.parametrize("malformed", ("false", 0, 1, None))
+def test_artifact_lock_requires_type_exact_immutable_store_bool(
+    tmp_path, malformed
+):
+    fixture = _fixture(tmp_path)
+    item = fixture["artifacts"]["dataset"]
+    payload = json.loads(item["lock"].read_text(encoding="utf-8"))
+    payload["immutable_store"] = malformed
+    item["lock"].write_text(canonical_json(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(ProvenanceError, match="immutable_store|boolean"):
+        verify_artifact_lock(
+            item["root"],
+            item["lock"],
+            verify_large_artifact_digests=True,
+        )
+
+
+def test_build_artifact_lock_rejects_non_boolean_immutable_store(tmp_path):
+    root, compact, large = _artifact(tmp_path / "artifact", kind="dataset")
+    with pytest.raises(ProvenanceError, match="immutable_store|boolean"):
+        build_artifact_lock(
+            root,
+            compact_paths=compact,
+            large_paths=large,
+            immutable_store="false",
+        )
+
+
+def test_unattested_immutable_claim_cannot_skip_large_digest(tmp_path):
+    fixture = _fixture(tmp_path)
+    item = fixture["artifacts"]["dataset"]
+    payload = json.loads(item["lock"].read_text(encoding="utf-8"))
+    payload["immutable_store"] = True
+    item["lock"].write_text(canonical_json(payload) + "\n", encoding="utf-8")
+
+    large = item["root"] / item["large"][0]
+    original = large.read_bytes()
+    replacement = bytes((value ^ 0xFF) for value in original)
+    assert len(replacement) == len(original)
+    large.write_bytes(replacement)
+
+    with pytest.raises(ProvenanceError, match="large|immutable|verify|attest"):
+        verify_artifact_lock(
+            item["root"],
+            item["lock"],
+            verify_large_artifact_digests=False,
+        )
+
+
+def test_git_fingerprint_disables_optional_locks_and_index_refresh(
+    tmp_path, monkeypatch
+):
+    repo = _git_repo(tmp_path / "repo")
+    calls = []
+    original = subprocess.run
+
+    def recording_run(*args, **kwargs):
+        if args and isinstance(args[0], list) and args[0][:1] == ["git"]:
+            calls.append((tuple(args[0]), dict(kwargs.get("env") or {})))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    fingerprint_git_repository(repo, purpose="fixture")
+
+    assert calls
+    for command, environment in calls:
+        assert environment["GIT_OPTIONAL_LOCKS"] == "0"
+        assert ("-c", "core.refreshIndex=false") == command[1:3]
+        assert ("-c", "core.fsmonitor=false") == command[3:5]

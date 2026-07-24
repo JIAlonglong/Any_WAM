@@ -75,20 +75,15 @@ COSMOS_WORKER_SITE_PACKAGES="${COSMOS_WORKER_SITE_PACKAGES:-${COSMOS_WORKER_ENV_
 COSMOS_POLICY_EXTRA_PYTHONPATH="$COSMOS_PREDICT2_REPO/packages/cosmos-cuda:$COSMOS_PREDICT2_REPO/packages/cosmos-oss"
 [[ -n "${COSMOS_PROVENANCE_LOCK_ROOT:-}" ]] || die \
     "COSMOS_PROVENANCE_LOCK_ROOT must be explicitly set"
-VERIFY_LARGE_ARTIFACT_DIGESTS="${VERIFY_LARGE_ARTIFACT_DIGESTS:-0}"
+VERIFY_LARGE_ARTIFACT_DIGESTS="${VERIFY_LARGE_ARTIFACT_DIGESTS:-1}"
 validate_binary_flag VERIFY_LARGE_ARTIFACT_DIGESTS \
     "$VERIFY_LARGE_ARTIFACT_DIGESTS"
-if [[ "${COSMOS_PROVENANCE_TEST_FIXTURE:-0}" == "1" ]]; then
-    [[ -n "${PYTEST_CURRENT_TEST:-}" ]] || die \
-        "COSMOS_PROVENANCE_TEST_FIXTURE is pytest-only"
-    [[ -n "${COSMOS_PROVENANCE_TEST_FLASHWAM_REPO:-}" ]] || die \
-        "COSMOS_PROVENANCE_TEST_FLASHWAM_REPO is required in fixture mode"
-    FLASHWAM_PROVENANCE_REPO="$COSMOS_PROVENANCE_TEST_FLASHWAM_REPO"
-else
-    [[ -z "${COSMOS_PROVENANCE_TEST_FLASHWAM_REPO:-}" ]] || die \
-        "test Flash-WAM provenance override is forbidden in formal mode"
-    FLASHWAM_PROVENANCE_REPO="$PROJECT_ROOT"
-fi
+[[ "$VERIFY_LARGE_ARTIFACT_DIGESTS" == "1" ]] || die \
+    "VERIFY_LARGE_ARTIFACT_DIGESTS must be 1 until a reviewed immutable-store attestation exists"
+for test_only_name in "${!COSMOS_PROVENANCE_TEST_@}"; do
+    die "test-only provenance environment is forbidden in the production launcher: $test_only_name"
+done
+FLASHWAM_PROVENANCE_REPO="$PROJECT_ROOT"
 
 arm="${1:-}"
 [[ -n "$arm" ]] || die "an experiment arm is required"
@@ -247,12 +242,6 @@ values = {
     "OPD_DANCEOPD_QUERY_ALPHA": record["opd_danceopd_query_alpha"],
     "OPD_DANCEOPD_QUERY_BETA": record["opd_danceopd_query_beta"],
     "TRAIN_SEED": record["train_seed"],
-    "ENABLE_TENSORBOARD": int(record["tensorboard_enabled"]),
-    "ENABLE_WANDB": int(record["enable_wandb"]),
-    "WANDB_MODE": record["wandb_mode"],
-    "HF_DATASETS_OFFLINE": int(record["hf_offline"]),
-    "TRANSFORMERS_OFFLINE": int(record["transformers_offline"]),
-    "HF_HUB_OFFLINE": int(record["hf_hub_offline"]),
     "COSMOS_LIBERO_VARIANT_JSON": canonical_variant_json(record),
 }
 identity_exports = {
@@ -448,18 +437,33 @@ if resume is not None:
             raise ValueError(
                 f"{student} Cosmos LIBERO provenance does not match current inputs"
             )
-    manifest = output / "cosmos_libero_variant.json"
-    if manifest.exists():
-        actual = manifest.read_text(encoding="utf-8").strip()
-        if actual != expected_variant:
-            raise ValueError("run-level canonical variant manifest does not match selected arm")
-    provenance_manifest = output / "cosmos_libero_provenance.json"
-    if provenance_manifest.exists():
-        actual = provenance_manifest.read_text(encoding="utf-8").strip()
-        if actual != os.environ["COSMOS_LIBERO_PROVENANCE_JSON"]:
-            raise ValueError(
-                "run-level provenance manifest does not match current inputs"
-            )
+    def read_required_canonical_manifest(path, *, label):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"required {label} manifest is missing or not a plain file")
+        raw = path.read_text(encoding="utf-8")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"required {label} manifest is malformed JSON") from exc
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if raw != canonical + "\n":
+            raise ValueError(f"required {label} manifest is not exact canonical JSON")
+        return canonical
+
+    actual_variant = read_required_canonical_manifest(
+        output / "cosmos_libero_variant.json",
+        label="variant",
+    )
+    if actual_variant != expected_variant:
+        raise ValueError("run-level canonical variant manifest does not match selected arm")
+    actual_provenance = read_required_canonical_manifest(
+        output / "cosmos_libero_provenance.json",
+        label="provenance",
+    )
+    if actual_provenance != os.environ["COSMOS_LIBERO_PROVENANCE_JSON"]:
+        raise ValueError(
+            "run-level provenance manifest does not match current inputs"
+        )
 payload = {
     "parent_stage1_path": parent.canonical_path,
     "parent_stage1_contract_identity": parent.contract_identity,
@@ -504,10 +508,6 @@ export COSMOS_PROGRESSIVE_OUTPUT_ROOT="$output_root"
 export OUTPUT_ROOT="$output_root"
 export STUDENT_BASE_MODEL_PATH COSMOS_LIBERO_VARIANT_JSON
 export COSMOS_LIBERO_PROVENANCE_JSON
-export USE_FSDP1=1
-export GRADIENT_CHECKPOINTING=1
-export OPD_AUX_GRADIENT_CHECKPOINTING=1
-export OPD_SERIAL_STUDENT_CFG=1
 export OPD_COSMOS_SPATIAL_CROP_SIZE=28
 export OPD_ROLLOUT_STEP_PAIRS OPD_DANCEOPD_ROLLOUT_STEPS
 export OPD_DANCEOPD_ENDPOINT_WEIGHT OPD_DANCEOPD_VELOCITY_WEIGHT
@@ -522,35 +522,9 @@ export MECHANISM_DIAGNOSTICS MECHANISM_DIAGNOSTIC_INTERVAL
 export MECHANISM_DIAGNOSTIC_SEED MECHANISM_DIAGNOSTIC_R
 export MECHANISM_DIAGNOSTIC_S MECHANISM_DIAGNOSTIC_TEACHER_STEPS
 export MECHANISM_COSMOS_T_MIN MECHANISM_COSMOS_T_MAX
-export OPD_AUX_EMPTY_CACHE=1
-export COSMOS_TRAIN_STEP_PROFILE=0
-export OPD_PROFILE=0
-export SKIP_TEACHER_COMPILE=1
-export CACHE_DATASET_IN_MEMORY=0
-export COSMOS_POLICY_VALIDATE_WEIGHTS=1
-export ENABLE_LIGHT_EVAL=0
-export ENABLE_ROLLOUT_EVAL=0
-export ENABLE_STAGE1_START_EVAL=0
-export ENABLE_STAGE1_START_EVAL_BASELINE=0
-export LIGHT_EVAL_INTERVAL="$SAVE_INTERVAL"
-export LIGHT_EVAL_NUM_BATCHES=1
-export LIGHT_EVAL_SEED=42
-export LIGHT_EVAL_START_INDEX=0
-export STOP_AFTER_STEP=0
-unset DATASET_SAMPLE_MANIFEST STAGE1_CKPT_NAME
-unset DISTILL_MODE TEACHER_PATH COSMOS_PROGRESSIVE_RUN_ID
-unset OPD_AUX_VARIANT OPD_TEACHER_TARGET_MODE ROLLOUT_STEP_PAIRS
-unset VIDEO_TRANSITION_PARAM VIDEO_TRANSITION_WEIGHT
-unset OPD_ENDPOINT_AUX_WEIGHT LOCAL_FM_WEIGHT
-unset OPD_TRANSITION_GROUP_WEIGHT OPD_ANCHOR_CAP_RATIO
-unset OPD_AUX_USE_NOFSDP_ROLLOUT
 unset ACTION_AWARE_WEIGHT GT_REGRESSION_WEIGHT ACTION_TRANSITION_PARAM
 unset ACTION_LOCAL_FM_WEIGHT ACTION_TRANSITION_BLOCK_WEIGHT
 unset ACTION_LOCAL_FM_BLOCK_WEIGHT
-export WANDB_MODE=offline
-export HF_DATASETS_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-export HF_HUB_OFFLINE=1
 export ATTN_MODE
 export COSMOS_POLICY_INFERENCE_MODE
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -562,16 +536,51 @@ export COSMOS_POLICY_EXTRA_PYTHONPATH="${COSMOS_POLICY_EXTRA_PYTHONPATH:-$COSMOS
 export COSMOS_WORKER_CUDA_LIBRARY_PATH="${COSMOS_WORKER_CUDA_LIBRARY_PATH:-${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cublas/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_cupti/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_nvrtc/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_runtime/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cudnn/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cufft/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cufile/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/curand/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusolver/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusparse/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusparselt/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/nccl/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/nvjitlink/lib}"
 export LD_LIBRARY_PATH="${COSMOS_WORKER_CUDA_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
+schema_actions_code='import os
+from distillation_flowmap.cosmos_progressive_env_schema import (
+    CLEARED_LEGACY_ENV,
+    resolve_pinned_environment,
+)
+for name, value in sorted(resolve_pinned_environment(os.environ).items()):
+    if "\t" in value or "\n" in value:
+        raise SystemExit(f"unsafe pinned environment value: {name}")
+    print(f"SET_PINNED\t{name}\t{value}")
+for name in sorted(CLEARED_LEGACY_ENV):
+    print(f"UNSET_LEGACY\t{name}\t")'
+schema_actions_output="$(
+    cd "$PROJECT_ROOT"
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
+        "$PREFLIGHT_BIN" -c "$schema_actions_code"
+)" || die "failed to resolve schema-owned launcher actions"
+while IFS=$'\t' read -r action key value; do
+    [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die \
+        "invalid schema-owned launcher action key: $key"
+    case "$action" in
+        SET_PINNED)
+            printf -v "$key" '%s' "$value"
+            export "$key"
+            ;;
+        UNSET_LEGACY)
+            unset "$key"
+            ;;
+        *)
+            die "unknown schema-owned launcher action: $action"
+            ;;
+    esac
+done <<< "$schema_actions_output"
+
 env_contract_code='import json, os
 from distillation_flowmap.cosmos_progressive_env_schema import (
     launcher_action_manifest,
     validate_launcher_environment,
 )
-validate_launcher_environment(os.environ)
+actions = launcher_action_manifest(os.environ)
+validate_launcher_environment(os.environ, actions=actions)
 print(
     "ENV_CONTRACT_ACTIONS_JSON="
     + json.dumps(
-        launcher_action_manifest(), sort_keys=True, separators=(",", ":")
+        actions, sort_keys=True, separators=(",", ":")
     )
 )'
 env_contract_output="$(

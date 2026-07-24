@@ -70,6 +70,41 @@ PINNED_OPERATIONAL_ENV = frozenset(
     }
 )
 
+# Each pinned config input has one schema-owned source of truth.  Literal
+# values are independent of the caller environment; derived values may refer
+# only to an already resolved canonical launcher value.
+PINNED_ENV_EXPECTED_VALUES: Mapping[str, tuple[str, str]] = {
+    "CACHE_DATASET_IN_MEMORY": ("literal", "0"),
+    "COSMOS_POLICY_VALIDATE_WEIGHTS": ("literal", "1"),
+    "COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES": (
+        "environment",
+        "CUDA_VISIBLE_DEVICES",
+    ),
+    "COSMOS_TRAIN_STEP_PROFILE": ("literal", "0"),
+    "ENABLE_LIGHT_EVAL": ("literal", "0"),
+    "ENABLE_ROLLOUT_EVAL": ("literal", "0"),
+    "ENABLE_STAGE1_START_EVAL": ("literal", "0"),
+    "ENABLE_STAGE1_START_EVAL_BASELINE": ("literal", "0"),
+    "ENABLE_TENSORBOARD": ("literal", "1"),
+    "ENABLE_WANDB": ("literal", "0"),
+    "GRADIENT_CHECKPOINTING": ("literal", "1"),
+    "HF_DATASETS_OFFLINE": ("literal", "1"),
+    "HF_HUB_OFFLINE": ("literal", "1"),
+    "LIGHT_EVAL_INTERVAL": ("environment", "SAVE_INTERVAL"),
+    "LIGHT_EVAL_NUM_BATCHES": ("literal", "1"),
+    "LIGHT_EVAL_SEED": ("literal", "42"),
+    "LIGHT_EVAL_START_INDEX": ("literal", "0"),
+    "OPD_AUX_EMPTY_CACHE": ("literal", "1"),
+    "OPD_AUX_GRADIENT_CHECKPOINTING": ("literal", "1"),
+    "OPD_PROFILE": ("literal", "0"),
+    "OPD_SERIAL_STUDENT_CFG": ("literal", "1"),
+    "SKIP_TEACHER_COMPILE": ("literal", "1"),
+    "STOP_AFTER_STEP": ("literal", "0"),
+    "TRANSFORMERS_OFFLINE": ("literal", "1"),
+    "USE_FSDP1": ("literal", "1"),
+    "WANDB_MODE": ("literal", "offline"),
+}
+
 _ALL_CURRENT_ENV = frozenset(
     """
 ACTION_BLOCK_WEIGHT ACTION_LOSS_WEIGHT ATTN_MODE BETA1 BETA2
@@ -173,12 +208,6 @@ def _identity_field(name: str) -> str:
 
 CANONICAL_ENV_TO_JSON_FIELDS = {
     name: (_identity_field(name),) for name in sorted(CANONICAL_ENV)
-}
-
-LAUNCHER_ENV_ACTION = {
-    **{name: "set_canonical" for name in CANONICAL_ENV},
-    **{name: "set_pinned" for name in PINNED_OPERATIONAL_ENV},
-    **{name: "unset_legacy" for name in CLEARED_LEGACY_ENV},
 }
 
 DYNAMIC_ENV_SITES: Mapping[str, str] = {}
@@ -465,19 +494,83 @@ def validate_environment_contract(
         )
 
 
-def launcher_action_manifest() -> dict[str, str]:
-    return {name: LAUNCHER_ENV_ACTION[name] for name in sorted(LAUNCHER_ENV_ACTION)}
+def resolve_pinned_environment(
+    environment: Mapping[str, str],
+) -> dict[str, str]:
+    expected_names = set(PINNED_OPERATIONAL_ENV)
+    actual_names = set(PINNED_ENV_EXPECTED_VALUES)
+    if actual_names != expected_names:
+        raise EnvSchemaError(
+            "pinned environment action specs drifted: "
+            f"missing={sorted(expected_names - actual_names)}, "
+            f"extra={sorted(actual_names - expected_names)}"
+        )
+    resolved = {}
+    for name in sorted(PINNED_OPERATIONAL_ENV):
+        source, value = PINNED_ENV_EXPECTED_VALUES[name]
+        if source == "literal":
+            resolved[name] = value
+        elif source == "environment":
+            if value not in environment:
+                raise EnvSchemaError(
+                    f"pinned environment source is missing for {name}: {value}"
+                )
+            resolved[name] = str(environment[value])
+        else:
+            raise EnvSchemaError(
+                f"unknown pinned environment source for {name}: {source}"
+            )
+    return resolved
 
 
-def validate_launcher_environment(environment: Mapping[str, str]) -> None:
-    required = CANONICAL_ENV | PINNED_OPERATIONAL_ENV
-    missing = {name for name in required if name not in environment}
+def launcher_action_manifest(
+    environment: Mapping[str, str],
+) -> dict[str, dict[str, str]]:
+    pinned = resolve_pinned_environment(environment)
+    missing_canonical = CANONICAL_ENV - set(environment)
+    if missing_canonical:
+        raise EnvSchemaError(
+            "canonical launcher actions are missing values: "
+            f"{sorted(missing_canonical)}"
+        )
+    actions: dict[str, dict[str, str]] = {}
+    for name in sorted(CANONICAL_ENV):
+        actions[name] = {
+            "action": "set_canonical",
+            "value": str(environment[name]),
+        }
+    for name, value in pinned.items():
+        actions[name] = {"action": "set_pinned", "value": value}
+    for name in sorted(CLEARED_LEGACY_ENV):
+        actions[name] = {"action": "unset_legacy"}
+    return actions
+
+
+def validate_launcher_environment(
+    environment: Mapping[str, str],
+    *,
+    actions: Mapping[str, Mapping[str, str]] | None = None,
+) -> None:
+    missing = CANONICAL_ENV - set(environment)
     if missing:
         raise EnvSchemaError(
             f"launcher environment is missing sealed values: {sorted(missing)}"
+        )
+    expected_pinned = resolve_pinned_environment(environment)
+    wrong_pinned = {
+        name: (environment.get(name), expected)
+        for name, expected in expected_pinned.items()
+        if environment.get(name) != expected
+    }
+    if wrong_pinned:
+        raise EnvSchemaError(
+            f"launcher pinned values differ from expected actions: {wrong_pinned}"
         )
     leaked = {name for name in CLEARED_LEGACY_ENV if name in environment}
     if leaked:
         raise EnvSchemaError(
             f"launcher environment retained cleared legacy values: {sorted(leaked)}"
         )
+    expected_actions = launcher_action_manifest(environment)
+    if actions is not None and dict(actions) != expected_actions:
+        raise EnvSchemaError("launcher action manifest does not match exact actions")

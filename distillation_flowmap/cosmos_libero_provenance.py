@@ -72,6 +72,8 @@ def build_artifact_lock(
 ) -> dict[str, Any]:
     """Prepare a lock payload explicitly; callers decide where to persist it."""
 
+    if type(immutable_store) is not bool:
+        raise ProvenanceError("immutable_store must be a plain boolean")
     canonical_root = _canonical_root(root, label="artifact root")
     compact = tuple(compact_paths)
     large = tuple(large_paths)
@@ -96,7 +98,7 @@ def build_artifact_lock(
     return {
         "schema": ARTIFACT_LOCK_SCHEMA,
         "root": str(canonical_root),
-        "immutable_store": bool(immutable_store),
+        "immutable_store": immutable_store,
         "entries": entries,
         "tree_digest": _sha256_bytes(canonical_json(entries).encode()),
     }
@@ -122,6 +124,10 @@ def verify_artifact_lock(
     *,
     verify_large_artifact_digests: bool,
 ) -> dict[str, Any]:
+    if type(verify_large_artifact_digests) is not bool:
+        raise ProvenanceError(
+            "verify_large_artifact_digests must be a plain boolean"
+        )
     canonical_root = _canonical_root(root, label="artifact root")
     canonical_lock, payload = _read_artifact_lock(lock_path)
     required_fields = {
@@ -135,6 +141,8 @@ def verify_artifact_lock(
         raise ProvenanceError("artifact lock fields do not match schema")
     if payload["schema"] != ARTIFACT_LOCK_SCHEMA:
         raise ProvenanceError("unsupported artifact lock schema")
+    if type(payload["immutable_store"]) is not bool:
+        raise ProvenanceError("artifact lock immutable_store must be a plain boolean")
     if payload["root"] != str(canonical_root):
         raise ProvenanceError("artifact lock root does not match resolved root")
     entries = payload["entries"]
@@ -144,9 +152,10 @@ def verify_artifact_lock(
         raise ProvenanceError("artifact lock entries must be path sorted")
     if payload["tree_digest"] != _sha256_bytes(canonical_json(entries).encode()):
         raise ProvenanceError("artifact lock tree digest does not match entries")
-    if not payload["immutable_store"] and not verify_large_artifact_digests:
+    if not verify_large_artifact_digests:
         raise ProvenanceError(
-            "large artifact digests require an immutable store or explicit verification"
+            "large artifact digests require explicit verification; "
+            "self-asserted immutable_store is not a trusted attestation"
         )
 
     compact_verified = []
@@ -202,14 +211,28 @@ def fingerprint_git_repository(
     path: str | Path, *, purpose: str
 ) -> dict[str, str]:
     root = _canonical_root(path, label=f"{purpose} repository")
+    git_environment = {
+        **os.environ,
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    git_prefix = [
+        "git",
+        "-c",
+        "core.refreshIndex=false",
+        "-c",
+        "core.fsmonitor=false",
+        "-C",
+        str(root),
+    ]
 
     def run(*args: str, text: bool = True):
         try:
             return subprocess.run(
-                ["git", "-C", str(root), *args],
+                [*git_prefix, *args],
                 check=True,
                 capture_output=True,
                 text=text,
+                env=git_environment,
             ).stdout
         except (OSError, subprocess.CalledProcessError) as exc:
             raise ProvenanceError(f"unable to fingerprint {purpose} repository") from exc

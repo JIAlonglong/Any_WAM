@@ -51,7 +51,7 @@ class CosmosProgressiveS4Client:
         service: Any,
         *,
         output_dir: str | Path,
-        student_steps: int,
+        student_steps: int = 4,
         warmup_steps: int = 5,
         warmup_gripper: float = 0.0,
         skip_first_action: bool = False,
@@ -95,6 +95,11 @@ class CosmosProgressiveS4Client:
 
     def _validate_service_student_steps(self, response: Mapping[str, Any]) -> None:
         if "student_steps" not in response:
+            if self.student_steps != 4:
+                raise ValueError(
+                    "S4 service response is missing student_steps for "
+                    f"client configured with {self.student_steps}"
+                )
             return
         response_steps = normalize_student_steps(response["student_steps"])
         if response_steps != self.student_steps:

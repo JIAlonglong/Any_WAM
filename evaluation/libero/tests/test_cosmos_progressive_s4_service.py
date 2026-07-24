@@ -225,6 +225,37 @@ class _DoneEnv:
         return None
 
 
+def test_client_omitted_student_steps_defaults_and_persists_four(tmp_path):
+    class LegacySuccessfulService:
+        def infer(self, request):
+            if request.get("reset"):
+                return {"ok": True}
+            return {"action": np.zeros((16, 7), dtype=np.float32)}
+
+    client = CosmosProgressiveS4Client(
+        LegacySuccessfulService(), output_dir=tmp_path, warmup_steps=0
+    )
+
+    record = client.run_with_env(
+        env=_DoneEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=1,
+        episode_idx=0,
+        prompt="open the drawer",
+        max_env_steps=1,
+        init_env_fn=lambda *_args, **_kwargs: OBS,
+        extract_video_fn=lambda _obs: {},
+        rollout_seed=19,
+    )
+
+    assert client.student_steps == 4
+    assert record["student_steps"] == 4
+    persisted = json.loads(
+        (tmp_path / "records" / "task_1_episode_0.json").read_text(encoding="utf-8")
+    )
+    assert persisted["student_steps"] == 4
+
+
 def test_client_records_rollout_seed_on_success(tmp_path):
     client = CosmosProgressiveS4Client(
         _SuccessfulService(), output_dir=tmp_path, student_steps=2, warmup_steps=0
@@ -371,6 +402,87 @@ def test_client_rejects_reset_student_steps_mismatch_before_infer(tmp_path):
     assert "student_steps mismatch" in record["error"]
     persisted = json.loads(
         (tmp_path / "records" / "task_5_episode_1.json").read_text(encoding="utf-8")
+    )
+    assert persisted["student_steps"] == 2
+
+
+class _MissingResetStepsService:
+    def __init__(self):
+        self.calls = 0
+
+    def infer(self, request):
+        self.calls += 1
+        if request.get("reset"):
+            return {"ok": True}
+        return {
+            "action": np.zeros((16, 7), dtype=np.float32),
+            "student_steps": 2,
+        }
+
+
+def test_k2_client_rejects_reset_response_missing_student_steps(tmp_path):
+    service = _MissingResetStepsService()
+    client = CosmosProgressiveS4Client(
+        service,
+        output_dir=tmp_path,
+        student_steps=2,
+        warmup_steps=0,
+    )
+
+    record = client.run_with_env(
+        env=_DoneEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=5,
+        episode_idx=2,
+        prompt="open the drawer",
+        max_env_steps=1,
+        init_env_fn=lambda *_args, **_kwargs: OBS,
+        extract_video_fn=lambda _obs: {},
+        rollout_seed=30,
+    )
+
+    assert service.calls == 1
+    assert record["server_failure"] is True
+    assert record["student_steps"] == 2
+    assert "missing student_steps" in record["error"]
+    persisted = json.loads(
+        (tmp_path / "records" / "task_5_episode_2.json").read_text(encoding="utf-8")
+    )
+    assert persisted["student_steps"] == 2
+
+
+class _MissingInferStepsService:
+    def infer(self, request):
+        if request.get("reset"):
+            return {"ok": True, "student_steps": 2}
+        return {"action": np.zeros((16, 7), dtype=np.float32)}
+
+
+def test_k2_client_rejects_infer_response_missing_student_steps(tmp_path):
+    client = CosmosProgressiveS4Client(
+        _MissingInferStepsService(),
+        output_dir=tmp_path,
+        student_steps=2,
+        warmup_steps=0,
+    )
+
+    record = client.run_with_env(
+        env=_DoneEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=5,
+        episode_idx=3,
+        prompt="open the drawer",
+        max_env_steps=1,
+        init_env_fn=lambda *_args, **_kwargs: OBS,
+        extract_video_fn=lambda _obs: {},
+        rollout_seed=30,
+    )
+
+    assert record["server_failure"] is True
+    assert record["student_steps"] == 2
+    assert "missing student_steps" in record["error"]
+    persisted = json.loads(
+        (tmp_path / "records" / "task_5_episode_3.json").read_text(encoding="utf-8")
     )
     assert persisted["student_steps"] == 2
 

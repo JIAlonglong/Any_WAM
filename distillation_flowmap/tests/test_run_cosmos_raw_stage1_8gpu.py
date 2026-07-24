@@ -51,6 +51,9 @@ def _layout(tmp_path: Path) -> dict[str, str]:
     _write_executable(
         preflight,
         'printf "%s\\n" "$*" >> "$PREFLIGHT_LOG"\n'
+        'if [[ "${CLAIM_OUTPUT_DURING_PREFLIGHT:-0}" == 1 ]]; then\n'
+        '    mkdir -p "$OUTPUT_DIR"\n'
+        "fi\n"
         'exit "${FAKE_PREFLIGHT_EXIT:-0}"\n',
     )
     torchrun = tmp_path / "fake-torchrun"
@@ -105,6 +108,41 @@ def _run(mode: str, *args: str, env: dict[str, str]) -> subprocess.CompletedProc
     )
 
 
+def _import_stage1_config(
+    **updates: str,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONPATH": str(ROOT),
+            "RESUME_FROM_PATH": "",
+            "RESUME_ONLINE_FROM_TARGET": "0",
+            "RESET_RESUME_STEP": "0",
+            "RESUME_OPTIMIZER_STATE": "0",
+            "TRAIN_SEED": "42",
+            **updates,
+        }
+    )
+    code = """import json
+from distillation_flowmap.config_libero_cosmos_policy_stage1 import cfg
+print(json.dumps({
+    "resume_from_path": cfg.resume_from_path,
+    "resume_online_from_target": cfg.resume_online_from_target,
+    "reset_resume_step": cfg.reset_resume_step,
+    "resume_optimizer_state": cfg.resume_optimizer_state,
+    "seed": cfg.seed,
+}))
+"""
+    return subprocess.run(
+        [str(PYTHON), "-c", code],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def _checkpoint(output: Path, step: int) -> Path:
     checkpoint = output / "checkpoints" / f"step_{step}"
     for variant in ("online_student", "target_student"):
@@ -112,6 +150,69 @@ def _checkpoint(output: Path, step: int) -> Path:
     (checkpoint / "optimizer.pt").write_bytes(b"test")
     (checkpoint / "lr_scheduler.pt").write_bytes(b"test")
     return checkpoint
+
+
+def test_stage1_config_explicitly_parses_fresh_resume_controls_and_seed():
+    result = _import_stage1_config(TRAIN_SEED="17")
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "resume_from_path": None,
+        "resume_online_from_target": False,
+        "reset_resume_step": False,
+        "resume_optimizer_state": False,
+        "seed": 17,
+    }
+
+
+def test_stage1_config_explicitly_parses_resume_controls_and_seed(tmp_path):
+    checkpoint = tmp_path / "output" / "checkpoints" / "step_10"
+
+    result = _import_stage1_config(
+        RESUME_FROM_PATH=str(checkpoint),
+        RESUME_ONLINE_FROM_TARGET="false",
+        RESET_RESUME_STEP="no",
+        RESUME_OPTIMIZER_STATE="true",
+        TRAIN_SEED="23",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "resume_from_path": str(checkpoint),
+        "resume_online_from_target": False,
+        "reset_resume_step": False,
+        "resume_optimizer_state": True,
+        "seed": 23,
+    }
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("RESUME_ONLINE_FROM_TARGET", "maybe"),
+        ("RESET_RESUME_STEP", "2"),
+        ("RESUME_OPTIMIZER_STATE", ""),
+        ("TRAIN_SEED", "not-an-int"),
+    ],
+)
+def test_stage1_config_rejects_invalid_typed_resume_or_seed_env(variable, value):
+    result = _import_stage1_config(**{variable: value})
+
+    assert result.returncode != 0
+    assert variable in result.stderr
+
+
+def _make_sharded(transformer: Path, shard_names: list[str]) -> Path:
+    (transformer / "diffusion_pytorch_model.safetensors").unlink()
+    weight_map = {}
+    for index, shard_name in enumerate(shard_names):
+        shard = transformer / shard_name
+        shard.parent.mkdir(parents=True, exist_ok=True)
+        shard.write_bytes(b"test")
+        weight_map[f"weight_{index}"] = shard_name
+    index_path = transformer / "diffusion_pytorch_model.safetensors.index.json"
+    index_path.write_text(json.dumps({"weight_map": weight_map}) + "\n", encoding="utf-8")
+    return index_path
 
 
 def test_dry_run_prints_corrected_raw_contract_without_mutation(tmp_path):
@@ -138,22 +239,113 @@ def test_dry_run_prints_corrected_raw_contract_without_mutation(tmp_path):
 def test_dry_run_accepts_sharded_clean_base_layout(tmp_path):
     env = _env(tmp_path)
     transformer = Path(env["CLEAN_STUDENT_BASE_MODEL_PATH"]) / "transformer"
-    (transformer / "diffusion_pytorch_model.safetensors").unlink()
     shards = [
         "diffusion_pytorch_model-00001-of-00002.safetensors",
         "diffusion_pytorch_model-00002-of-00002.safetensors",
     ]
-    for shard in shards:
-        (transformer / shard).write_bytes(b"test")
-    (transformer / "diffusion_pytorch_model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"a": shards[0], "b": shards[1]}}) + "\n",
-        encoding="utf-8",
-    )
+    _make_sharded(transformer, shards)
 
     result = _run("dry-run", env=env)
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert not Path(env["STAGE1_OUTPUT"]).exists()
+
+
+@pytest.mark.parametrize(
+    "protected_key",
+    [
+        "CLEAN_STUDENT_BASE_MODEL_PATH",
+        "DATASET_PATH",
+        "COSMOS_POLICY_PATH",
+        "COSMOS_PREDICT2_REPO",
+        "COSMOS_PREDICT25_LOCAL_MODEL_DIR",
+    ],
+)
+def test_fresh_output_cannot_equal_or_nest_beneath_protected_inputs(
+    tmp_path, protected_key
+):
+    env = _env(tmp_path)
+    protected = Path(env[protected_key])
+
+    equal = _run("dry-run", "--output-dir", str(protected), env=env)
+    assert equal.returncode != 0
+    assert "protected" in equal.stderr
+
+    nested = _run("dry-run", "--output-dir", str(protected / "new-output"), env=env)
+    assert nested.returncode != 0
+    assert "protected" in nested.stderr
+
+
+def test_fresh_mode_rejects_dangling_output_symlink(tmp_path):
+    env = _env(tmp_path)
+    output = Path(env["STAGE1_OUTPUT"])
+    output.symlink_to(tmp_path / "missing-output", target_is_directory=True)
+
+    result = _run("dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+
+
+def test_fresh_output_cannot_escape_under_protected_input_through_parent_symlink(
+    tmp_path,
+):
+    env = _env(tmp_path)
+    alias = tmp_path / "clean-base-alias"
+    alias.symlink_to(env["CLEAN_STUDENT_BASE_MODEL_PATH"], target_is_directory=True)
+
+    result = _run("dry-run", "--output-dir", str(alias / "new-output"), env=env)
+
+    assert result.returncode != 0
+    assert "protected" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        ("missing", "missing declared"),
+        ("empty", "nonempty weight_map"),
+        ("malformed", "nonempty weight_map"),
+        ("nested", "invalid shard name"),
+        ("absolute", "invalid shard name"),
+        ("dotdot", "invalid shard name"),
+        ("symlink", "symlink"),
+        ("index_symlink", "symlink"),
+    ],
+)
+def test_rejects_invalid_sharded_transformer_layout(tmp_path, kind, message):
+    env = _env(tmp_path)
+    transformer = Path(env["CLEAN_STUDENT_BASE_MODEL_PATH"]) / "transformer"
+    (transformer / "diffusion_pytorch_model.safetensors").unlink()
+    index_path = transformer / "diffusion_pytorch_model.safetensors.index.json"
+
+    if kind == "missing":
+        payload = {"weight_map": {"a": "missing.safetensors"}}
+    elif kind == "empty":
+        payload = {"weight_map": {}}
+    elif kind == "malformed":
+        payload = {"weight_map": []}
+    elif kind == "nested":
+        payload = {"weight_map": {"a": "nested/shard.safetensors"}}
+    elif kind == "absolute":
+        payload = {"weight_map": {"a": str(tmp_path / "outside.safetensors")}}
+    elif kind == "dotdot":
+        payload = {"weight_map": {"a": ".."}}
+    else:
+        payload = {"weight_map": {"a": "shard.safetensors"}}
+        target = tmp_path / "outside-shard.safetensors"
+        target.write_bytes(b"test")
+        (transformer / "shard.safetensors").symlink_to(target)
+
+    real_index = tmp_path / "real-index.json" if kind == "index_symlink" else index_path
+    real_index.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    if kind == "index_symlink":
+        index_path.symlink_to(real_index)
+
+    result = _run("dry-run", env=env)
+
+    assert result.returncode != 0
+    assert message in result.stderr
 
 
 def test_cli_overrides_and_valid_run_tag_are_resolved(tmp_path):
@@ -211,6 +403,7 @@ def test_rejects_invalid_cli_values(tmp_path, args, message):
         ("0,1", "exactly 8"),
         ("0,1,2,3,4,5,6,6", "duplicate"),
         ("0,1,2,3,4,5,6,x", "non-numeric"),
+        ("0,00,1,2,3,4,5,6", "canonical"),
     ],
 )
 def test_rejects_invalid_gpu_layout(tmp_path, devices, message):
@@ -268,6 +461,85 @@ def test_resume_requires_exact_step_and_complete_v2_raw_checkpoint(tmp_path):
     assert "RESUME_ONLINE_FROM_TARGET=0" in result.stdout
     assert "RESET_RESUME_STEP=0" in result.stdout
     assert "RESUME_OPTIMIZER_STATE=1" in result.stdout
+    assert not Path(env["TORCHRUN_LOG"]).exists()
+
+
+def test_real_config_preflight_accepts_fresh_and_resume_modes(tmp_path):
+    env = _env(tmp_path)
+    env["PREFLIGHT_BIN"] = str(PYTHON)
+
+    fresh = _run("dry-run", "--steps", "20", env=env)
+    assert fresh.returncode == 0, fresh.stdout + fresh.stderr
+    assert not Path(env["STAGE1_OUTPUT"]).exists()
+
+    _checkpoint(Path(env["STAGE1_OUTPUT"]), 10)
+    resume = _run(
+        "dry-run",
+        "--steps",
+        "20",
+        "--resume-step",
+        "10",
+        env=env,
+    )
+    assert resume.returncode == 0, resume.stdout + resume.stderr
+
+
+@pytest.mark.parametrize(
+    "component",
+    [
+        "output",
+        "checkpoints",
+        "checkpoint",
+        "transformer",
+        "config",
+        "optimizer",
+        "scheduler",
+        "weights",
+    ],
+)
+def test_resume_rejects_symlinked_path_components_and_files(tmp_path, component):
+    env = _env(tmp_path)
+    output = Path(env["STAGE1_OUTPUT"])
+    checkpoint = _checkpoint(output, 3000)
+
+    if component == "output":
+        real_output = tmp_path / "real-output"
+        output.rename(real_output)
+        output.symlink_to(real_output, target_is_directory=True)
+    elif component == "checkpoints":
+        real_checkpoints = tmp_path / "real-checkpoints"
+        (output / "checkpoints").rename(real_checkpoints)
+        (output / "checkpoints").symlink_to(real_checkpoints, target_is_directory=True)
+    elif component == "checkpoint":
+        real_checkpoint = tmp_path / "real-checkpoint"
+        checkpoint.rename(real_checkpoint)
+        checkpoint.symlink_to(real_checkpoint, target_is_directory=True)
+    elif component == "transformer":
+        transformer = checkpoint / "online_student" / "transformer"
+        real_transformer = tmp_path / "real-transformer"
+        transformer.rename(real_transformer)
+        transformer.symlink_to(real_transformer, target_is_directory=True)
+    else:
+        paths = {
+            "config": checkpoint / "online_student" / "transformer" / "config.json",
+            "optimizer": checkpoint / "optimizer.pt",
+            "scheduler": checkpoint / "lr_scheduler.pt",
+            "weights": (
+                checkpoint
+                / "target_student"
+                / "transformer"
+                / "diffusion_pytorch_model.safetensors"
+            ),
+        }
+        path = paths[component]
+        target = tmp_path / f"real-{component}"
+        path.rename(target)
+        path.symlink_to(target)
+
+    result = _run("dry-run", "--resume-step", "3000", env=env)
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
     assert not Path(env["TORCHRUN_LOG"]).exists()
 
 
@@ -329,6 +601,18 @@ def test_preflight_failure_is_fail_closed_and_does_not_create_output(tmp_path):
     assert not Path(env["STAGE1_OUTPUT"]).exists()
 
 
+def test_run_loses_atomic_output_claim_without_starting_torchrun(tmp_path):
+    env = _env(tmp_path)
+    env["CLAIM_OUTPUT_DURING_PREFLIGHT"] = "1"
+
+    result = _run("run", env=env)
+
+    assert result.returncode != 0
+    assert "claim OUTPUT_DIR" in result.stderr
+    assert Path(env["STAGE1_OUTPUT"]).is_dir()
+    assert not Path(env["TORCHRUN_LOG"]).exists()
+
+
 def test_run_creates_output_only_after_preflight_and_executes_fake_torchrun(tmp_path):
     env = _env(tmp_path)
 
@@ -342,3 +626,22 @@ def test_run_creates_output_only_after_preflight_and_executes_fake_torchrun(tmp_
     assert "--master_port=29671" in log
     assert "CONFIG_FILE=distillation_flowmap.config_libero_cosmos_policy_stage1" in log
     assert f"STUDENT_BASE_MODEL_PATH={env['CLEAN_STUDENT_BASE_MODEL_PATH']}" in log
+    assert "RESUME_ONLINE_FROM_TARGET=0" in log
+    assert "RESET_RESUME_STEP=0" in log
+    assert "RESUME_OPTIMIZER_STATE=0" in log
+    assert "--resume-from-path" not in log
+
+
+def test_resume_run_executes_fake_torchrun_with_exact_restore_contract(tmp_path):
+    env = _env(tmp_path)
+    checkpoint = _checkpoint(Path(env["STAGE1_OUTPUT"]), 10)
+
+    result = _run("run", "--steps", "20", "--resume-step", "10", env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    log = Path(env["TORCHRUN_LOG"]).read_text(encoding="utf-8")
+    assert f"--resume-from-path {checkpoint}" in log
+    assert f"RESUME_FROM_PATH={checkpoint}" in log
+    assert "RESUME_ONLINE_FROM_TARGET=0" in log
+    assert "RESET_RESUME_STEP=0" in log
+    assert "RESUME_OPTIMIZER_STATE=1" in log

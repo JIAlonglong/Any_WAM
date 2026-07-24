@@ -39,18 +39,33 @@ require_file() {
 }
 
 
+require_plain_dir() {
+    [[ ! -L "$2" ]] || die "$1 must not be a symlink: $2"
+    require_dir "$1" "$2"
+}
+
+
+require_plain_file() {
+    [[ ! -L "$2" ]] || die "$1 must not be a symlink: $2"
+    require_file "$1" "$2"
+}
+
+
 require_transformer() {
     local label="$1"
     local root="$2"
-    require_dir "$label" "$root"
-    require_file "$label/config.json" "$root/config.json"
+    require_plain_dir "$label" "$root"
+    require_plain_file "$label/config.json" "$root/config.json"
     if [[ -f "$root/diffusion_pytorch_model.safetensors" ]]; then
+        require_plain_file "$label/diffusion_pytorch_model.safetensors" \
+            "$root/diffusion_pytorch_model.safetensors"
         return
     fi
 
     local index_path="$root/diffusion_pytorch_model.safetensors.index.json"
-    require_file "$label/diffusion_pytorch_model.safetensors.index.json" "$index_path"
-    local shard_validation_code='import json, sys
+    require_plain_file "$label/diffusion_pytorch_model.safetensors.index.json" \
+        "$index_path"
+    local shard_validation_code='import json, os, sys
 from pathlib import Path
 
 index = Path(sys.argv[1])
@@ -60,9 +75,17 @@ if not isinstance(weight_map, dict) or not weight_map:
     raise ValueError(f"{index} must contain a nonempty weight_map")
 root = index.parent
 for raw_name in set(weight_map.values()):
-    if not isinstance(raw_name, str) or Path(raw_name).name != raw_name:
+    if (
+        not isinstance(raw_name, str)
+        or raw_name in ("", ".", "..")
+        or "/" in raw_name
+        or os.path.isabs(raw_name)
+        or Path(raw_name).name != raw_name
+    ):
         raise ValueError(f"invalid shard name in {index}: {raw_name!r}")
     shard = root / raw_name
+    if shard.is_symlink():
+        raise ValueError(f"declared transformer shard must not be a symlink: {shard}")
     if not shard.is_file():
         raise FileNotFoundError(f"missing declared transformer shard: {shard}")'
     if ! PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -c \
@@ -93,6 +116,8 @@ validate_devices() {
     for ordinal in "${ordinals[@]}"; do
         [[ "$ordinal" =~ ^[0-9]+$ ]] || die \
             "$label contains a non-numeric GPU ordinal: $ordinal"
+        [[ "$ordinal" =~ ^(0|[1-9][0-9]*)$ ]] || die \
+            "$label contains a non-canonical GPU ordinal: $ordinal"
         [[ -z "${seen[$ordinal]:-}" ]] || die \
             "$label contains duplicate GPU ordinal: $ordinal"
         seen["$ordinal"]=1
@@ -217,18 +242,70 @@ require_dir COSMOS_POLICY_PATH "$COSMOS_POLICY_PATH"
 require_dir COSMOS_PREDICT2_REPO "$COSMOS_PREDICT2_REPO"
 require_dir COSMOS_PREDICT25_LOCAL_MODEL_DIR "$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
 
+output_safety_code='import os, sys
+from pathlib import Path
+
+mode = sys.argv[1]
+raw_output = Path(sys.argv[2])
+if os.path.lexists(raw_output) and raw_output.is_symlink():
+    raise ValueError(f"OUTPUT_DIR must not be a symlink: {raw_output}")
+output = raw_output.resolve(strict=(mode == "resume"))
+if mode == "fresh":
+    for raw_protected in sys.argv[3:]:
+        protected = Path(raw_protected).resolve(strict=True)
+        if output == protected or protected in output.parents:
+            raise ValueError(
+                f"OUTPUT_DIR {output} equals or is nested beneath protected input {protected}"
+            )
+elif not output.is_dir():
+    raise ValueError(f"resume OUTPUT_DIR is not a directory: {output}")
+print(output)'
+output_mode=fresh
+[[ -z "$RESUME_STEP" ]] || output_mode=resume
+if ! OUTPUT_DIR="$(
+    PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -c "$output_safety_code" \
+        "$output_mode" "$OUTPUT_DIR" \
+        "$CLEAN_STUDENT_BASE_MODEL_PATH" \
+        "$DATASET_PATH" \
+        "$COSMOS_POLICY_PATH" \
+        "$COSMOS_PREDICT2_REPO" \
+        "$COSMOS_PREDICT25_LOCAL_MODEL_DIR" \
+        "$COSMOS_WORKER_ENV_ROOT"
+)"; then
+    die "OUTPUT_DIR canonical safety validation failed"
+fi
+
 RESUME_FROM_PATH=""
 RESUME_ONLINE_FROM_TARGET=0
 RESET_RESUME_STEP=0
 RESUME_OPTIMIZER_STATE=0
 if [[ -n "$RESUME_STEP" ]]; then
+    require_plain_dir "resume OUTPUT_DIR" "$OUTPUT_DIR"
+    require_plain_dir "resume checkpoints" "$OUTPUT_DIR/checkpoints"
     RESUME_FROM_PATH="$OUTPUT_DIR/checkpoints/step_$RESUME_STEP"
+    require_plain_dir "resume checkpoint" "$RESUME_FROM_PATH"
     for variant in online_student target_student; do
+        require_plain_dir "resume $variant" "$RESUME_FROM_PATH/$variant"
         require_transformer "resume $variant/transformer" \
             "$RESUME_FROM_PATH/$variant/transformer"
     done
-    require_file optimizer.pt "$RESUME_FROM_PATH/optimizer.pt"
-    require_file lr_scheduler.pt "$RESUME_FROM_PATH/lr_scheduler.pt"
+    require_plain_file optimizer.pt "$RESUME_FROM_PATH/optimizer.pt"
+    require_plain_file lr_scheduler.pt "$RESUME_FROM_PATH/lr_scheduler.pt"
+
+    resume_path_code='import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve(strict=True)
+checkpoint = Path(sys.argv[2]).resolve(strict=True)
+expected = (root / "checkpoints" / f"step_{sys.argv[3]}").resolve(strict=True)
+if checkpoint != expected or root not in checkpoint.parents:
+    raise ValueError(
+        f"resume checkpoint {checkpoint} is not the exact checkpoint inside {root}"
+    )'
+    if ! PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -c "$resume_path_code" \
+        "$OUTPUT_DIR" "$RESUME_FROM_PATH" "$RESUME_STEP"; then
+        die "resume checkpoint canonical containment validation failed"
+    fi
 
     resume_validation_code='import json, sys
 from pathlib import Path
@@ -260,7 +337,7 @@ print(f"validated corrected raw Stage-1 checkpoint step {expected_step}")'
     RESET_RESUME_STEP=0
     RESUME_OPTIMIZER_STATE=1
 else
-    [[ ! -e "$OUTPUT_DIR" ]] || die \
+    [[ ! -e "$OUTPUT_DIR" && ! -L "$OUTPUT_DIR" ]] || die \
         "Refusing fresh run with existing OUTPUT_DIR: $OUTPUT_DIR"
 fi
 
@@ -320,10 +397,16 @@ from distillation_flowmap.cosmos_training_contract import (
 cfg = import_module(os.environ["CONFIG_FILE"]).cfg
 metadata = contract_metadata(cfg, stage="raw_stage1")
 validate_contract_metadata(metadata, required_stage="raw_stage1")
+resume_path = os.environ["RESUME_FROM_PATH"] or None
 assert cfg.teacher_backend == "cosmos_policy"
 assert cfg.training_contract_stage == "raw_stage1"
 assert cfg.student_base_model_path == os.environ["STUDENT_BASE_MODEL_PATH"]
 assert cfg.teacher_model_path == os.environ["COSMOS_POLICY_PATH"]
+assert cfg.resume_from_path == resume_path
+assert cfg.resume_online_from_target is False
+assert cfg.reset_resume_step is False
+assert cfg.resume_optimizer_state is (resume_path is not None)
+assert cfg.seed == int(os.environ["TRAIN_SEED"])
 assert cfg.max_train_steps == int(os.environ["MAX_TRAIN_STEPS"])
 assert cfg.save_interval == int(os.environ["SAVE_INTERVAL"])
 print("corrected Cosmos raw Stage-1 config preflight passed")'
@@ -350,7 +433,13 @@ if (( dry_run )); then
     exit 0
 fi
 
-mkdir -p "$OUTPUT_DIR"
+if [[ -z "$RESUME_STEP" ]]; then
+    OUTPUT_PARENT="$(dirname "$OUTPUT_DIR")"
+    mkdir -p "$OUTPUT_PARENT" || die \
+        "failed to create OUTPUT_DIR parent: $OUTPUT_PARENT"
+    mkdir "$OUTPUT_DIR" || die \
+        "failed to atomically claim OUTPUT_DIR: $OUTPUT_DIR"
+fi
 printf '%s\n' "${launch_env[@]}" > "$OUTPUT_DIR/launch_env.txt"
 printf '%q ' "${command[@]}" > "$OUTPUT_DIR/launch_command.txt"
 printf '\n' >> "$OUTPUT_DIR/launch_command.txt"

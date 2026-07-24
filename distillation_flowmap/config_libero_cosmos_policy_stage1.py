@@ -27,7 +27,31 @@ def _env_bool(name, default):
     val = os.environ.get(name)
     if val is None:
         return default
-    return val.lower() in ("1", "true", "yes", "on")
+    normalized = val.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(
+        f"{name} must be a boolean (1/0, true/false, yes/no, or on/off), got {val!r}"
+    )
+
+
+def _env_int(name, default):
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {val!r}") from None
+
+
+cfg.resume_from_path = os.environ.get("RESUME_FROM_PATH") or None
+cfg.resume_online_from_target = _env_bool("RESUME_ONLINE_FROM_TARGET", False)
+cfg.reset_resume_step = _env_bool("RESET_RESUME_STEP", False)
+cfg.resume_optimizer_state = _env_bool("RESUME_OPTIMIZER_STATE", False)
+cfg.seed = _env_int("TRAIN_SEED", cfg.seed)
 
 
 cfg.teacher_backend = "cosmos_policy"

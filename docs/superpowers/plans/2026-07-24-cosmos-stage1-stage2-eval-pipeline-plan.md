@@ -849,12 +849,18 @@ git commit -m "feat: launch corrected Cosmos raw Stage-1"
 
 **Files:**
 - Modify: `distillation_flowmap/run_cosmos_progressive_stage2_8gpu.sh`
+- Modify: `distillation_flowmap/config_libero_cosmos_policy_stage2_progressive.py`
 - Modify: `distillation_flowmap/tests/test_run_cosmos_progressive_stage2_8gpu.py`
+- Modify: `distillation_flowmap/tests/test_cosmos_progressive_config.py`
 
 **Interfaces:**
 - Consumes: corrected `COSMOS_STAGE1_ROOT`.
 - Requires: Stage-1 online/target contract version 2 and packing schema v2.
 - Produces: `universal-video-action` Stage-2 at 5,000 steps with deployment contract.
+- Guarantees: fresh Stage-2 reads the corrected Stage-1 target/EMA but makes
+  zero writes below the Stage-1 root; resume reads only its own Stage-2 arm.
+- Produces resolved parent path/identity fields for the Task 7 completion
+  manifest and Task 9 handoff.
 
 - [ ] **Step 1: Write failing corrected-lineage tests**
 
@@ -887,6 +893,37 @@ def test_stage2_rejects_incompatible_stage1_contract(tmp_path, mutation):
     result = run_launcher("universal-video-action", "--dry-run", env=env)
     assert result.returncode != 0
     assert "Stage-1 contract" in result.stderr
+```
+
+Add fail-closed isolation and resume tests:
+
+```python
+def test_fresh_stage2_leaves_corrected_stage1_tree_byte_and_stat_identical(tmp_path):
+    stage1 = make_stage1_checkpoint(tmp_path / "stage1/checkpoints/step_5000")
+    before = recursive_file_identity(stage1)
+    result = run_fake_launcher(
+        "universal-video-action", stage1=stage1, output=tmp_path / "stage2"
+    )
+    assert result.returncode == 0
+    assert recursive_file_identity(stage1) == before
+
+
+@pytest.mark.parametrize("hazard", ["output_symlink", "output_nested_in_stage1", "resume_outside_arm"])
+def test_stage2_rejects_path_aliases_that_can_modify_stage1(tmp_path, hazard):
+    result = run_hazard_case(tmp_path, hazard)
+    assert result.returncode != 0
+    assert "path isolation" in result.stderr
+
+
+def test_stage2_resume_requires_optimizer_scheduler_and_exact_progressive_contract(tmp_path):
+    checkpoint = make_stage2_checkpoint(tmp_path, step=2000)
+    (checkpoint / "lr_scheduler.pt").unlink()
+    result = run_launcher(
+        "universal-video-action", "--dry-run", "--resume-step", "2000",
+        env=launcher_env(tmp_path),
+    )
+    assert result.returncode != 0
+    assert "lr_scheduler.pt" in result.stderr
 ```
 
 Positive dry-run assertions:
@@ -924,8 +961,16 @@ requires:
     "action_packing_schema": "downsample_survivor_v2",
     "action_chunk_shape": [4, 4],
     "checkpoint_step": 5000,
+    "training_contract_stage": "raw_stage1",
 }
 ```
+
+Require both variants to match exactly, reject either variant if it is a
+symlink or resolves to the same inode, and reject the known contaminated
+default `raw_stage1_5000`. Canonicalize Stage-1, Stage-2 output, and resume
+paths; reject equality, nesting in either direction, output symlinks, and a
+resume path resolving outside the selected Stage-2 arm. Fresh mode follows
+the reference launcher and refuses any existing final output path.
 
 Export:
 
@@ -939,8 +984,15 @@ TRAIN_SEED=42
 ```
 
 Stage-2 resume validates its own full Stage-2 contract plus optimizer and
-scheduler. Fresh mode still initializes online from corrected Stage-1 target
-and resets step/optimizer.
+scheduler, exact `checkpoint_step`, and its own canonical arm containment.
+Fresh mode initializes online from corrected Stage-1 target, resets to step
+zero, and loads neither optimizer nor scheduler. Resume initializes from its
+own online student at step N and restores both optimizer and scheduler.
+
+The launcher emits canonical `PARENT_STAGE1_PATH` and a deterministic parent
+contract identity for Task 7/9 provenance. It writes no launch artifact
+through a symlink, and all preflight checks use explicit exceptions rather
+than Python `assert`.
 
 - [ ] **Step 4: Run launcher/config regressions**
 

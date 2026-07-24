@@ -19,6 +19,8 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
         "OPD_DANCEOPD_VELOCITY_WEIGHT",
         "OPD_DANCEOPD_ENDPOINT_WEIGHT",
         "OPD_DANCEOPD_ROLLOUT_STEPS",
+        "OPD_AUX_INTERVAL",
+        "OPD_AUX_PHASE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -47,6 +49,20 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
     assert module.cfg.deployment_timestep_end == 0
     assert module.cfg.deployment_action_weight == 1.0
     assert module.cfg.raw_teacher_window_is_auxiliary is True
+    assert module.cfg.opd_aux_interval == 8
+    assert module.cfg.opd_aux_phase == 2
+
+
+def test_progressive_raw_auxiliary_schedule_ignores_conflicting_environment(
+    monkeypatch,
+):
+    monkeypatch.setenv("COSMOS_PROGRESSIVE_STAGE", "s4")
+    monkeypatch.setenv("OPD_AUX_INTERVAL", "4")
+    monkeypatch.setenv("OPD_AUX_PHASE", "0")
+    module = importlib.reload(importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive"
+    ))
+
     assert module.cfg.opd_aux_interval == 8
     assert module.cfg.opd_aux_phase == 2
 

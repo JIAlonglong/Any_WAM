@@ -36,8 +36,12 @@ def deployment_endpoint_losses(
     if action_weight < 0:
         raise ValueError("action_weight must be non-negative")
     video = (video_final.float() - video_x0.detach().float()).square().mean()
-    mask = action_mask.detach().float()
-    diff = (action_final.float() - action_x0.detach().float()) * mask
-    denom = (mask.sum() * action_final.shape[1]).clamp(min=1)
+    action_diff = action_final.float() - action_x0.detach().float()
+    try:
+        mask = torch.broadcast_to(action_mask.detach().float(), action_diff.shape)
+    except RuntimeError as exc:
+        raise ValueError("action_mask must be broadcastable to action shape") from exc
+    diff = action_diff * mask
+    denom = mask.sum().clamp(min=1)
     action = diff.square().sum() / denom
     return {"video": video, "action": action, "total": video + action_weight * action}

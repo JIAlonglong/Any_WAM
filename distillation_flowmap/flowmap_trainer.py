@@ -57,6 +57,7 @@ from distillation_flowmap.mechanism_diagnostics import (
     means_from_reduced_stats,
 )
 from distillation_flowmap.distributed_safety import all_ranks_finite
+from distillation_flowmap.runtime_metadata import flowmap_runtime_metadata
 
 try:
     import wandb
@@ -1307,9 +1308,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 # Persist FlowMap/runtime metadata needed by inference and resume scripts.
                 config_dict['gate_value'] = getattr(self.config, 'gate_value', 0.0)
                 config_dict['deltatime_type'] = getattr(self.config, 'deltatime_type', 'r')
-                config_dict['num_train_timesteps'] = getattr(self.config, 'num_train_timesteps', 1000)
-                config_dict['snr_shift'] = getattr(self.config, 'snr_shift', 1.0)
-                config_dict['action_snr_shift'] = getattr(self.config, 'action_snr_shift', 1.0)
+                config_dict.update(flowmap_runtime_metadata(self.config))
                 config_dict['patch_size'] = list(getattr(self.config, 'patch_size', (1, 2, 2)))
                 config_dict['distill_mode'] = getattr(self.config, 'distill_mode', 'flashwam')
                 config_dict['checkpoint_step'] = self.step

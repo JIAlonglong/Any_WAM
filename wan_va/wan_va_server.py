@@ -62,6 +62,9 @@ from wan_va.utils import (
 
 from model_flowmap import patch_model_forward, setup_flowmap_model
 from inference import create_inference_kwargs, flowmap_inference, flowmap_update_cache
+from distillation_flowmap.runtime_metadata import (
+    resolve_action_downsample_factor,
+)
 from einops import rearrange
 from tqdm import tqdm
 
@@ -251,8 +254,8 @@ class VA_Server:
                 "action_snr_shift": ckpt_config.get(
                     "action_snr_shift", job_config.action_snr_shift
                 ),
-                "action_downsample_factor": ckpt_config.get(
-                    "action_downsample_factor",
+                "action_downsample_factor": resolve_action_downsample_factor(
+                    ckpt_config,
                     getattr(job_config, "action_downsample_factor", 1),
                 ),
             })

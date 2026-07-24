@@ -84,11 +84,19 @@ def test_dry_run_prints_full_eight_gpu_video_only_contract(tmp_path):
     assert "OPD_DANCEOPD_ACTION_VELOCITY_WEIGHT=0.0" in result.stdout
     assert "OPD_AUX_ACTION=0" in result.stdout
     assert "OPD_JOINT_ACTION_ROLLOUT=0" in result.stdout
+    assert "VIDEO_ACTION_BRIDGE=1" in result.stdout
+    assert "VIDEO_ACTION_BRIDGE_WEIGHT=1.0" in result.stdout
+    assert "VIDEO_ACTION_BRIDGE_WARMUP_END=500" in result.stdout
+    assert "VIDEO_ACTION_BRIDGE_MID_END=1500" in result.stdout
+    assert "VIDEO_ACTION_BRIDGE_START_PROB=0.25" in result.stdout
+    assert "VIDEO_ACTION_BRIDGE_MID_PROB=0.50" in result.stdout
+    assert "VIDEO_ACTION_BRIDGE_FINAL_PROB=0.75" in result.stdout
     assert "MECHANISM_DIAGNOSTIC_INTERVAL=50" in result.stdout
     assert "ATTN_MODE=torch" in result.stdout
     assert "--nproc_per_node=8" in result.stdout
     assert "--master_port=29659" in result.stdout
     assert 'import_module(os.environ["CONFIG_FILE"])' in log.read_text()
+    assert "assert cfg.video_action_bridge" in log.read_text()
     assert not Path(env["OUTPUT_DIR"]).exists()
 
 

@@ -1,6 +1,7 @@
 """Progressive Cosmos-only Stage 2 for K=4 -> K=2 -> K=1 deployment."""
 
 import copy
+import math
 import os
 
 from distillation_flowmap.config_libero_cosmos_policy_stage2_cosmos_latent_cdiff import (
@@ -191,9 +192,27 @@ cfg.opd_danceopd_query_beta = float(
 cfg.opd_danceopd_verify_terminal_prior = _env_bool(
     "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR", True
 )
+cfg.opd_danceopd_terminal_prior_tolerance = float(
+    os.environ.get("OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE", 2e-6)
+)
 cfg.opd_danceopd_terminal_prior_warn_factor = float(
     os.environ.get("OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR", 0.5)
 )
+if (
+    not math.isfinite(cfg.opd_danceopd_terminal_prior_tolerance)
+    or cfg.opd_danceopd_terminal_prior_tolerance < 0
+):
+    raise ValueError(
+        "OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE must be finite and "
+        "non-negative"
+    )
+if (
+    not math.isfinite(cfg.opd_danceopd_terminal_prior_warn_factor)
+    or not 0 <= cfg.opd_danceopd_terminal_prior_warn_factor <= 1
+):
+    raise ValueError(
+        "OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR must be finite and in [0, 1]"
+    )
 cfg.opd_danceopd_endpoint_weight = float(
     os.environ.get("OPD_DANCEOPD_ENDPOINT_WEIGHT", 1.0)
 )

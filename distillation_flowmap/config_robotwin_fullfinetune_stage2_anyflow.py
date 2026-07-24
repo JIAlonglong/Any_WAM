@@ -165,13 +165,23 @@ cfg.opd_danceopd_verify_terminal_prior = _env_bool(
     "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR", True
 )
 cfg.opd_danceopd_terminal_prior_tolerance = float(os.environ.get(
-    "OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE", 1e-6
+    "OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE", 2e-6
+))
+cfg.opd_danceopd_terminal_prior_warn_factor = float(os.environ.get(
+    "OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR", 0.5
 ))
 if (
     not math.isfinite(cfg.opd_danceopd_terminal_prior_tolerance)
     or cfg.opd_danceopd_terminal_prior_tolerance < 0
 ):
     raise ValueError("OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE must be finite and non-negative")
+if (
+    not math.isfinite(cfg.opd_danceopd_terminal_prior_warn_factor)
+    or not 0 <= cfg.opd_danceopd_terminal_prior_warn_factor <= 1
+):
+    raise ValueError(
+        "OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR must be finite and in [0, 1]"
+    )
 cfg.opd_danceopd_diagnostic_interval = int(os.environ.get(
     "OPD_DANCEOPD_DIAGNOSTIC_INTERVAL", 50
 ))

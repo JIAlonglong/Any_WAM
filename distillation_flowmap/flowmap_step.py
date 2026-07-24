@@ -123,57 +123,36 @@ from distillation_flowmap.cosmos_progressive_opd import (
 from distillation_flowmap.cosmos_deployment_rollout import (
     deployment_endpoint_losses,
 )
-from distillation_flowmap.numerical_contracts import compare_terminal_prior
+from distillation_flowmap.numerical_contracts import (
+    validate_terminal_prior_sources,
+)
 
 
-_TERMINAL_PRIOR_SEVERITY_CODE = {
-    "quiet": 0.0,
-    "warning": 1.0,
-    "error": 2.0,
-}
-
-
-def _terminal_prior_check_details(checks):
-    """Format every effective comparator threshold for diagnostics/errors."""
-    return "; ".join(
-        (
-            f"{name}: max_error={check.max_error:.3e}, "
-            f"reference_scale={check.reference_scale:.3e}, "
-            f"atol={check.atol:.3e}, rtol={check.rtol:.3e}, "
-            f"threshold={check.threshold:.3e}, severity={check.severity}"
-        )
-        for name, check in checks.items()
+def _validate_terminal_prior_pair(
+    *,
+    config,
+    video_actual,
+    video_expected,
+    video_source_dtype,
+    action_actual,
+    action_expected,
+    action_source_dtype,
+    reference,
+    error_context,
+):
+    """Execute the shared video/action terminal-prior production boundary."""
+    validation = validate_terminal_prior_sources(
+        {
+            "video": (video_actual, video_expected, video_source_dtype),
+            "action": (action_actual, action_expected, action_source_dtype),
+        },
+        config=config,
+        warning_callback=(
+            logger.warning if getattr(config, "rank", 0) == 0 else None
+        ),
+        error_context=error_context,
     )
-
-
-def _terminal_prior_diagnostic_tensors(checks, reference):
-    """Return tensor metadata for the most severe normalized comparison."""
-    severity_rank = {"quiet": 0, "warning": 1, "error": 2}
-
-    def _score(item):
-        check = item[1]
-        ratio = (
-            check.max_error / check.threshold
-            if math.isfinite(check.max_error)
-            and math.isfinite(check.threshold)
-            and check.threshold > 0
-            else math.inf
-        )
-        return severity_rank[check.severity], ratio
-
-    _, worst = max(checks.items(), key=_score)
-    values = {
-        "max_error": max(check.max_error for check in checks.values()),
-        "reference_scale": worst.reference_scale,
-        "atol": worst.atol,
-        "rtol": worst.rtol,
-        "threshold": worst.threshold,
-        "severity": _TERMINAL_PRIOR_SEVERITY_CODE[worst.severity],
-    }
-    return {
-        name: torch.tensor(value, device=reference.device, dtype=torch.float32)
-        for name, value in values.items()
-    }
+    return validation, validation.diagnostic_tensors(reference)
 
 
 class FlowMapStepMixin:
@@ -4078,52 +4057,23 @@ class FlowMapStepMixin:
             (1.0 - action_start_sigma) * action_clean
             + action_start_sigma * action_noise
         )
-        terminal_prior_warn_factor = float(getattr(
-            self.config, 'opd_danceopd_terminal_prior_warn_factor', 0.5
-        ))
-        terminal_prior_checks = {
-            "video": compare_terminal_prior(
-                current_video,
-                expected_video_start,
-                source_dtype=batch['latents'].dtype,
-                warn_factor=terminal_prior_warn_factor,
+        (
+            terminal_prior_validation,
+            terminal_prior_diagnostics,
+        ) = _validate_terminal_prior_pair(
+            config=self.config,
+            video_actual=current_video,
+            video_expected=expected_video_start,
+            video_source_dtype=batch["latents"].dtype,
+            action_actual=current_action,
+            action_expected=expected_action_start,
+            action_source_dtype=action_clean.dtype,
+            reference=current_video,
+            error_context=(
+                "Cosmos DanceOPD window start state is inconsistent with "
+                "the raw-teacher interpolation"
             ),
-            "action": compare_terminal_prior(
-                current_action,
-                expected_action_start,
-                source_dtype=action_clean.dtype,
-                warn_factor=terminal_prior_warn_factor,
-            ),
-        }
-        terminal_prior_diagnostics = _terminal_prior_diagnostic_tensors(
-            terminal_prior_checks, current_video
         )
-        verify_terminal_prior = bool(getattr(
-            self.config, 'opd_danceopd_verify_terminal_prior', True
-        ))
-        terminal_prior_details = _terminal_prior_check_details(
-            terminal_prior_checks
-        )
-        if verify_terminal_prior and any(
-            check.severity == "error" for check in terminal_prior_checks.values()
-        ):
-            raise RuntimeError(
-                "Cosmos DanceOPD window start state is inconsistent with the "
-                f"raw-teacher interpolation: {terminal_prior_details}"
-            )
-        if (
-            verify_terminal_prior
-            and any(
-                check.severity == "warning"
-                for check in terminal_prior_checks.values()
-            )
-            and getattr(self.config, 'rank', 0) == 0
-        ):
-            logger.warning(
-                "Cosmos DanceOPD window start is within the numerical "
-                "warning band: %s",
-                terminal_prior_details,
-            )
         action_base = input_dict['action_dict']
         action_grid_id = _downsample_action_grid_id(
             action_base.get('grid_id'), action_base['latent'], action_downsample
@@ -5425,53 +5375,21 @@ class FlowMapStepMixin:
         current_action = self.train_scheduler_action.add_noise(
             action_clean, action_noise, terminal_action_t, t_dim=2
         )
-        terminal_prior_warn_factor = float(getattr(
-            self.config, 'opd_danceopd_terminal_prior_warn_factor', 0.5
-        ))
-        terminal_prior_checks = {
-            "video": compare_terminal_prior(
-                current_video,
-                video_noise,
-                source_dtype=batch['latents'].dtype,
-                warn_factor=terminal_prior_warn_factor,
-            ),
-            "action": compare_terminal_prior(
-                current_action,
-                action_noise,
-                source_dtype=action_clean.dtype,
-                warn_factor=terminal_prior_warn_factor,
-            ),
-        }
-        terminal_prior_diagnostics = _terminal_prior_diagnostic_tensors(
-            terminal_prior_checks, current_video
+        (
+            terminal_prior_validation,
+            terminal_prior_diagnostics,
+        ) = _validate_terminal_prior_pair(
+            config=self.config,
+            video_actual=current_video,
+            video_expected=video_noise,
+            video_source_dtype=batch["latents"].dtype,
+            action_actual=current_action,
+            action_expected=action_noise,
+            action_source_dtype=action_clean.dtype,
+            reference=current_video,
+            error_context="DanceOPD terminal state is not pure scheduler noise",
         )
         danceopd_terminal_prior_max_error = terminal_prior_diagnostics['max_error']
-        verify_terminal_prior = bool(getattr(
-            self.config, 'opd_danceopd_verify_terminal_prior', True
-        ))
-        terminal_prior_details = _terminal_prior_check_details(
-            terminal_prior_checks
-        )
-        if verify_terminal_prior and any(
-            check.severity == "error" for check in terminal_prior_checks.values()
-        ):
-            raise RuntimeError(
-                "DanceOPD terminal state is not pure scheduler noise: "
-                f"{terminal_prior_details}"
-            )
-        if (
-            verify_terminal_prior
-            and any(
-                check.severity == "warning"
-                for check in terminal_prior_checks.values()
-            )
-            and getattr(self.config, 'rank', 0) == 0
-        ):
-            logger.warning(
-                "DanceOPD terminal state is within the numerical warning "
-                "band: %s",
-                terminal_prior_details,
-            )
 
         video_path = self._build_timestep_path(
             terminal_video_t, zero_video_t, rollout_steps

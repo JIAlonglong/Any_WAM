@@ -14,6 +14,10 @@ from distillation_flowmap.cosmos_policy_raw_worker import (
 from distillation_flowmap.cosmos_training_contract import (
     normalize_cosmos_inference_request,
 )
+from distillation_flowmap.cosmos_libero_provenance import (
+    build_artifact_lock,
+    canonical_json,
+)
 
 
 @pytest.mark.parametrize("budget", (1, 2, 4))
@@ -105,6 +109,31 @@ def test_official_teacher_root_requires_verified_provenance_identity(tmp_path):
 
     with pytest.raises(ValueError, match="provenance contract identity"):
         resolve_cosmos_official_teacher_root(root)
+
+
+def test_official_teacher_root_reproduces_and_verifies_real_artifact_lock(tmp_path):
+    root = _write_official_teacher_root(tmp_path / "teacher")
+    lock = build_artifact_lock(
+        root,
+        compact_paths=(
+            "config.json",
+            "libero_dataset_statistics.json",
+            "libero_t5_embeddings.pkl",
+        ),
+        large_paths=("Cosmos-Policy-LIBERO-Predict2-2B.pt",),
+        immutable_store=False,
+    )
+    lock_path = tmp_path / "teacher.lock.json"
+    lock_path.write_text(canonical_json(lock) + "\n", encoding="utf-8")
+
+    resolved = resolve_cosmos_official_teacher_root(
+        root, provenance_lock_path=lock_path
+    )
+
+    assert resolved.contract_identity
+    (root / "Cosmos-Policy-LIBERO-Predict2-2B.pt").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="digest|size"):
+        resolve_cosmos_official_teacher_root(root, provenance_lock_path=lock_path)
 
 
 @pytest.mark.parametrize("budget", (1, 2, 4))
@@ -221,6 +250,8 @@ def _verified_result(budget=2):
         "effective_action_steps": budget,
         "matched_budget_verified": True,
         "observed_joint_nfe": budget,
+        "cosmos_repo_commit": "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2",
+        "cosmos_source_sha256": "b" * 64,
     }
 
 
@@ -239,6 +270,7 @@ def test_official_adapter_returns_raw_actions_and_verified_metadata(budget):
     assert result["actions"].shape == (1, 16, 7)
     assert result["effective_action_steps"] == budget
     assert result["effective_video_steps"] == budget
+    assert result["cosmos_repo_commit"] == "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
     assert "future_image_predictions" in result
     assert teacher.calls == [
         (
@@ -247,6 +279,21 @@ def test_official_adapter_returns_raw_actions_and_verified_metadata(budget):
             {"video_steps": budget, "action_steps": budget},
         )
     ]
+
+
+@pytest.mark.parametrize("missing", ("cosmos_repo_commit", "cosmos_source_sha256"))
+def test_official_adapter_requires_audited_cosmos_source_identity(missing):
+    payload = _verified_result()
+    payload.pop(missing)
+    adapter = OfficialTeacherMatchedBudgetAdapter(
+        teacher=_Teacher(payload),
+        video_steps=2,
+        action_steps=2,
+        include_future=True,
+    )
+
+    with pytest.raises(RuntimeError, match="source|commit|missing"):
+        adapter.infer_raw({"obs": "raw"})
 
 
 @pytest.mark.parametrize(

@@ -189,6 +189,21 @@ class CosmosProgressiveS4Client:
                 or int(response.get("observed_joint_nfe", -1)) != self.action_steps
             ):
                 raise ValueError("official_teacher effective video/action K mismatch")
+            if not bool(response.get("reset", False)):
+                source_digest = response.get("cosmos_source_sha256")
+                if (
+                    response.get("cosmos_repo_commit")
+                    != "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
+                    or not isinstance(source_digest, str)
+                    or len(source_digest) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in source_digest
+                    )
+                ):
+                    raise ValueError(
+                        "official_teacher response lacks audited Cosmos source identity"
+                    )
             return
         if "model_role" in response and response["model_role"] != self.model_role:
             raise ValueError("S4 service model_role mismatch")
@@ -349,6 +364,8 @@ class CosmosProgressiveS4Client:
                         "effective_action_steps",
                         "matched_budget_verified",
                         "observed_joint_nfe",
+                        "cosmos_repo_commit",
+                        "cosmos_source_sha256",
                         "future_prediction_keys",
                     )
                     if key in response

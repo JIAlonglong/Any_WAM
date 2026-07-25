@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -218,6 +219,53 @@ def test_same_prior_model_load_accepts_only_audited_clean_layout_commit(
 
     assert loaded is sentinel
     assert loader_calls == [cfg]
+
+
+def test_raw_actions_model_load_uses_same_audited_clean_repository_gate(
+    monkeypatch, tmp_path
+):
+    import distillation_flowmap.cosmos_policy_raw_worker as worker
+
+    repo = tmp_path / "cosmos"
+    cosmos_utils = _cosmos_layout_module(repo)
+    _install_git_provenance(
+        monkeypatch,
+        worker,
+        repo,
+        head="0000000000000000000000000000000000000000",
+    )
+    loader_calls = []
+
+    with pytest.raises(RuntimeError, match="audited commit"):
+        worker._model_for_request(
+            None,
+            mode="actions",
+            repo=str(repo),
+            cosmos_utils=cosmos_utils,
+            cfg=SimpleNamespace(),
+            get_model=lambda cfg: loader_calls.append(cfg),
+        )
+
+    assert loader_calls == []
+
+
+def test_audited_cosmos_source_identity_records_commit_and_source_digest(
+    monkeypatch, tmp_path
+):
+    import distillation_flowmap.cosmos_policy_raw_worker as worker
+
+    repo = tmp_path / "cosmos"
+    cosmos_utils = _cosmos_layout_module(repo)
+    _install_git_provenance(monkeypatch, worker, repo)
+
+    identity = worker._validate_same_prior_layout_source(repo, cosmos_utils)
+
+    assert identity == {
+        "cosmos_repo_commit": "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2",
+        "cosmos_source_sha256": hashlib.sha256(
+            Path(cosmos_utils.__file__).read_bytes()
+        ).hexdigest(),
+    }
 
 
 def test_joint_continuation_model_load_uses_same_audited_layout_gate(

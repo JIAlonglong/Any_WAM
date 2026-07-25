@@ -290,19 +290,43 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
     local_model = tmp_path / "local-model"
     local_model.mkdir()
     repo = tmp_path / "clean-cosmos-repo"
-    repo.mkdir()
-    _plain_file(repo / "source.py", b"revision = 1\n")
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    audited_source = Path(
+        os.environ.get(
+            "COSMOS_AUDITED_REPO_SOURCE",
+            "/kpfs-intern/jialongliu/projects/cosmos-predict2.5-formal-441b897",
+        )
+    )
     subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "fixture@example.com"],
+        ["git", "clone", "-q", "--shared", "--no-checkout", str(audited_source), str(repo)],
         check=True,
     )
     subprocess.run(
-        ["git", "-C", str(repo), "config", "user.name", "Fixture"],
+        ["git", "-C", str(repo), "sparse-checkout", "init", "--no-cone"],
         check=True,
     )
-    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "sparse-checkout",
+            "set",
+            "cosmos_predict2/_src/predict2/cosmos_policy/experiments/robot/cosmos_utils.py",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "checkout",
+            "-q",
+            "--detach",
+            "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2",
+        ],
+        check=True,
+    )
     output_root = tmp_path / "outputs"
     env = os.environ.copy()
     env.update(
@@ -392,7 +416,26 @@ def test_pipeline_read_only_modes_write_nothing(tmp_path, mode):
     assert "PARENT_STAGE1_CONTRACT_IDENTITY=__DERIVED_AFTER_STAGE1__" in result.stdout
     assert "official_teacher" in result.stdout
     assert "COSMOS_POLICY_PATH=" in result.stdout
+    assert "COSMOS_POLICY_TEACHER_LOCK=" in result.stdout
+    assert (
+        "COSMOS_PREDICT2_REPO_COMMIT="
+        "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
+    ) in result.stdout
     assert "S4_PROMPT_TABLE=" in result.stdout
+
+
+def test_pipeline_rejects_cosmos_repo_not_at_audited_commit(tmp_path):
+    env, output_root = _pipeline_env(tmp_path)
+    repo = Path(env["COSMOS_PREDICT2_REPO"])
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-q", "--detach", "HEAD^"],
+        check=True,
+    )
+
+    result = _pipeline(env, output_root, "--dry-run")
+
+    assert result.returncode != 0
+    assert "audited commit" in result.stderr
 
 
 def test_pipeline_requires_explicit_all_40_prompt_table(tmp_path):

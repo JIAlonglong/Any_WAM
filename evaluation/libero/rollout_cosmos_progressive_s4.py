@@ -196,6 +196,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-transformer", default=None)
     parser.add_argument("--cosmos-policy-path", default=None)
     parser.add_argument("--teacher-provenance-lock", default=None)
+    parser.add_argument("--teacher-contract-identity", default=None)
     parser.add_argument(
         "--config",
         default="distillation_flowmap.config_libero_cosmos_policy_stage2_progressive",
@@ -561,7 +562,12 @@ def build_live_service(args: argparse.Namespace) -> tuple[CosmosProgressiveS4Ser
     if request.model_role == "official_teacher":
         resolved_teacher = resolve_cosmos_official_teacher_root(
             args.cosmos_policy_path or args.teacher_model_path,
-            provenance_lock_path=args.teacher_provenance_lock,
+            verified_contract_identity=args.teacher_contract_identity,
+            provenance_lock_path=(
+                None
+                if args.teacher_contract_identity
+                else args.teacher_provenance_lock
+            ),
         )
         require_live_s4_prerequisites(
             device=args.device,
@@ -707,7 +713,12 @@ def main(argv: list[str] | None = None) -> int:
         preflight_checkpoint = (
             resolve_cosmos_official_teacher_root(
                 args.cosmos_policy_path or args.teacher_model_path,
-                provenance_lock_path=args.teacher_provenance_lock,
+                verified_contract_identity=args.teacher_contract_identity,
+                provenance_lock_path=(
+                    None
+                    if args.teacher_contract_identity
+                    else args.teacher_provenance_lock
+                ),
             ).root_path
             if request.model_role == "official_teacher"
             else args.checkpoint_transformer

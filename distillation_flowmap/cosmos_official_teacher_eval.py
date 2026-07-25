@@ -126,7 +126,7 @@ def resolve_cosmos_official_teacher_root(
         verify_artifact_lock(
             canonical_root,
             lock_path,
-            verify_large_artifact_digests=False,
+            verify_large_artifact_digests=True,
         )
         verified_contract_identity = hashlib.sha256(lock_path.read_bytes()).hexdigest()
     if (
@@ -160,6 +160,8 @@ class OfficialTeacherMatchedBudgetAdapter:
         "effective_action_steps",
         "matched_budget_verified",
         "observed_joint_nfe",
+        "cosmos_repo_commit",
+        "cosmos_source_sha256",
     )
 
     def __init__(
@@ -245,6 +247,19 @@ class OfficialTeacherMatchedBudgetAdapter:
                 "official teacher did not return a verified matched budget "
                 f"K={expected}: {proof}"
             )
+        if (
+            proof["cosmos_repo_commit"]
+            != "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
+            or not isinstance(proof["cosmos_source_sha256"], str)
+            or len(proof["cosmos_source_sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in proof["cosmos_source_sha256"]
+            )
+        ):
+            raise RuntimeError(
+                "official teacher did not return the audited Cosmos source identity"
+            )
         actions = np.asarray(result.get("actions"), dtype=np.float32)
         if actions.ndim == 2:
             actions = actions[None]
@@ -326,5 +341,7 @@ class OfficialTeacherEvaluationService:
             "effective_action_steps": result["effective_action_steps"],
             "matched_budget_verified": result["matched_budget_verified"],
             "observed_joint_nfe": result["observed_joint_nfe"],
+            "cosmos_repo_commit": result["cosmos_repo_commit"],
+            "cosmos_source_sha256": result["cosmos_source_sha256"],
             "future_prediction_keys": future_keys,
         }

@@ -94,6 +94,8 @@ def merge_formal_records(
     seen: dict[tuple[str, int, int], str] = {}
     per_task: dict[int, list[float]] = defaultdict(list)
     contract_identities: set[str] = set()
+    cosmos_repo_commits: set[str] = set()
+    cosmos_source_digests: set[str] = set()
 
     pattern = "shard_*/seed_*/records/task_*_episode_*.json"
     for record_path in sorted(root.glob(pattern)):
@@ -135,11 +137,26 @@ def merge_formal_records(
             if "student_steps" in record:
                 _fail("official_teacher record must not claim student_steps")
             if (
-                int(record.get("effective_video_steps", -1)) != requested_steps
+                int(record.get("requested_video_steps", -1)) != requested_steps
+                or int(record.get("requested_action_steps", -1)) != requested_steps
+                or int(record.get("effective_video_steps", -1)) != requested_steps
                 or int(record.get("effective_action_steps", -1)) != requested_steps
+                or int(record.get("observed_joint_nfe", -1)) != requested_steps
                 or record.get("matched_budget_verified") is not True
             ):
                 _fail("official_teacher effective matched-budget proof is missing")
+            repo_commit = record.get("cosmos_repo_commit")
+            source_digest = record.get("cosmos_source_sha256")
+            if repo_commit != "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2":
+                _fail("official_teacher audited Cosmos repository commit is missing")
+            if (
+                not isinstance(source_digest, str)
+                or len(source_digest) != 64
+                or any(character not in "0123456789abcdef" for character in source_digest)
+            ):
+                _fail("official_teacher audited Cosmos source identity is missing")
+            cosmos_repo_commits.add(repo_commit)
+            cosmos_source_digests.add(source_digest)
         elif int(record.get("student_steps", -1)) != requested_steps:
             _fail(
                 f"step mismatch: expected={requested_steps} got={record.get('student_steps')!r}"
@@ -166,7 +183,10 @@ def merge_formal_records(
         if key in seen:
             _fail(f"duplicate record: {key}: {seen[key]} and {record_path}")
         seen[key] = str(record_path)
-        per_task[task].append(1.0 if bool(record.get("success", False)) else 0.0)
+        success = record.get("success")
+        if type(success) is not bool:
+            _fail("success must be a plain boolean in every formal record")
+        per_task[task].append(1.0 if success else 0.0)
 
     unexpected = set(seen) - expected
     if unexpected:
@@ -179,6 +199,10 @@ def merge_formal_records(
             "checkpoint_contract_identity mismatch across formal records: "
             f"{sorted(contract_identities)!r}"
         )
+    if model_role == "official_teacher" and (
+        len(cosmos_repo_commits) != 1 or len(cosmos_source_digests) != 1
+    ):
+        _fail("official_teacher Cosmos source identity mismatch across records")
 
     task_means = {
         f"{suite}:{task}": sum(per_task[task]) / seed_count for task in range(10)
@@ -215,6 +239,9 @@ def merge_formal_records(
     }
     if model_role != "official_teacher":
         summary["student_steps"] = requested_steps
+    else:
+        summary["cosmos_repo_commit"] = next(iter(cosmos_repo_commits))
+        summary["cosmos_source_sha256"] = next(iter(cosmos_source_digests))
     _atomic_json(root / "formal_summary.json", summary)
     _atomic_csv(
         root / "formal_summary.csv",
@@ -262,6 +289,8 @@ def merge_student_matrix(
     identities: set[str] = set()
     unique_tasks: set[str] = set()
     task_budget_cells: set[tuple[str, int]] = set()
+    cosmos_repo_commits: set[str] = set()
+    cosmos_source_digests: set[str] = set()
 
     for step in STUDENT_STEPS:
         step_tasks: set[str] = set()
@@ -282,6 +311,21 @@ def merge_student_matrix(
             if model_role == "official_teacher":
                 if "student_steps" in payload:
                     _fail(f"official_teacher child must not claim student_steps for {suite} K={step}")
+                repo_commit = payload.get("cosmos_repo_commit")
+                source_digest = payload.get("cosmos_source_sha256")
+                if repo_commit != "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2":
+                    _fail(f"official_teacher Cosmos repo commit mismatch for {suite} K={step}")
+                if (
+                    not isinstance(source_digest, str)
+                    or len(source_digest) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in source_digest
+                    )
+                ):
+                    _fail(f"official_teacher Cosmos source identity missing for {suite} K={step}")
+                cosmos_repo_commits.add(repo_commit)
+                cosmos_source_digests.add(source_digest)
             elif int(payload.get("student_steps", -1)) != step:
                 _fail(f"video/action step mismatch for {suite} K={step}")
             if int(payload.get("num_tasks", -1)) != 10:
@@ -352,6 +396,11 @@ def merge_student_matrix(
         "task_budget_cells": len(task_budget_cells),
         "summaries": summaries,
     }
+    if model_role == "official_teacher":
+        if len(cosmos_repo_commits) != 1 or len(cosmos_source_digests) != 1:
+            _fail("official_teacher Cosmos source identity mismatch across matrix")
+        summary["cosmos_repo_commit"] = next(iter(cosmos_repo_commits))
+        summary["cosmos_source_sha256"] = next(iter(cosmos_source_digests))
     _atomic_json(root / "matrix_summary.json", summary)
     _atomic_csv(
         root / "matrix_summary.csv",
@@ -408,6 +457,7 @@ def merge_complete_matrix(
         )
     rows: list[dict[str, Any]] = []
     summaries: dict[str, str] = {}
+    official_teacher_source: dict[str, str] = {}
     for role in roles:
         role_root = root / role
         role_summary = merge_student_matrix(
@@ -418,6 +468,15 @@ def merge_complete_matrix(
             model_role=role,
             episodes_per_task=episodes_per_task,
         )
+        if role == "official_teacher":
+            official_teacher_source = {
+                "official_teacher_cosmos_repo_commit": role_summary[
+                    "cosmos_repo_commit"
+                ],
+                "official_teacher_cosmos_source_sha256": role_summary[
+                    "cosmos_source_sha256"
+                ],
+            }
         for cell, path in role_summary["summaries"].items():
             key = f"{role}/{cell}"
             if key in summaries:
@@ -452,6 +511,7 @@ def merge_complete_matrix(
         "summaries": summaries,
         "evaluation_classification": evaluation_classification,
         "is_formal": bool(is_formal),
+        **official_teacher_source,
     }
     _atomic_json(root / "matrix_summary.json", summary)
     _atomic_csv(

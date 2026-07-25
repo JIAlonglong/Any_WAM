@@ -579,6 +579,17 @@ class CosmosPolicyActionTeacher:
         self._official_model, _ = get_model(cfg)
         self._official_get_action = get_action
         self._official_cfg = cfg
+        from cosmos_predict2._src.predict2.cosmos_policy.experiments.robot import (
+            cosmos_utils,
+        )
+        from distillation_flowmap.cosmos_policy_raw_worker import (
+            _validate_same_prior_layout_source,
+        )
+        self._official_cosmos_source_identity = (
+            _validate_same_prior_layout_source(
+                self.cosmos_repo_path, cosmos_utils
+            )
+        )
 
     def _predict_raw_actions_inprocess(self, raw_batch):
         return self._predict_raw_action_result_inprocess(raw_batch, include_future=False)["actions"]
@@ -670,6 +681,7 @@ class CosmosPolicyActionTeacher:
                 effective_action_steps=action_steps,
                 matched_budget_verified=True,
                 observed_joint_nfe=observed_joint_nfes[0],
+                **self._official_cosmos_source_identity,
             )
         if include_future:
             output["future_image_predictions"] = future_predictions
@@ -844,6 +856,8 @@ class CosmosPolicyActionTeacher:
                 "effective_action_steps",
                 "matched_budget_verified",
                 "observed_joint_nfe",
+                "cosmos_repo_commit",
+                "cosmos_source_sha256",
             ):
                 if field in data.files:
                     result[field] = data[field].item()

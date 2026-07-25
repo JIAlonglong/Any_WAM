@@ -36,6 +36,26 @@ def _write_formal_records(root: Path, checkpoint: Path, *, suite: str, steps: in
                 )
 
 
+def _convert_to_official_teacher(root: Path, *, steps: int) -> None:
+    for record_path in root.glob(
+        "shard_*/seed_*/records/task_*_episode_*.json"
+    ):
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record.pop("student_steps")
+        record.update(
+            model_role="official_teacher",
+            requested_video_steps=steps,
+            requested_action_steps=steps,
+            effective_video_steps=steps,
+            effective_action_steps=steps,
+            observed_joint_nfe=steps,
+            matched_budget_verified=True,
+            cosmos_repo_commit="1eb8457072b4a1adfe1f83c3076e4aa5452cbab2",
+            cosmos_source_sha256="b" * 64,
+        )
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+
+
 def test_formal_merger_validates_suite_records_and_writes_json_and_csv(tmp_path):
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
@@ -85,6 +105,111 @@ def test_formal_merger_rejects_record_from_wrong_suite(tmp_path):
     record.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(SystemExit, match="suite mismatch"):
+        merge_formal_records(
+            root=root,
+            checkpoint=checkpoint,
+            suite="libero_10",
+            seed_count=1,
+            requested_steps=1,
+            shard_plan="0:0:3;1:3:6;2:6:8;3:8:10",
+            evaluation_classification="formal_verified",
+            is_formal=True,
+            model_role="stage2_target",
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "requested_video_steps",
+        "requested_action_steps",
+        "effective_video_steps",
+        "effective_action_steps",
+        "observed_joint_nfe",
+        "cosmos_repo_commit",
+        "cosmos_source_sha256",
+    ),
+)
+def test_formal_teacher_merger_rejects_missing_runtime_proof_before_publish(
+    tmp_path, field
+):
+    checkpoint = tmp_path / "teacher"
+    checkpoint.mkdir()
+    root = tmp_path / "formal"
+    _write_formal_records(root, checkpoint, suite="libero_10", steps=2, episodes=1)
+    _convert_to_official_teacher(root, steps=2)
+    record_path = (
+        root / "shard_0" / "seed_0" / "records" / "task_0_episode_0.json"
+    )
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record.pop(field)
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="proof|source|commit"):
+        merge_formal_records(
+            root=root,
+            checkpoint=checkpoint,
+            suite="libero_10",
+            seed_count=1,
+            requested_steps=2,
+            shard_plan="0:0:3;1:3:6;2:6:8;3:8:10",
+            evaluation_classification="formal_verified",
+            is_formal=True,
+            model_role="official_teacher",
+        )
+
+    assert not (root / "formal_summary.json").exists()
+    assert not (root / "formal_summary.csv").exists()
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "requested_video_steps",
+        "requested_action_steps",
+        "observed_joint_nfe",
+    ),
+)
+def test_formal_teacher_merger_rejects_runtime_budget_mismatch(tmp_path, field):
+    checkpoint = tmp_path / "teacher"
+    checkpoint.mkdir()
+    root = tmp_path / "formal"
+    _write_formal_records(root, checkpoint, suite="libero_10", steps=4, episodes=1)
+    _convert_to_official_teacher(root, steps=4)
+    record_path = (
+        root / "shard_0" / "seed_0" / "records" / "task_0_episode_0.json"
+    )
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record[field] = 2
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="proof"):
+        merge_formal_records(
+            root=root,
+            checkpoint=checkpoint,
+            suite="libero_10",
+            seed_count=1,
+            requested_steps=4,
+            shard_plan="0:0:3;1:3:6;2:6:8;3:8:10",
+            evaluation_classification="formal_verified",
+            is_formal=True,
+            model_role="official_teacher",
+        )
+
+
+def test_formal_merger_rejects_non_boolean_success(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    root = tmp_path / "formal"
+    _write_formal_records(root, checkpoint, suite="libero_10", steps=1, episodes=1)
+    record_path = (
+        root / "shard_0" / "seed_0" / "records" / "task_0_episode_0.json"
+    )
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["success"] = "false"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="success.*boolean"):
         merge_formal_records(
             root=root,
             checkpoint=checkpoint,

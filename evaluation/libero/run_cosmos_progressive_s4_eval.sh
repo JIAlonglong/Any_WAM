@@ -210,7 +210,7 @@ preflight_shard() {
     if [[ "${S4_MODEL_ROLE}" == "official_teacher" ]]; then
         command+=(
             --cosmos-policy-path "${COSMOS_POLICY_PATH}"
-            --teacher-provenance-lock "${COSMOS_POLICY_TEACHER_LOCK}"
+            --teacher-contract-identity "${COSMOS_POLICY_TEACHER_IDENTITY}"
         )
     else
         command+=(--checkpoint-transformer "${S4_CKPT_ROOT}")
@@ -248,7 +248,7 @@ launch_shard() {
         if [[ "${S4_MODEL_ROLE}" == "official_teacher" ]]; then
             command+=(
                 --cosmos-policy-path "${COSMOS_POLICY_PATH}"
-                --teacher-provenance-lock "${COSMOS_POLICY_TEACHER_LOCK}"
+                --teacher-contract-identity "${COSMOS_POLICY_TEACHER_IDENTITY}"
             )
         else
             command+=(--checkpoint-transformer "${S4_CKPT_ROOT}")
@@ -367,6 +367,7 @@ S4_CKPT_ROOT="${S4_CKPT_ROOT:-}"
 S4_CONFIG="${S4_CONFIG:-distillation_flowmap.config_libero_cosmos_policy_stage2_progressive}"
 COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B}"
 COSMOS_POLICY_TEACHER_LOCK="${COSMOS_POLICY_TEACHER_LOCK:-}"
+COSMOS_POLICY_TEACHER_IDENTITY="${COSMOS_POLICY_TEACHER_IDENTITY:-}"
 S4_PROMPT_TABLE="${S4_PROMPT_TABLE:-}"
 S4_DATASET_PATH="${S4_DATASET_PATH:-}"
 S4_EMPTY_EMBEDDING="${S4_EMPTY_EMBEDDING:-}"
@@ -434,6 +435,29 @@ if [[ -n "${S4_VIDEO_SEEDS}" ]]; then
 fi
 DRY_RUN=0
 [[ "${MODE}" == "dry-run" || "${S4_DRY_RUN:-0}" == "1" ]] && DRY_RUN=1
+if [[ "${S4_MODEL_ROLE}" == "official_teacher" ]]; then
+    if [[ -z "${COSMOS_POLICY_TEACHER_IDENTITY}" ]]; then
+        teacher_lock_command=(
+            "${PYTHON_BIN}" -c
+            'import sys; from distillation_flowmap.cosmos_official_teacher_eval import resolve_cosmos_official_teacher_root; print(resolve_cosmos_official_teacher_root(sys.argv[1], provenance_lock_path=sys.argv[2]).contract_identity)'
+            "${COSMOS_POLICY_PATH}"
+            "${COSMOS_POLICY_TEACHER_LOCK}"
+        )
+        printf 'TEACHER_LOCK_VERIFICATION_COMMAND='
+        printf '%q ' "${teacher_lock_command[@]}"
+        printf '\n'
+        if (( DRY_RUN )); then
+            COSMOS_POLICY_TEACHER_IDENTITY=__VERIFIED_ON_FORMAL_RUN__
+        else
+            COSMOS_POLICY_TEACHER_IDENTITY="$("${teacher_lock_command[@]}")"
+        fi
+    fi
+    if [[ "${COSMOS_POLICY_TEACHER_IDENTITY}" != __VERIFIED_ON_FORMAL_RUN__ && \
+          ! "${COSMOS_POLICY_TEACHER_IDENTITY}" =~ ^[0-9a-f]{64}$ ]]; then
+        die "COSMOS_POLICY_TEACHER_IDENTITY must be a verified 64-hex identity"
+    fi
+    export COSMOS_POLICY_TEACHER_IDENTITY
+fi
 S4_ALIGNMENT_VERIFIED="${S4_ALIGNMENT_VERIFIED:-0}"
 S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH="${S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH:-0}"
 case "${S4_ALIGNMENT_VERIFIED}" in

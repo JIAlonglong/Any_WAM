@@ -99,6 +99,26 @@ else
     export S4_DRY_RUN=0
 fi
 
+if [[ " ${ROLES[*]} " == *" official_teacher "* ]]; then
+    teacher_lock_command=(
+        "${PYTHON_BIN}" -c
+        'import sys; from distillation_flowmap.cosmos_official_teacher_eval import resolve_cosmos_official_teacher_root; print(resolve_cosmos_official_teacher_root(sys.argv[1], provenance_lock_path=sys.argv[2]).contract_identity)'
+        "${COSMOS_POLICY_PATH}"
+        "${COSMOS_POLICY_TEACHER_LOCK}"
+    )
+    printf 'TEACHER_LOCK_VERIFICATION_COMMAND='
+    printf '%q ' "${teacher_lock_command[@]}"
+    printf '\n'
+    if [[ "${MODE}" == "dry-run" ]]; then
+        COSMOS_POLICY_TEACHER_IDENTITY=__VERIFIED_ON_FORMAL_RUN__
+    else
+        COSMOS_POLICY_TEACHER_IDENTITY="$("${teacher_lock_command[@]}")"
+        [[ "${COSMOS_POLICY_TEACHER_IDENTITY}" =~ ^[0-9a-f]{64}$ ]] || \
+            die "teacher lock verification did not return a 64-hex identity"
+    fi
+    export COSMOS_POLICY_TEACHER_IDENTITY
+fi
+
 emit_kv "MATRIX_MODE" "${MODE}"
 emit_kv "MATRIX_ROOT" "${MATRIX_ROOT}"
 emit_kv "EPISODES_PER_TASK" "${S4_EPISODES_PER_TASK}"

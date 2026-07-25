@@ -316,6 +316,12 @@ def _validate_same_prior_layout_source(repo, cosmos_utils):
         raise RuntimeError(
             "same-prior Cosmos repository must be clean before model invocation"
         )
+    return {
+        "cosmos_repo_commit": head,
+        "cosmos_source_sha256": hashlib.sha256(
+            expected_source.read_bytes()
+        ).hexdigest(),
+    }
 
 
 def _model_for_request(
@@ -326,9 +332,11 @@ def _model_for_request(
     cosmos_utils,
     cfg,
     get_model,
+    source_identity_out=None,
 ):
-    if mode in ("same_prior_endpoint", "joint_continuation_endpoint"):
-        _validate_same_prior_layout_source(repo, cosmos_utils)
+    source_identity = _validate_same_prior_layout_source(repo, cosmos_utils)
+    if source_identity_out is not None:
+        source_identity_out.update(source_identity)
     if model is None:
         model, _ = get_model(cfg)
     return model
@@ -1077,6 +1085,7 @@ def main():
             proprio = data["proprio"].astype(np.float32)
             tasks = request["tasks"]
             mode = request.get("mode", "actions")
+            cosmos_source_identity = {}
             model = _model_for_request(
                 model,
                 mode=mode,
@@ -1084,6 +1093,7 @@ def main():
                 cosmos_utils=cosmos_utils,
                 cfg=cfg,
                 get_model=get_model,
+                source_identity_out=cosmos_source_identity,
             )
             if mode == "joint_continuation_endpoint":
                 teacher_steps = request.get("teacher_steps")
@@ -1479,7 +1489,11 @@ def main():
                     observed_joint_nfe=observed_joint_nfes[0],
                 )
             actions_path = request["actions_path"]
-            fields = {"actions": actions, **matched_budget_fields}
+            fields = {
+                "actions": actions,
+                **matched_budget_fields,
+                **cosmos_source_identity,
+            }
             if include_future:
                 keys = sorted(
                     {

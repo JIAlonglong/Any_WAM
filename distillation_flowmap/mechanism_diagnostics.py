@@ -6,6 +6,35 @@ from collections.abc import Mapping
 import torch
 
 
+def build_diagnostic_probe_noise(
+    video_clean: torch.Tensor,
+    action_clean: torch.Tensor,
+    *,
+    seed: int,
+    batch_index: int,
+    rank: int,
+) -> dict[str, torch.Tensor]:
+    """Build detached probe noise without consulting checkpoint/training step."""
+    generator = torch.Generator(device=video_clean.device)
+    generator.manual_seed(int(seed) + int(batch_index) * 97 + int(rank))
+    video_noise = torch.randn(
+        video_clean.shape,
+        device=video_clean.device,
+        dtype=video_clean.dtype,
+        generator=generator,
+    )
+    action_noise = torch.randn(
+        action_clean.shape,
+        device=action_clean.device,
+        dtype=action_clean.dtype,
+        generator=generator,
+    )
+    return {
+        "video_noise": video_noise.detach(),
+        "action_noise": action_noise.detach(),
+    }
+
+
 def squared_l2_per_sample(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     return (lhs.float() - rhs.float()).flatten(1).square().sum(1)
 

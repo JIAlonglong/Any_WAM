@@ -4,12 +4,37 @@ import pytest
 import torch
 
 from distillation_flowmap.mechanism_diagnostics import (
+    build_diagnostic_probe_noise,
     compute_mechanism_metric_samples,
     diagnostic_due,
     diagnostic_seed,
     means_from_reduced_stats,
     pack_finite_metric_stats,
 )
+
+
+def test_fixed_probe_noise_is_reproducible_detached_and_shape_preserving():
+    video = torch.zeros(2, 3, 4, 5, dtype=torch.bfloat16)
+    action = torch.zeros(2, 1, 7, 3, dtype=torch.float32)
+
+    first = build_diagnostic_probe_noise(
+        video, action, seed=42, batch_index=0, rank=0
+    )
+    torch.manual_seed(999)
+    second = build_diagnostic_probe_noise(
+        video, action, seed=42, batch_index=0, rank=0
+    )
+
+    assert torch.equal(first["video_noise"], second["video_noise"])
+    assert torch.equal(first["action_noise"], second["action_noise"])
+    assert first["video_noise"].shape == video.shape
+    assert first["video_noise"].dtype == video.dtype
+    assert first["action_noise"].shape == action.shape
+    assert first["action_noise"].dtype == action.dtype
+    assert not first["video_noise"].requires_grad
+    assert not first["action_noise"].requires_grad
+    assert first["video_noise"].grad_fn is None
+    assert first["action_noise"].grad_fn is None
 
 
 def _metric_samples(**overrides):

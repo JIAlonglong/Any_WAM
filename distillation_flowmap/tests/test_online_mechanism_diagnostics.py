@@ -201,6 +201,24 @@ def _batch():
     }
 
 
+def test_explicit_probe_noise_overrides_step_dependent_generation():
+    host = _host()
+    batch = _batch()
+    video_probe = torch.full_like(batch["latents"], 7.0)
+    action_probe = torch.full_like(batch["actions"], 11.0)
+    batch["_mechanism_probe_video_noise"] = video_probe
+    batch["_mechanism_probe_action_noise"] = action_probe
+
+    stats = host._compute_mechanism_diagnostic_stats(
+        batch, diagnostic_index=123
+    )
+
+    assert torch.equal(host.student_calls[0]["video"], video_probe)
+    assert torch.equal(host.student_calls[0]["action"], action_probe)
+    assert all(not value.requires_grad for value in stats.values())
+    assert all(value.grad_fn is None for value in stats.values())
+
+
 def _load_trainer_harness():
     """Compile the scoped trainer methods without importing its GPU stack."""
     trainer_path = os.path.join(FLOWMAP_DIR, "flowmap_trainer.py")

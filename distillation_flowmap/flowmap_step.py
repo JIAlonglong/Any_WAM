@@ -119,6 +119,7 @@ from distillation_flowmap.cosmos_progressive_opd import (
     rollout_velocity_field,
 )
 from distillation_flowmap.mechanism_diagnostics import (
+    build_diagnostic_probe_noise,
     compute_mechanism_metric_samples,
     diagnostic_seed,
     pack_finite_metric_stats,
@@ -5508,25 +5509,51 @@ class FlowMapStepMixin:
         batch_index = int(prepared_batch.get(
             '_mechanism_diagnostic_batch_index', 0
         ))
-        generator = torch.Generator(device=device)
-        generator.manual_seed(diagnostic_seed(
-            int(self.config.mechanism_diagnostic_seed),
-            int(diagnostic_index),
-            batch_index,
-            int(getattr(self.config, 'rank', 0)),
-        ))
-        video_noise = torch.randn(
-            video_clean.shape,
-            device=device,
-            dtype=video_clean.dtype,
-            generator=generator,
+        explicit_video_noise = prepared_batch.get(
+            '_mechanism_probe_video_noise'
         )
-        action_noise = torch.randn(
-            action_clean.shape,
-            device=action_clean.device,
-            dtype=action_clean.dtype,
-            generator=generator,
+        explicit_action_noise = prepared_batch.get(
+            '_mechanism_probe_action_noise'
         )
+        if (explicit_video_noise is None) != (explicit_action_noise is None):
+            raise ValueError(
+                "Mechanism probe must provide both video and action noise"
+            )
+        if explicit_video_noise is not None:
+            for label, noise, clean in (
+                ("video", explicit_video_noise, video_clean),
+                ("action", explicit_action_noise, action_clean),
+            ):
+                if noise.shape != clean.shape:
+                    raise ValueError(
+                        f"Mechanism probe {label} noise shape {noise.shape} "
+                        f"does not match clean shape {clean.shape}"
+                    )
+                if noise.dtype != clean.dtype:
+                    raise ValueError(
+                        f"Mechanism probe {label} noise dtype {noise.dtype} "
+                        f"does not match clean dtype {clean.dtype}"
+                    )
+                if noise.device != clean.device:
+                    raise ValueError(
+                        f"Mechanism probe {label} noise device {noise.device} "
+                        f"does not match clean device {clean.device}"
+                    )
+            video_noise = explicit_video_noise.detach()
+            action_noise = explicit_action_noise.detach()
+        else:
+            probe = build_diagnostic_probe_noise(
+                video_clean,
+                action_clean,
+                seed=(
+                    int(self.config.mechanism_diagnostic_seed)
+                    + int(diagnostic_index) * 1009
+                ),
+                batch_index=batch_index,
+                rank=int(getattr(self.config, 'rank', 0)),
+            )
+            video_noise = probe["video_noise"]
+            action_noise = probe["action_noise"]
 
         terminal = float(self.config.num_train_timesteps)
         r_value = float(self.config.mechanism_diagnostic_r)

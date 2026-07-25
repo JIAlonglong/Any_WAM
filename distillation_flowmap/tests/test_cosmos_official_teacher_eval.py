@@ -251,7 +251,9 @@ def _verified_result(budget=2):
         "matched_budget_verified": True,
         "observed_joint_nfe": budget,
         "cosmos_repo_commit": "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2",
-        "cosmos_source_sha256": "b" * 64,
+        "cosmos_source_sha256": (
+            "c8cf94e18f840dda55afa162d6f6b0a4cada36fbbd8bbb45bf27c131f940f980"
+        ),
     }
 
 
@@ -293,6 +295,20 @@ def test_official_adapter_requires_audited_cosmos_source_identity(missing):
     )
 
     with pytest.raises(RuntimeError, match="source|commit|missing"):
+        adapter.infer_raw({"obs": "raw"})
+
+
+def test_official_adapter_rejects_wrong_well_formed_cosmos_source_digest():
+    payload = _verified_result()
+    payload["cosmos_source_sha256"] = "c" * 64
+    adapter = OfficialTeacherMatchedBudgetAdapter(
+        teacher=_Teacher(payload),
+        video_steps=2,
+        action_steps=2,
+        include_future=True,
+    )
+
+    with pytest.raises(RuntimeError, match="audited Cosmos source identity"):
         adapter.infer_raw({"obs": "raw"})
 
 

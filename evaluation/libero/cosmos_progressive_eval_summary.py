@@ -11,6 +11,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from distillation_flowmap.cosmos_official_source_contract import (
+    AUDITED_COSMOS_REPO_COMMIT,
+    AUDITED_COSMOS_SOURCE_SHA256,
+    has_exact_audited_cosmos_source,
+)
+
 
 LIBERO_SUITES = (
     "libero_10",
@@ -136,23 +142,26 @@ def merge_formal_records(
         if model_role == "official_teacher":
             if "student_steps" in record:
                 _fail("official_teacher record must not claim student_steps")
-            if (
-                int(record.get("requested_video_steps", -1)) != requested_steps
-                or int(record.get("requested_action_steps", -1)) != requested_steps
-                or int(record.get("effective_video_steps", -1)) != requested_steps
-                or int(record.get("effective_action_steps", -1)) != requested_steps
-                or int(record.get("observed_joint_nfe", -1)) != requested_steps
-                or record.get("matched_budget_verified") is not True
+            runtime_fields = (
+                "requested_video_steps",
+                "requested_action_steps",
+                "effective_video_steps",
+                "effective_action_steps",
+                "observed_joint_nfe",
+            )
+            if any(type(record.get(name)) is not int for name in runtime_fields):
+                _fail(
+                    "official_teacher runtime proof fields must be plain integers"
+                )
+            if any(record[name] != requested_steps for name in runtime_fields) or (
+                record.get("matched_budget_verified") is not True
             ):
                 _fail("official_teacher effective matched-budget proof is missing")
             repo_commit = record.get("cosmos_repo_commit")
             source_digest = record.get("cosmos_source_sha256")
-            if repo_commit != "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2":
-                _fail("official_teacher audited Cosmos repository commit is missing")
-            if (
-                not isinstance(source_digest, str)
-                or len(source_digest) != 64
-                or any(character not in "0123456789abcdef" for character in source_digest)
+            if not has_exact_audited_cosmos_source(
+                repo_commit=repo_commit,
+                source_sha256=source_digest,
             ):
                 _fail("official_teacher audited Cosmos source identity is missing")
             cosmos_repo_commits.add(repo_commit)
@@ -313,16 +322,9 @@ def merge_student_matrix(
                     _fail(f"official_teacher child must not claim student_steps for {suite} K={step}")
                 repo_commit = payload.get("cosmos_repo_commit")
                 source_digest = payload.get("cosmos_source_sha256")
-                if repo_commit != "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2":
+                if repo_commit != AUDITED_COSMOS_REPO_COMMIT:
                     _fail(f"official_teacher Cosmos repo commit mismatch for {suite} K={step}")
-                if (
-                    not isinstance(source_digest, str)
-                    or len(source_digest) != 64
-                    or any(
-                        character not in "0123456789abcdef"
-                        for character in source_digest
-                    )
-                ):
+                if source_digest != AUDITED_COSMOS_SOURCE_SHA256:
                     _fail(f"official_teacher Cosmos source identity missing for {suite} K={step}")
                 cosmos_repo_commits.add(repo_commit)
                 cosmos_source_digests.add(source_digest)

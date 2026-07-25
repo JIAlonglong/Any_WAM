@@ -34,7 +34,9 @@ class _Adapter:
             "matched_budget_verified": True,
             "observed_joint_nfe": 2,
             "cosmos_repo_commit": "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2",
-            "cosmos_source_sha256": "b" * 64,
+            "cosmos_source_sha256": (
+                "c8cf94e18f840dda55afa162d6f6b0a4cada36fbbd8bbb45bf27c131f940f980"
+            ),
             "future_image_predictions": [{"primary": np.zeros((2, 2, 3), dtype=np.uint8)}],
         }
 
@@ -180,7 +182,9 @@ def _write_role_matrix(root, checkpoint, role):
                 payload["cosmos_repo_commit"] = (
                     "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
                 )
-                payload["cosmos_source_sha256"] = "b" * 64
+                payload["cosmos_source_sha256"] = (
+                    "c8cf94e18f840dda55afa162d6f6b0a4cada36fbbd8bbb45bf27c131f940f980"
+                )
             (child / "formal_summary.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
@@ -210,7 +214,9 @@ def test_complete_matrix_separates_roles_and_requires_all_240_task_budget_cells(
     assert summary["official_teacher_cosmos_repo_commit"] == (
         "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
     )
-    assert summary["official_teacher_cosmos_source_sha256"] == "b" * 64
+    assert summary["official_teacher_cosmos_source_sha256"] == (
+        "c8cf94e18f840dda55afa162d6f6b0a4cada36fbbd8bbb45bf27c131f940f980"
+    )
 
     extra = root / "official_teacher/k2/libero_goal/duplicate/formal_summary.json"
     extra.parent.mkdir()

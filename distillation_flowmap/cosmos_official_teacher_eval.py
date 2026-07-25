@@ -15,6 +15,9 @@ import numpy as np
 from distillation_flowmap.cosmos_training_contract import (
     normalize_cosmos_inference_request,
 )
+from distillation_flowmap.cosmos_official_source_contract import (
+    has_exact_audited_cosmos_source,
+)
 
 
 @dataclass(frozen=True)
@@ -247,15 +250,9 @@ class OfficialTeacherMatchedBudgetAdapter:
                 "official teacher did not return a verified matched budget "
                 f"K={expected}: {proof}"
             )
-        if (
-            proof["cosmos_repo_commit"]
-            != "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
-            or not isinstance(proof["cosmos_source_sha256"], str)
-            or len(proof["cosmos_source_sha256"]) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in proof["cosmos_source_sha256"]
-            )
+        if not has_exact_audited_cosmos_source(
+            repo_commit=proof["cosmos_repo_commit"],
+            source_sha256=proof["cosmos_source_sha256"],
         ):
             raise RuntimeError(
                 "official teacher did not return the audited Cosmos source identity"

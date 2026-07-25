@@ -51,7 +51,9 @@ def _convert_to_official_teacher(root: Path, *, steps: int) -> None:
             observed_joint_nfe=steps,
             matched_budget_verified=True,
             cosmos_repo_commit="1eb8457072b4a1adfe1f83c3076e4aa5452cbab2",
-            cosmos_source_sha256="b" * 64,
+            cosmos_source_sha256=(
+                "c8cf94e18f840dda55afa162d6f6b0a4cada36fbbd8bbb45bf27c131f940f980"
+            ),
         )
         record_path.write_text(json.dumps(record), encoding="utf-8")
 
@@ -190,6 +192,76 @@ def test_formal_teacher_merger_rejects_runtime_budget_mismatch(tmp_path, field):
             suite="libero_10",
             seed_count=1,
             requested_steps=4,
+            shard_plan="0:0:3;1:3:6;2:6:8;3:8:10",
+            evaluation_classification="formal_verified",
+            is_formal=True,
+            model_role="official_teacher",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "steps"),
+    [
+        (field, value, steps)
+        for field in (
+            "requested_video_steps",
+            "requested_action_steps",
+            "effective_video_steps",
+            "effective_action_steps",
+            "observed_joint_nfe",
+        )
+        for value, steps in ((True, 1), ("2", 2))
+    ],
+)
+def test_formal_teacher_merger_requires_plain_integer_runtime_proof(
+    tmp_path, field, value, steps
+):
+    checkpoint = tmp_path / "teacher"
+    checkpoint.mkdir()
+    root = tmp_path / "formal"
+    _write_formal_records(root, checkpoint, suite="libero_10", steps=steps, episodes=1)
+    _convert_to_official_teacher(root, steps=steps)
+    record_path = (
+        root / "shard_0" / "seed_0" / "records" / "task_0_episode_0.json"
+    )
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record[field] = value
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="plain integer|proof"):
+        merge_formal_records(
+            root=root,
+            checkpoint=checkpoint,
+            suite="libero_10",
+            seed_count=1,
+            requested_steps=steps,
+            shard_plan="0:0:3;1:3:6;2:6:8;3:8:10",
+            evaluation_classification="formal_verified",
+            is_formal=True,
+            model_role="official_teacher",
+        )
+
+
+def test_formal_teacher_merger_rejects_wrong_well_formed_source_digest(tmp_path):
+    checkpoint = tmp_path / "teacher"
+    checkpoint.mkdir()
+    root = tmp_path / "formal"
+    _write_formal_records(root, checkpoint, suite="libero_10", steps=2, episodes=1)
+    _convert_to_official_teacher(root, steps=2)
+    record_path = (
+        root / "shard_0" / "seed_0" / "records" / "task_0_episode_0.json"
+    )
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["cosmos_source_sha256"] = "c" * 64
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="source identity"):
+        merge_formal_records(
+            root=root,
+            checkpoint=checkpoint,
+            suite="libero_10",
+            seed_count=1,
+            requested_steps=2,
             shard_plan="0:0:3;1:3:6;2:6:8;3:8:10",
             evaluation_classification="formal_verified",
             is_formal=True,

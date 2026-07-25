@@ -223,3 +223,36 @@ GREEN: 125 passed (the prior scoped regression command, expanded by round 2).
 
 No training, torchrun, checkpoint mutation, or evaluation launch was
 performed.
+
+## Review-fix round 3 addendum
+
+Round 3 removes the final public-output ambiguity for unavailable anchors.
+Internal zero-count sums/counts remain in the packed distributed reduction so
+all ranks retain a stable schema. During public mean reconstruction, an
+unmeasured anchor now emits none of its mean, finite-count, synthesized
+availability, ratio, flag, or branch-dominance keys. The two protocol keys are
+the only anchor-related keys retained for the normal mixed-clock record:
+
+```text
+mechanism/g_anchor_available = 0
+mechanism/g_anchor_unavailable_mixed_clock = 1
+```
+
+Those protocol flags no longer generate second-order
+`*_finite_count`/`*_available` aliases. Equal-clock runs still expose measured
+`G_anchor`, `G_anchor_mse`, their finite counts, and the normal derived
+metrics. Exact-key tests verify that the mixed-clock mapping is identical
+across JSONL, TensorBoard, and W&B-offline fanout.
+
+Round 3 TDD and verification:
+
+```text
+RED: 3 failed (zero-count anchor bookkeeping and protocol aliases leaked).
+GREEN: 3 passed (focused exact-key aggregation/fanout tests).
+GREEN: 40 passed (Task 5 mechanism and aggregation; prior 39 plus one test).
+GREEN: 71 passed (worker and Task 5; prior 70 plus one test).
+GREEN: 126 passed (prior scoped 125 plus one round-3 test).
+```
+
+No training, torchrun, checkpoint mutation, or evaluation launch was
+performed.

@@ -213,13 +213,15 @@ def test_zero_global_count_omits_unmeasured_mean_and_marks_unavailable():
     )
 
     assert "mechanism/g_anchor" not in means
-    assert means["mechanism/g_anchor_finite_count"] == 0.0
-    assert means["mechanism/g_anchor_available"] == 0.0
+    assert "mechanism/g_anchor_finite_count" not in means
+    assert "mechanism/g_anchor_available" not in means
     assert means["mechanism/diagnostic_valid"] == 0.0
     assert all(math.isfinite(value) for value in means.values())
 
 
-def test_mixed_clock_anchor_is_unavailable_not_a_zero_measurement(tmp_path):
+def test_mixed_clock_fanout_exposes_only_explicit_anchor_protocol_keys(
+    tmp_path,
+):
     samples = _samples(
         teacher_continuation_video=None,
         anchor_available=False,
@@ -232,28 +234,83 @@ def test_mixed_clock_anchor_is_unavailable_not_a_zero_measurement(tmp_path):
 
     assert stats["mechanism/g_anchor_count"].item() == 0
     assert stats["mechanism/g_anchor_mse_count"].item() == 0
-    assert "mechanism/g_anchor" not in means
-    assert "mechanism/g_anchor_mse" not in means
-    assert means["mechanism/g_anchor_finite_count"] == 0.0
     assert means["mechanism/g_anchor_available"] == 0.0
     assert means["mechanism/g_anchor_unavailable_mixed_clock"] == 1.0
     assert means["mechanism/g_comp"] > 0
     assert means["mechanism/diagnostic_valid"] == 1.0
+    anchor_public_keys = {
+        key
+        for key in means
+        if key.startswith("mechanism/g_anchor")
+        or key.startswith("mechanism/branch_dominance")
+    }
+    assert anchor_public_keys == {
+        "mechanism/g_anchor_available",
+        "mechanism/g_anchor_unavailable_mixed_clock",
+    }
 
     jsonl = tmp_path / "mixed-clock.jsonl"
+    tb_calls = []
+    tb = SimpleNamespace(
+        add_scalar=lambda key, value, step: tb_calls.append(
+            (key, value, step)
+        ),
+        flush=mock.Mock(),
+    )
+    wandb_log = mock.Mock()
+    wandb = SimpleNamespace(
+        run=SimpleNamespace(settings=SimpleNamespace(mode="offline")),
+        log=wandb_log,
+    )
     fan_out_mechanism_metrics(
         means,
         step=10,
         rank=0,
-        tb_writer=None,
-        wandb_module=None,
+        tb_writer=tb,
+        wandb_module=wandb,
         jsonl_path=jsonl,
     )
-    logged = json.loads(jsonl.read_text())
-    assert "mechanism/g_anchor" not in logged
-    assert logged["mechanism/g_anchor_available"] == 0.0
-    assert logged["mechanism/g_anchor_finite_count"] == 0.0
-    assert logged["mechanism/g_anchor_unavailable_mixed_clock"] == 1.0
+    jsonl_record = json.loads(jsonl.read_text())
+    jsonl_metrics = {
+        key: value
+        for key, value in jsonl_record.items()
+        if key.startswith("mechanism/")
+    }
+    tb_metrics = {key: value for key, value, _ in tb_calls}
+    wandb_metrics = wandb_log.call_args.args[0]
+    assert jsonl_metrics == tb_metrics == wandb_metrics == means
+    for public_mapping in (jsonl_metrics, tb_metrics, wandb_metrics):
+        public_anchor_keys = {
+            key
+            for key in public_mapping
+            if key.startswith("mechanism/g_anchor")
+            or key.startswith("mechanism/branch_dominance")
+        }
+        assert public_anchor_keys == {
+            "mechanism/g_anchor_available",
+            "mechanism/g_anchor_unavailable_mixed_clock",
+        }
+
+
+def test_equal_clock_means_retain_measured_anchor_metrics_and_counts():
+    means = means_from_reduced_stats(pack_finite_metric_stats(_samples()))
+
+    assert means["mechanism/g_anchor"] == pytest.approx(16.5)
+    assert means["mechanism/g_anchor_finite_count"] == 2.0
+    assert means["mechanism/g_anchor_mse"] == pytest.approx(8.25)
+    assert means["mechanism/g_anchor_mse_finite_count"] == 2.0
+    assert means["mechanism/g_anchor_available"] == 1.0
+    assert means["mechanism/g_anchor_unavailable_mixed_clock"] == 0.0
+    assert "mechanism/g_anchor_available_finite_count" not in means
+    assert "mechanism/g_anchor_available_available" not in means
+    assert (
+        "mechanism/g_anchor_unavailable_mixed_clock_finite_count"
+        not in means
+    )
+    assert (
+        "mechanism/g_anchor_unavailable_mixed_clock_available"
+        not in means
+    )
 
 
 def test_scheduler_runs_due_only_after_success_and_defers_skipped_once():

@@ -332,18 +332,29 @@ def means_from_reduced_stats(stats: Mapping[str, torch.Tensor]) -> dict[str, flo
         "mechanism/g_anchor_exploded",
         "mechanism/branch_dominance",
     }
+    explicit_protocol_keys = {
+        "mechanism/g_anchor_available",
+        "mechanism/g_anchor_unavailable_mixed_clock",
+    }
     for name in sorted(stats):
         if not name.endswith("_sum"):
             continue
         metric_name = name.removesuffix("_sum")
         count = float(stats[f"{metric_name}_count"].item())
         total = float(stats[name].item())
+        omitted_unmeasured = (
+            count == 0 and metric_name in omit_when_unmeasured
+        )
         if count > 0:
             means[metric_name] = total / count
-        elif metric_name not in omit_when_unmeasured:
+        elif not omitted_unmeasured:
             means[metric_name] = 0.0
-        means[f"{metric_name}_finite_count"] = count
-        means[f"{metric_name}_available"] = float(count > 0)
+        if (
+            not omitted_unmeasured
+            and metric_name not in explicit_protocol_keys
+        ):
+            means[f"{metric_name}_finite_count"] = count
+            means[f"{metric_name}_available"] = float(count > 0)
     batch_count = float(stats.get("diagnostic_batch_count", torch.tensor(0.0)).item())
     valid_count = float(stats.get("diagnostic_valid_count", torch.tensor(0.0)).item())
     teacher_joint_available = means.get(

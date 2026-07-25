@@ -309,6 +309,14 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
         _plain_file(teacher / name)
     local_model = tmp_path / "local-model"
     local_model.mkdir()
+    worker_python = _write_executable(
+        tmp_path / "cosmos-worker-python",
+        "exit 0\n",
+    )
+    cosmos_cuda = tmp_path / "cosmos-worker-pythonpath" / "cosmos-cuda"
+    cosmos_oss = tmp_path / "cosmos-worker-pythonpath" / "cosmos-oss"
+    cosmos_cuda.mkdir(parents=True)
+    cosmos_oss.mkdir(parents=True)
     repo = tmp_path / "clean-cosmos-repo"
     audited_source = Path(
         os.environ.get(
@@ -357,6 +365,8 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
             "COSMOS_POLICY_PATH": str(teacher),
             "S4_PROMPT_TABLE": str(prompt_table),
             "COSMOS_PREDICT25_LOCAL_MODEL_DIR": str(local_model),
+            "COSMOS_POLICY_PYTHON": str(worker_python),
+            "COSMOS_POLICY_EXTRA_PYTHONPATH": f"{cosmos_cuda}:{cosmos_oss}",
             "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
             "CALLS_LOG": str(calls),
             "COSMOS_RAW_STAGE1_LAUNCHER": str(stage1),
@@ -445,6 +455,61 @@ def test_pipeline_read_only_modes_write_nothing(tmp_path, mode):
         "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
     ) in result.stdout
     assert "S4_PROMPT_TABLE=" in result.stdout
+    evaluation = next(
+        line for line in result.stdout.splitlines()
+        if line.startswith("EVAL_COMMAND=")
+    )
+    assert f"COSMOS_POLICY_PYTHON={env['COSMOS_POLICY_PYTHON']}" in evaluation
+    assert (
+        f"COSMOS_POLICY_EXTRA_PYTHONPATH="
+        f"{env['COSMOS_POLICY_EXTRA_PYTHONPATH']}"
+    ) in evaluation
+
+
+@pytest.mark.parametrize(
+    "missing_name",
+    ("COSMOS_POLICY_PYTHON", "COSMOS_POLICY_EXTRA_PYTHONPATH"),
+)
+def test_pipeline_requires_explicit_cosmos_worker_environment(
+    tmp_path, missing_name
+):
+    env, output_root = _pipeline_env(tmp_path)
+    env.pop(missing_name)
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    result = _pipeline(env, output_root, "--dry-run")
+
+    after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    assert result.returncode != 0
+    assert missing_name in result.stderr
+    assert before == after
+    assert not output_root.exists()
+    assert not Path(env["CALLS_LOG"]).exists()
+
+
+@pytest.mark.parametrize("invalid_kind", ("python", "pythonpath"))
+def test_pipeline_rejects_invalid_cosmos_worker_environment_without_writes(
+    tmp_path, invalid_kind
+):
+    env, output_root = _pipeline_env(tmp_path)
+    if invalid_kind == "python":
+        invalid = tmp_path / "not-executable-python"
+        invalid.write_text("#!/bin/sh\n", encoding="utf-8")
+        env["COSMOS_POLICY_PYTHON"] = str(invalid)
+        expected = "COSMOS_POLICY_PYTHON"
+    else:
+        env["COSMOS_POLICY_EXTRA_PYTHONPATH"] += f":{tmp_path / 'missing'}"
+        expected = "COSMOS_POLICY_EXTRA_PYTHONPATH"
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    result = _pipeline(env, output_root, "--dry-run")
+
+    after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    assert result.returncode != 0
+    assert expected in result.stderr
+    assert before == after
+    assert not output_root.exists()
+    assert not Path(env["CALLS_LOG"]).exists()
 
 
 def test_pipeline_rejects_cosmos_repo_not_at_audited_commit(tmp_path):

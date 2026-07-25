@@ -64,13 +64,16 @@ def aligned_anchor_mse(
     while sigma.ndim < query_video.ndim:
         sigma = sigma.unsqueeze(-1)
     student_endpoint = query_video - sigma * student_velocity
-    if valid_video_mask is not None:
-        mask = valid_video_mask.to(device=query_video.device, dtype=query_video.dtype)
-        if mask.ndim == 2 and query_video.ndim == 5:
-            mask = mask[:, None, :, None, None]
-        student_endpoint = student_endpoint * mask
-        teacher_endpoint = teacher_endpoint * mask
-    return F.mse_loss(student_endpoint, teacher_endpoint, reduction="mean")
+    if valid_video_mask is None:
+        return F.mse_loss(student_endpoint, teacher_endpoint, reduction="mean")
+
+    mask = valid_video_mask.to(device=query_video.device, dtype=query_video.dtype)
+    if mask.ndim == 2 and query_video.ndim == 5:
+        mask = mask[:, None, :, None, None]
+    squared_error = (student_endpoint - teacher_endpoint).square()
+    expanded_mask = torch.broadcast_to(mask, squared_error.shape)
+    valid_elements = expanded_mask.sum().clamp_min(1.0)
+    return (squared_error * expanded_mask).sum() / valid_elements
 
 
 def sample_endpoint_sigmas(

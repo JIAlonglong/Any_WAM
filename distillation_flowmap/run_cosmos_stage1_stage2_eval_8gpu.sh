@@ -63,6 +63,34 @@ require_transformer() {
         die "$label weights are missing: $root"
 }
 
+resolve_executable() {
+    local label="$1"
+    local raw="$2"
+    [[ -e "$raw" && -x "$raw" ]] || die "$label is not executable: $raw"
+    local resolved
+    resolved="$(readlink -f -- "$raw")" || die "$label cannot be resolved: $raw"
+    [[ -f "$resolved" && -x "$resolved" ]] || \
+        die "$label does not resolve to an executable file: $raw"
+    printf '%s\n' "$resolved"
+}
+
+resolve_pythonpath() {
+    local label="$1"
+    local raw="$2"
+    [[ -n "$raw" ]] || die "$label must be set explicitly"
+    [[ "$raw" != :* && "$raw" != *: && "$raw" != *::* ]] || \
+        die "$label contains an empty path component"
+    local -a entries resolved_entries
+    local entry
+    IFS=':' read -r -a entries <<< "$raw"
+    for entry in "${entries[@]}"; do
+        [[ -d "$entry" ]] || die "$label directory is missing: $entry"
+        resolved_entries+=("$(cd "$entry" && pwd -P)")
+    done
+    local IFS=':'
+    printf '%s\n' "${resolved_entries[*]}"
+}
+
 print_command() {
     local label="$1"
     shift
@@ -177,6 +205,8 @@ elif [[ -n "${CLEAN_STUDENT_BASE_MODEL_PATH:-}" && \
     die "WAN_STUDENT_BASE_MODEL_PATH and deprecated CLEAN_STUDENT_BASE_MODEL_PATH disagree"
 fi
 require_env COSMOS_PREDICT2_REPO
+require_env COSMOS_POLICY_PYTHON
+require_env COSMOS_POLICY_EXTRA_PYTHONPATH
 require_dir WAN_STUDENT_BASE_MODEL_PATH "$WAN_STUDENT_BASE_MODEL_PATH"
 require_transformer \
     WAN_STUDENT_BASE_MODEL_PATH/transformer \
@@ -206,6 +236,14 @@ git_status="$(
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 PYTHON_BIN="${PYTHON_BIN:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python}"
+COSMOS_POLICY_PYTHON="$(
+    resolve_executable COSMOS_POLICY_PYTHON "$COSMOS_POLICY_PYTHON"
+)"
+COSMOS_POLICY_EXTRA_PYTHONPATH="$(
+    resolve_pythonpath \
+        COSMOS_POLICY_EXTRA_PYTHONPATH \
+        "$COSMOS_POLICY_EXTRA_PYTHONPATH"
+)"
 STAGE1_LAUNCHER="${COSMOS_RAW_STAGE1_LAUNCHER:-$SCRIPT_DIR/run_cosmos_raw_stage1_8gpu.sh}"
 STAGE2_LAUNCHER="${COSMOS_STAGE2_LAUNCHER:-$SCRIPT_DIR/run_cosmos_libero_train_8gpu.sh}"
 EVAL_LAUNCHER="${COSMOS_JOINT124_EVAL_LAUNCHER:-$PROJECT_ROOT/evaluation/libero/run_cosmos_progressive_joint_124_eval_8gpu.sh}"
@@ -328,6 +366,8 @@ stage1_environment=(
     "COSMOS_POLICY_TEACHER_LOCK=$LOCK_ROOT/teacher.lock.json"
     "COSMOS_PREDICT2_REPO=$COSMOS_PREDICT2_REPO"
     "COSMOS_PREDICT2_REPO_COMMIT=$COSMOS_PREDICT2_REPO_COMMIT"
+    "COSMOS_POLICY_PYTHON=$COSMOS_POLICY_PYTHON"
+    "COSMOS_POLICY_EXTRA_PYTHONPATH=$COSMOS_POLICY_EXTRA_PYTHONPATH"
     "COSMOS_PREDICT25_LOCAL_MODEL_DIR=$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
     "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 )
@@ -349,6 +389,8 @@ stage2_environment=(
     "COSMOS_POLICY_PATH=$COSMOS_POLICY_PATH"
     "COSMOS_PREDICT2_REPO=$COSMOS_PREDICT2_REPO"
     "COSMOS_PREDICT2_REPO_COMMIT=$COSMOS_PREDICT2_REPO_COMMIT"
+    "COSMOS_POLICY_PYTHON=$COSMOS_POLICY_PYTHON"
+    "COSMOS_POLICY_EXTRA_PYTHONPATH=$COSMOS_POLICY_EXTRA_PYTHONPATH"
     "COSMOS_PREDICT25_LOCAL_MODEL_DIR=$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
     "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
     "ALIGNED_VIDEO_OPD_INTERVAL=4"
@@ -368,6 +410,8 @@ eval_environment=(
     "COSMOS_POLICY_TEACHER_LOCK=$LOCK_ROOT/teacher.lock.json"
     "COSMOS_PREDICT2_REPO=$COSMOS_PREDICT2_REPO"
     "COSMOS_PREDICT2_REPO_COMMIT=$COSMOS_PREDICT2_REPO_COMMIT"
+    "COSMOS_POLICY_PYTHON=$COSMOS_POLICY_PYTHON"
+    "COSMOS_POLICY_EXTRA_PYTHONPATH=$COSMOS_POLICY_EXTRA_PYTHONPATH"
     "WAN_STUDENT_BASE_MODEL_PATH=$WAN_STUDENT_BASE_MODEL_PATH"
     "STUDENT_BASE_MODEL_PATH=$STAGE1_TARGET"
     "RESUME_FROM_PATH=$STAGE1_CHECKPOINT"
@@ -459,6 +503,8 @@ printf 'EVAL_PROTOCOL=40 tasks, matched joint 1/2/4, %s episodes per role/K\n' \
 printf 'EVAL_TOTAL_EPISODES=%s\n' "$((10#$EVAL_EPISODES * 40 * 3 * 2))"
 printf 'EVAL_EPISODES=%s\n' "$EVAL_EPISODES"
 printf 'COSMOS_PREDICT2_REPO_COMMIT=%s\n' "$COSMOS_PREDICT2_REPO_COMMIT"
+printf 'COSMOS_POLICY_PYTHON=%s\n' "$COSMOS_POLICY_PYTHON"
+printf 'COSMOS_POLICY_EXTRA_PYTHONPATH=%s\n' "$COSMOS_POLICY_EXTRA_PYTHONPATH"
 printf 'ALIGNED_VIDEO_OPD_INTERVAL=4\n'
 printf 'OPD_AUX_INTERVAL=4\n'
 printf 'OPD_DANCEOPD_ROLLOUT_STEPS=2,4\n'

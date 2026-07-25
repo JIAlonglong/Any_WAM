@@ -72,6 +72,29 @@ class DanceOPDQueryTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(loss, torch.tensor(0.0)))
 
+    def test_aligned_anchor_mse_mask_normalizes_over_valid_video_elements(self):
+        query_video = torch.tensor(
+            [[[[[3.0, 3.0], [3.0, 3.0]], [[100.0, 100.0], [100.0, 100.0]]]]]
+        )
+        query_sigma = torch.tensor([1.0])
+        student_velocity = torch.zeros_like(query_video)
+        teacher_endpoint = torch.tensor(
+            [[[[[1.0, 1.0], [1.0, 1.0]], [[-100.0, -100.0], [-100.0, -100.0]]]]]
+        )
+        valid_video_mask = torch.tensor([[True, False]])
+
+        loss = aligned_anchor_mse(
+            query_video,
+            query_sigma,
+            student_velocity,
+            teacher_endpoint,
+            valid_video_mask,
+        )
+
+        # Four valid elements each have squared error 4.  Invalid elements must
+        # contribute neither to the numerator nor to the mean denominator.
+        self.assertTrue(torch.allclose(loss, torch.tensor(4.0)))
+
     def test_endpoint_sigma_sampler_uses_exact_clean_region_formula(self):
         original_sample = torch.distributions.Beta.sample
         try:

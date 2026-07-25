@@ -29,7 +29,7 @@ class CosmosInferenceRequest:
     model_role: str
     video_steps: int
     action_steps: int
-    student_steps: int
+    student_steps: int | None
 
 
 def normalize_cosmos_inference_request(
@@ -83,7 +83,7 @@ def normalize_cosmos_inference_request(
         model_role=model_role,
         video_steps=video_steps,
         action_steps=action_steps,
-        student_steps=video_steps,
+        student_steps=None if model_role == "official_teacher" else video_steps,
     )
 
 _COMMON_CONTRACT = {

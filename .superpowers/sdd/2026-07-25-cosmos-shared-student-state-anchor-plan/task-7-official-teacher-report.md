@@ -11,6 +11,8 @@ resolve, or advertise a FlowMap/Wan student transformer.
   `{1, 2, 4}`.
 - The policy root must contain the monolithic `.pt`, official `config.json`,
   LIBERO statistics, and T5 embeddings.
+- Official requests leave the student-only compatibility field unset; they do
+  not advertise student checkpoint metadata.
 - `config.json` must identify `model_type=cosmos-policy`,
   `architecture=diffusion-transformer`, parallel generation, and the official
   `16 x 7` action contract.

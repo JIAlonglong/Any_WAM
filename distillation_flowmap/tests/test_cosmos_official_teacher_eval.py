@@ -27,7 +27,7 @@ def test_official_teacher_accepts_explicit_matched_budgets(budget):
     assert request.model_role == "official_teacher"
     assert request.video_steps == budget
     assert request.action_steps == budget
-    assert request.student_steps == budget
+    assert request.student_steps is None
 
 
 def _write_official_teacher_root(root: Path) -> Path:

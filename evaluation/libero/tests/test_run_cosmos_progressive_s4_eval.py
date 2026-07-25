@@ -329,6 +329,7 @@ def test_formal_merge_rejects_missing_or_mismatched_payload_seed(
     record_path = output_root / "shard_0" / "seed_0" / "records" / "task_0_episode_0.json"
     record_path.parent.mkdir(parents=True)
     record = {
+        "libero_benchmark": "libero_10",
         "task_idx": 0,
         "episode_idx": 0,
         "s4_checkpoint": str(checkpoint.resolve()),
@@ -353,8 +354,9 @@ def test_formal_merge_rejects_step_mismatch(tmp_path):
     record_path.parent.mkdir(parents=True)
     record_path.write_text(
         json.dumps(
-            {
-                "task_idx": 0,
+                {
+                    "libero_benchmark": "libero_10",
+                    "task_idx": 0,
                 "episode_idx": 0,
                 "seed": 0,
                 "s4_checkpoint": str(checkpoint.resolve()),
@@ -379,8 +381,9 @@ def test_formal_merge_rejects_episode_index_that_does_not_match_path_seed(tmp_pa
     record_path.parent.mkdir(parents=True)
     record_path.write_text(
         json.dumps(
-            {
-                "task_idx": 0,
+                {
+                    "libero_benchmark": "libero_10",
+                    "task_idx": 0,
                 "episode_idx": 0,
                 "seed": 7,
                 "s4_checkpoint": str(checkpoint.resolve()),
@@ -409,8 +412,9 @@ def test_formal_merge_writes_joint_k_and_accepts_four_shard_plan(tmp_path):
             for task in range(task_start, task_end):
                 (records_dir / f"task_{task}_episode_{seed}.json").write_text(
                     json.dumps(
-                        {
-                            "task_idx": task,
+                            {
+                                "libero_benchmark": "libero_10",
+                                "task_idx": task,
                             "episode_idx": seed,
                             "seed": seed,
                             "s4_checkpoint": str(checkpoint.resolve()),
@@ -527,8 +531,9 @@ def test_formal_merge_counts_real_failure_setup_and_skip_records_as_unsuccessful
         for seed in range(50):
             record = constructed.get(
                 (task, seed),
-                {
-                    "task_idx": task,
+                    {
+                        "libero_benchmark": "libero_10",
+                        "task_idx": task,
                     "episode_idx": seed,
                     "seed": seed,
                     "s4_checkpoint": checkpoint_id,
@@ -544,6 +549,7 @@ def test_formal_merge_counts_real_failure_setup_and_skip_records_as_unsuccessful
                 / f"task_{task}_episode_{seed}.json"
             )
             record.update(
+                libero_benchmark="libero_10",
                 model_role="stage2_target",
                 video_steps=2,
                 action_steps=2,
@@ -559,7 +565,7 @@ def test_formal_merge_counts_real_failure_setup_and_skip_records_as_unsuccessful
         (output_root / "formal_summary.json").read_text(encoding="utf-8")
     )
     assert summary["num_records"] == 500
-    assert summary["per_task_success"]["0"] == 47 / 50
+    assert summary["per_task_success"]["libero_10:0"] == 47 / 50
 
 
 def test_formal_merge_rejects_real_checkpoint_mismatch_record(tmp_path):
@@ -614,6 +620,7 @@ def test_formal_merge_rejects_real_checkpoint_mismatch_record(tmp_path):
     assert record["s4_checkpoint"] == "/observed/wrong-checkpoint"
     assert record["expected_s4_checkpoint"] == checkpoint_id
     record.update(
+        libero_benchmark="libero_10",
         model_role="stage2_target",
         video_steps=2,
         action_steps=2,
@@ -701,13 +708,6 @@ def test_live_formal_launcher_rejects_unclassified_or_unknown_before_child(
     assert not marker.exists()
 
 
-def test_formal_child_summary_is_published_atomically():
-    source = SCRIPT.read_text(encoding="utf-8")
-
-    assert 'temporary_path = root / ".formal_summary.json.tmp"' in source
-    assert "os.replace(temporary_path, path)" in source
-
-
 def test_formal_waits_for_every_shard_and_skips_merge_when_one_shard_fails(tmp_path):
     env = _launcher_env(tmp_path)
     env.update(
@@ -750,7 +750,7 @@ def test_formal_waits_for_every_shard_and_skips_merge_when_one_shard_fails(tmp_p
     assert "MERGE" not in lines
 
 
-def test_launcher_syntax_and_merge_guards_are_present():
+def test_launcher_syntax_is_valid():
     syntax = subprocess.run(
         ["bash", "-n", str(SCRIPT)],
         cwd=ROOT,
@@ -759,16 +759,6 @@ def test_launcher_syntax_and_merge_guards_are_present():
         check=False,
     )
     _assert_success(syntax)
-
-    source = SCRIPT.read_text(encoding="utf-8")
-    assert "-m evaluation.libero.rollout_cosmos_progressive_s4" in source
-    assert "duplicate record" in source
-    assert "checkpoint mismatch" in source
-    assert "seed mismatch" in source
-    assert "bootstrap_ci_95" in source
-    assert "record_path.relative_to(root).parts" in source
-    assert 'if "seed" not in record:' in source
-    assert "record_seed != seed" in source
 
 
 def test_dry_run_plans_prompt_materialization_without_invoking_a_child(tmp_path):

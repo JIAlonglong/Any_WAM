@@ -334,6 +334,67 @@ def test_client_records_rollout_seed_on_success(tmp_path):
     assert persisted["student_steps"] == 2
 
 
+def test_real_service_metadata_is_persisted_in_client_episode_record(tmp_path):
+    """Dropping service provenance must make the formal merger reject real rollouts."""
+    teacher = _RecordingTeacher()
+    engine = CosmosProgressiveS4Engine(
+        cosmos_teacher=teacher,
+        prompt_table=PromptEmbeddingTable(
+            {"open the drawer": np.zeros((1, 512, 4096), dtype=np.float32)}
+        ),
+        action_template=_template(),
+        action_encoder=lambda raw_actions: raw_actions,
+        joint_s4_runner=lambda *_args, **_kwargs: np.zeros(
+            (1, 7, 4, 4, 1), dtype=np.float32
+        ),
+        anchor_noise_factory=lambda: np.ones(
+            (1, 16, 9, 28, 28), dtype=np.float32
+        ),
+        model_role="stage2_target",
+        video_steps=2,
+        action_steps=2,
+        checkpoint_contract_identity="real-service-contract",
+    )
+    service = CosmosProgressiveS4Service(
+        engine=engine,
+        checkpoint_identifier="s4-checkpoint",
+        checkpoint_contract_identity="real-service-contract",
+    )
+    client = CosmosProgressiveS4Client(
+        service,
+        output_dir=tmp_path,
+        student_steps=2,
+        libero_benchmark="libero_spatial",
+        expected_s4_checkpoint="s4-checkpoint",
+        expected_checkpoint_contract_identity="real-service-contract",
+        warmup_steps=0,
+    )
+
+    record = client.run_with_env(
+        env=_DoneEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=3,
+        episode_idx=7,
+        prompt="open the drawer",
+        max_env_steps=1,
+        init_env_fn=lambda *_args, **_kwargs: OBS,
+        extract_video_fn=lambda _obs: {},
+        rollout_seed=7,
+    )
+
+    persisted = json.loads(
+        (tmp_path / "records" / "task_3_episode_7.json").read_text(encoding="utf-8")
+    )
+    expected = {
+        "model_role": "stage2_target",
+        "video_steps": 2,
+        "action_steps": 2,
+        "libero_benchmark": "libero_spatial",
+    }
+    assert {key: record[key] for key in expected} == expected
+    assert {key: persisted[key] for key in expected} == expected
+
+
 def test_non_video_episode_does_not_extract_or_save_frames(tmp_path):
     client = CosmosProgressiveS4Client(
         _SuccessfulService(), output_dir=tmp_path, student_steps=2, warmup_steps=0

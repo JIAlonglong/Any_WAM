@@ -64,6 +64,10 @@ class CosmosProgressiveS4Client:
         *,
         output_dir: str | Path,
         student_steps: int = 4,
+        model_role: str = "stage2_target",
+        video_steps: int | None = None,
+        action_steps: int | None = None,
+        libero_benchmark: str | None = None,
         expected_s4_checkpoint: str | None = None,
         expected_checkpoint_contract_identity: str | None = None,
         warmup_steps: int = 5,
@@ -75,6 +79,20 @@ class CosmosProgressiveS4Client:
         self.service = service
         self.output_dir = Path(output_dir)
         self.student_steps = normalize_student_steps(student_steps)
+        self.model_role = str(model_role)
+        self.video_steps = normalize_student_steps(
+            self.student_steps if video_steps is None else video_steps
+        )
+        self.action_steps = normalize_student_steps(
+            self.student_steps if action_steps is None else action_steps
+        )
+        self.libero_benchmark = (
+            str(libero_benchmark) if libero_benchmark is not None else None
+        )
+        if self.video_steps != self.action_steps or self.video_steps != self.student_steps:
+            raise ValueError(
+                "Cosmos Progressive client requires matched student/video/action budgets"
+            )
         service_checkpoint = getattr(service, "checkpoint_identifier", None)
         checkpoint = (
             expected_s4_checkpoint
@@ -88,6 +106,17 @@ class CosmosProgressiveS4Client:
         self.warmup_steps = int(warmup_steps)
         self.warmup_gripper = float(warmup_gripper)
         self.skip_first_action = bool(skip_first_action)
+
+    def _inference_contract_record(self) -> dict[str, Any]:
+        contract = {
+            "model_role": self.model_role,
+            "video_steps": self.video_steps,
+            "action_steps": self.action_steps,
+            "student_steps": self.student_steps,
+        }
+        if self.libero_benchmark is not None:
+            contract["libero_benchmark"] = self.libero_benchmark
+        return contract
 
     def _record_path(self, task_idx: int, episode_idx: int) -> Path:
         return self.output_dir / "records" / f"task_{int(task_idx)}_episode_{int(episode_idx)}.json"
@@ -169,7 +198,7 @@ class CosmosProgressiveS4Client:
             "episode_idx": int(episode_idx),
             "prompt": str(prompt),
             "seed": int(rollout_seed),
-            "student_steps": self.student_steps,
+            **self._inference_contract_record(),
             "s4_checkpoint": record_checkpoint,
             "checkpoint_contract_identity": self.expected_checkpoint_contract_identity,
             "done": False,
@@ -288,7 +317,7 @@ class CosmosProgressiveS4Client:
                 "episode_idx": int(episode_idx),
                 "prompt": str(prompt),
                 "seed": int(rollout_seed),
-                "student_steps": self.student_steps,
+                **self._inference_contract_record(),
                 "s4_checkpoint": self.expected_s4_checkpoint,
                 "checkpoint_contract_identity": self.expected_checkpoint_contract_identity,
                 "done": bool(done),
@@ -309,7 +338,7 @@ class CosmosProgressiveS4Client:
                 "episode_idx": int(episode_idx),
                 "prompt": str(prompt),
                 "seed": int(rollout_seed),
-                "student_steps": self.student_steps,
+                **self._inference_contract_record(),
                 "s4_checkpoint": self.expected_s4_checkpoint,
                 "checkpoint_contract_identity": self.expected_checkpoint_contract_identity,
                 "done": False,
@@ -378,7 +407,7 @@ class CosmosProgressiveS4Client:
                 "episode_idx": int(episode_idx),
                 "prompt": prompt,
                 "seed": rollout_seed,
-                "student_steps": self.student_steps,
+                **self._inference_contract_record(),
                 "s4_checkpoint": self.expected_s4_checkpoint,
                 "checkpoint_contract_identity": self.expected_checkpoint_contract_identity,
                 "done": False,

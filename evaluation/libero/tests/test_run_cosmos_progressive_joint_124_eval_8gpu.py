@@ -22,6 +22,8 @@ def _base_env(tmp_path):
     dataset.mkdir()
     empty_embedding = dataset / "empty emb.pt"
     empty_embedding.write_bytes(b"test")
+    prompt_table = dataset / "all forty task prompts.pt"
+    prompt_table.write_bytes(b"test")
     env = os.environ.copy()
     env.update(
         {
@@ -29,11 +31,11 @@ def _base_env(tmp_path):
             "S4_CKPT_ROOT": str(checkpoint),
             "S4_DATASET_PATH": str(dataset),
             "S4_EMPTY_EMBEDDING": str(empty_embedding),
+            "S4_PROMPT_TABLE": str(prompt_table),
             "PYTHON_BIN": sys.executable,
             "S4_ALIGNMENT_VERIFIED": "1",
         }
     )
-    env.pop("S4_PROMPT_TABLE", None)
     env.pop("S4_VIDEO_SEEDS", None)
     env.pop("S4_FORMAL_NUM_SHARDS", None)
     env.pop("S4_STUDENT_STEPS", None)
@@ -42,6 +44,17 @@ def _base_env(tmp_path):
     env.pop("S4_EPISODES_PER_TASK", None)
     env.pop("S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH", None)
     return env
+
+
+def test_matrix_requires_explicit_all_suite_prompt_table(tmp_path):
+    env = _base_env(tmp_path)
+    env.pop("S4_PROMPT_TABLE")
+
+    result = _run("dry-run", env=env)
+
+    assert result.returncode == 2
+    assert "set S4_PROMPT_TABLE" in result.stderr
+    assert not Path(env["MATRIX_ROOT"]).exists()
 
 
 def _run(mode, *, env):
@@ -59,7 +72,7 @@ def _assert_success(result):
     assert result.returncode == 0, result.stdout + "\n" + result.stderr
 
 
-def test_matrix_dry_run_plans_three_full_sequential_evaluations(tmp_path):
+def test_matrix_dry_run_plans_four_suites_for_three_matched_budgets(tmp_path):
     env = _base_env(tmp_path)
     root = Path(env["MATRIX_ROOT"])
 
@@ -71,13 +84,24 @@ def test_matrix_dry_run_plans_three_full_sequential_evaluations(tmp_path):
         for line in result.stdout.splitlines()
         if line.startswith("MATRIX_STEP=")
     ] == [1, 2, 4]
-    assert result.stdout.count("REQUESTED_RECORDS=500") == 3
-    assert result.stdout.count("FORMAL_NUM_SHARDS=4") == 3
-    assert result.stdout.count("VIDEO_SEEDS=0,1") == 3
+    suites = [
+        line.split("=", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("MATRIX_SUITE=")
+    ]
+    assert suites == [
+        suite
+        for _step in (1, 2, 4)
+        for suite in ("libero_10", "libero_spatial", "libero_object", "libero_goal")
+    ]
+    assert result.stdout.count("REQUESTED_RECORDS=500") == 12
+    assert result.stdout.count("FORMAL_NUM_SHARDS=4") == 12
+    assert result.stdout.count("VIDEO_SEEDS=0,1") == 12
     for step in (1, 2, 4):
-        assert result.stdout.count(f"--video-steps {step}") == 204
-        assert result.stdout.count(f"--action-steps {step}") == 204
+        assert result.stdout.count(f"--video-steps {step}") == 816
+        assert result.stdout.count(f"--action-steps {step}") == 816
     assert "--student-steps" not in result.stdout
+    assert "MATRIX_SUMMARY_CSV_PLAN=" in result.stdout
     assert not root.exists()
 
 
@@ -109,9 +133,10 @@ def _write_child_sentinel(path, *, fail_step=None, corrupt_step=None):
         "assert sys.argv[1:] == ['formal']\n"
         "root = pathlib.Path(os.environ['EVAL_ROOT'])\n"
         "step = int(os.environ['S4_STUDENT_STEPS'])\n"
+        "suite = os.environ['S4_LIBERO_BENCHMARK']\n"
         "episodes_per_task = int(os.environ['S4_EPISODES_PER_TASK'])\n"
         "with pathlib.Path(os.environ['SENTINEL_LOG']).open('a', encoding='utf-8') as f:\n"
-        "    f.write(f'{step}\\n')\n"
+        "    f.write(f'{suite}:{step}\\n')\n"
         + (
             f"if step == {fail_step}:\n"
             "    raise SystemExit(17)\n"
@@ -131,13 +156,17 @@ def _write_child_sentinel(path, *, fail_step=None, corrupt_step=None):
         )
         + "summary = {\n"
         "    'checkpoint': str(pathlib.Path(os.environ['S4_CKPT_ROOT']).resolve()),\n"
+        "    'libero_benchmark': suite,\n"
         "    'student_steps': reported_step,\n"
         "    'video_steps': step,\n"
         "    'action_steps': step,\n"
         "    'model_role': os.environ.get('S4_MODEL_ROLE', 'stage2_target'),\n"
         "    'checkpoint_contract_identity': 'contract-v1',\n"
+        "    'num_tasks': 10,\n"
         "    'num_records': 10 * episodes_per_task,\n"
         "    'seeds_per_task': episodes_per_task,\n"
+        "    'per_task_success': {f'{suite}:{task}': 0.5 for task in range(10)},\n"
+        "    'macro_success': 0.5,\n"
         "    'evaluation_classification': os.environ['S4_EVAL_CLASSIFICATION'],\n"
         "    'is_formal': os.environ['S4_EVAL_IS_FORMAL'] == '1',\n"
         "}\n"
@@ -161,7 +190,7 @@ def _write_child_sentinel(path, *, fail_step=None, corrupt_step=None):
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def test_live_matrix_runs_serially_reuses_k1_prompt_and_writes_summary(tmp_path):
+def test_live_matrix_runs_all_cells_with_shared_prompt_and_writes_summary(tmp_path):
     env = _base_env(tmp_path)
     log = tmp_path / "child-order.log"
     child = tmp_path / "child.py"
@@ -177,34 +206,35 @@ def test_live_matrix_runs_serially_reuses_k1_prompt_and_writes_summary(tmp_path)
     _assert_success(result)
 
     root = Path(env["MATRIX_ROOT"])
-    assert log.read_text(encoding="utf-8").splitlines() == ["1", "2", "4"]
-    assert (root / "k1" / "prompt_embeddings.pt").is_file()
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        f"{suite}:{step}"
+        for step in (1, 2, 4)
+        for suite in ("libero_10", "libero_spatial", "libero_object", "libero_goal")
+    ]
+    assert not (root / "k1" / "libero_10" / "prompt_embeddings.pt").exists()
     for step in (1, 2, 4):
-        child_payload = json.loads(
-            (root / f"k{step}" / "formal_summary.json").read_text(encoding="utf-8")
-        )
-        assert child_payload["student_steps"] == step
-        assert child_payload["video_steps"] == step
-        assert child_payload["action_steps"] == step
-        assert child_payload["model_role"] == "stage2_target"
-        assert child_payload["checkpoint_contract_identity"] == "contract-v1"
+        for suite in ("libero_10", "libero_spatial", "libero_object", "libero_goal"):
+            child_payload = json.loads(
+                (root / f"k{step}" / suite / "formal_summary.json").read_text(encoding="utf-8")
+            )
+            assert child_payload["libero_benchmark"] == suite
+            assert child_payload["student_steps"] == step
+            assert child_payload["video_steps"] == step
+            assert child_payload["action_steps"] == step
+            assert child_payload["model_role"] == "stage2_target"
+            assert child_payload["checkpoint_contract_identity"] == "contract-v1"
     payload = json.loads((root / "matrix_summary.json").read_text(encoding="utf-8"))
-    assert payload == {
-        "schema": "cosmos_progressive_joint_124_matrix_v1",
-        "checkpoint": str(Path(env["S4_CKPT_ROOT"]).resolve()),
-        "evaluation_classification": "formal_verified",
-        "is_formal": True,
-        "steps": [1, 2, 4],
-        "episodes_per_task": 50,
-        "episodes_per_k": 500,
-        "model_role": "stage2_target",
-        "checkpoint_contract_identity": "contract-v1",
-        "summaries": {
-            "1": str(root / "k1" / "formal_summary.json"),
-            "2": str(root / "k2" / "formal_summary.json"),
-            "4": str(root / "k4" / "formal_summary.json"),
-        },
-    }
+    assert payload["schema"] == "cosmos_progressive_joint_124_matrix_v2"
+    assert payload["suites"] == [
+        "libero_10", "libero_spatial", "libero_object", "libero_goal"
+    ]
+    assert payload["steps"] == [1, 2, 4]
+    assert payload["episodes_per_task"] == 50
+    assert payload["episodes_per_k"] == 2000
+    assert payload["unique_tasks"] == 40
+    assert payload["task_budget_cells"] == 120
+    assert len(payload["summaries"]) == 12
+    assert (root / "matrix_summary.csv").is_file()
 
 
 def test_live_matrix_propagates_nondefault_episode_count_to_every_k(tmp_path):
@@ -225,18 +255,19 @@ def test_live_matrix_propagates_nondefault_episode_count_to_every_k(tmp_path):
 
     root = Path(env["MATRIX_ROOT"])
     for step in (1, 2, 4):
-        child_payload = json.loads(
-            (root / f"k{step}" / "formal_summary.json").read_text(
-                encoding="utf-8"
+        for suite in ("libero_10", "libero_spatial", "libero_object", "libero_goal"):
+            child_payload = json.loads(
+                (root / f"k{step}" / suite / "formal_summary.json").read_text(
+                    encoding="utf-8"
+                )
             )
-        )
-        assert child_payload["seeds_per_task"] == 3
-        assert child_payload["num_records"] == 30
+            assert child_payload["seeds_per_task"] == 3
+            assert child_payload["num_records"] == 30
     matrix = json.loads(
         (root / "matrix_summary.json").read_text(encoding="utf-8")
     )
     assert matrix["episodes_per_task"] == 3
-    assert matrix["episodes_per_k"] == 30
+    assert matrix["episodes_per_k"] == 120
 
 
 def test_unverified_run_stops_before_any_child(tmp_path):
@@ -293,13 +324,14 @@ def test_explicit_known_mismatch_override_marks_every_summary_nonformal(tmp_path
 
     root = Path(env["MATRIX_ROOT"])
     for step in (1, 2, 4):
-        child_summary = json.loads(
-            (root / f"k{step}" / "formal_summary.json").read_text(encoding="utf-8")
-        )
-        assert child_summary["evaluation_classification"] == (
-            "diagnostic_known_alignment_mismatch"
-        )
-        assert child_summary["is_formal"] is False
+        for suite in ("libero_10", "libero_spatial", "libero_object", "libero_goal"):
+            child_summary = json.loads(
+                (root / f"k{step}" / suite / "formal_summary.json").read_text(encoding="utf-8")
+            )
+            assert child_summary["evaluation_classification"] == (
+                "diagnostic_known_alignment_mismatch"
+            )
+            assert child_summary["is_formal"] is False
     matrix = json.loads((root / "matrix_summary.json").read_text(encoding="utf-8"))
     assert matrix["evaluation_classification"] == (
         "diagnostic_known_alignment_mismatch"
@@ -322,7 +354,13 @@ def test_child_failure_stops_before_later_k_and_publishes_no_summary(tmp_path):
     result = _run("run", env=env)
 
     assert result.returncode == 17
-    assert log.read_text(encoding="utf-8").splitlines() == ["1", "2"]
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        "libero_10:1",
+        "libero_spatial:1",
+        "libero_object:1",
+        "libero_goal:1",
+        "libero_10:2",
+    ]
     root = Path(env["MATRIX_ROOT"])
     assert not (root / "k4").exists()
     assert not (root / "matrix_summary.json").exists()
@@ -343,7 +381,7 @@ def test_invalid_child_summary_is_rejected_before_matrix_publish(tmp_path):
     result = _run("run", env=env)
 
     assert result.returncode != 0
-    assert "student_steps mismatch" in result.stderr
+    assert "video/action step mismatch" in result.stderr
     assert not (Path(env["MATRIX_ROOT"]) / "matrix_summary.json").exists()
 
 
@@ -396,7 +434,7 @@ def test_child_contract_fields_must_match_before_matrix_publish(tmp_path):
         ("model_role", "model_role mismatch"),
         ("video_steps", "video/action step mismatch"),
         ("action_steps", "video/action step mismatch"),
-        ("identity", "checkpoint_contract_identity mismatch across K"),
+        ("identity", "checkpoint_contract_identity mismatch across matrix"),
     ):
         case = tmp_path / corruption
         case.mkdir()
@@ -436,5 +474,7 @@ def test_caller_prompt_table_is_reused_for_all_children(tmp_path):
     result = _run("run", env=env)
     _assert_success(result)
 
-    assert log.read_text(encoding="utf-8").splitlines() == ["1", "2", "4"]
-    assert not (Path(env["MATRIX_ROOT"]) / "k1" / "prompt_embeddings.pt").exists()
+    assert len(log.read_text(encoding="utf-8").splitlines()) == 12
+    assert not (
+        Path(env["MATRIX_ROOT"]) / "k1" / "libero_10" / "prompt_embeddings.pt"
+    ).exists()

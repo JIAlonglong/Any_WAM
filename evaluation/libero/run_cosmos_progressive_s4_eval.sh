@@ -100,13 +100,11 @@ verify_formal_results() {
     "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" \
         "${S4_STUDENT_STEPS}" "${shard_plan}" "${S4_EVAL_CLASSIFICATION}" \
         "${S4_EVAL_IS_FORMAL}" <<'PY'
-import json
 import os
-import random
-import re
 import sys
-from collections import defaultdict
 from pathlib import Path
+
+from evaluation.libero.cosmos_progressive_eval_summary import merge_formal_records
 
 root = Path(sys.argv[1])
 expected_checkpoint = str(Path(sys.argv[2]).resolve())
@@ -115,113 +113,20 @@ requested_steps = int(sys.argv[4])
 evaluation_classification = sys.argv[6]
 is_formal = sys.argv[7] == "1"
 expected_model_role = os.environ.get("S4_MODEL_ROLE", "stage2_target")
-shard_plan = {}
-for entry in sys.argv[5].split(";"):
-    shard_text, start_text, end_text = entry.split(":")
-    shard = int(shard_text)
-    task_start, task_end = int(start_text), int(end_text)
-    if shard in shard_plan or task_start < 0 or task_end < task_start:
-        raise SystemExit(f"invalid shard plan: {sys.argv[5]!r}")
-    shard_plan[shard] = range(task_start, task_end)
-expected_tasks = tuple(sorted({task for tasks in shard_plan.values() for task in tasks}))
-if expected_tasks != tuple(range(10)):
-    raise SystemExit(f"invalid shard plan coverage: {sys.argv[5]!r}")
-expected = {(task, seed) for task in expected_tasks for seed in range(seed_count)}
-seen = {}
-per_task = defaultdict(list)
-contract_identities = set()
-
-for record_path in sorted(root.glob("shard_*/seed_*/records/task_*_episode_*.json")):
-    relative_parts = record_path.relative_to(root).parts
-    shard_match = next((re.fullmatch(r"shard_(\d+)", part) for part in relative_parts if re.fullmatch(r"shard_(\d+)", part)), None)
-    seed_match = next((re.fullmatch(r"seed_(\d+)", part) for part in relative_parts if re.fullmatch(r"seed_(\d+)", part)), None)
-    if shard_match is None or seed_match is None:
-        raise SystemExit(f"seed mismatch: record path lacks shard/seed identity: {record_path}")
-    shard, seed = int(shard_match.group(1)), int(seed_match.group(1))
-    if shard not in shard_plan or seed not in range(seed_count):
-        raise SystemExit(f"seed mismatch: unexpected shard={shard} seed={seed} in {record_path}")
-    record = json.loads(record_path.read_text(encoding="utf-8"))
-    task = int(record.get("task_idx", -1))
-    allowed = shard_plan[shard]
-    if task not in allowed:
-        raise SystemExit(f"seed mismatch: task {task} is not assigned to shard {shard}")
-    episode_idx = int(record.get("episode_idx", -1))
-    if episode_idx != seed:
-        raise SystemExit(
-            f"episode mismatch: expected episode_idx={seed} got={episode_idx}"
-        )
-    if "seed" not in record:
-        raise SystemExit(f"seed mismatch: missing record seed for task={task} path seed={seed}")
-    try:
-        record_seed = int(record["seed"])
-    except (TypeError, ValueError):
-        raise SystemExit(f"seed mismatch: invalid record seed={record['seed']!r} path seed={seed}")
-    if record_seed != seed:
-        raise SystemExit(f"seed mismatch: record seed={record_seed} path seed={seed}")
-    if int(record.get("student_steps", -1)) != requested_steps:
-        raise SystemExit(
-            f"step mismatch: expected={requested_steps} "
-            f"got={record.get('student_steps')!r}"
-        )
-    if record.get("model_role") != expected_model_role:
-        raise SystemExit(f"model_role mismatch: expected={expected_model_role!r} got={record.get('model_role')!r}")
-    if int(record.get("video_steps", -1)) != requested_steps or int(record.get("action_steps", -1)) != requested_steps:
-        raise SystemExit("video/action steps mismatch in formal record")
-    identity = record.get("checkpoint_contract_identity")
-    if not isinstance(identity, str) or not identity:
-        raise SystemExit("checkpoint_contract_identity missing in formal record")
-    contract_identities.add(identity)
-    if record.get("s4_checkpoint") != expected_checkpoint:
-        raise SystemExit(f"checkpoint mismatch: task={task} seed={seed} expected={expected_checkpoint!r} got={record.get('s4_checkpoint')!r}")
-    key = (task, seed)
-    if key in seen:
-        raise SystemExit(f"duplicate record: task={task} seed={seed}: {seen[key]} and {record_path}")
-    seen[key] = str(record_path)
-    per_task[task].append(1.0 if bool(record.get("success", False)) else 0.0)
-
-unexpected = set(seen) - expected
-if unexpected:
-    raise SystemExit(f"seed mismatch: unexpected task/seed records: {sorted(unexpected)}")
-missing = expected - set(seen)
-if missing:
-    raise SystemExit(f"missing record: {len(missing)} required task/seed records absent, first={sorted(missing)[:5]}")
-if len(seen) != len(expected):
-    raise SystemExit(f"duplicate record: expected {len(expected)} records, found {len(seen)}")
-if len(contract_identities) != 1:
-    raise SystemExit(f"checkpoint_contract_identity mismatch across formal records: {sorted(contract_identities)!r}")
-
-task_means = {str(task): sum(per_task[task]) / seed_count for task in expected_tasks}
-macro_success = sum(task_means[str(task)] for task in expected_tasks) / len(expected_tasks)
-rng = random.Random(0)
-bootstrap = []
-for _ in range(10000):
-    sampled_means = [sum(rng.choice(per_task[task]) for _ in range(seed_count)) / seed_count for task in expected_tasks]
-    bootstrap.append(sum(sampled_means) / len(sampled_means))
-bootstrap.sort()
-summary = {
-    "schema": "cosmos_progressive_s4_formal_eval_v1",
-    "checkpoint": expected_checkpoint,
-    "student_steps": requested_steps,
-    "model_role": expected_model_role,
-    "video_steps": requested_steps,
-    "action_steps": requested_steps,
-    "checkpoint_contract_identity": next(iter(contract_identities)),
-    "evaluation_classification": evaluation_classification,
-    "is_formal": is_formal,
-    "num_records": len(seen),
-    "seeds_per_task": seed_count,
-    "per_task_success": task_means,
-    "macro_success": macro_success,
-    "bootstrap_ci_95": [bootstrap[int(0.025 * len(bootstrap))], bootstrap[int(0.975 * len(bootstrap))]],
-}
-path = root / "formal_summary.json"
-temporary_path = root / ".formal_summary.json.tmp"
-temporary_path.write_text(
-    json.dumps(summary, indent=2, sort_keys=True) + "\n",
-    encoding="utf-8",
+suite = os.environ.get("S4_LIBERO_BENCHMARK", "libero_10")
+merge_formal_records(
+    root=root,
+    checkpoint=expected_checkpoint,
+    suite=suite,
+    seed_count=seed_count,
+    requested_steps=requested_steps,
+    shard_plan=sys.argv[5],
+    evaluation_classification=evaluation_classification,
+    is_formal=is_formal,
+    model_role=expected_model_role,
 )
-os.replace(temporary_path, path)
-print(f"MERGE_SUMMARY={path}")
+print(f"MERGE_SUMMARY={root / 'formal_summary.json'}")
+print(f"MERGE_SUMMARY_CSV={root / 'formal_summary.csv'}")
 PY
 }
 
@@ -456,6 +361,10 @@ S4_SMOKE_PAIRS="${S4_SMOKE_PAIRS:-}"
 S4_SMOKE_CACHE_DIR="${S4_SMOKE_CACHE_DIR:-}"
 S4_INITIAL_STATES_JSON="${S4_INITIAL_STATES_JSON:-}"
 S4_LIBERO_BENCHMARK="${S4_LIBERO_BENCHMARK:-libero_10}"
+case "${S4_LIBERO_BENCHMARK}" in
+    libero_10|libero_spatial|libero_object|libero_goal) ;;
+    *) die "S4_LIBERO_BENCHMARK must be libero_10, libero_spatial, libero_object, or libero_goal" ;;
+esac
 S4_STUDENT_STEPS="${S4_STUDENT_STEPS:-4}"
 case "${S4_STUDENT_STEPS}" in
     1|2|4) ;;
@@ -536,6 +445,7 @@ emit_kv "DRY_RUN" "${DRY_RUN}"
 emit_kv "S4_CKPT_ROOT" "${S4_CKPT_ROOT}"
 emit_kv "EVAL_ROOT" "${EVAL_ROOT}"
 emit_kv "S4_STUDENT_STEPS" "${S4_STUDENT_STEPS}"
+emit_kv "S4_LIBERO_BENCHMARK" "${S4_LIBERO_BENCHMARK}"
 emit_kv "S4_EPISODES_PER_TASK" "${S4_EPISODES_PER_TASK}"
 emit_kv "S4_FORMAL_NUM_SHARDS" "${S4_FORMAL_NUM_SHARDS}"
 emit_kv "S4_VIDEO_SEEDS" "${S4_VIDEO_SEEDS}"

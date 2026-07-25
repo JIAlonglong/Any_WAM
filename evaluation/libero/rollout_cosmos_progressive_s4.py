@@ -678,6 +678,10 @@ def main(argv: list[str] | None = None) -> int:
             service,
             output_dir=args.output_dir,
             student_steps=request.student_steps,
+            model_role=request.model_role,
+            video_steps=request.video_steps,
+            action_steps=request.action_steps,
+            libero_benchmark=args.libero_benchmark,
             expected_s4_checkpoint=getattr(
                 service,
                 "checkpoint_identifier",

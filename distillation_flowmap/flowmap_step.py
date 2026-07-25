@@ -126,7 +126,7 @@ from distillation_flowmap.mechanism_diagnostics import (
 )
 from distillation_flowmap.video_action_bridge import (
     bridge_probability,
-    masked_action_teacher_forcing_loss,
+    masked_action_x0_teacher_forcing_loss,
 )
 
 
@@ -6086,9 +6086,6 @@ class FlowMapStepMixin:
             bridge_action_state = self.train_scheduler_action.add_noise(
                 action_clean, action_noise, query_action_t, t_dim=2
             )
-            bridge_action_target = self.train_scheduler_action.training_target(
-                action_clean, action_noise, query_action_t
-            )
             bridge_input = self._build_joint_input(
                 query_video,
                 query_video_t,
@@ -6128,9 +6125,15 @@ class FlowMapStepMixin:
             bridge_action_velocity = self._extract_action_v(
                 bridge_action_velocity_seq, action_frames
             )
-            bridge_loss = masked_action_teacher_forcing_loss(
+            bridge_action_sigma = (
+                query_action_t[:, None, :, None, None]
+                / self.config.num_train_timesteps
+            )
+            bridge_loss = masked_action_x0_teacher_forcing_loss(
                 bridge_action_velocity,
-                bridge_action_target,
+                bridge_action_state,
+                action_clean,
+                bridge_action_sigma,
                 action_mask,
             )
         velocity_weight = float(getattr(

@@ -41,3 +41,23 @@ def masked_action_teacher_forcing_loss(
         mask = mask.unsqueeze(-1)
     mask = torch.broadcast_to(mask, squared_error.shape)
     return (squared_error * mask).sum() / mask.sum().clamp(min=1.0)
+
+
+def masked_action_x0_teacher_forcing_loss(
+    predicted_velocity,
+    noisy_action,
+    clean_action,
+    sigma,
+    valid_mask=None,
+):
+    """Apply deployment-video action supervision in the main x0 parameterization."""
+    predicted_x0 = (
+        noisy_action.float()
+        - sigma.to(device=noisy_action.device, dtype=torch.float32)
+        * predicted_velocity.float()
+    )
+    return masked_action_teacher_forcing_loss(
+        predicted_x0,
+        clean_action,
+        valid_mask,
+    )

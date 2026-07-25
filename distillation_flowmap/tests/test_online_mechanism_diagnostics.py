@@ -827,8 +827,10 @@ def test_action_interventions_replace_only_the_requested_joint_state():
         gt_video_context,
         student_context,
         teacher_video_context,
+        student_generated_history_context,
+        teacher_video_generated_history_context,
         teacher_joint_context,
-    ) = host.student_calls[-4:]
+    ) = host.student_calls[-6:]
     assert torch.equal(gt_video_context["video"], student_context["video"])
     assert not torch.equal(
         gt_video_context["condition_video"],
@@ -842,6 +844,17 @@ def test_action_interventions_replace_only_the_requested_joint_state():
     assert not torch.equal(
         teacher_video_context["action"], teacher_joint_context["action"]
     )
+    assert torch.equal(
+        student_context["video"], student_generated_history_context["video"]
+    )
+    assert torch.equal(
+        teacher_video_context["video"],
+        teacher_video_generated_history_context["video"],
+    )
+    assert torch.equal(
+        student_generated_history_context["action"],
+        teacher_video_generated_history_context["action"],
+    )
 
 
 def test_action_interventions_replace_condition_streams_with_the_route_state():
@@ -852,8 +865,10 @@ def test_action_interventions_replace_condition_streams_with_the_route_state():
         gt_video_context,
         student_context,
         teacher_video_context,
+        student_generated_history_context,
+        teacher_video_generated_history_context,
         teacher_joint_context,
-    ) = host.student_calls[-4:]
+    ) = host.student_calls[-6:]
     assert gt_video_context["condition_video"] is not None
     assert not torch.equal(
         gt_video_context["condition_video"], gt_video_context["video"]
@@ -876,6 +891,14 @@ def test_action_interventions_replace_condition_streams_with_the_route_state():
     assert torch.equal(
         student_context["condition_action"],
         teacher_video_context["condition_action"],
+    )
+    assert torch.equal(
+        student_generated_history_context["condition_action"],
+        student_generated_history_context["action"],
+    )
+    assert torch.equal(
+        teacher_video_generated_history_context["condition_action"],
+        teacher_video_generated_history_context["action"],
     )
 
 

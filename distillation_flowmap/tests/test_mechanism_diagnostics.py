@@ -49,6 +49,12 @@ def _metric_samples(**overrides):
         "action_gt_video_context": torch.tensor([[2.0], [1.0]]),
         "action_student_context": torch.tensor([[3.0], [1.0]]),
         "action_teacher_video_context": torch.tensor([[1.0], [1.0]]),
+        "action_student_generated_history_context": torch.tensor(
+            [[4.0], [2.0]]
+        ),
+        "action_teacher_video_generated_history_context": torch.tensor(
+            [[2.0], [2.0]]
+        ),
         "action_teacher_joint_context": torch.zeros(2, 1),
         "action_mask": None,
     }
@@ -80,6 +86,14 @@ def test_video_metrics_keep_exact_squared_l2_separate_from_normalized_mse():
         samples["mechanism/video_to_action_student_condition_penalty"],
         torch.tensor([5.0, 0.0]),
     )
+    assert torch.equal(
+        samples["mechanism/action_error_student_generated_history_context"],
+        torch.tensor([16.0, 4.0]),
+    )
+    assert torch.equal(
+        samples["mechanism/video_to_action_deployment_oracle_gain"],
+        torch.tensor([12.0, 0.0]),
+    )
 
 
 @pytest.mark.parametrize(
@@ -98,6 +112,8 @@ def test_action_intervention_metrics_are_masked_and_keep_signed_gains(
         action_gt_video_context=student,
         action_student_context=student,
         action_teacher_video_context=teacher_video,
+        action_student_generated_history_context=student,
+        action_teacher_video_generated_history_context=teacher_video,
         action_teacher_joint_context=torch.tensor([[[0.5], [77.0]]]),
         action_mask=torch.tensor([[[1.0], [0.0]]]),
         teacher_cont_video=torch.zeros(1, 2),

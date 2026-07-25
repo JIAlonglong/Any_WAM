@@ -71,9 +71,10 @@ def test_danceopd_conditions_action_on_detached_generated_video():
 
     assert "condition_video=current_video.detach()" in block
     assert "condition_video=query_video.detach()" in block
-    assert "condition_action=action_clean" in block
-    assert "masked_action_teacher_forcing_loss(" in block
-    assert "self.train_scheduler_action.training_target(" in block
+    assert "condition_action=current_action.detach()" in block
+    assert "condition_action=query_action.detach()" in block
+    assert "masked_action_x0_teacher_forcing_loss(" in block
+    assert "bridge_action_sigma = (" in block
     assert "'video_action_bridge_loss': bridge_loss.detach()" in block
 
 

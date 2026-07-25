@@ -5709,6 +5709,32 @@ class FlowMapStepMixin:
                 condition_action=action_clean,
             )
         )
+        _, action_student_generated_history_context, _, _ = (
+            self._diagnostic_student_joint_map(
+                z_r_video,
+                z_r_action,
+                video_r_t,
+                action_r_t,
+                video_zero_t,
+                action_zero_t,
+                context=context,
+                condition_video=z_r_video,
+                condition_action=z_r_action,
+            )
+        )
+        _, action_teacher_video_generated_history_context, _, _ = (
+            self._diagnostic_student_joint_map(
+                y_r_video,
+                z_r_action,
+                video_r_t,
+                action_r_t,
+                video_zero_t,
+                action_zero_t,
+                context=context,
+                condition_video=y_r_video,
+                condition_action=z_r_action,
+            )
+        )
         _, action_teacher_joint_context, _, _ = (
             self._diagnostic_student_joint_map(
                 y_r_video,
@@ -5743,6 +5769,12 @@ class FlowMapStepMixin:
             action_gt_video_context=action_gt_video_context,
             action_student_context=action_student_context,
             action_teacher_video_context=action_teacher_video_context,
+            action_student_generated_history_context=(
+                action_student_generated_history_context
+            ),
+            action_teacher_video_generated_history_context=(
+                action_teacher_video_generated_history_context
+            ),
             action_teacher_joint_context=action_teacher_joint_context,
             action_mask=context.get('action_mask'),
         )
@@ -5914,7 +5946,7 @@ class FlowMapStepMixin:
                     video_base=rollout_video_base,
                     action_latent=rollout_action_latent,
                     condition_video=current_video.detach(),
-                    condition_action=action_clean,
+                    condition_action=current_action.detach(),
                     action_cond_t=rollout_action_cond_t,
                     action_text=rollout_action_text,
                     action_grid=action_grid_id,
@@ -6004,7 +6036,7 @@ class FlowMapStepMixin:
             video_base=input_dict['latent_dict'],
             action_latent=action_base['latent'][:, :, ::action_downsample],
             condition_video=query_video.detach(),
-            condition_action=action_clean,
+            condition_action=query_action.detach(),
             action_cond_t=action_base['cond_timesteps'][:, ::action_downsample],
             action_text=action_base['text_emb'],
             action_grid=_downsample_action_grid_id(
@@ -6094,7 +6126,7 @@ class FlowMapStepMixin:
                 video_base=input_dict['latent_dict'],
                 action_latent=action_base['latent'][:, :, ::action_downsample],
                 condition_video=query_video.detach(),
-                condition_action=action_clean,
+                condition_action=query_action.detach(),
                 action_cond_t=action_base['cond_timesteps'][:, ::action_downsample],
                 action_text=action_base['text_emb'],
                 action_grid=_downsample_action_grid_id(

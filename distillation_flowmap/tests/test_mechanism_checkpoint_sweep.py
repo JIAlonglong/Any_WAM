@@ -39,8 +39,10 @@ def _metrics(anchor=25.0, comp=4.0, student=9.0, video=4.0, joint=1.0):
         "mechanism/g_anchor_mse": anchor / 5,
         "mechanism/g_comp": comp,
         "mechanism/g_comp_mse": comp / 5,
-        "mechanism/action_error_student_context": student,
-        "mechanism/action_error_teacher_video_context": video,
+        "mechanism/action_error_student_context": 90.0,
+        "mechanism/action_error_teacher_video_context": 40.0,
+        "mechanism/action_error_student_generated_history_context": student,
+        "mechanism/action_error_teacher_video_generated_history_context": video,
         "mechanism/action_error_teacher_joint_context": joint,
     }
 
@@ -99,6 +101,23 @@ def test_paper_record_uses_signed_and_clamped_action_derivations(tmp_path):
     )
     assert negative["delta_video"] == -1.0
     assert negative["r_video"] == 0.0
+
+
+def test_paper_record_uses_deployment_generated_action_history(tmp_path):
+    metrics = _metrics(student=7.0, video=2.0, joint=1.0)
+
+    record = paper_record(
+        step=1000,
+        checkpoint=tmp_path / "step_1000",
+        metrics=metrics,
+        valid_sample_count=1,
+    )
+
+    assert record["e_student"] == 7.0
+    assert record["e_video"] == 2.0
+    assert record["delta_video"] == 5.0
+    assert record["r_video"] == pytest.approx(5.0 / 7.0)
+    assert record["g_residual"] == 1.0
 
 
 def test_paper_record_rejects_nonfinite_metric(tmp_path):

@@ -220,10 +220,12 @@ def build_manifest(
             "e_student": {
                 "state": "(z_r.video, z_r.action)",
                 "trajectory_synchronized": True,
+                "action_history": "student_generated",
             },
             "e_video": {
                 "state": "(y_r.video, z_r.action)",
                 "trajectory_synchronized": False,
+                "action_history": "student_generated",
                 "description": (
                     "counterfactual teacher-video swap with student action "
                     "state fixed; not a causal oracle"
@@ -234,6 +236,8 @@ def build_manifest(
                 "trajectory_synchronized": True,
             },
         },
+        "diagnostic_data_source": "fixed_probe_posthoc_checkpoint_sweep",
+        "online_training_diagnostics_role": "monitoring_only",
         "epsilon": 1e-8,
     }
 

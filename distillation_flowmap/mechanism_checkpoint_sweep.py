@@ -32,8 +32,8 @@ _METRIC_MAP = {
     "g_anchor_mse": "mechanism/g_anchor_mse",
     "g_comp_l2": "mechanism/g_comp",
     "g_comp_mse": "mechanism/g_comp_mse",
-    "e_student": "mechanism/action_error_student_context",
-    "e_video": "mechanism/action_error_teacher_video_context",
+    "e_student": "mechanism/action_error_student_generated_history_context",
+    "e_video": "mechanism/action_error_teacher_video_generated_history_context",
     "e_joint": "mechanism/action_error_teacher_joint_context",
 }
 

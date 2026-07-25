@@ -154,6 +154,15 @@ def test_manifest_labels_counterfactual_video_swap(tmp_path):
     assert manifest["checkpoint_steps"] == [1000, 2000]
     assert manifest["action_contexts"]["e_video"]["trajectory_synchronized"] is False
     assert "counterfactual" in manifest["action_contexts"]["e_video"]["description"]
+    assert (
+        manifest["action_contexts"]["e_student"]["action_history"]
+        == "student_generated"
+    )
+    assert (
+        manifest["action_contexts"]["e_video"]["action_history"]
+        == "student_generated"
+    )
+    assert manifest["diagnostic_data_source"] == "fixed_probe_posthoc_checkpoint_sweep"
     assert manifest["metric_reduction"]["g_anchor_l2"] == "per-sample squared L2 mean"
 
 

@@ -957,6 +957,22 @@ def test_live_service_resolves_checkpoint_role_before_cuda_preflight(monkeypatch
     assert events[1][1]["checkpoint_transformer"] == "/validated/target/transformer"
 
 
+def test_live_student_service_binds_validated_lineage_before_config_or_load():
+    import inspect
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    source = inspect.getsource(rollout.build_live_service)
+    bind_at = source.index("bind_stage2_inference_runtime(")
+    config_at = source.index("_configure_live_config(", bind_at)
+    student_load_at = source.index('dependencies["load_stage1_model"](', bind_at)
+
+    assert bind_at < config_at < student_load_at
+    assert (
+        "args.teacher_model_path = "
+        "resolved_checkpoint.cosmos_teacher_model_path"
+    ) in source
+
+
 def _cuda_available_torch(*, device_count=1):
     return SimpleNamespace(
         cuda=SimpleNamespace(

@@ -230,9 +230,20 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
         '    case "$1" in --output-dir) output="$2"; shift 2;;'
         ' --steps) steps="$2"; shift 2;; *) shift;; esac\n'
         "  done\n"
-        '  root="$output/checkpoints/step_$steps/target_student/transformer"\n'
-        '  mkdir -p "$root"; printf "{}\\n" > "$root/config.json"\n'
-        '  printf x > "$root/diffusion_pytorch_model.safetensors"\n'
+        '  for variant in online_student target_student; do\n'
+        '    root="$output/checkpoints/step_$steps/$variant/transformer"\n'
+        '    mkdir -p "$root"\n'
+        "    printf "
+        '\'{\"contract_version\":2,\"training_contract_stage\":\"raw_stage1\",'
+        '\"action_packing_schema\":\"downsample_survivor_v2\",'
+        '\"action_downsample_factor\":4,\"action_chunk_shape\":[4,4],'
+        '\"checkpoint_step\":%s,\"student_backend\":\"wan_flowmap\",'
+        '\"teacher_backend\":\"cosmos_policy\",'
+        '\"student_base_model_path\":\"%s\",\"teacher_model_path\":\"%s\"}\\n\' '
+        '"$steps" "$WAN_STUDENT_BASE_MODEL_PATH" "$COSMOS_POLICY_PATH" '
+        '> "$root/config.json"\n'
+        '    printf x > "$root/diffusion_pytorch_model.safetensors"\n'
+        '  done\n'
         "fi\n",
     )
     stage2 = _write_executable(
@@ -371,6 +382,14 @@ def test_pipeline_read_only_modes_write_nothing(tmp_path, mode):
     assert not Path(env["CALLS_LOG"]).exists()
     assert "universal-video-action" in result.stdout
     assert "stage2_target" in result.stdout
+    for name in (
+        "RESUME_FROM_PATH",
+        "PARENT_STAGE1_PATH",
+        "PARENT_STAGE1_CONTRACT_IDENTITY",
+        "STAGE2_LINEAGE_JSON",
+    ):
+        assert result.stdout.count(f"{name}=") >= 2
+    assert "PARENT_STAGE1_CONTRACT_IDENTITY=__DERIVED_AFTER_STAGE1__" in result.stdout
     assert "official_teacher" in result.stdout
     assert "COSMOS_POLICY_PATH=" in result.stdout
     assert "S4_PROMPT_TABLE=" in result.stdout

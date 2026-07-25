@@ -7,7 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from distillation_flowmap.cosmos_stage2_lineage import validate_stage1_parent
+from distillation_flowmap.cosmos_stage2_lineage import (
+    validate_stage1_parent,
+    validated_stage1_hybrid_model_paths,
+)
 from distillation_flowmap.cosmos_libero_variants import resolve_variant
 
 
@@ -22,6 +25,22 @@ for path in (FLOWMAP_DIR, WANVA_DIR):
 @pytest.fixture(autouse=True)
 def _explicit_cosmos_paths(monkeypatch, tmp_path):
     stage1 = tmp_path / "stage1"
+    wan_base = tmp_path / "wan-base"
+    (wan_base / "transformer").mkdir(parents=True)
+    (wan_base / "transformer" / "config.json").write_text(
+        json.dumps({"_class_name": "WanTransformer3DModel"})
+    )
+    cosmos_teacher = tmp_path / "cosmos-teacher"
+    cosmos_teacher.mkdir()
+    (cosmos_teacher / "config.json").write_text(
+        json.dumps({"model_type": "cosmos-policy"})
+    )
+    for name in (
+        "Cosmos-Policy-LIBERO-Predict2-2B.pt",
+        "libero_dataset_statistics.json",
+        "libero_t5_embeddings.pkl",
+    ):
+        (cosmos_teacher / name).write_bytes(b"fixture")
     payload = {
         "contract_version": 2,
         "training_contract_stage": "raw_stage1",
@@ -31,6 +50,8 @@ def _explicit_cosmos_paths(monkeypatch, tmp_path):
         "checkpoint_step": 5000,
         "teacher_backend": "cosmos_policy",
         "student_backend": "wan_flowmap",
+        "student_base_model_path": str(wan_base.resolve()),
+        "teacher_model_path": str(cosmos_teacher.resolve()),
     }
     for variant in ("online_student", "target_student"):
         transformer = stage1 / variant / "transformer"
@@ -50,6 +71,8 @@ def _explicit_cosmos_paths(monkeypatch, tmp_path):
     )
     values = {
         "STUDENT_BASE_MODEL_PATH": str(stage1 / "target_student"),
+        "WAN_STUDENT_BASE_MODEL_PATH": str(wan_base),
+        "COSMOS_POLICY_PATH": str(cosmos_teacher),
         "RESUME_FROM_PATH": str(stage1),
         "PARENT_STAGE1_PATH": parent.canonical_path,
         "PARENT_STAGE1_CONTRACT_IDENTITY": parent.contract_identity,
@@ -204,6 +227,7 @@ def _write_stage2_resume(
     root, *, step, parent, missing=None, parent_identity=None
 ):
     checkpoint = root / "checkpoints" / f"step_{step}"
+    _wan_base, teacher_model_path = validated_stage1_hybrid_model_paths(parent)
     payload = {
         "contract_version": 2,
         "training_contract_stage": "progressive_stage2",
@@ -217,6 +241,9 @@ def _write_stage2_resume(
         "deployment_joint_rollout_interval": 4,
         "deployment_action_weight": 1.0,
         "raw_teacher_window_is_auxiliary": True,
+        "student_backend": "wan_flowmap",
+        "teacher_backend": "cosmos_policy",
+        "teacher_model_path": teacher_model_path,
         "parent_stage1_path": parent.canonical_path,
         "parent_stage1_contract_identity": (
             parent_identity or parent.contract_identity

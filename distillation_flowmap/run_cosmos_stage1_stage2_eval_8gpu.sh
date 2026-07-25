@@ -297,6 +297,14 @@ stage2_environment=(
     env
     "COSMOS_STAGE1_ROOT=$STAGE1_CHECKPOINT"
     "STUDENT_BASE_MODEL_PATH=$STAGE1_TARGET"
+    "WAN_STUDENT_BASE_MODEL_PATH=$WAN_STUDENT_BASE_MODEL_PATH"
+    "RESUME_FROM_PATH=$STAGE1_CHECKPOINT"
+    "PARENT_STAGE1_PATH=$STAGE1_CHECKPOINT"
+    "PARENT_STAGE1_CONTRACT_IDENTITY=__DERIVED_AFTER_STAGE1__"
+    "STAGE2_LINEAGE_JSON=__DERIVED_AFTER_STAGE1__"
+    "RESUME_ONLINE_FROM_TARGET=1"
+    "RESET_RESUME_STEP=1"
+    "RESUME_OPTIMIZER_STATE=0"
     "COSMOS_PROVENANCE_LOCK_ROOT=$LOCK_ROOT"
     "VERIFY_LARGE_ARTIFACT_DIGESTS=1"
     "DATASET_PATH=$DATASET_PATH"
@@ -318,6 +326,15 @@ eval_environment=(
     "MATRIX_ROOT=$MATRIX_ROOT"
     "S4_CKPT_ROOT=$EVAL_TRANSFORMER"
     "COSMOS_POLICY_PATH=$COSMOS_POLICY_PATH"
+    "WAN_STUDENT_BASE_MODEL_PATH=$WAN_STUDENT_BASE_MODEL_PATH"
+    "STUDENT_BASE_MODEL_PATH=$STAGE1_TARGET"
+    "RESUME_FROM_PATH=$STAGE1_CHECKPOINT"
+    "PARENT_STAGE1_PATH=$STAGE1_CHECKPOINT"
+    "PARENT_STAGE1_CONTRACT_IDENTITY=__DERIVED_AFTER_STAGE1__"
+    "STAGE2_LINEAGE_JSON=__DERIVED_AFTER_STAGE1__"
+    "RESUME_ONLINE_FROM_TARGET=1"
+    "RESET_RESUME_STEP=1"
+    "RESUME_OPTIMIZER_STATE=0"
     "S4_MATRIX_ROLES=stage2_target,official_teacher"
     "S4_DATASET_PATH=$DATASET_PATH"
     "S4_EMPTY_EMBEDDING=$EMPTY_EMB_PATH"
@@ -334,6 +351,60 @@ stage2_execution=("${stage2_environment[@]}" "${stage2_command[@]}")
 stage2_plan=("${stage2_environment[@]}" "${stage2_command[@]}" --dry-run)
 eval_execution=("${eval_environment[@]}" "${eval_command[@]}")
 eval_plan=("${eval_environment[@]}" "$EVAL_LAUNCHER" dry-run)
+
+replace_env_assignment() {
+    local array_name="$1"
+    local key="$2"
+    local value="$3"
+    local -n assignments="$array_name"
+    local index
+    for index in "${!assignments[@]}"; do
+        if [[ "${assignments[$index]}" == "$key="* ]]; then
+            assignments[$index]="$key=$value"
+            return
+        fi
+    done
+    die "internal environment assignment is missing: $key"
+}
+
+derive_stage1_lineage() {
+    local -a derived
+    mapfile -t derived < <(
+        cd "$PROJECT_ROOT"
+        PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:${PYTHONPATH:-}" \
+            "$PYTHON_BIN" - "$STAGE1_CHECKPOINT" "$STAGE1_STEPS" <<'PY'
+import json
+import sys
+from pathlib import Path
+from distillation_flowmap.cosmos_stage2_lineage import validate_stage1_parent
+
+parent = validate_stage1_parent(Path(sys.argv[1]), expected_step=int(sys.argv[2]))
+print(parent.contract_identity)
+print(json.dumps(
+    {
+        "parent_stage1_contract_identity": parent.contract_identity,
+        "parent_stage1_path": parent.canonical_path,
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+))
+PY
+    )
+    (( ${#derived[@]} == 2 )) || die "failed to derive Stage-1 lineage"
+    PARENT_STAGE1_CONTRACT_IDENTITY="${derived[0]}"
+    STAGE2_LINEAGE_JSON="${derived[1]}"
+    local array_name
+    for array_name in stage2_environment eval_environment; do
+        replace_env_assignment "$array_name" \
+            PARENT_STAGE1_CONTRACT_IDENTITY \
+            "$PARENT_STAGE1_CONTRACT_IDENTITY"
+        replace_env_assignment "$array_name" STAGE2_LINEAGE_JSON \
+            "$STAGE2_LINEAGE_JSON"
+    done
+    stage2_execution=("${stage2_environment[@]}" "${stage2_command[@]}")
+    eval_execution=("${eval_environment[@]}" "${eval_command[@]}")
+}
 
 printf 'PIPELINE_SEMANTICS=LingBotVA/Wan student init + Cosmos teacher\n'
 printf 'PHASE=%s\n' "$PHASE"
@@ -409,6 +480,8 @@ if [[ "$PHASE" == all || "$PHASE" == stage1 ]]; then
     require_transformer Stage1-target "$STAGE1_TARGET/transformer"
 fi
 [[ "$PHASE" != stage1 ]] || exit 0
+
+derive_stage1_lineage
 
 if [[ "$PHASE" == all || ( "$PHASE" == stage2 && -z "$RESUME_STAGE" ) ]]; then
     [[ ! -e "$LOCK_ROOT" && ! -L "$LOCK_ROOT" ]] || die \

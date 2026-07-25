@@ -6,6 +6,7 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+from typing import MutableMapping
 
 from distillation_flowmap.cosmos_training_contract import validate_contract_metadata
 from distillation_flowmap.cosmos_hybrid_backend import (
@@ -244,6 +245,36 @@ def validate_stage1_parent(
     )
 
 
+def validate_stage1_resume_hybrid_lineage(
+    path: Path,
+    *,
+    expected_step: int,
+    current_wan_student_base: str | Path,
+    current_cosmos_teacher: str | Path,
+) -> ValidatedStage1Parent:
+    """Bind a Stage-1 resume checkpoint to the exact current hybrid roots."""
+
+    parent = validate_stage1_parent(path, expected_step=expected_step)
+    checkpoint_wan, checkpoint_teacher = _validated_hybrid_model_paths(parent)
+    current_wan = str(
+        validate_wan_student_base_model_path(current_wan_student_base)
+    )
+    current_teacher = str(
+        validate_cosmos_teacher_model_path(current_cosmos_teacher)
+    )
+    if current_wan != checkpoint_wan:
+        raise ValueError(
+            "current Wan Student base does not match checkpoint provenance: "
+            f"{current_wan} != {checkpoint_wan}"
+        )
+    if current_teacher != checkpoint_teacher:
+        raise ValueError(
+            "current Cosmos Teacher root does not match checkpoint provenance: "
+            f"{current_teacher} != {checkpoint_teacher}"
+        )
+    return parent
+
+
 def validate_stage2_resume(
     checkpoint: Path,
     *,
@@ -307,6 +338,20 @@ def validate_stage2_resume(
                 raise ValueError(
                     f"{variant} parent_stage1_contract_identity does not match "
                     "validated parent"
+                )
+            _, expected_teacher = _validated_hybrid_model_paths(expected_parent)
+            configured_teacher = payload.get("teacher_model_path")
+            if not isinstance(configured_teacher, str) or not configured_teacher:
+                raise ValueError(
+                    f"{variant} teacher_model_path must identify the Stage-1 Teacher"
+                )
+            actual_teacher = str(
+                validate_cosmos_teacher_model_path(configured_teacher)
+            )
+            if actual_teacher != expected_teacher:
+                raise ValueError(
+                    f"{variant} teacher_model_path does not match validated Stage-1 "
+                    "Teacher"
                 )
     if _contract_payload(payloads["online_student"]) != _contract_payload(
         payloads["target_student"]
@@ -496,3 +541,80 @@ def _validated_hybrid_model_paths(
     wan_base = validate_wan_student_base_model_path(student_path)
     cosmos_teacher = validate_cosmos_teacher_model_path(teacher_path)
     return str(wan_base), str(cosmos_teacher)
+
+
+def validated_stage1_hybrid_model_paths(
+    parent: ValidatedStage1Parent,
+) -> tuple[str, str]:
+    """Public fail-closed accessor for verified Stage-1 hybrid roots."""
+
+    return _validated_hybrid_model_paths(parent)
+
+
+def stage2_inference_lineage_environment(
+    resolved: ResolvedCosmosInferenceCheckpoint,
+) -> dict[str, str]:
+    """Derive the exact Stage-2 config environment from a verified checkpoint."""
+
+    if resolved.training_stage != "progressive_stage2":
+        raise ValueError(
+            "Stage-2 inference lineage requires a progressive_stage2 checkpoint"
+        )
+    if not resolved.parent_stage1_path:
+        raise ValueError("Stage-2 inference checkpoint is missing its Stage-1 parent")
+    parent = validate_stage1_parent(Path(resolved.parent_stage1_path))
+    expected_wan, expected_teacher = _validated_hybrid_model_paths(parent)
+    if resolved.wan_student_base_model_path != expected_wan:
+        raise ValueError("resolved Wan Student base no longer matches Stage-1")
+    if resolved.cosmos_teacher_model_path != expected_teacher:
+        raise ValueError("resolved Cosmos Teacher no longer matches Stage-1")
+    lineage = json.dumps(
+        {
+            "parent_stage1_contract_identity": parent.contract_identity,
+            "parent_stage1_path": parent.canonical_path,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "STUDENT_BASE_MODEL_PATH": str(
+            Path(parent.canonical_path) / "target_student"
+        ),
+        "WAN_STUDENT_BASE_MODEL_PATH": expected_wan,
+        "COSMOS_POLICY_PATH": expected_teacher,
+        "RESUME_FROM_PATH": parent.canonical_path,
+        "PARENT_STAGE1_PATH": parent.canonical_path,
+        "PARENT_STAGE1_CONTRACT_IDENTITY": parent.contract_identity,
+        "STAGE2_LINEAGE_JSON": lineage,
+        "RESUME_ONLINE_FROM_TARGET": "1",
+        "RESET_RESUME_STEP": "1",
+        "RESUME_OPTIMIZER_STATE": "0",
+    }
+
+
+def bind_stage2_inference_runtime(
+    resolved: ResolvedCosmosInferenceCheckpoint,
+    *,
+    environment: MutableMapping[str, str],
+    configured_teacher_model_path: str | Path | None,
+) -> dict[str, str]:
+    """Fail closed on ambient/CLI lineage mismatches, then bind exact values."""
+
+    expected = stage2_inference_lineage_environment(resolved)
+    if configured_teacher_model_path is not None:
+        configured_teacher = str(
+            validate_cosmos_teacher_model_path(configured_teacher_model_path)
+        )
+        if configured_teacher != resolved.cosmos_teacher_model_path:
+            raise ValueError(
+                "configured Cosmos Teacher does not match checkpoint lineage"
+            )
+    for name, expected_value in expected.items():
+        actual_value = environment.get(name)
+        if actual_value not in (None, "", expected_value):
+            raise ValueError(
+                f"{name} does not match checkpoint lineage: "
+                f"{actual_value!r} != {expected_value!r}"
+            )
+    environment.update(expected)
+    return expected

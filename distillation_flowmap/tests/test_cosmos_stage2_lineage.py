@@ -12,6 +12,9 @@ from distillation_flowmap.cosmos_stage2_lineage import (
     validate_stage1_parent,
     validate_stage2_path_isolation,
     validate_stage2_resume,
+    validate_stage1_resume_hybrid_lineage,
+    stage2_inference_lineage_environment,
+    bind_stage2_inference_runtime,
 )
 
 
@@ -537,11 +540,150 @@ def _lineaged_stage2(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
             _config(checkpoint, variant),
             teacher_backend="cosmos_policy",
             student_backend="wan_flowmap",
+            teacher_model_path=str(cosmos_teacher.resolve()),
             parent_stage1_path=parent.canonical_path,
             parent_stage1_contract_identity=parent.contract_identity,
             student_base_model_path=str(stage1 / "target_student"),
         )
     return stage1, arm, checkpoint, wan_base, cosmos_teacher
+
+
+def _official_teacher(root: Path) -> Path:
+    root.mkdir(parents=True)
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "cosmos-policy"}) + "\n",
+        encoding="utf-8",
+    )
+    for name in (
+        "Cosmos-Policy-LIBERO-Predict2-2B.pt",
+        "libero_dataset_statistics.json",
+        "libero_t5_embeddings.pkl",
+    ):
+        (root / name).write_bytes(b"fixture")
+    return root
+
+
+def _wan_base(root: Path) -> Path:
+    (root / "transformer").mkdir(parents=True)
+    (root / "transformer" / "config.json").write_text(
+        json.dumps({"_class_name": "WanTransformer3DModel"}) + "\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_stage1_resume_binds_checkpoint_paths_to_current_hybrid_roots(tmp_path):
+    stage1, _arm, _checkpoint, wan_base, cosmos_teacher = _lineaged_stage2(tmp_path)
+
+    validated = validate_stage1_resume_hybrid_lineage(
+        stage1,
+        expected_step=5000,
+        current_wan_student_base=wan_base,
+        current_cosmos_teacher=cosmos_teacher,
+    )
+    assert validated.canonical_path == str(stage1.resolve())
+
+    different_wan = _wan_base(tmp_path / "different-wan")
+    with pytest.raises(ValueError, match="Wan Student.*checkpoint provenance"):
+        validate_stage1_resume_hybrid_lineage(
+            stage1,
+            expected_step=5000,
+            current_wan_student_base=different_wan,
+            current_cosmos_teacher=cosmos_teacher,
+        )
+
+    different_teacher = _official_teacher(tmp_path / "different-cosmos")
+    with pytest.raises(ValueError, match="Cosmos Teacher.*checkpoint provenance"):
+        validate_stage1_resume_hybrid_lineage(
+            stage1,
+            expected_step=5000,
+            current_wan_student_base=wan_base,
+            current_cosmos_teacher=different_teacher,
+        )
+
+
+def test_stage1_resume_rejects_missing_path_provenance(tmp_path):
+    stage1, _arm, _checkpoint, wan_base, cosmos_teacher = _lineaged_stage2(tmp_path)
+    for variant in ("online_student", "target_student"):
+        payload_path = _config(stage1, variant)
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        payload.pop("teacher_model_path")
+        payload_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="teacher_model_path"):
+        validate_stage1_resume_hybrid_lineage(
+            stage1,
+            expected_step=5000,
+            current_wan_student_base=wan_base,
+            current_cosmos_teacher=cosmos_teacher,
+        )
+
+
+def test_stage2_resume_rejects_teacher_different_from_parent(tmp_path):
+    stage1, arm, checkpoint, _wan_base_path, _cosmos_teacher = _lineaged_stage2(
+        tmp_path
+    )
+    parent = validate_stage1_parent(stage1)
+    different_teacher = _official_teacher(tmp_path / "different-stage2-teacher")
+    for variant in ("online_student", "target_student"):
+        _rewrite(
+            _config(checkpoint, variant),
+            teacher_model_path=str(different_teacher.resolve()),
+        )
+
+    with pytest.raises(ValueError, match="teacher_model_path.*Stage-1"):
+        validate_stage2_resume(
+            checkpoint,
+            arm_root=arm,
+            expected_step=1000,
+            expected_parent=parent,
+        )
+
+
+def test_inference_lineage_environment_is_derived_from_validated_checkpoint(
+    tmp_path,
+):
+    stage1, _arm, checkpoint, _wan_base_path, cosmos_teacher = _lineaged_stage2(
+        tmp_path
+    )
+    resolved = resolve_cosmos_inference_checkpoint(
+        model_role="stage2_target",
+        checkpoint_transformer=checkpoint / "target_student" / "transformer",
+    )
+
+    environment = stage2_inference_lineage_environment(resolved)
+    parent = validate_stage1_parent(stage1)
+    assert environment["STUDENT_BASE_MODEL_PATH"] == str(
+        stage1 / "target_student"
+    )
+    assert environment["RESUME_FROM_PATH"] == parent.canonical_path
+    assert environment["PARENT_STAGE1_PATH"] == parent.canonical_path
+    assert (
+        environment["PARENT_STAGE1_CONTRACT_IDENTITY"]
+        == parent.contract_identity
+    )
+    assert json.loads(environment["STAGE2_LINEAGE_JSON"]) == {
+        "parent_stage1_contract_identity": parent.contract_identity,
+        "parent_stage1_path": parent.canonical_path,
+    }
+    assert environment["COSMOS_POLICY_PATH"] == str(cosmos_teacher.resolve())
+
+    ambient = {"COSMOS_POLICY_PATH": str(tmp_path / "wrong-teacher")}
+    with pytest.raises(ValueError, match="COSMOS_POLICY_PATH.*checkpoint lineage"):
+        bind_stage2_inference_runtime(
+            resolved,
+            environment=ambient,
+            configured_teacher_model_path=None,
+        )
+
+    with pytest.raises(ValueError, match="configured Cosmos Teacher"):
+        bind_stage2_inference_runtime(
+            resolved,
+            environment={},
+            configured_teacher_model_path=_official_teacher(
+                tmp_path / "cli-other-teacher"
+            ),
+        )
 
 
 def test_inference_resolver_accepts_only_explicit_validated_student_roles(tmp_path):

@@ -47,6 +47,7 @@ from distillation_flowmap.cosmos_training_contract import (
     normalize_cosmos_inference_request,
 )
 from distillation_flowmap.cosmos_stage2_lineage import (
+    bind_stage2_inference_runtime,
     resolve_cosmos_inference_checkpoint,
 )
 
@@ -610,6 +611,12 @@ def build_live_service(args: argparse.Namespace) -> tuple[CosmosProgressiveS4Ser
         device=args.device,
         checkpoint_transformer=resolved_checkpoint.transformer_path,
     )
+    bind_stage2_inference_runtime(
+        resolved_checkpoint,
+        environment=os.environ,
+        configured_teacher_model_path=args.teacher_model_path,
+    )
+    args.teacher_model_path = resolved_checkpoint.cosmos_teacher_model_path
     import torch
 
     dependencies = _runtime_dependencies()

@@ -56,10 +56,7 @@ cfg.seed = _env_int("TRAIN_SEED", cfg.seed)
 
 cfg.teacher_backend = "cosmos_policy"
 cfg.student_backend = "wan_flowmap"
-cfg.teacher_model_path = os.environ.get(
-    "COSMOS_POLICY_PATH",
-    "/root/nas/junjie/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B",
-)
+cfg.teacher_model_path = os.environ["COSMOS_POLICY_PATH"]
 cfg.student_base_model_path = os.environ["WAN_STUDENT_BASE_MODEL_PATH"]
 cfg.cosmos_policy_validate_weights = _env_bool("COSMOS_POLICY_VALIDATE_WEIGHTS", False)
 cfg.cosmos_policy_use_raw_inference = _env_bool("COSMOS_POLICY_USE_RAW_INFERENCE", False)

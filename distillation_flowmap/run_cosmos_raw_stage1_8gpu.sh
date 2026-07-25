@@ -356,37 +356,29 @@ if checkpoint != expected or root not in checkpoint.parents:
         die "resume checkpoint canonical containment validation failed"
     fi
 
-    resume_validation_code='import json, sys
+    resume_validation_code='import sys
 from pathlib import Path
-from distillation_flowmap.cosmos_training_contract import validate_contract_metadata
+from distillation_flowmap.cosmos_stage2_lineage import (
+    validate_stage1_resume_hybrid_lineage,
+)
 
-expected_step = int(sys.argv[3])
-for variant, raw_path in zip(("online_student", "target_student"), sys.argv[1:3]):
-    path = Path(raw_path)
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    validate_contract_metadata(payload, required_stage="raw_stage1")
-    if payload.get("student_backend") != "wan_flowmap":
-        raise ValueError(
-            f"{variant} student_backend must be exactly 'wan_flowmap'"
-        )
-    if payload.get("teacher_backend") != "cosmos_policy":
-        raise ValueError(
-            f"{variant} teacher_backend must be exactly 'cosmos_policy'"
-        )
-    actual_step = payload.get("checkpoint_step")
-    if type(actual_step) is not int or actual_step != expected_step:
-        raise ValueError(
-            f"{variant} checkpoint_step must be exactly {expected_step}, got {actual_step!r}"
-        )
+expected_step = int(sys.argv[2])
+validate_stage1_resume_hybrid_lineage(
+    Path(sys.argv[1]),
+    expected_step=expected_step,
+    current_wan_student_base=sys.argv[3],
+    current_cosmos_teacher=sys.argv[4],
+)
 print(f"validated corrected raw Stage-1 checkpoint step {expected_step}")'
     if ! (
         cd "$PROJECT_ROOT"
         PYTHONDONTWRITEBYTECODE=1 \
         PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
             "$PYTHON_BIN" -c "$resume_validation_code" \
-            "$RESUME_FROM_PATH/online_student/transformer/config.json" \
-            "$RESUME_FROM_PATH/target_student/transformer/config.json" \
-            "$RESUME_STEP"
+            "$RESUME_FROM_PATH" \
+            "$RESUME_STEP" \
+            "$WAN_STUDENT_BASE_MODEL_PATH" \
+            "$COSMOS_POLICY_PATH"
     ); then
         die "resume checkpoint metadata validation failed"
     fi

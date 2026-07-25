@@ -198,6 +198,7 @@ def _import_stage1_config(
             "RESUME_OPTIMIZER_STATE": "0",
             "TRAIN_SEED": "42",
             "WAN_STUDENT_BASE_MODEL_PATH": "/explicit/wan-flowmap-base",
+            "COSMOS_POLICY_PATH": "/explicit/cosmos-policy-teacher",
             **updates,
         }
     )
@@ -223,10 +224,20 @@ print(json.dumps({
     )
 
 
-def _checkpoint(output: Path, step: int) -> Path:
+def _checkpoint(
+    output: Path, step: int, *, env: dict[str, str] | None = None
+) -> Path:
     checkpoint = output / "checkpoints" / f"step_{step}"
     for variant in ("online_student", "target_student"):
         _transformer(checkpoint / variant / "transformer", step=step)
+        if env is not None:
+            config = checkpoint / variant / "transformer" / "config.json"
+            payload = json.loads(config.read_text(encoding="utf-8"))
+            payload["student_base_model_path"] = env[
+                "CLEAN_STUDENT_BASE_MODEL_PATH"
+            ]
+            payload["teacher_model_path"] = env["COSMOS_POLICY_PATH"]
+            config.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     (checkpoint / "optimizer.pt").write_bytes(b"test")
     (checkpoint / "lr_scheduler.pt").write_bytes(b"test")
     return checkpoint
@@ -645,7 +656,7 @@ def test_fresh_mode_refuses_any_existing_output_and_never_auto_selects_checkpoin
 
 def test_resume_requires_exact_step_and_complete_v2_raw_checkpoint(tmp_path):
     env = _env(tmp_path)
-    checkpoint = _checkpoint(Path(env["STAGE1_OUTPUT"]), 3000)
+    checkpoint = _checkpoint(Path(env["STAGE1_OUTPUT"]), 3000, env=env)
 
     result = _run("dry-run", "--steps", "5000", "--resume-step", "3000", env=env)
 
@@ -665,7 +676,7 @@ def test_real_config_preflight_accepts_fresh_and_resume_modes(tmp_path):
     assert fresh.returncode == 0, fresh.stdout + fresh.stderr
     assert not Path(env["STAGE1_OUTPUT"]).exists()
 
-    _checkpoint(Path(env["STAGE1_OUTPUT"]), 10)
+    _checkpoint(Path(env["STAGE1_OUTPUT"]), 10, env=env)
     resume = _run(
         "dry-run",
         "--steps",
@@ -693,7 +704,7 @@ def test_real_config_preflight_accepts_fresh_and_resume_modes(tmp_path):
 def test_resume_rejects_symlinked_path_components_and_files(tmp_path, component):
     env = _env(tmp_path)
     output = Path(env["STAGE1_OUTPUT"])
-    checkpoint = _checkpoint(output, 3000)
+    checkpoint = _checkpoint(output, 3000, env=env)
 
     if component == "output":
         real_output = tmp_path / "real-output"
@@ -750,7 +761,7 @@ def test_resume_rejects_wrong_metadata_on_both_variants(
     tmp_path, variant, field, value, message
 ):
     env = _env(tmp_path)
-    checkpoint = _checkpoint(Path(env["STAGE1_OUTPUT"]), 3000)
+    checkpoint = _checkpoint(Path(env["STAGE1_OUTPUT"]), 3000, env=env)
     config = checkpoint / variant / "transformer" / "config.json"
     payload = json.loads(config.read_text(encoding="utf-8"))
     payload[field] = value
@@ -763,10 +774,37 @@ def test_resume_rejects_wrong_metadata_on_both_variants(
     assert not Path(env["TORCHRUN_LOG"]).exists()
 
 
+def test_resume_requires_student_and_teacher_path_provenance(tmp_path):
+    env = _env(tmp_path)
+    checkpoint = _checkpoint(Path(env["STAGE1_OUTPUT"]), 3000, env=env)
+    for variant in ("online_student", "target_student"):
+        config = checkpoint / variant / "transformer" / "config.json"
+        payload = json.loads(config.read_text(encoding="utf-8"))
+        payload.pop("student_base_model_path")
+        config.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    result = _run("dry-run", "--resume-step", "3000", env=env)
+
+    assert result.returncode != 0
+    assert "student_base_model_path" in result.stderr
+
+
+def test_resume_rejects_current_hybrid_roots_different_from_checkpoint(tmp_path):
+    env = _env(tmp_path)
+    _checkpoint(Path(env["STAGE1_OUTPUT"]), 3000, env=env)
+    other = _layout(tmp_path / "other")
+    env["CLEAN_STUDENT_BASE_MODEL_PATH"] = other["clean_base"]
+
+    result = _run("dry-run", "--resume-step", "3000", env=env)
+
+    assert result.returncode != 0
+    assert "checkpoint provenance" in result.stderr
+
+
 @pytest.mark.parametrize("state_file", ["optimizer.pt", "lr_scheduler.pt"])
 def test_resume_rejects_missing_training_state(tmp_path, state_file):
     env = _env(tmp_path)
-    checkpoint = _checkpoint(Path(env["STAGE1_OUTPUT"]), 3000)
+    checkpoint = _checkpoint(Path(env["STAGE1_OUTPUT"]), 3000, env=env)
     (checkpoint / state_file).unlink()
 
     result = _run("dry-run", "--resume-step", "3000", env=env)
@@ -777,7 +815,7 @@ def test_resume_rejects_missing_training_state(tmp_path, state_file):
 
 def test_resume_step_must_precede_requested_final_step(tmp_path):
     env = _env(tmp_path)
-    _checkpoint(Path(env["STAGE1_OUTPUT"]), 5000)
+    _checkpoint(Path(env["STAGE1_OUTPUT"]), 5000, env=env)
 
     result = _run("dry-run", "--resume-step", "5000", "--steps", "5000", env=env)
 
@@ -887,7 +925,7 @@ def test_run_exports_validated_cuda_libraries_to_torchrun_and_preserves_suffix(
 
 def test_resume_run_executes_fake_torchrun_with_exact_restore_contract(tmp_path):
     env = _env(tmp_path)
-    checkpoint = _checkpoint(Path(env["STAGE1_OUTPUT"]), 10)
+    checkpoint = _checkpoint(Path(env["STAGE1_OUTPUT"]), 10, env=env)
 
     result = _run("run", "--steps", "20", "--resume-step", "10", env=env)
 
@@ -903,7 +941,7 @@ def test_resume_run_executes_fake_torchrun_with_exact_restore_contract(tmp_path)
 def test_resume_run_atomically_replaces_launch_artifact_symlinks(tmp_path):
     env = _env(tmp_path)
     output = Path(env["STAGE1_OUTPUT"])
-    _checkpoint(output, 10)
+    _checkpoint(output, 10, env=env)
     env_sentinel = tmp_path / "outside-env-sentinel"
     command_sentinel = tmp_path / "outside-command-sentinel"
     env_sentinel.write_text("outside env stays unchanged\n", encoding="utf-8")

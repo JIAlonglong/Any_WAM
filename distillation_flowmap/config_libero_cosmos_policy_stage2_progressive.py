@@ -15,8 +15,12 @@ from distillation_flowmap.cosmos_training_contract import (
     CONTRACT_VERSION,
 )
 from distillation_flowmap.cosmos_stage2_lineage import (
+    validated_stage1_hybrid_model_paths,
     validate_stage1_parent,
     validate_stage2_resume,
+)
+from distillation_flowmap.cosmos_hybrid_backend import (
+    validate_cosmos_teacher_model_path,
 )
 from distillation_flowmap.cosmos_libero_variants import canonical_variant_json
 
@@ -30,6 +34,9 @@ cfg.action_downsample_factor = 4
 cfg.action_chunk_shape = [4, 4]
 cfg.training_contract_stage = "progressive_stage2"
 cfg.student_backend = "wan_flowmap"
+if not os.environ.get("COSMOS_POLICY_PATH"):
+    raise ValueError("COSMOS_POLICY_PATH must be explicitly set")
+cfg.teacher_model_path = os.environ["COSMOS_POLICY_PATH"]
 
 
 def _env_bool(name, default):
@@ -201,6 +208,17 @@ if cfg.cosmos_libero_variant_json is not None:
 _validated_parent = validate_stage1_parent(
     Path(cfg.parent_stage1_path), expected_step=5000
 )
+_, _parent_teacher_model_path = validated_stage1_hybrid_model_paths(
+    _validated_parent
+)
+_current_teacher_model_path = str(
+    validate_cosmos_teacher_model_path(cfg.teacher_model_path)
+)
+if _current_teacher_model_path != _parent_teacher_model_path:
+    raise ValueError(
+        "COSMOS_POLICY_PATH must match the Cosmos Teacher recorded by Stage-1"
+    )
+cfg.teacher_model_path = _current_teacher_model_path
 if (
     _validated_parent.contract_identity
     != cfg.parent_stage1_contract_identity

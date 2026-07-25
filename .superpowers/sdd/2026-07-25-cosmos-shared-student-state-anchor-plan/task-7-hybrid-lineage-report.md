@@ -54,3 +54,29 @@ GREEN:
 The broader Cosmos policy suite still contains pre-existing simulator import
 failures on this host (`robosuite` unavailable); those failures are unrelated
 to this change and no training or evaluation was launched.
+
+## Independent review follow-up
+
+The Important lineage findings were closed in a second test-first pass:
+
+- Stage-1 resume now validates the complete online/target checkpoint contract,
+  requires both model paths, and rejects current Wan/Cosmos roots that differ
+  from checkpoint provenance.
+- Stage-2 fresh config and resume require the Cosmos Teacher to equal the
+  validated Stage-1 Teacher.
+- The inference resolver now derives the complete Stage-2 config environment
+  from its validated parent. Ambient environment and explicit CLI Teacher
+  mismatches fail before config import or model load.
+- The live student service binds the validated Teacher path and lineage before
+  constructing its config, Student, or Teacher.
+- The serial wrapper prints and propagates `RESUME_FROM_PATH`,
+  `PARENT_STAGE1_PATH`, `PARENT_STAGE1_CONTRACT_IDENTITY`, and
+  `STAGE2_LINEAGE_JSON` to both Stage-2 and evaluation. Dynamic identity values
+  are derived immediately after Stage-1 completes.
+- The final machine-local Cosmos Teacher fallback was removed from Stage-1.
+
+Final focused verification:
+
+```text
+237 passed in 140.25s
+```

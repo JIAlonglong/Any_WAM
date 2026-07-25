@@ -341,7 +341,12 @@ def resolve_variant(
         "warmup_steps": 100,
         "num_ddim_timesteps_action": 1,
         "cosmos_policy_use_raw_inference": True,
-        "skip_target_student_for_cosmos_latent": True,
+        # The trainer's action-OPD contract requires a retained target branch.
+        # This also gives formal stage2_target evaluation a real EMA model;
+        # pure Cosmos-video arms can retain the lower-memory direct-teacher path.
+        "skip_target_student_for_cosmos_latent": (
+            name != "universal-video-action"
+        ),
         "cosmos_latent_cdiff_loss_weight": 1.0,
         "cosmos_latent_endpoint_loss_weight": 0.0,
         "cosmos_latent_epsilon": 0.001,

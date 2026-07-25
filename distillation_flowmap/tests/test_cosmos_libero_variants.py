@@ -34,6 +34,7 @@ PROGRESSIVE_ALLOWED_DIFFERENCES = {
     "danceopd_rollout_steps",
     "video_velocity_weight",
     "action_opd_enabled",
+    "skip_target_student_for_cosmos_latent",
     "opd_rollout_grad_mode",
     "opd_action_rollout_grad_mode",
     "opd_rollout_grad_steps",
@@ -163,6 +164,9 @@ def test_progressive_arms_differ_only_in_declared_budget_fields(tmp_path):
         assert records[name]["action_endpoint_weight"] == 1.0
         assert records[name]["action_opd_enabled"] is (
             name == "universal-video-action"
+        )
+        assert records[name]["skip_target_student_for_cosmos_latent"] is (
+            name != "universal-video-action"
         )
         assert records[name]["use_opd_aux"] is True
 

@@ -185,7 +185,7 @@ def test_lock_cli_dry_run_is_write_free(tmp_path):
     assert "video_vae.lock.json=" in result.stdout
 
 
-def test_universal_video_action_differs_only_by_explicit_action_opd(tmp_path):
+def test_universal_video_action_retains_target_required_by_action_opd(tmp_path):
     common = {
         "output_root": tmp_path,
         "run_tag": "contract",
@@ -197,7 +197,14 @@ def test_universal_video_action_differs_only_by_explicit_action_opd(tmp_path):
     action = dict(resolve_variant("universal-video-action", **common))
     assert video["action_opd_enabled"] is False
     assert action["action_opd_enabled"] is True
-    for key in ("name", "output_dir", "action_opd_enabled"):
+    assert video["skip_target_student_for_cosmos_latent"] is True
+    assert action["skip_target_student_for_cosmos_latent"] is False
+    for key in (
+        "name",
+        "output_dir",
+        "action_opd_enabled",
+        "skip_target_student_for_cosmos_latent",
+    ):
         video.pop(key)
         action.pop(key)
     assert video == action

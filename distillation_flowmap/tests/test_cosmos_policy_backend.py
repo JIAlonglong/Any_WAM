@@ -373,7 +373,7 @@ def test_same_prior_endpoint_request_round_trips_exact_priors_and_eight_steps(
     tmp_path,
 ):
     teacher = _make_same_prior_teacher(tmp_path)
-    video_prior = torch.randn(1, 16, 9, 2, 2)
+    video_prior = torch.randn(1, 16, 9, 28, 28)
     action_prior = torch.randn(1, 16, 7)
     captured = {}
 
@@ -411,9 +411,25 @@ def test_same_prior_endpoint_rejects_non_eight_steps_before_worker_start(tmp_pat
     with pytest.raises(ValueError, match="exactly 8"):
         teacher.predict_raw_same_prior_endpoint(
             {"raw_task": ["task"]},
-            video_prior=torch.zeros(1, 16, 9, 2, 2),
+            video_prior=torch.zeros(1, 16, 9, 28, 28),
             action_prior=torch.zeros(1, 16, 7),
             teacher_steps=7,
+        )
+
+
+@pytest.mark.parametrize("teacher_steps", [8.5, "8", True])
+def test_same_prior_endpoint_rejects_non_integer_budget_before_worker_start(
+    tmp_path, teacher_steps
+):
+    teacher = _make_same_prior_teacher(tmp_path)
+    teacher._ensure_raw_worker = lambda: pytest.fail("worker must not start")
+
+    with pytest.raises((TypeError, ValueError), match="integer"):
+        teacher.predict_raw_same_prior_endpoint(
+            {"raw_task": ["task"]},
+            video_prior=torch.zeros(1, 16, 9, 28, 28),
+            action_prior=torch.zeros(1, 16, 7),
+            teacher_steps=teacher_steps,
         )
 
 
@@ -429,7 +445,7 @@ def test_same_prior_endpoint_rejects_worker_contract_mismatch(
     tmp_path, response_override, match
 ):
     teacher = _make_same_prior_teacher(tmp_path)
-    video_prior = torch.zeros(1, 16, 9, 2, 2)
+    video_prior = torch.zeros(1, 16, 9, 28, 28)
     action_prior = torch.zeros(1, 16, 7)
 
     def fake_worker(payload, arrays):
@@ -450,6 +466,71 @@ def test_same_prior_endpoint_rejects_worker_contract_mismatch(
             video_prior=video_prior,
             action_prior=action_prior,
         )
+
+
+@pytest.mark.parametrize("effective_steps", [8.5, "8", True])
+def test_same_prior_endpoint_rejects_non_integer_response_budget(
+    tmp_path, effective_steps
+):
+    teacher = _make_same_prior_teacher(tmp_path)
+    video_prior = torch.zeros(1, 16, 9, 28, 28)
+    action_prior = torch.zeros(1, 16, 7)
+
+    def fake_worker(payload, arrays):
+        return {
+            "endpoint_video": np.zeros_like(arrays["video_prior"]),
+            "video_frame_mask": np.ones((1, video_prior.shape[2]), dtype=bool),
+            "effective_teacher_steps": effective_steps,
+            "video_prior_sha256": _sha256_array(arrays["video_prior"]),
+            "action_prior_sha256": _sha256_array(arrays["action_prior"]),
+        }
+
+    teacher._request_raw_worker_npz = fake_worker
+    with pytest.raises(RuntimeError, match="integer"):
+        teacher.predict_raw_same_prior_endpoint(
+            {"raw_task": ["task"]},
+            video_prior=video_prior,
+            action_prior=action_prior,
+        )
+
+
+@pytest.mark.parametrize(
+    "worker_line",
+    [
+        "not-json\n",
+        json.dumps({"ok": False, "error": "expected failure"}) + "\n",
+        json.dumps({"ok": True, "actions_path": "/unexpected/response.npz"}) + "\n",
+    ],
+)
+def test_raw_worker_npz_transport_cleans_owned_files_on_every_error(
+    tmp_path, worker_line
+):
+    teacher = _make_same_prior_teacher(tmp_path)
+    teacher._raw_worker_tmpdir = str(tmp_path)
+
+    class FakeStdin:
+        def write(self, line):
+            payload = json.loads(line)
+            np.savez_compressed(payload["actions_path"], partial=np.zeros(1))
+
+        def flush(self):
+            pass
+
+    class FakeStdout:
+        def readline(self):
+            return worker_line
+
+    teacher._raw_worker = SimpleNamespace(stdin=FakeStdin(), stdout=FakeStdout())
+    teacher._ensure_raw_worker = lambda: None
+    existing = set(tmp_path.iterdir())
+
+    with pytest.raises((RuntimeError, json.JSONDecodeError)):
+        teacher._request_raw_worker_npz(
+            {"mode": "same_prior_endpoint", "tasks": ["task"], "teacher_steps": 8},
+            {"video_prior": np.zeros((1, 16, 9, 2, 2), dtype=np.float32)},
+        )
+
+    assert set(tmp_path.iterdir()) == existing
 
 
 def test_cosmos_latent_target_mode_controls_cdiff_requests():

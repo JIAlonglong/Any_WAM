@@ -109,31 +109,226 @@ def _array_sha256(value):
     return hashlib.sha256(array.view(np.uint8)).hexdigest()
 
 
+def _require_exact_teacher_steps(value, *, error_cls=ValueError, source="request"):
+    if type(value) is not int:
+        raise error_cls(
+            f"same-prior {source} teacher steps must be an integer equal to 8"
+        )
+    if value != 8:
+        raise error_cls("same-prior endpoint requires exactly 8 teacher steps")
+    return value
+
+
+def _qualified_type_name(value):
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__name__}"
+
+
+def _validate_explicit_prior_runtime(model):
+    expected_model = (
+        "cosmos_predict2._src.predict2.cosmos_policy.models."
+        "policy_video2world_model.CosmosPolicyVideo2WorldModel"
+    )
+    expected_sampler = (
+        "cosmos_predict2._src.predict2.cosmos_policy.modules."
+        "cosmos_sampler.CosmosPolicySampler"
+    )
+    expected_sde = (
+        "cosmos_predict2._src.predict2.cosmos_policy.modules."
+        "hybrid_edm_sde.HybridEDMSDE"
+    )
+    actual_model = _qualified_type_name(model)
+    if actual_model != expected_model:
+        raise RuntimeError(
+            f"unsupported Cosmos runtime model {actual_model!r}; "
+            f"expected {expected_model!r}"
+        )
+    sampler = getattr(model, "sampler", None)
+    actual_sampler = _qualified_type_name(sampler)
+    if actual_sampler != expected_sampler:
+        raise RuntimeError(
+            f"unsupported Cosmos runtime sampler {actual_sampler!r}; "
+            f"expected {expected_sampler!r}"
+        )
+    sde = getattr(model, "sde", None)
+    actual_sde = _qualified_type_name(sde)
+    if actual_sde != expected_sde:
+        raise RuntimeError(
+            f"unsupported Cosmos runtime SDE {actual_sde!r}; "
+            f"expected {expected_sde!r}"
+        )
+    if getattr(sde, "sigma_min", None) != 4:
+        raise RuntimeError(
+            f"Cosmos HybridEDMSDE sigma_min must equal 4, got "
+            f"{getattr(sde, 'sigma_min', None)!r}"
+        )
+    if getattr(sde, "sigma_max", None) != 80:
+        raise RuntimeError(
+            f"Cosmos HybridEDMSDE sigma_max must equal 80, got "
+            f"{getattr(sde, 'sigma_max', None)!r}"
+        )
+    if getattr(getattr(model, "config", None), "use_flowunipc_scheduler", None) is not False:
+        raise RuntimeError(
+            "Cosmos backend is not using the required named EDM sampler path"
+        )
+
+
 def _generate_from_explicit_prior(
     model, data_batch, joint_prior, *, teacher_steps
 ):
-    """Call only a sampler whose public signature proves explicit prior use."""
-    if int(teacher_steps) != 8:
-        raise ValueError("same-prior endpoint requires exactly 8 teacher steps")
+    """Run the audited EDM endpoint and return its observed denoiser count."""
+    _require_exact_teacher_steps(teacher_steps)
+    _validate_explicit_prior_runtime(model)
     generate = model.generate_samples_from_batch
     signature = inspect.signature(generate)
     if "x_sigma_max" not in signature.parameters:
         raise RuntimeError(
             "Cosmos backend cannot honor explicit same-prior sampling"
         )
-    if bool(getattr(getattr(model, "config", None), "use_flowunipc_scheduler", False)):
-        raise RuntimeError(
-            "Cosmos backend is not using the required named EDM sampler path"
-        )
-    return generate(
-        data_batch,
-        x_sigma_max=joint_prior,
-        num_steps=8,
-        solver_option="2ab",
-        sigma_max=80,
-        guidance=0,
-        use_variance_scale=False,
+
+    original_get_x0 = model.get_x0_fn_from_batch
+    instance_marker = object()
+    previous_instance_value = model.__dict__.get(
+        "get_x0_fn_from_batch", instance_marker
     )
+    observed_nfe = 0
+
+    def instrumented_get_x0(*args, **kwargs):
+        result = original_get_x0(*args, **kwargs)
+        if isinstance(result, tuple):
+            x0_fn, *rest = result
+        else:
+            x0_fn, rest = result, None
+
+        def counted_x0(*fn_args, **fn_kwargs):
+            nonlocal observed_nfe
+            observed_nfe += 1
+            return x0_fn(*fn_args, **fn_kwargs)
+
+        if rest is None:
+            return counted_x0
+        return (counted_x0, *rest)
+
+    model.get_x0_fn_from_batch = instrumented_get_x0
+    try:
+        endpoint = generate(
+            data_batch,
+            x_sigma_max=joint_prior,
+            num_steps=8,
+            solver_option="2ab",
+            sigma_max=80,
+            guidance=0,
+            use_variance_scale=False,
+        )
+    finally:
+        if previous_instance_value is instance_marker:
+            delattr(model, "get_x0_fn_from_batch")
+        else:
+            model.get_x0_fn_from_batch = previous_instance_value
+    if observed_nfe != 8:
+        raise RuntimeError(
+            "Cosmos same-prior sampler did not execute exactly 8 denoiser "
+            f"evaluations; observed {observed_nfe}"
+        )
+    return endpoint, observed_nfe
+
+
+def _validate_official_libero_geometry(cfg, model):
+    required_cfg = {
+        "suite": "libero",
+        "use_proprio": True,
+        "normalize_proprio": True,
+        "use_wrist_image": True,
+        "num_wrist_images": 1,
+        "use_third_person_image": True,
+        "num_third_person_images": 1,
+        "use_jpeg_compression": True,
+        "trained_with_image_aug": True,
+    }
+    for name, expected in required_cfg.items():
+        actual = getattr(cfg, name, None)
+        if actual != expected or type(actual) is not type(expected):
+            raise RuntimeError(
+                f"official LIBERO {name} must equal {expected!r}, got {actual!r}"
+            )
+
+    required_model = {
+        "state_ch": 16,
+        "state_t": 9,
+        "min_num_conditional_frames": 4,
+    }
+    config = getattr(model, "config", None)
+    for name, expected in required_model.items():
+        actual = getattr(config, name, None)
+        if actual != expected:
+            raise RuntimeError(
+                f"official LIBERO model {name} must equal {expected}, got {actual!r}"
+            )
+    tokenizer = getattr(model, "tokenizer", None)
+    spatial_factor = getattr(tokenizer, "spatial_compression_factor", None)
+    if spatial_factor != 8:
+        raise RuntimeError(
+            "official LIBERO tokenizer spatial compression factor must equal 8, "
+            f"got {spatial_factor!r}"
+        )
+    latent_frames = tokenizer.get_latent_num_frames(33)
+    if latent_frames != 9:
+        raise RuntimeError(
+            "official LIBERO tokenizer must map 33 input frames to 9 latent "
+            f"frames, got {latent_frames!r}"
+        )
+    return (16, 9, 28, 28)
+
+
+def _load_same_prior_arrays(data):
+    video_raw = np.asarray(data["video_prior"])
+    action_raw = np.asarray(data["action_prior"])
+    if video_raw.dtype != np.float32:
+        raise ValueError(
+            f"same-prior video_prior NPZ dtype must be float32, got {video_raw.dtype}"
+        )
+    if action_raw.dtype != np.float32:
+        raise ValueError(
+            f"same-prior action_prior NPZ dtype must be float32, got {action_raw.dtype}"
+        )
+    video_prior = np.ascontiguousarray(video_raw)
+    action_prior = np.ascontiguousarray(action_raw)
+    if not np.isfinite(video_prior).all():
+        raise ValueError("same-prior video_prior must contain only finite values")
+    if not np.isfinite(action_prior).all():
+        raise ValueError("same-prior action_prior must contain only finite values")
+    return (
+        video_prior,
+        action_prior,
+        _array_sha256(video_prior),
+        _array_sha256(action_prior),
+    )
+
+
+def _same_prior_response_fields(
+    result, *, video_prior_sha256, action_prior_sha256
+):
+    endpoint = result["endpoint_video"]
+    frame_mask = result["video_frame_mask"]
+    effective_steps = result["effective_teacher_steps"]
+    _require_exact_teacher_steps(
+        effective_steps,
+        error_cls=RuntimeError,
+        source="observed effective",
+    )
+    if not isinstance(endpoint, torch.Tensor) or endpoint.dtype != torch.float32:
+        raise RuntimeError("same-prior backend endpoint dtype must be float32")
+    if not isinstance(frame_mask, torch.Tensor) or frame_mask.dtype != torch.bool:
+        raise RuntimeError("same-prior backend video frame mask must be boolean")
+    if frame_mask.shape != (endpoint.shape[0], endpoint.shape[2]):
+        raise RuntimeError("same-prior backend video frame mask shape is invalid")
+    return {
+        "endpoint_video": endpoint.detach().cpu().numpy(),
+        "video_frame_mask": frame_mask.detach().cpu().numpy(),
+        "effective_teacher_steps": np.asarray(effective_steps, dtype=np.int64),
+        "video_prior_sha256": np.asarray(video_prior_sha256),
+        "action_prior_sha256": np.asarray(action_prior_sha256),
+    }
 
 
 def _video_frame_mask(video_prior, latent_indices):
@@ -168,13 +363,15 @@ def _run_same_prior_endpoint(
     teacher_steps,
 ):
     """Pack the split caller priors and run the exact eight-step EDM endpoint."""
-    video_prior = torch.as_tensor(video_prior, dtype=torch.float32)
-    action_prior = torch.as_tensor(
-        action_prior, device=video_prior.device, dtype=torch.float32
-    )
-    if video_prior.ndim != 5 or video_prior.shape[1] != 16:
+    video_prior = torch.as_tensor(video_prior)
+    action_prior = torch.as_tensor(action_prior, device=video_prior.device)
+    if video_prior.dtype != torch.float32:
+        raise ValueError("video_prior must use float32 without conversion")
+    if action_prior.dtype != torch.float32:
+        raise ValueError("action_prior must use float32 without conversion")
+    if video_prior.ndim != 5 or tuple(video_prior.shape[1:]) != (16, 9, 28, 28):
         raise ValueError(
-            "video_prior must have Cosmos joint latent shape [B,16,T,H,W]"
+            "video_prior must have Cosmos joint latent shape [B,16,9,28,28]"
         )
     if action_prior.ndim != 3 or action_prior.shape[1:] != (16, 7):
         raise ValueError(
@@ -187,6 +384,29 @@ def _run_same_prior_endpoint(
     if not bool(torch.isfinite(action_prior).all()):
         raise ValueError("action_prior must contain only finite values")
 
+    data_video = data_batch.get("video")
+    if not isinstance(data_video, torch.Tensor) or data_video.ndim != 5:
+        raise ValueError("Cosmos data batch is missing a rank-5 video tensor")
+    tokenizer = getattr(model, "tokenizer", None)
+    spatial_factor = getattr(tokenizer, "spatial_compression_factor", None)
+    if spatial_factor != 8:
+        raise RuntimeError("Cosmos tokenizer spatial compression drift detected")
+    expected_shape = (
+        video_prior.shape[0],
+        getattr(getattr(model, "config", None), "state_ch", None),
+        tokenizer.get_latent_num_frames(data_video.shape[-3]),
+        data_video.shape[-2] // spatial_factor,
+        data_video.shape[-1] // spatial_factor,
+    )
+    if expected_shape != (video_prior.shape[0], 16, 9, 28, 28):
+        raise RuntimeError(
+            f"Cosmos conditioning batch derives unsupported joint shape {expected_shape}"
+        )
+    if tuple(video_prior.shape) != expected_shape:
+        raise ValueError(
+            "video_prior must match the official derived "
+            f"[B,16,9,28,28] shape, got {tuple(video_prior.shape)}"
+        )
     action_indices = data_batch.get("action_latent_idx")
     if action_indices is None:
         raise ValueError("Cosmos data batch is missing action_latent_idx")
@@ -197,7 +417,7 @@ def _run_same_prior_endpoint(
     if not torch.equal(joint_prior[mask[:, None, :, None, None].expand_as(joint_prior)],
                        video_prior[mask[:, None, :, None, None].expand_as(video_prior)]):
         raise RuntimeError("action packing changed a valid video frame")
-    endpoint = _generate_from_explicit_prior(
+    endpoint, effective_steps = _generate_from_explicit_prior(
         model,
         data_batch,
         joint_prior,
@@ -207,19 +427,31 @@ def _run_same_prior_endpoint(
         raise RuntimeError("Cosmos same-prior sampler returned a non-tensor endpoint")
     if endpoint.shape != joint_prior.shape:
         raise RuntimeError("Cosmos same-prior sampler returned an invalid endpoint shape")
+    if endpoint.dtype != torch.float32:
+        raise RuntimeError("Cosmos same-prior sampler endpoint dtype must be float32")
     if not bool(torch.isfinite(endpoint).all()):
         raise RuntimeError("Cosmos same-prior sampler returned non-finite values")
+    if mask.dtype != torch.bool:
+        raise RuntimeError("Cosmos same-prior video frame mask must be boolean")
     return {
         "endpoint_video": endpoint,
         "video_frame_mask": mask,
-        "effective_teacher_steps": 8,
+        "effective_teacher_steps": effective_steps,
     }
 
 
 def _build_libero_data_batch(cfg, model, dataset_stats, obs, task, cosmos_utils):
     """Reproduce the official LIBERO pre-sampling batch without calling get_action."""
-    if cfg.suite != "libero":
-        raise RuntimeError("same-prior endpoint currently supports only LIBERO")
+    _validate_explicit_prior_runtime(model)
+    expected_state_shape = _validate_official_libero_geometry(cfg, model)
+    if cosmos_utils.COSMOS_IMAGE_SIZE != 224:
+        raise RuntimeError(
+            "official LIBERO COSMOS_IMAGE_SIZE drifted from pinned value 224"
+        )
+    if cosmos_utils.COSMOS_TEMPORAL_COMPRESSION_FACTOR != 4:
+        raise RuntimeError(
+            "official LIBERO temporal compression factor drifted from pinned value 4"
+        )
     device = torch.device(model.tensor_kwargs["device"])
     text_embedding = cosmos_utils.get_t5_embedding_from_cache(task)
     wrist_image, primary_image = cosmos_utils.prepare_images_for_model(
@@ -275,6 +507,11 @@ def _build_libero_data_batch(cfg, model, dataset_stats, obs, task, cosmos_utils)
 
     raw_image_sequence = np.concatenate(image_sequence, axis=0)[None]
     raw_image_sequence = np.transpose(raw_image_sequence, (0, 4, 1, 2, 3))
+    if raw_image_sequence.shape != (1, 3, 33, 224, 224):
+        raise RuntimeError(
+            "official LIBERO conditioning layout drifted; expected "
+            f"[1,3,33,224,224], got {raw_image_sequence.shape}"
+        )
     raw_image_sequence = torch.from_numpy(raw_image_sequence).to(
         device=device, dtype=torch.uint8
     )
@@ -301,6 +538,16 @@ def _build_libero_data_batch(cfg, model, dataset_stats, obs, task, cosmos_utils)
     }
     for key, value in latent_indices.items():
         data_batch[key] = torch.tensor([value], dtype=torch.int64, device=device)
+    derived_state_shape = (
+        model.config.state_ch,
+        model.tokenizer.get_latent_num_frames(raw_image_sequence.shape[-3]),
+        raw_image_sequence.shape[-2] // model.tokenizer.spatial_compression_factor,
+        raw_image_sequence.shape[-1] // model.tokenizer.spatial_compression_factor,
+    )
+    if derived_state_shape != expected_state_shape:
+        raise RuntimeError(
+            "official LIBERO conditioning batch and model tokenizer geometry differ"
+        )
     return data_batch, latent_indices
 
 
@@ -406,6 +653,7 @@ def main():
     model, _ = get_model(cfg)
 
     for line in sys.stdin:
+        data = None
         try:
             request = json.loads(line)
             data = np.load(request["npz_path"])
@@ -415,23 +663,45 @@ def main():
             tasks = request["tasks"]
             mode = request.get("mode", "actions")
             if mode == "same_prior_endpoint":
-                teacher_steps = int(request.get("teacher_steps", -1))
-                video_prior_np = np.ascontiguousarray(
-                    data["video_prior"], dtype=np.float32
-                )
-                action_prior_np = np.ascontiguousarray(
-                    data["action_prior"], dtype=np.float32
-                )
+                teacher_steps = request.get("teacher_steps")
+                _require_exact_teacher_steps(teacher_steps)
+                (
+                    video_prior_np,
+                    action_prior_np,
+                    video_prior_sha256,
+                    action_prior_sha256,
+                ) = _load_same_prior_arrays(data)
+                if tuple(video_prior_np.shape[1:]) != (16, 9, 28, 28):
+                    raise ValueError(
+                        "same-prior video_prior NPZ shape must be "
+                        f"[B,16,9,28,28], got {video_prior_np.shape}"
+                    )
+                if tuple(action_prior_np.shape[1:]) != (16, 7):
+                    raise ValueError(
+                        "same-prior action_prior NPZ shape must be [B,16,7], "
+                        f"got {action_prior_np.shape}"
+                    )
+                if action_prior_np.shape[0] != video_prior_np.shape[0]:
+                    raise ValueError(
+                        "same-prior action/video prior batch sizes differ"
+                    )
+                _validate_explicit_prior_runtime(model)
+                _validate_official_libero_geometry(cfg, model)
                 if len(tasks) != video_prior_np.shape[0]:
                     raise ValueError(
                         "same-prior task count does not match video prior batch"
                     )
-                if primary.shape[0] != len(tasks) or wrist.shape[0] != len(tasks):
+                if (
+                    primary.shape[0] != len(tasks)
+                    or wrist.shape[0] != len(tasks)
+                    or proprio.shape[0] != len(tasks)
+                ):
                     raise ValueError(
                         "same-prior observation batch does not match task count"
                     )
-                endpoints = []
-                masks = []
+                endpoint_tensors = []
+                mask_tensors = []
+                observed_steps = []
                 with torch.no_grad():
                     for idx, task in enumerate(tasks):
                         obs = {
@@ -456,26 +726,32 @@ def main():
                             torch.from_numpy(action_prior_np[idx: idx + 1]).to(device),
                             teacher_steps=teacher_steps,
                         )
-                        endpoints.append(
-                            endpoint_result["endpoint_video"]
-                            .detach()
-                            .cpu()
-                            .numpy()
-                            .astype(np.float32)
+                        endpoint_tensors.append(
+                            endpoint_result["endpoint_video"].detach().cpu()
                         )
-                        masks.append(
-                            endpoint_result["video_frame_mask"].detach().cpu().numpy()
+                        mask_tensors.append(
+                            endpoint_result["video_frame_mask"].detach().cpu()
                         )
-                response_path = request["actions_path"]
-                np.savez_compressed(
-                    response_path,
-                    endpoint_video=np.concatenate(endpoints, axis=0),
-                    video_frame_mask=np.concatenate(masks, axis=0).astype(bool),
-                    effective_teacher_steps=np.asarray(8, dtype=np.int64),
-                    video_prior_sha256=np.asarray(_array_sha256(video_prior_np)),
-                    action_prior_sha256=np.asarray(_array_sha256(action_prior_np)),
+                        observed_steps.append(
+                            endpoint_result["effective_teacher_steps"]
+                        )
+                if not observed_steps or any(
+                    value != observed_steps[0] for value in observed_steps
+                ):
+                    raise RuntimeError(
+                        "same-prior batch returned inconsistent observed teacher steps"
+                    )
+                fields = _same_prior_response_fields(
+                    {
+                        "endpoint_video": torch.cat(endpoint_tensors, dim=0),
+                        "video_frame_mask": torch.cat(mask_tensors, dim=0),
+                        "effective_teacher_steps": observed_steps[0],
+                    },
+                    video_prior_sha256=video_prior_sha256,
+                    action_prior_sha256=action_prior_sha256,
                 )
-                data.close()
+                response_path = request["actions_path"]
+                np.savez_compressed(response_path, **fields)
                 print(
                     json.dumps({"ok": True, "actions_path": response_path}),
                     file=response_out,
@@ -690,6 +966,9 @@ def main():
                 file=response_out,
                 flush=True,
             )
+        finally:
+            if data is not None:
+                data.close()
 
 
 if __name__ == "__main__":

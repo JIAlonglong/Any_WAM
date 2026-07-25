@@ -1,43 +1,146 @@
+import hashlib
+import io
+import json
+import sys
+from types import ModuleType, SimpleNamespace
+
+import numpy as np
 import pytest
 import torch
 
 
-def test_explicit_prior_sampler_uses_exact_edm_protocol():
+def _runtime_model(*, nfe=8, endpoint_dtype=torch.float32, sigma_min=4, sigma_max=80):
+    captured = {}
+
+    def get_x0_fn_from_batch(self, data_batch, guidance, **kwargs):
+        return lambda value, sigma: value
+
+    def generate_samples_from_batch(
+        self,
+        data_batch,
+        *,
+        x_sigma_max=None,
+        num_steps=None,
+        solver_option=None,
+        sigma_max=None,
+        guidance=None,
+        use_variance_scale=None,
+        seed=None,
+    ):
+        captured.update(
+            data_batch=data_batch,
+            x_sigma_max=x_sigma_max,
+            num_steps=num_steps,
+            solver_option=solver_option,
+            sigma_max=sigma_max,
+            guidance=guidance,
+            use_variance_scale=use_variance_scale,
+            seed=seed,
+        )
+        x0_fn = self.get_x0_fn_from_batch(data_batch, guidance)
+        sigma = torch.ones(x_sigma_max.shape[0])
+        for _ in range(self.requested_nfe):
+            x0_fn(x_sigma_max, sigma)
+        captured["joint_prior"] = x_sigma_max.clone()
+        return (x_sigma_max + 10).to(endpoint_dtype)
+
+    model_type = type(
+        "CosmosPolicyVideo2WorldModel",
+        (torch.nn.Module,),
+        {
+            "__module__": (
+                "cosmos_predict2._src.predict2.cosmos_policy.models."
+                "policy_video2world_model"
+            ),
+            "get_x0_fn_from_batch": get_x0_fn_from_batch,
+            "generate_samples_from_batch": generate_samples_from_batch,
+        },
+    )
+    sampler_type = type(
+        "CosmosPolicySampler",
+        (torch.nn.Module,),
+        {
+            "__module__": (
+                "cosmos_predict2._src.predict2.cosmos_policy.modules.cosmos_sampler"
+            )
+        },
+    )
+    sde_type = type(
+        "HybridEDMSDE",
+        (),
+        {
+            "__module__": (
+                "cosmos_predict2._src.predict2.cosmos_policy.modules.hybrid_edm_sde"
+            )
+        },
+    )
+
+    class Tokenizer:
+        spatial_compression_factor = 8
+
+        @staticmethod
+        def get_latent_num_frames(num_frames):
+            return (num_frames - 1) // 4 + 1
+
+    model = model_type()
+    model.requested_nfe = nfe
+    model.sampler = sampler_type()
+    model.sde = sde_type()
+    model.sde.sigma_min = sigma_min
+    model.sde.sigma_max = sigma_max
+    model.config = SimpleNamespace(
+        use_flowunipc_scheduler=False,
+        state_ch=16,
+        state_t=9,
+        min_num_conditional_frames=4,
+    )
+    model.tokenizer = Tokenizer()
+    model.tensor_kwargs = {"device": "cpu"}
+    return model, captured
+
+
+def _libero_cfg(**overrides):
+    fields = dict(
+        suite="libero",
+        use_proprio=True,
+        normalize_proprio=True,
+        use_wrist_image=True,
+        num_wrist_images=1,
+        use_third_person_image=True,
+        num_third_person_images=1,
+        use_jpeg_compression=True,
+        trained_with_image_aug=True,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _data_batch(action_index=4):
+    return {
+        "video": torch.zeros(1, 3, 33, 224, 224, dtype=torch.uint8),
+        "action_latent_idx": torch.tensor([action_index]),
+    }
+
+
+def _latent_indices():
+    return {
+        "future_wrist_image_latent_idx": 6,
+        "future_wrist_image2_latent_idx": -1,
+        "future_image_latent_idx": 7,
+        "future_image2_latent_idx": -1,
+    }
+
+
+def test_explicit_prior_sampler_proves_runtime_and_observes_exact_edm_budget():
     from distillation_flowmap.cosmos_policy_raw_worker import (
         _generate_from_explicit_prior,
     )
 
-    captured = {}
-
-    class ExplicitPriorModel:
-        def generate_samples_from_batch(
-            self,
-            data_batch,
-            *,
-            x_sigma_max=None,
-            num_steps=None,
-            solver_option=None,
-            sigma_max=None,
-            guidance=None,
-            use_variance_scale=None,
-            seed=None,
-        ):
-            captured.update(
-                data_batch=data_batch,
-                x_sigma_max=x_sigma_max,
-                num_steps=num_steps,
-                solver_option=solver_option,
-                sigma_max=sigma_max,
-                guidance=guidance,
-                use_variance_scale=use_variance_scale,
-                seed=seed,
-            )
-            return x_sigma_max + 1
-
-    prior = torch.randn(1, 3, 5, 2, 2)
-    batch = {"action_latent_idx": torch.tensor([1])}
-    endpoint = _generate_from_explicit_prior(
-        ExplicitPriorModel(), batch, prior, teacher_steps=8
+    model, captured = _runtime_model()
+    prior = torch.randn(1, 16, 9, 28, 28)
+    batch = _data_batch()
+    endpoint, effective_steps = _generate_from_explicit_prior(
+        model, batch, prior, teacher_steps=8
     )
 
     assert captured["data_batch"] is batch
@@ -48,110 +151,342 @@ def test_explicit_prior_sampler_uses_exact_edm_protocol():
     assert captured["guidance"] == 0
     assert captured["use_variance_scale"] is False
     assert captured["seed"] is None
-    assert torch.equal(endpoint, prior + 1)
+    assert effective_steps == 8
+    assert torch.equal(endpoint, prior + 10)
 
 
-def test_seed_only_or_kwargs_backend_fails_closed_without_invocation():
+def test_same_signature_wrong_runtime_class_fails_before_invocation():
     from distillation_flowmap.cosmos_policy_raw_worker import (
         _generate_from_explicit_prior,
     )
 
-    class SeedOnlyModel:
+    class CompatibleLookingModel:
         calls = 0
 
-        def generate_samples_from_batch(self, data_batch, *, seed=1, **kwargs):
+        def generate_samples_from_batch(self, data_batch, *, x_sigma_max, **kwargs):
             self.calls += 1
-            return torch.zeros(1)
+            return x_sigma_max
 
-    model = SeedOnlyModel()
-    with pytest.raises(RuntimeError, match="cannot honor explicit same-prior"):
+    model = CompatibleLookingModel()
+    with pytest.raises(RuntimeError, match="runtime model"):
         _generate_from_explicit_prior(
-            model, {}, torch.zeros(1, 3, 5, 2, 2), teacher_steps=8
+            model, {}, torch.zeros(1, 16, 9, 28, 28), teacher_steps=8
         )
     assert model.calls == 0
 
 
-def test_same_prior_worker_packs_action_without_changing_video_frames():
+@pytest.mark.parametrize(
+    "model_kwargs,match",
+    [
+        ({"sigma_min": 3}, "sigma_min"),
+        ({"sigma_max": 79}, "sigma_max"),
+    ],
+)
+def test_explicit_prior_sampler_rejects_sde_drift(model_kwargs, match):
+    from distillation_flowmap.cosmos_policy_raw_worker import (
+        _generate_from_explicit_prior,
+    )
+
+    model, _ = _runtime_model(**model_kwargs)
+    with pytest.raises(RuntimeError, match=match):
+        _generate_from_explicit_prior(
+            model, _data_batch(), torch.zeros(1, 16, 9, 28, 28), teacher_steps=8
+        )
+
+
+def test_explicit_prior_sampler_rejects_observed_non_eight_nfe():
+    from distillation_flowmap.cosmos_policy_raw_worker import (
+        _generate_from_explicit_prior,
+    )
+
+    model, _ = _runtime_model(nfe=7)
+    with pytest.raises(RuntimeError, match="observed 7"):
+        _generate_from_explicit_prior(
+            model, _data_batch(), torch.zeros(1, 16, 9, 28, 28), teacher_steps=8
+        )
+
+
+@pytest.mark.parametrize("teacher_steps", [8.5, "8", True])
+def test_worker_rejects_non_integer_teacher_budget(teacher_steps):
+    from distillation_flowmap.cosmos_policy_raw_worker import (
+        _generate_from_explicit_prior,
+    )
+
+    model, _ = _runtime_model()
+    with pytest.raises((TypeError, ValueError), match="integer"):
+        _generate_from_explicit_prior(
+            model,
+            _data_batch(),
+            torch.zeros(1, 16, 9, 28, 28),
+            teacher_steps=teacher_steps,
+        )
+
+
+@pytest.mark.parametrize(
+    "cfg_overrides,match",
+    [
+        ({"suite": "robocasa"}, "suite"),
+        ({"use_proprio": False}, "use_proprio"),
+        ({"normalize_proprio": False}, "normalize_proprio"),
+        ({"num_wrist_images": 2}, "num_wrist_images"),
+        ({"num_third_person_images": 2}, "num_third_person_images"),
+        ({"trained_with_image_aug": False}, "trained_with_image_aug"),
+    ],
+)
+def test_official_libero_geometry_rejects_config_drift(cfg_overrides, match):
+    from distillation_flowmap.cosmos_policy_raw_worker import (
+        _validate_official_libero_geometry,
+    )
+
+    model, _ = _runtime_model()
+    with pytest.raises(RuntimeError, match=match):
+        _validate_official_libero_geometry(_libero_cfg(**cfg_overrides), model)
+
+
+def test_official_libero_geometry_rejects_model_or_tokenizer_drift():
+    from distillation_flowmap.cosmos_policy_raw_worker import (
+        _validate_official_libero_geometry,
+    )
+
+    model, _ = _runtime_model()
+    model.config.state_t = 8
+    with pytest.raises(RuntimeError, match="state_t"):
+        _validate_official_libero_geometry(_libero_cfg(), model)
+
+    model, _ = _runtime_model()
+    model.tokenizer.spatial_compression_factor = 4
+    with pytest.raises(RuntimeError, match="spatial"):
+        _validate_official_libero_geometry(_libero_cfg(), model)
+
+
+def test_local_libero_batch_builder_matches_pinned_official_layout():
+    from distillation_flowmap.cosmos_policy_raw_worker import (
+        _build_libero_data_batch,
+    )
+
+    model, _ = _runtime_model()
+
+    class CosmosUtils:
+        COSMOS_IMAGE_SIZE = 224
+        COSMOS_TEMPORAL_COMPRESSION_FACTOR = 4
+
+        @staticmethod
+        def get_t5_embedding_from_cache(task):
+            return torch.zeros(1, 2, 3)
+
+        @staticmethod
+        def prepare_images_for_model(images, cfg):
+            return [
+                np.full((224, 224, 3), 2, dtype=np.uint8),
+                np.full((224, 224, 3), 3, dtype=np.uint8),
+            ]
+
+        @staticmethod
+        def rescale_proprio(value, *args, **kwargs):
+            return value
+
+        @staticmethod
+        def duplicate_array(value, total_num_copies):
+            return np.repeat(value[None], total_num_copies, axis=0)
+
+    data_batch, indices = _build_libero_data_batch(
+        _libero_cfg(),
+        model,
+        {},
+        {
+            "wrist_image": np.zeros((2, 2, 3), dtype=np.uint8),
+            "primary_image": np.zeros((2, 2, 3), dtype=np.uint8),
+            "proprio": np.zeros(9, dtype=np.float32),
+        },
+        "task",
+        CosmosUtils,
+    )
+
+    video = data_batch["video"]
+    assert video.shape == (1, 3, 33, 224, 224)
+    assert torch.count_nonzero(video[:, :, 0:5]) == 0
+    assert torch.all(video[:, :, 5:9] == 2)
+    assert torch.all(video[:, :, 9:13] == 3)
+    assert torch.count_nonzero(video[:, :, 13:21]) == 0
+    assert torch.all(video[:, :, 21:25] == 2)
+    assert torch.all(video[:, :, 25:29] == 3)
+    assert torch.count_nonzero(video[:, :, 29:33]) == 0
+    assert indices["action_latent_idx"] == 4
+    assert indices["future_wrist_image_latent_idx"] == 6
+    assert indices["future_image_latent_idx"] == 7
+    assert data_batch["action_latent_idx"].tolist() == [4]
+
+
+def test_same_prior_worker_requires_exact_joint_geometry_and_preserves_video():
     from distillation_flowmap.cosmos_policy_raw_worker import (
         _run_same_prior_endpoint,
     )
 
-    video_prior = torch.arange(1 * 16 * 5 * 2 * 2, dtype=torch.float32).reshape(
-        1, 16, 5, 2, 2
-    )
+    model, captured = _runtime_model()
+    video_prior = torch.arange(
+        1 * 16 * 9 * 28 * 28, dtype=torch.float32
+    ).reshape(1, 16, 9, 28, 28)
     action_prior = torch.arange(1 * 16 * 7, dtype=torch.float32).reshape(1, 16, 7)
-    data_batch = {"action_latent_idx": torch.tensor([1])}
-    latent_indices = {
-        "future_wrist_image_latent_idx": 3,
-        "future_wrist_image2_latent_idx": -1,
-        "future_image_latent_idx": 4,
-        "future_image2_latent_idx": -1,
-    }
-    captured = {}
-
-    class ExplicitPriorModel:
-        def generate_samples_from_batch(
-            self,
-            data_batch,
-            *,
-            x_sigma_max,
-            num_steps,
-            solver_option,
-            sigma_max,
-            guidance,
-            use_variance_scale,
-        ):
-            captured["joint_prior"] = x_sigma_max.clone()
-            return x_sigma_max + 10
-
     result = _run_same_prior_endpoint(
-        ExplicitPriorModel(),
-        data_batch,
-        latent_indices,
+        model,
+        _data_batch(),
+        _latent_indices(),
         video_prior,
         action_prior,
         teacher_steps=8,
     )
 
     joint = captured["joint_prior"]
-    expected_action = action_prior.flatten()[:64].reshape(16, 2, 2)
-    assert torch.equal(joint[0, :, 1], expected_action)
-    assert torch.equal(joint[0, :, 3], video_prior[0, :, 3])
-    assert torch.equal(joint[0, :, 4], video_prior[0, :, 4])
-    assert result["video_frame_mask"].tolist() == [[False, False, False, True, True]]
+    packed = action_prior.flatten().repeat(112)[: 16 * 28 * 28].reshape(16, 28, 28)
+    assert torch.equal(joint[0, :, 4], packed)
+    assert torch.equal(joint[0, :, 6], video_prior[0, :, 6])
+    assert torch.equal(joint[0, :, 7], video_prior[0, :, 7])
+    assert result["video_frame_mask"].tolist() == [
+        [False, False, False, False, False, False, True, True, False]
+    ]
     assert torch.equal(result["endpoint_video"], joint + 10)
     assert result["effective_teacher_steps"] == 8
 
+    with pytest.raises(ValueError, match=r"\[B,16,9,28,28\]"):
+        _run_same_prior_endpoint(
+            model,
+            _data_batch(),
+            _latent_indices(),
+            torch.zeros(1, 16, 9, 14, 14),
+            action_prior,
+            teacher_steps=8,
+        )
 
-def test_same_prior_worker_rejects_nonfinite_or_wrong_action_shape():
+
+def test_same_prior_npz_loader_rejects_dtype_before_fingerprinting():
     from distillation_flowmap.cosmos_policy_raw_worker import (
-        _run_same_prior_endpoint,
+        _load_same_prior_arrays,
     )
 
-    class ExplicitPriorModel:
-        def generate_samples_from_batch(self, data_batch, *, x_sigma_max, **kwargs):
-            return x_sigma_max
-
-    data_batch = {"action_latent_idx": torch.tensor([1])}
-    video_prior = torch.zeros(1, 16, 5, 2, 2)
-
-    with pytest.raises(ValueError, match="finite"):
-        bad_video = video_prior.clone()
-        bad_video[0, 0, 0, 0, 0] = float("nan")
-        _run_same_prior_endpoint(
-            ExplicitPriorModel(),
-            data_batch,
-            {},
-            bad_video,
-            torch.zeros(1, 16, 7),
-            teacher_steps=8,
+    float64_video = np.zeros((1, 16, 9, 28, 28), dtype=np.float64)
+    with pytest.raises(ValueError, match="video_prior.*float32"):
+        _load_same_prior_arrays(
+            {
+                "video_prior": float64_video,
+                "action_prior": np.zeros((1, 16, 7), dtype=np.float32),
+            }
         )
-    with pytest.raises(ValueError, match=r"\[B,16,7\]"):
-        _run_same_prior_endpoint(
-            ExplicitPriorModel(),
-            data_batch,
-            {},
-            video_prior,
-            torch.zeros(1, 4),
-            teacher_steps=8,
+
+    video = np.arange(16 * 9 * 28 * 28, dtype=np.float32).reshape(
+        1, 16, 9, 28, 28
+    )
+    action = np.arange(16 * 7, dtype=np.float32).reshape(1, 16, 7)
+    loaded_video, loaded_action, video_sha, action_sha = _load_same_prior_arrays(
+        {"video_prior": video, "action_prior": action}
+    )
+    assert loaded_video.dtype == np.float32
+    assert loaded_action.dtype == np.float32
+    assert video_sha == hashlib.sha256(
+        np.ascontiguousarray(video).view(np.uint8)
+    ).hexdigest()
+    assert action_sha == hashlib.sha256(
+        np.ascontiguousarray(action).view(np.uint8)
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "endpoint_dtype,mask_dtype,match",
+    [
+        (torch.bfloat16, torch.bool, "endpoint.*float32"),
+        (torch.float32, torch.uint8, "mask.*boolean"),
+    ],
+)
+def test_same_prior_response_serialization_rejects_backend_dtype_drift(
+    endpoint_dtype, mask_dtype, match
+):
+    from distillation_flowmap.cosmos_policy_raw_worker import (
+        _same_prior_response_fields,
+    )
+
+    with pytest.raises(RuntimeError, match=match):
+        _same_prior_response_fields(
+            {
+                "endpoint_video": torch.zeros(
+                    1, 16, 9, 28, 28, dtype=endpoint_dtype
+                ),
+                "video_frame_mask": torch.zeros(1, 9, dtype=mask_dtype),
+                "effective_teacher_steps": 8,
+            },
+            video_prior_sha256="v",
+            action_prior_sha256="a",
         )
+
+
+def test_worker_main_closes_loaded_npz_when_request_fails(monkeypatch):
+    import distillation_flowmap.cosmos_policy_raw_worker as worker
+
+    fake_data = {
+        "primary_image": np.zeros((0, 2, 2, 3), dtype=np.uint8),
+        "wrist_image": np.zeros((0, 2, 2, 3), dtype=np.uint8),
+        "proprio": np.zeros((0, 9), dtype=np.float32),
+    }
+
+    class LoadedNpz:
+        closed = False
+
+        def __getitem__(self, key):
+            return fake_data[key]
+
+        def close(self):
+            self.closed = True
+
+    loaded = LoadedNpz()
+    monkeypatch.setattr(worker.np, "load", lambda path: loaded)
+    monkeypatch.setattr(
+        worker,
+        "_parse_args",
+        lambda: SimpleNamespace(
+            checkpoint_dir="checkpoint",
+            repo="",
+            config_name="config",
+            config_file="config.py",
+            dataset_stats_path="stats.json",
+            t5_embeddings_path="t5.pkl",
+            extra_pythonpath="",
+            num_denoising_steps_action=5,
+            seed=1,
+        ),
+    )
+
+    robot_name = (
+        "cosmos_predict2._src.predict2.cosmos_policy.experiments.robot"
+    )
+    cosmos_utils = ModuleType(f"{robot_name}.cosmos_utils")
+    cosmos_utils.get_action = lambda *args, **kwargs: None
+    cosmos_utils.get_model = lambda cfg: (object(), None)
+    cosmos_utils.init_t5_text_embeddings_cache = lambda *args, **kwargs: None
+    cosmos_utils.load_dataset_stats = lambda path: {}
+    robot_module = ModuleType(robot_name)
+    robot_module.cosmos_utils = cosmos_utils
+    for name in (
+        "cosmos_predict2",
+        "cosmos_predict2._src",
+        "cosmos_predict2._src.predict2",
+        "cosmos_predict2._src.predict2.cosmos_policy",
+        "cosmos_predict2._src.predict2.cosmos_policy.experiments",
+    ):
+        module = ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+    robot_module.__path__ = []
+    monkeypatch.setitem(sys.modules, robot_name, robot_module)
+    monkeypatch.setitem(sys.modules, f"{robot_name}.cosmos_utils", cosmos_utils)
+
+    request = {
+        "npz_path": "request.npz",
+        "actions_path": "response.npz",
+        "tasks": [],
+        "mode": "unsupported",
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request) + "\n"))
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+
+    worker.main()
+
+    assert loaded.closed is True

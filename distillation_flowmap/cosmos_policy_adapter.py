@@ -127,6 +127,18 @@ def _array_sha256(value):
     return hashlib.sha256(array.view(np.uint8)).hexdigest()
 
 
+def _require_exact_teacher_steps(value, *, error_cls=ValueError, source="request"):
+    if type(value) is not int:
+        raise error_cls(
+            f"same-prior {source} teacher steps must be an integer equal to 8"
+        )
+    if value != 8:
+        if source == "request":
+            raise error_cls("same-prior endpoint requires exactly 8 teacher steps")
+        raise error_cls(f"same-prior {source} teacher steps must equal 8")
+    return value
+
+
 def _as_task_list(value, batch_size):
     if isinstance(value, str):
         return [value] * batch_size
@@ -679,49 +691,65 @@ class CosmosPolicyActionTeacher:
     def _request_raw_worker_npz(self, payload, arrays):
         """Exchange one NPZ request/response with the persistent raw worker."""
         self._ensure_raw_worker()
-        req_dir = self._raw_worker_tmpdir or tempfile.mkdtemp(prefix="cosmos_policy_raw_")
+        owns_req_dir = self._raw_worker_tmpdir is None
+        req_dir = self._raw_worker_tmpdir or tempfile.mkdtemp(
+            prefix="cosmos_policy_raw_"
+        )
         fd, npz_path = tempfile.mkstemp(prefix="request_", suffix=".npz", dir=req_dir)
         os.close(fd)
         response_path = npz_path.replace("request_", "actions_")
-        np.savez_compressed(npz_path, **arrays)
-        request = dict(payload)
-        request.update(npz_path=npz_path, actions_path=response_path)
         try:
-            self._raw_worker.stdin.write(json.dumps(request) + "\n")
-            self._raw_worker.stdin.flush()
-            line = self._raw_worker.stdout.readline()
-        except BrokenPipeError as exc:
-            raise RuntimeError("Cosmos Policy raw worker exited before responding.") from exc
-        if not line:
+            np.savez_compressed(npz_path, **arrays)
+            request = dict(payload)
+            request.update(npz_path=npz_path, actions_path=response_path)
             try:
-                code = self._raw_worker.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                code = self._raw_worker.poll()
-            raise RuntimeError(
-                f"Cosmos Policy raw worker produced no response; exit code={code}"
-            )
-        response = json.loads(line)
-        if not response.get("ok", False):
-            raise RuntimeError(
-                "Cosmos Policy raw worker failed:\n"
-                + response.get("error", "unknown error")
-            )
-        actual_response_path = response.get("actions_path")
-        if actual_response_path != response_path:
-            raise RuntimeError("Cosmos Policy raw worker returned an unexpected response path")
-        try:
-            with np.load(actual_response_path) as data:
-                result = {}
-                for key in data.files:
-                    value = data[key]
-                    result[key] = value.item() if value.ndim == 0 else value.copy()
+                self._raw_worker.stdin.write(json.dumps(request) + "\n")
+                self._raw_worker.stdin.flush()
+                line = self._raw_worker.stdout.readline()
+            except BrokenPipeError as exc:
+                raise RuntimeError(
+                    "Cosmos Policy raw worker exited before responding."
+                ) from exc
+            if not line:
+                try:
+                    code = self._raw_worker.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    code = self._raw_worker.poll()
+                raise RuntimeError(
+                    f"Cosmos Policy raw worker produced no response; exit code={code}"
+                )
+            response = json.loads(line)
+            if not response.get("ok", False):
+                raise RuntimeError(
+                    "Cosmos Policy raw worker failed:\n"
+                    + response.get("error", "unknown error")
+                )
+            actual_response_path = response.get("actions_path")
+            if actual_response_path != response_path:
+                raise RuntimeError(
+                    "Cosmos Policy raw worker returned an unexpected response path"
+                )
+            with np.load(response_path) as data:
+                result = {
+                    key: (
+                        data[key].item()
+                        if data[key].ndim == 0
+                        else data[key].copy()
+                    )
+                    for key in data.files
+                }
+            return result
         finally:
-            for path in (npz_path, actual_response_path):
+            for path in (npz_path, response_path):
                 try:
                     os.remove(path)
-                except (OSError, TypeError):
+                except OSError:
                     pass
-        return result
+            if owns_req_dir:
+                try:
+                    os.rmdir(req_dir)
+                except OSError:
+                    pass
 
     def _predict_raw_action_result_subprocess(self, raw_batch, include_future=False):
         primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
@@ -999,9 +1027,7 @@ class CosmosPolicyActionTeacher:
         teacher_steps=8,
     ):
         """Run the official eight-step Cosmos teacher from caller-owned priors."""
-        teacher_steps = int(teacher_steps)
-        if teacher_steps != 8:
-            raise ValueError("same-prior endpoint requires exactly 8 teacher steps")
+        _require_exact_teacher_steps(teacher_steps)
 
         primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
         video_prior_np = np.ascontiguousarray(_as_numpy(video_prior))
@@ -1010,9 +1036,12 @@ class CosmosPolicyActionTeacher:
             raise ValueError("video_prior must use float32 without conversion")
         if action_prior_np.dtype != np.float32:
             raise ValueError("action_prior must use float32 without conversion")
-        if video_prior_np.ndim != 5:
+        if (
+            video_prior_np.ndim != 5
+            or tuple(video_prior_np.shape[1:]) != (16, 9, 28, 28)
+        ):
             raise ValueError(
-                "video_prior must have Cosmos joint latent shape [B,C,T,H,W]"
+                "video_prior must have Cosmos joint latent shape [B,16,9,28,28]"
             )
         if action_prior_np.ndim != 3 or action_prior_np.shape[1:] != (16, 7):
             raise ValueError(
@@ -1058,7 +1087,13 @@ class CosmosPolicyActionTeacher:
             raise RuntimeError(
                 f"same-prior worker response missing required fields: {missing}"
             )
-        if int(result["effective_teacher_steps"]) != teacher_steps:
+        effective_steps = result["effective_teacher_steps"]
+        _require_exact_teacher_steps(
+            effective_steps,
+            error_cls=RuntimeError,
+            source="response effective",
+        )
+        if effective_steps != teacher_steps:
             raise RuntimeError(
                 "same-prior worker returned an invalid effective teacher steps count"
             )
@@ -1087,7 +1122,7 @@ class CosmosPolicyActionTeacher:
         return {
             "endpoint_video": torch.from_numpy(endpoint.astype(np.float32)),
             "video_frame_mask": torch.from_numpy(frame_mask.copy()),
-            "effective_teacher_steps": teacher_steps,
+            "effective_teacher_steps": effective_steps,
             "video_prior_sha256": str(result["video_prior_sha256"]),
             "action_prior_sha256": str(result["action_prior_sha256"]),
         }

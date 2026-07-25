@@ -131,6 +131,157 @@ def _latent_indices():
     }
 
 
+def _cosmos_layout_module(repo):
+    source = (
+        repo
+        / "cosmos_predict2"
+        / "_src"
+        / "predict2"
+        / "cosmos_policy"
+        / "experiments"
+        / "robot"
+        / "cosmos_utils.py"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_text("# audited layout source fixture\n")
+    return SimpleNamespace(__file__=str(source))
+
+
+def _install_git_provenance(
+    monkeypatch,
+    worker,
+    repo,
+    *,
+    head="1eb8457072b4a1adfe1f83c3076e4aa5452cbab2",
+    status="",
+    metadata_available=True,
+):
+    def fake_run(command, **kwargs):
+        assert command[:3] == ["/usr/bin/git", "-C", str(repo.resolve())]
+        operation = tuple(command[3:])
+        if operation == ("rev-parse", "--show-toplevel"):
+            if not metadata_available:
+                return SimpleNamespace(
+                    returncode=128,
+                    stdout="",
+                    stderr="fatal: not a git repository",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=str(repo.resolve()) + "\n",
+                stderr="",
+            )
+        if operation == ("rev-parse", "HEAD"):
+            return SimpleNamespace(returncode=0, stdout=head + "\n", stderr="")
+        if operation == (
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ):
+            return SimpleNamespace(returncode=0, stdout=status, stderr="")
+        raise AssertionError(f"unexpected git command: {command}")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+
+def test_same_prior_model_load_accepts_only_audited_clean_layout_commit(
+    monkeypatch, tmp_path
+):
+    import distillation_flowmap.cosmos_policy_raw_worker as worker
+
+    repo = tmp_path / "cosmos"
+    cosmos_utils = _cosmos_layout_module(repo)
+    _install_git_provenance(monkeypatch, worker, repo)
+    sentinel = object()
+    loader_calls = []
+
+    def get_model(cfg):
+        loader_calls.append(cfg)
+        return sentinel, None
+
+    cfg = SimpleNamespace()
+    loaded = worker._model_for_request(
+        None,
+        mode="same_prior_endpoint",
+        repo=str(repo),
+        cosmos_utils=cosmos_utils,
+        cfg=cfg,
+        get_model=get_model,
+    )
+
+    assert loaded is sentinel
+    assert loader_calls == [cfg]
+
+
+@pytest.mark.parametrize(
+    ("git_fields", "match"),
+    [
+        (
+            {"head": "0000000000000000000000000000000000000000"},
+            "audited commit",
+        ),
+        (
+            {
+                "status": (
+                    " M cosmos_predict2/_src/predict2/cosmos_policy/"
+                    "experiments/robot/cosmos_utils.py\n"
+                )
+            },
+            "must be clean",
+        ),
+        ({"metadata_available": False}, "Git metadata"),
+    ],
+)
+def test_same_prior_provenance_rejection_precedes_model_invocation(
+    monkeypatch, tmp_path, git_fields, match
+):
+    import distillation_flowmap.cosmos_policy_raw_worker as worker
+
+    repo = tmp_path / "cosmos"
+    cosmos_utils = _cosmos_layout_module(repo)
+    _install_git_provenance(monkeypatch, worker, repo, **git_fields)
+    loader_calls = []
+
+    def get_model(cfg):
+        loader_calls.append(cfg)
+        return object(), None
+
+    with pytest.raises(RuntimeError, match=match):
+        worker._model_for_request(
+            None,
+            mode="same_prior_endpoint",
+            repo=str(repo),
+            cosmos_utils=cosmos_utils,
+            cfg=SimpleNamespace(),
+            get_model=get_model,
+        )
+
+    assert loader_calls == []
+
+
+def test_same_prior_rejects_layout_module_imported_outside_selected_repo(
+    monkeypatch, tmp_path
+):
+    import distillation_flowmap.cosmos_policy_raw_worker as worker
+
+    repo = tmp_path / "selected-cosmos"
+    _cosmos_layout_module(repo)
+    outside_module = _cosmos_layout_module(tmp_path / "other-cosmos")
+    loader_calls = []
+
+    with pytest.raises(RuntimeError, match="imported from selected repository"):
+        worker._model_for_request(
+            None,
+            mode="same_prior_endpoint",
+            repo=str(repo),
+            cosmos_utils=outside_module,
+            cfg=SimpleNamespace(),
+            get_model=lambda cfg: loader_calls.append(cfg),
+        )
+
+    assert loader_calls == []
+
+
 def test_explicit_prior_sampler_proves_runtime_and_observes_exact_edm_budget():
     from distillation_flowmap.cosmos_policy_raw_worker import (
         _generate_from_explicit_prior,

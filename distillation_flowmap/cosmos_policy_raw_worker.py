@@ -10,6 +10,8 @@ import hashlib
 import inspect
 import json
 import os
+from pathlib import Path
+import subprocess
 import sys
 import time
 import traceback
@@ -17,6 +19,13 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+
+
+_AUDITED_COSMOS_LAYOUT_COMMIT = "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
+_COSMOS_LAYOUT_SOURCE = Path(
+    "cosmos_predict2/_src/predict2/cosmos_policy/experiments/robot/"
+    "cosmos_utils.py"
+)
 
 
 def _parse_args():
@@ -122,6 +131,95 @@ def _require_exact_teacher_steps(value, *, error_cls=ValueError, source="request
 def _qualified_type_name(value):
     value_type = type(value)
     return f"{value_type.__module__}.{value_type.__name__}"
+
+
+def _run_layout_git(repo, *arguments):
+    git_env = os.environ.copy()
+    git_env.update(
+        GIT_OPTIONAL_LOCKS="0",
+        GIT_CONFIG_GLOBAL="/dev/null",
+        GIT_CONFIG_SYSTEM="/dev/null",
+        GIT_CONFIG_NOSYSTEM="1",
+    )
+    try:
+        result = subprocess.run(
+            ["/usr/bin/git", "-C", str(repo), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=git_env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            "same-prior Cosmos repository Git metadata is unverifiable"
+        ) from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "git failed"
+        raise RuntimeError(
+            "same-prior Cosmos repository Git metadata is unverifiable: "
+            f"{detail}"
+        )
+    return result.stdout
+
+
+def _validate_same_prior_layout_source(repo, cosmos_utils):
+    try:
+        repo_path = Path(repo).resolve(strict=True)
+        expected_source = (repo_path / _COSMOS_LAYOUT_SOURCE).resolve(strict=True)
+        imported_source = Path(cosmos_utils.__file__).resolve(strict=True)
+    except (AttributeError, OSError, TypeError) as exc:
+        raise RuntimeError(
+            "same-prior Cosmos layout source is missing or unverifiable"
+        ) from exc
+    if imported_source != expected_source:
+        raise RuntimeError(
+            "same-prior cosmos_utils must be imported from selected repository"
+        )
+
+    git_root_text = _run_layout_git(repo_path, "rev-parse", "--show-toplevel")
+    try:
+        git_root = Path(git_root_text.strip()).resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "same-prior Cosmos repository Git metadata is unverifiable"
+        ) from exc
+    if git_root != repo_path:
+        raise RuntimeError(
+            "same-prior selected Cosmos path must be the Git repository root"
+        )
+
+    head = _run_layout_git(repo_path, "rev-parse", "HEAD").strip()
+    if head != _AUDITED_COSMOS_LAYOUT_COMMIT:
+        raise RuntimeError(
+            "same-prior Cosmos repository must be at audited commit "
+            f"{_AUDITED_COSMOS_LAYOUT_COMMIT}, got {head!r}"
+        )
+    status = _run_layout_git(
+        repo_path,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    )
+    if status:
+        raise RuntimeError(
+            "same-prior Cosmos repository must be clean before model invocation"
+        )
+
+
+def _model_for_request(
+    model,
+    *,
+    mode,
+    repo,
+    cosmos_utils,
+    cfg,
+    get_model,
+):
+    if mode == "same_prior_endpoint":
+        _validate_same_prior_layout_source(repo, cosmos_utils)
+    if model is None:
+        model, _ = get_model(cfg)
+    return model
 
 
 def _validate_explicit_prior_runtime(model):
@@ -650,7 +748,7 @@ def main():
         embeddings_kind=cfg.text_embeddings_kind,
     )
     dataset_stats = load_dataset_stats(cfg.dataset_stats_path)
-    model, _ = get_model(cfg)
+    model = None
 
     for line in sys.stdin:
         data = None
@@ -662,6 +760,14 @@ def main():
             proprio = data["proprio"].astype(np.float32)
             tasks = request["tasks"]
             mode = request.get("mode", "actions")
+            model = _model_for_request(
+                model,
+                mode=mode,
+                repo=args.repo,
+                cosmos_utils=cosmos_utils,
+                cfg=cfg,
+                get_model=get_model,
+            )
             if mode == "same_prior_endpoint":
                 teacher_steps = request.get("teacher_steps")
                 _require_exact_teacher_steps(teacher_steps)

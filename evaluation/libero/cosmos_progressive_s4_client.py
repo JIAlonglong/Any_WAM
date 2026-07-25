@@ -65,6 +65,7 @@ class CosmosProgressiveS4Client:
         output_dir: str | Path,
         student_steps: int = 4,
         expected_s4_checkpoint: str | None = None,
+        expected_checkpoint_contract_identity: str | None = None,
         warmup_steps: int = 5,
         warmup_gripper: float = 0.0,
         skip_first_action: bool = False,
@@ -83,6 +84,7 @@ class CosmosProgressiveS4Client:
         self.expected_s4_checkpoint = (
             str(checkpoint) if checkpoint is not None else None
         )
+        self.expected_checkpoint_contract_identity = expected_checkpoint_contract_identity
         self.warmup_steps = int(warmup_steps)
         self.warmup_gripper = float(warmup_gripper)
         self.skip_first_action = bool(skip_first_action)
@@ -139,6 +141,12 @@ class CosmosProgressiveS4Client:
                 observed=response_checkpoint,
                 expected=self.expected_s4_checkpoint,
             )
+        if (
+            self.expected_checkpoint_contract_identity is not None
+            and response.get("checkpoint_contract_identity")
+            != self.expected_checkpoint_contract_identity
+        ):
+            raise ValueError("S4 service checkpoint_contract_identity mismatch")
 
     def _server_failure_record(
         self,
@@ -163,6 +171,7 @@ class CosmosProgressiveS4Client:
             "seed": int(rollout_seed),
             "student_steps": self.student_steps,
             "s4_checkpoint": record_checkpoint,
+            "checkpoint_contract_identity": self.expected_checkpoint_contract_identity,
             "done": False,
             "success": False,
             "server_failure": True,
@@ -281,6 +290,7 @@ class CosmosProgressiveS4Client:
                 "seed": int(rollout_seed),
                 "student_steps": self.student_steps,
                 "s4_checkpoint": self.expected_s4_checkpoint,
+                "checkpoint_contract_identity": self.expected_checkpoint_contract_identity,
                 "done": bool(done),
                 "success": bool(done),
                 "server_failure": False,
@@ -301,6 +311,7 @@ class CosmosProgressiveS4Client:
                 "seed": int(rollout_seed),
                 "student_steps": self.student_steps,
                 "s4_checkpoint": self.expected_s4_checkpoint,
+                "checkpoint_contract_identity": self.expected_checkpoint_contract_identity,
                 "done": False,
                 "success": False,
                 "server_failure": False,
@@ -369,6 +380,7 @@ class CosmosProgressiveS4Client:
                 "seed": rollout_seed,
                 "student_steps": self.student_steps,
                 "s4_checkpoint": self.expected_s4_checkpoint,
+                "checkpoint_contract_identity": self.expected_checkpoint_contract_identity,
                 "done": False,
                 "success": False,
                 "server_failure": False,

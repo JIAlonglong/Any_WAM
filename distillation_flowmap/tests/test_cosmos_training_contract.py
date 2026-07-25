@@ -12,11 +12,14 @@ from distillation_flowmap.cosmos_training_contract import (
     contract_metadata,
     validate_contract_metadata,
 )
-from distillation_flowmap.verify_cosmos_joint_training_contract import (
-    _verify_deployment_contract,
-    _write_new_attestation,
-    main as verifier_main,
-)
+
+
+def _verifier_module():
+    # The production verifier imports the strict Stage-2 config.  Keep pure
+    # contract tests runnable without a real Stage-1 checkpoint environment.
+    import distillation_flowmap.verify_cosmos_joint_training_contract as verifier
+
+    return verifier
 
 
 class _IntSubclass(int):
@@ -160,7 +163,7 @@ def test_stage1_validator_rejects_stage2_only_fields(field):
 
 
 def test_verifier_executes_exact_production_deployment_contract():
-    evidence = _verify_deployment_contract(_stage2_config(
+    evidence = _verifier_module()._verify_deployment_contract(_stage2_config(
         opd_aux_warmup_steps=8,
         opd_aux_interval=8,
         opd_aux_phase=2,
@@ -182,7 +185,7 @@ def test_verifier_executes_exact_production_deployment_contract():
 def test_contract_verifier_runs_production_action_round_trip(tmp_path):
     output = tmp_path / "attestation.json"
 
-    assert verifier_main(["--output", str(output)]) == 0
+    assert _verifier_module().main(["--output", str(output)]) == 0
     payload = json.loads(output.read_text())
 
     assert payload["action_round_trip"]["num_actions"] == 16
@@ -203,7 +206,7 @@ def test_contract_verifier_refuses_to_overwrite_existing_attestation(tmp_path):
     output.write_text('{"sentinel": true}\n')
 
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
-        verifier_main(["--output", str(output)])
+        _verifier_module().main(["--output", str(output)])
 
     assert output.read_text() == '{"sentinel": true}\n'
 
@@ -214,7 +217,7 @@ def test_attestation_refuses_dangling_symlink_destination(tmp_path):
     output.symlink_to(target.name)
 
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
-        _write_new_attestation(output, {"sentinel": True})
+        _verifier_module()._write_new_attestation(output, {"sentinel": True})
 
     assert output.is_symlink()
     assert os.readlink(output) == target.name
@@ -229,7 +232,7 @@ def test_concurrent_attestation_publication_has_one_complete_winner(tmp_path):
     def publish(index):
         barrier.wait()
         try:
-            _write_new_attestation(
+            _verifier_module()._write_new_attestation(
                 output,
                 {"writer": index, "body": "x" * 100_000},
             )
@@ -254,8 +257,64 @@ def test_verifier_resolves_git_commit_from_unrelated_cwd(tmp_path, monkeypatch):
     output = tmp_path / "attestation.json"
     monkeypatch.chdir(unrelated)
 
-    assert verifier_main(["--output", str(output)]) == 0
+    assert _verifier_module().main(["--output", str(output)]) == 0
     payload = json.loads(output.read_text())
 
     assert len(payload["git_commit"]) == 40
     assert set(payload["git_commit"]) <= set("0123456789abcdef")
+
+
+def test_inference_request_requires_explicit_matched_video_and_action_budgets():
+    import distillation_flowmap.cosmos_training_contract as contract
+
+    request = contract.normalize_cosmos_inference_request(
+        model_role="stage1_target",
+        video_steps=2,
+        action_steps=2,
+        student_steps=None,
+    )
+
+    assert request.model_role == "stage1_target"
+    assert request.video_steps == 2
+    assert request.action_steps == 2
+    assert request.student_steps == 2
+
+    with pytest.raises(ValueError, match="video_steps.*action_steps"):
+        contract.normalize_cosmos_inference_request(
+            model_role="stage1_target",
+            video_steps=1,
+            action_steps=2,
+            student_steps=None,
+        )
+
+
+def test_inference_request_supports_student_steps_only_as_unambiguous_alias():
+    import distillation_flowmap.cosmos_training_contract as contract
+
+    request = contract.normalize_cosmos_inference_request(
+        model_role="stage2_target",
+        video_steps=None,
+        action_steps=None,
+        student_steps=4,
+    )
+    assert (request.video_steps, request.action_steps, request.student_steps) == (4, 4, 4)
+
+    with pytest.raises(ValueError, match="student_steps"):
+        contract.normalize_cosmos_inference_request(
+            model_role="stage2_target",
+            video_steps=4,
+            action_steps=4,
+            student_steps=4,
+        )
+
+
+def test_official_teacher_matched_k_request_fails_closed_before_runtime_load():
+    import distillation_flowmap.cosmos_training_contract as contract
+
+    with pytest.raises(ValueError, match="official_teacher.*matched-K"):
+        contract.normalize_cosmos_inference_request(
+            model_role="official_teacher",
+            video_steps=2,
+            action_steps=2,
+            student_steps=None,
+        )

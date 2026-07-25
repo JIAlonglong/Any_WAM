@@ -111,6 +111,7 @@ seed_count = int(sys.argv[3])
 requested_steps = int(sys.argv[4])
 evaluation_classification = sys.argv[6]
 is_formal = sys.argv[7] == "1"
+expected_model_role = os.environ.get("S4_MODEL_ROLE", "stage2_target")
 shard_plan = {}
 for entry in sys.argv[5].split(";"):
     shard_text, start_text, end_text = entry.split(":")
@@ -125,6 +126,7 @@ if expected_tasks != tuple(range(10)):
 expected = {(task, seed) for task in expected_tasks for seed in range(seed_count)}
 seen = {}
 per_task = defaultdict(list)
+contract_identities = set()
 
 for record_path in sorted(root.glob("shard_*/seed_*/records/task_*_episode_*.json")):
     relative_parts = record_path.relative_to(root).parts
@@ -158,6 +160,14 @@ for record_path in sorted(root.glob("shard_*/seed_*/records/task_*_episode_*.jso
             f"step mismatch: expected={requested_steps} "
             f"got={record.get('student_steps')!r}"
         )
+    if record.get("model_role") != expected_model_role:
+        raise SystemExit(f"model_role mismatch: expected={expected_model_role!r} got={record.get('model_role')!r}")
+    if int(record.get("video_steps", -1)) != requested_steps or int(record.get("action_steps", -1)) != requested_steps:
+        raise SystemExit("video/action steps mismatch in formal record")
+    identity = record.get("checkpoint_contract_identity")
+    if not isinstance(identity, str) or not identity:
+        raise SystemExit("checkpoint_contract_identity missing in formal record")
+    contract_identities.add(identity)
     if record.get("s4_checkpoint") != expected_checkpoint:
         raise SystemExit(f"checkpoint mismatch: task={task} seed={seed} expected={expected_checkpoint!r} got={record.get('s4_checkpoint')!r}")
     key = (task, seed)
@@ -174,6 +184,8 @@ if missing:
     raise SystemExit(f"missing record: {len(missing)} required task/seed records absent, first={sorted(missing)[:5]}")
 if len(seen) != len(expected):
     raise SystemExit(f"duplicate record: expected {len(expected)} records, found {len(seen)}")
+if len(contract_identities) != 1:
+    raise SystemExit(f"checkpoint_contract_identity mismatch across formal records: {sorted(contract_identities)!r}")
 
 task_means = {str(task): sum(per_task[task]) / seed_count for task in expected_tasks}
 macro_success = sum(task_means[str(task)] for task in expected_tasks) / len(expected_tasks)
@@ -187,6 +199,10 @@ summary = {
     "schema": "cosmos_progressive_s4_formal_eval_v1",
     "checkpoint": expected_checkpoint,
     "student_steps": requested_steps,
+    "model_role": expected_model_role,
+    "video_steps": requested_steps,
+    "action_steps": requested_steps,
+    "checkpoint_contract_identity": next(iter(contract_identities)),
     "evaluation_classification": evaluation_classification,
     "is_formal": is_formal,
     "num_records": len(seen),
@@ -279,7 +295,9 @@ preflight_shard() {
         --empty-embedding "${S4_EMPTY_EMBEDDING}"
         --teacher-model-path "${COSMOS_POLICY_PATH}"
         --device cuda:0
-        --student-steps "${S4_STUDENT_STEPS}"
+        --model-role "${S4_MODEL_ROLE}"
+        --video-steps "${S4_STUDENT_STEPS}"
+        --action-steps "${S4_STUDENT_STEPS}"
         --preflight
     )
     emit_kv "PREFLIGHT_SHARD" "${shard}"
@@ -309,7 +327,9 @@ launch_shard() {
             --episodes 1
             --env-seed "${seed}"
             --episode-index-offset "${seed}"
-            --student-steps "${S4_STUDENT_STEPS}"
+            --model-role "${S4_MODEL_ROLE}"
+            --video-steps "${S4_STUDENT_STEPS}"
+            --action-steps "${S4_STUDENT_STEPS}"
         )
         if [[ -n "${S4_VIDEO_SEED_SET[${seed}]:-}" ]]; then
             command+=(--save-video)
@@ -438,6 +458,12 @@ case "${S4_STUDENT_STEPS}" in
     1|2|4) ;;
     *) die "S4_STUDENT_STEPS must be 1, 2, or 4" ;;
 esac
+S4_MODEL_ROLE="${S4_MODEL_ROLE:-stage2_target}"
+case "${S4_MODEL_ROLE}" in
+    stage2_online|stage2_target) ;;
+    *) die "S4_MODEL_ROLE must be stage2_online or stage2_target" ;;
+esac
+export S4_MODEL_ROLE
 S4_EVAL_CLASSIFICATION="${S4_EVAL_CLASSIFICATION:-unclassified}"
 S4_EVAL_IS_FORMAL="${S4_EVAL_IS_FORMAL:-0}"
 case "${S4_EVAL_IS_FORMAL}" in

@@ -37,6 +37,7 @@ def _base_env(tmp_path):
     env.pop("S4_VIDEO_SEEDS", None)
     env.pop("S4_FORMAL_NUM_SHARDS", None)
     env.pop("S4_STUDENT_STEPS", None)
+    env.pop("S4_MODEL_ROLE", None)
     env.pop("S4_DRY_RUN", None)
     env.pop("S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH", None)
     return env
@@ -72,9 +73,10 @@ def test_matrix_dry_run_plans_three_full_sequential_evaluations(tmp_path):
     assert result.stdout.count("REQUESTED_RECORDS=500") == 3
     assert result.stdout.count("FORMAL_NUM_SHARDS=4") == 3
     assert result.stdout.count("VIDEO_SEEDS=0,1") == 3
-    assert result.stdout.count("--student-steps 1") == 204
-    assert result.stdout.count("--student-steps 2") == 204
-    assert result.stdout.count("--student-steps 4") == 204
+    for step in (1, 2, 4):
+        assert result.stdout.count(f"--video-steps {step}") == 204
+        assert result.stdout.count(f"--action-steps {step}") == 204
+    assert "--student-steps" not in result.stdout
     assert not root.exists()
 
 
@@ -128,6 +130,10 @@ def _write_child_sentinel(path, *, fail_step=None, corrupt_step=None):
         + "summary = {\n"
         "    'checkpoint': str(pathlib.Path(os.environ['S4_CKPT_ROOT']).resolve()),\n"
         "    'student_steps': reported_step,\n"
+        "    'video_steps': step,\n"
+        "    'action_steps': step,\n"
+        "    'model_role': os.environ.get('S4_MODEL_ROLE', 'stage2_target'),\n"
+        "    'checkpoint_contract_identity': 'contract-v1',\n"
         "    'num_records': 500,\n"
         "    'evaluation_classification': os.environ['S4_EVAL_CLASSIFICATION'],\n"
         "    'is_formal': os.environ['S4_EVAL_IS_FORMAL'] == '1',\n"
@@ -138,6 +144,14 @@ def _write_child_sentinel(path, *, fail_step=None, corrupt_step=None):
         "    summary['checkpoint'] = '/wrong/checkpoint'\n"
         "if step == 2 and os.environ.get('CORRUPTION') == 'classification':\n"
         "    summary['evaluation_classification'] = 'wrong'\n"
+        "if step == 2 and os.environ.get('CORRUPTION') == 'model_role':\n"
+        "    summary['model_role'] = 'wrong-role'\n"
+        "if step == 2 and os.environ.get('CORRUPTION') == 'video_steps':\n"
+        "    summary['video_steps'] = 99\n"
+        "if step == 2 and os.environ.get('CORRUPTION') == 'action_steps':\n"
+        "    summary['action_steps'] = 99\n"
+        "if step == 2 and os.environ.get('CORRUPTION') == 'identity':\n"
+        "    summary['checkpoint_contract_identity'] = 'different-contract'\n"
         "(root / 'formal_summary.json').write_text(json.dumps(summary), encoding='utf-8')\n",
         encoding="utf-8",
     )
@@ -162,6 +176,15 @@ def test_live_matrix_runs_serially_reuses_k1_prompt_and_writes_summary(tmp_path)
     root = Path(env["MATRIX_ROOT"])
     assert log.read_text(encoding="utf-8").splitlines() == ["1", "2", "4"]
     assert (root / "k1" / "prompt_embeddings.pt").is_file()
+    for step in (1, 2, 4):
+        child_payload = json.loads(
+            (root / f"k{step}" / "formal_summary.json").read_text(encoding="utf-8")
+        )
+        assert child_payload["student_steps"] == step
+        assert child_payload["video_steps"] == step
+        assert child_payload["action_steps"] == step
+        assert child_payload["model_role"] == "stage2_target"
+        assert child_payload["checkpoint_contract_identity"] == "contract-v1"
     payload = json.loads((root / "matrix_summary.json").read_text(encoding="utf-8"))
     assert payload == {
         "schema": "cosmos_progressive_joint_124_matrix_v1",
@@ -169,6 +192,8 @@ def test_live_matrix_runs_serially_reuses_k1_prompt_and_writes_summary(tmp_path)
         "evaluation_classification": "formal_verified",
         "is_formal": True,
         "steps": [1, 2, 4],
+        "model_role": "stage2_target",
+        "checkpoint_contract_identity": "contract-v1",
         "summaries": {
             "1": str(root / "k1" / "formal_summary.json"),
             "2": str(root / "k2" / "formal_summary.json"),
@@ -327,6 +352,33 @@ def test_child_classification_must_match_before_matrix_publish(tmp_path):
     assert result.returncode != 0
     assert "evaluation classification mismatch" in result.stderr
     assert not (Path(env["MATRIX_ROOT"]) / "matrix_summary.json").exists()
+
+
+def test_child_contract_fields_must_match_before_matrix_publish(tmp_path):
+    for corruption, message in (
+        ("model_role", "model_role mismatch"),
+        ("video_steps", "video/action step mismatch"),
+        ("action_steps", "video/action step mismatch"),
+        ("identity", "checkpoint_contract_identity mismatch across K"),
+    ):
+        case = tmp_path / corruption
+        case.mkdir()
+        env = _base_env(case)
+        child = case / "corrupt-child.py"
+        _write_child_sentinel(child)
+        env.update(
+            {
+                "S4_FORMAL_LAUNCHER": str(child),
+                "SENTINEL_LOG": str(case / "child.log"),
+                "CORRUPTION": corruption,
+            }
+        )
+
+        result = _run("run", env=env)
+
+        assert result.returncode != 0
+        assert message in result.stderr
+        assert not (Path(env["MATRIX_ROOT"]) / "matrix_summary.json").exists()
 
 
 def test_caller_prompt_table_is_reused_for_all_children(tmp_path):

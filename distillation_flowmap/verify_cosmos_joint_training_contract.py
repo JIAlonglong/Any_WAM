@@ -12,9 +12,6 @@ from typing import Sequence
 import numpy as np
 import torch
 
-from distillation_flowmap.config_libero_cosmos_policy_stage2_progressive import (
-    cfg as stage2_config,
-)
 from distillation_flowmap.cosmos_policy_adapter import cosmos_actions_to_flowmap_x0
 from distillation_flowmap.cosmos_deployment_rollout import (
     deployment_endpoint_losses,
@@ -199,6 +196,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+    # Keep standalone atomic-attestation helpers importable for CPU tests; the
+    # strict production Stage-2 configuration is still imported before any
+    # actual contract attestation is generated.
+    from distillation_flowmap.config_libero_cosmos_policy_stage2_progressive import (
+        cfg as stage2_config,
+    )
+
     metadata = contract_metadata(stage2_config, stage="progressive_stage2")
     validate_contract_metadata(metadata, required_stage="progressive_stage2")
     num_actions, max_abs_error = _production_action_round_trip(stage2_config)

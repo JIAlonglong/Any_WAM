@@ -97,7 +97,7 @@ if [[ "${MODE}" == "dry-run" ]]; then
 fi
 
 "${PYTHON_BIN}" - "${MATRIX_ROOT}" "${S4_CKPT_ROOT}" \
-    "${S4_EVAL_CLASSIFICATION}" "${S4_EVAL_IS_FORMAL}" <<'PY'
+    "${S4_EVAL_CLASSIFICATION}" "${S4_EVAL_IS_FORMAL}" "${S4_MODEL_ROLE:-stage2_target}" <<'PY'
 import json
 import os
 import sys
@@ -107,6 +107,7 @@ root = Path(sys.argv[1])
 expected_checkpoint = str(Path(sys.argv[2]).resolve())
 expected_classification = sys.argv[3]
 expected_is_formal = sys.argv[4] == "1"
+expected_model_role = sys.argv[5]
 steps = (1, 2, 4)
 summary_paths = {
     str(step): root / f"k{step}" / "formal_summary.json" for step in steps
@@ -127,6 +128,10 @@ for step in steps:
             f"student_steps mismatch for K={step}: "
             f"got={payload.get('student_steps')!r}"
         )
+    if payload.get("model_role") != expected_model_role:
+        raise SystemExit(f"model_role mismatch for K={step}: {payload.get('model_role')!r}")
+    if int(payload.get("video_steps", -1)) != step or int(payload.get("action_steps", -1)) != step:
+        raise SystemExit(f"video/action step mismatch for K={step}")
     reported_checkpoint = payload.get("checkpoint")
     if not isinstance(reported_checkpoint, str):
         raise SystemExit(
@@ -149,12 +154,18 @@ for step in steps:
             f"got={payload.get('is_formal')!r}"
         )
 
+identities = {json.loads(path.read_text(encoding="utf-8")).get("checkpoint_contract_identity") for path in summary_paths.values()}
+if len(identities) != 1 or None in identities:
+    raise SystemExit(f"checkpoint_contract_identity mismatch across K: {sorted(identities)!r}")
+
 matrix_summary = {
     "schema": "cosmos_progressive_joint_124_matrix_v1",
     "checkpoint": expected_checkpoint,
     "evaluation_classification": expected_classification,
     "is_formal": expected_is_formal,
     "steps": list(steps),
+    "model_role": expected_model_role,
+    "checkpoint_contract_identity": next(iter(identities)),
     "summaries": {key: str(path) for key, path in summary_paths.items()},
 }
 output_path = root / "matrix_summary.json"

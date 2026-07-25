@@ -65,7 +65,9 @@ def test_formal_dry_run_assigns_two_student_worker_pairs_and_task_shards(tmp_pat
     assert "REQUESTED_SEEDS_PER_TASK=50" in output
     assert "REQUESTED_RECORDS=500" in output
     assert output.count("--env-seed") == 100
-    assert output.count("--student-steps 4") == 102
+    assert output.count("--model-role stage2_target") == 102
+    assert output.count("--video-steps 4") == 102
+    assert output.count("--action-steps 4") == 102
     assert output.count("--episode-index-offset") == 100
     assert "--save-video" not in output
 
@@ -108,7 +110,9 @@ def test_formal_four_shards_use_all_eight_gpus_and_joint_k2(tmp_path):
         (2, 4, 5, "6,8"),
         (3, 6, 7, "8,10"),
     ]
-    assert result.stdout.count("--student-steps 2") == 204
+    assert result.stdout.count("--model-role stage2_target") == 204
+    assert result.stdout.count("--video-steps 2") == 204
+    assert result.stdout.count("--action-steps 2") == 204
     assert result.stdout.count("--save-video") == 8
     assert result.stdout.count("--episode-index-offset") == 200
 
@@ -140,7 +144,9 @@ def test_formal_joint_k1_reaches_every_preflight_and_rollout(tmp_path):
     ]
     assert len(command_lines) == 102
     assert all(
-        tokens[tokens.index("--student-steps") + 1] == "1"
+        tokens[tokens.index("--model-role") + 1] == "stage2_target"
+        and tokens[tokens.index("--video-steps") + 1] == "1"
+        and tokens[tokens.index("--action-steps") + 1] == "1"
         for tokens in command_lines
     )
 
@@ -409,6 +415,10 @@ def test_formal_merge_writes_joint_k_and_accepts_four_shard_plan(tmp_path):
                             "seed": seed,
                             "s4_checkpoint": str(checkpoint.resolve()),
                             "student_steps": 2,
+                            "model_role": "stage2_target",
+                            "video_steps": 2,
+                            "action_steps": 2,
+                            "checkpoint_contract_identity": "test-contract-identity",
                             "success": (task + seed) % 2 == 0,
                         }
                     ),
@@ -427,6 +437,10 @@ def test_formal_merge_writes_joint_k_and_accepts_four_shard_plan(tmp_path):
         (output_root / "formal_summary.json").read_text(encoding="utf-8")
     )
     assert summary["student_steps"] == 2
+    assert summary["model_role"] == "stage2_target"
+    assert summary["video_steps"] == 2
+    assert summary["action_steps"] == 2
+    assert summary["checkpoint_contract_identity"] == "test-contract-identity"
     assert summary["num_records"] == 500
     assert summary["evaluation_classification"] == "formal_verified"
     assert summary["is_formal"] is True
@@ -529,6 +543,12 @@ def test_formal_merge_counts_real_failure_setup_and_skip_records_as_unsuccessful
                 / "records"
                 / f"task_{task}_episode_{seed}.json"
             )
+            record.update(
+                model_role="stage2_target",
+                video_steps=2,
+                action_steps=2,
+                checkpoint_contract_identity="test-contract-identity",
+            )
             record_path.parent.mkdir(parents=True, exist_ok=True)
             record_path.write_text(json.dumps(record), encoding="utf-8")
 
@@ -564,8 +584,12 @@ def test_formal_merge_rejects_real_checkpoint_mismatch_record(tmp_path):
             return {
                 "ok": True,
                 "action": np.zeros((16, 7), dtype=np.float32),
-                "student_steps": 2,
-                "s4_checkpoint": "/observed/wrong-checkpoint",
+                    "student_steps": 2,
+                    "s4_checkpoint": "/observed/wrong-checkpoint",
+                    "model_role": "stage2_target",
+                    "video_steps": 2,
+                    "action_steps": 2,
+                    "checkpoint_contract_identity": "test-contract-identity",
             }
 
     output_root = tmp_path / "formal output"
@@ -573,7 +597,8 @@ def test_formal_merge_rejects_real_checkpoint_mismatch_record(tmp_path):
         MismatchService(),
         output_dir=output_root / "shard_0" / "seed_0",
         student_steps=2,
-        expected_s4_checkpoint=checkpoint_id,
+            expected_s4_checkpoint=checkpoint_id,
+            expected_checkpoint_contract_identity="test-contract-identity",
     )
     record = client.run_with_env(
         env=_DoneEnv(),
@@ -588,6 +613,15 @@ def test_formal_merge_rejects_real_checkpoint_mismatch_record(tmp_path):
 
     assert record["s4_checkpoint"] == "/observed/wrong-checkpoint"
     assert record["expected_s4_checkpoint"] == checkpoint_id
+    record.update(
+        model_role="stage2_target",
+        video_steps=2,
+        action_steps=2,
+        checkpoint_contract_identity="test-contract-identity",
+    )
+    (output_root / "shard_0" / "seed_0" / "records" / "task_0_episode_0.json").write_text(
+        json.dumps(record), encoding="utf-8"
+    )
     result = _run_formal_merge(output_root, checkpoint)
     assert result.returncode != 0
     assert "checkpoint mismatch" in result.stderr

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 CONTRACT_VERSION = 2
@@ -7,6 +9,86 @@ ACTION_PACKING_SCHEMA = "downsample_survivor_v2"
 ACTION_DOWNSAMPLE_FACTOR = 4
 RAW_STAGE1 = "raw_stage1"
 PROGRESSIVE_STAGE2 = "progressive_stage2"
+SUPPORTED_COSMOS_STUDENT_STEPS = (1, 2, 4)
+SUPPORTED_COSMOS_MODEL_ROLES = (
+    "stage1_target",
+    "stage2_online",
+    "stage2_target",
+    "official_teacher",
+)
+
+
+@dataclass(frozen=True)
+class CosmosInferenceRequest:
+    """A fully resolved, matched-budget Cosmos inference request.
+
+    ``student_steps`` remains an output-only compatibility field.  Callers
+    should pass the explicit video/action budgets for every new request.
+    """
+
+    model_role: str
+    video_steps: int
+    action_steps: int
+    student_steps: int
+
+
+def normalize_cosmos_inference_request(
+    *,
+    model_role: str,
+    video_steps: int | None,
+    action_steps: int | None,
+    student_steps: int | None,
+) -> CosmosInferenceRequest:
+    """Validate an explicit matched video/action inference budget.
+
+    The historical scalar ``student_steps`` is accepted only as an
+    unambiguous alias.  The official Cosmos teacher has no verified
+    matched-K rollout adapter, so requests for it fail before model loading.
+    """
+
+    if model_role not in SUPPORTED_COSMOS_MODEL_ROLES:
+        raise ValueError(
+            "model_role must be one of "
+            f"{SUPPORTED_COSMOS_MODEL_ROLES!r}, got {model_role!r}"
+        )
+    if student_steps is not None:
+        if video_steps is not None or action_steps is not None:
+            raise ValueError(
+                "student_steps is a compatibility alias and cannot be combined "
+                "with video_steps or action_steps"
+            )
+        video_steps = student_steps
+        action_steps = student_steps
+    if video_steps is None or action_steps is None:
+        raise ValueError(
+            "video_steps and action_steps must both be explicitly provided"
+        )
+    if type(video_steps) is not int or video_steps not in SUPPORTED_COSMOS_STUDENT_STEPS:
+        raise ValueError(
+            "video_steps must be one of "
+            f"{SUPPORTED_COSMOS_STUDENT_STEPS!r}, got {video_steps!r}"
+        )
+    if type(action_steps) is not int or action_steps not in SUPPORTED_COSMOS_STUDENT_STEPS:
+        raise ValueError(
+            "action_steps must be one of "
+            f"{SUPPORTED_COSMOS_STUDENT_STEPS!r}, got {action_steps!r}"
+        )
+    if video_steps != action_steps:
+        raise ValueError(
+            "video_steps and action_steps must be equal for matched-budget "
+            f"evaluation, got {video_steps!r} and {action_steps!r}"
+        )
+    if model_role == "official_teacher":
+        raise ValueError(
+            "official_teacher matched-K inference is unavailable: no verified "
+            "Cosmos matched-K adapter is configured"
+        )
+    return CosmosInferenceRequest(
+        model_role=model_role,
+        video_steps=video_steps,
+        action_steps=action_steps,
+        student_steps=video_steps,
+    )
 
 _COMMON_CONTRACT = {
     "contract_version": CONTRACT_VERSION,

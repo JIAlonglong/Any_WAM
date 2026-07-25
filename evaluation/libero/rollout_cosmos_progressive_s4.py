@@ -36,15 +36,17 @@ from evaluation.libero.cosmos_progressive_s4_server import (
     S4_ACTION_DIM,
     S4_ACTION_STEPS,
     SUPPORTED_STUDENT_STEPS,
-    normalize_student_steps,
+)
+from distillation_flowmap.cosmos_training_contract import (
+    normalize_cosmos_inference_request,
+)
+from distillation_flowmap.cosmos_stage2_lineage import (
+    resolve_cosmos_inference_checkpoint,
 )
 
 
 _MIN_COSMOS_DRIVER = (570, 124, 6)
 _MIN_COSMOS_CUDA = (12, 8)
-_DEFAULT_COSMOS_PYTHON = "/root/nas/junjie/cosmos_predict2_5/envs/predict2_py310/bin/python"
-
-
 def _version_tuple(value: str) -> tuple[int, ...]:
     """Extract a comparable numeric version without importing CUDA packages."""
     return tuple(int(part) for part in re.findall(r"\d+", str(value)))
@@ -105,6 +107,24 @@ def _cosmos_python_cuda_version(cosmos_python: str | Path) -> str:
     return value
 
 
+def resolve_cosmos_policy_python() -> Path:
+    """Require an explicitly supplied official Cosmos worker interpreter."""
+
+    raw = os.environ.get("COSMOS_POLICY_PYTHON", "").strip()
+    if not raw:
+        raise CosmosRuntimePrerequisiteError(
+            "COSMOS_POLICY_PYTHON must explicitly name the official Cosmos cu128 "
+            "interpreter; no machine-local fallback is permitted."
+        )
+    path = Path(raw)
+    if not path.is_file():
+        raise CosmosRuntimePrerequisiteError(
+            f"Official Cosmos Python is missing: {path}. Set COSMOS_POLICY_PYTHON "
+            "to the cu128 Cosmos environment; do not substitute the Flash-WAM Python."
+        )
+    return path
+
+
 def require_live_s4_prerequisites(*, device: str, checkpoint_transformer: str | Path) -> None:
     """Reject unsupported live execution early, without spawning a Cosmos worker.
 
@@ -155,14 +175,7 @@ def require_live_s4_prerequisites(*, device: str, checkpoint_transformer: str | 
             "requires >=570.124.06. Do not start the raw worker on this host."
         )
 
-    cosmos_python = Path(
-        os.environ.get("COSMOS_POLICY_PYTHON", _DEFAULT_COSMOS_PYTHON)
-    )
-    if not cosmos_python.is_file():
-        raise CosmosRuntimePrerequisiteError(
-            f"Official Cosmos Python is missing: {cosmos_python}. Set COSMOS_POLICY_PYTHON "
-            "to the cu128 Cosmos environment; do not substitute the Flash-WAM Python."
-        )
+    cosmos_python = resolve_cosmos_policy_python()
     cosmos_cuda = _cosmos_python_cuda_version(cosmos_python)
     if _version_tuple(cosmos_cuda) < _MIN_COSMOS_CUDA:
         raise CosmosRuntimePrerequisiteError(
@@ -185,14 +198,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--empty-embedding", default=None)
     parser.add_argument("--teacher-model-path", default=None)
+    parser.add_argument(
+        "--model-role",
+        choices=("stage1_target", "stage2_online", "stage2_target", "official_teacher"),
+        default="stage2_target",
+        help="Checkpoint role; official_teacher is rejected until a matched-K adapter exists.",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--cfg-scale", type=float, default=3.0)
     parser.add_argument(
         "--student-steps",
         type=int,
         choices=SUPPORTED_STUDENT_STEPS,
-        default=4,
+        default=None,
+        help="Deprecated compatibility alias; use --video-steps and --action-steps.",
     )
+    parser.add_argument("--video-steps", type=int, choices=SUPPORTED_STUDENT_STEPS, default=None)
+    parser.add_argument("--action-steps", type=int, choices=SUPPORTED_STUDENT_STEPS, default=None)
     parser.add_argument("--anchor-record-dir", default="outputs/cosmos_progressive_s4/anchors")
     parser.add_argument("--output-dir", default="outputs/cosmos_progressive_s4")
     parser.add_argument("--libero-benchmark", default="libero_10")
@@ -219,6 +241,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Serve reset/infer JSON lines only; no LIBERO environment is constructed here.",
     )
     return parser.parse_args(argv)
+
+
+def resolve_cli_inference_request(args: argparse.Namespace):
+    """Resolve new explicit budgets while keeping an old bare CLI at K=4."""
+
+    student_steps = args.student_steps
+    if (
+        args.video_steps is None
+        and args.action_steps is None
+        and student_steps is None
+    ):
+        student_steps = 4
+    return normalize_cosmos_inference_request(
+        model_role=args.model_role,
+        video_steps=args.video_steps,
+        action_steps=args.action_steps,
+        student_steps=student_steps,
+    )
 
 
 def seed_live_rollout(seed: int) -> None:
@@ -369,6 +409,7 @@ class FlowMapJointS4Runner:
         build_paired_eval_timesteps: Any,
         empty_embedding: Any,
         cfg_scale: float,
+        model_role: str = "stage2_target",
     ) -> None:
         self.harness = harness
         self.config = config
@@ -379,6 +420,7 @@ class FlowMapJointS4Runner:
         self.build_paired_eval_timesteps = build_paired_eval_timesteps
         self.empty_embedding = empty_embedding
         self.cfg_scale = float(cfg_scale)
+        self.model_role = str(model_role)
 
     def __call__(
         self,
@@ -389,9 +431,17 @@ class FlowMapJointS4Runner:
         noise: Any,
         t1000: Any,
         t0: Any,
-        k_steps: int,
+        video_steps: int,
+        action_steps: int,
+        return_trajectory: bool = False,
     ) -> Any:
-        k_steps = normalize_student_steps(k_steps)
+        request = normalize_cosmos_inference_request(
+            model_role=self.model_role,
+            video_steps=video_steps,
+            action_steps=action_steps,
+            student_steps=None,
+        )
+        k_steps = request.student_steps
         torch = self.torch
         video_x0 = torch.as_tensor(video_x0, device=self.device, dtype=torch.bfloat16)
         video_noise = torch.as_tensor(noise, device=self.device, dtype=video_x0.dtype)
@@ -443,7 +493,7 @@ class FlowMapJointS4Runner:
         rollout_input["latent_dict"]["noisy_latents"] = video_noise
         rollout_input["latent_dict"]["timesteps"] = video_t
         with torch.no_grad():
-            _video, _field, _action_sequence, final_action = self.harness._student_euler_integrate(
+            integrated = self.harness._student_euler_integrate(
                 noisy_latents=rollout_input["latent_dict"]["noisy_latents"],
                 timesteps=video_t,
                 target_r=video_r,
@@ -457,13 +507,18 @@ class FlowMapJointS4Runner:
                 action_target_r=action_r,
                 return_final_action=True,
                 return_final_action_state=True,
+                return_trajectory=return_trajectory,
             )
+        if return_trajectory:
+            _video, _field, _action_sequence, final_action, trajectory = integrated
+        else:
+            _video, _field, _action_sequence, final_action = integrated
         if tuple(final_action.shape) != tuple(rollout_input["action_dict"]["noisy_latents"].shape):
             raise RuntimeError(
                 "S4 student returned an action state with an unexpected shape: "
                 f"{tuple(final_action.shape)}"
             )
-        return final_action
+        return (final_action, trajectory) if return_trajectory else final_action
 
 
 def run_joint_s4_student(
@@ -475,7 +530,8 @@ def run_joint_s4_student(
     noise: Any,
     t1000: Any,
     t0: Any,
-    k_steps: int,
+    video_steps: int,
+    action_steps: int,
 ) -> Any:
     """Named deployment hook used by the service and audit logs."""
     return runner(
@@ -485,15 +541,21 @@ def run_joint_s4_student(
         noise=noise,
         t1000=t1000,
         t0=t0,
-        k_steps=k_steps,
+        video_steps=video_steps,
+        action_steps=action_steps,
     )
 
 
 def build_live_service(args: argparse.Namespace) -> tuple[CosmosProgressiveS4Service, Any]:
     """Construct the live service without running any LIBERO environment."""
+    request = resolve_cli_inference_request(args)
+    resolved_checkpoint = resolve_cosmos_inference_checkpoint(
+        model_role=request.model_role,
+        checkpoint_transformer=args.checkpoint_transformer,
+    )
     require_live_s4_prerequisites(
         device=args.device,
-        checkpoint_transformer=args.checkpoint_transformer,
+        checkpoint_transformer=resolved_checkpoint.transformer_path,
     )
     import torch
 
@@ -504,7 +566,7 @@ def build_live_service(args: argparse.Namespace) -> tuple[CosmosProgressiveS4Ser
     prompt_table = PromptEmbeddingTable.from_file(args.prompt_table)
     empty_embedding = _load_empty_embedding(config.empty_emb_path, torch_module=torch, device=device)
     student = dependencies["load_stage1_model"](
-        Path(args.checkpoint_transformer), config, device, torch.bfloat16
+        Path(resolved_checkpoint.transformer_path), config, device, torch.bfloat16
     )
     harness = dependencies["StudentRolloutHarness"](student, config, device)
     teacher = dependencies["CosmosPolicyActionTeacher"](
@@ -529,6 +591,7 @@ def build_live_service(args: argparse.Namespace) -> tuple[CosmosProgressiveS4Ser
         build_paired_eval_timesteps=dependencies["build_paired_eval_timesteps"],
         empty_embedding=empty_embedding,
         cfg_scale=args.cfg_scale,
+        model_role=request.model_role,
     )
     engine = CosmosProgressiveS4Engine(
         cosmos_teacher=teacher,
@@ -539,11 +602,15 @@ def build_live_service(args: argparse.Namespace) -> tuple[CosmosProgressiveS4Ser
             runner, video_x0, action_x0, text_emb, **kwargs
         ),
         anchor_epsilon=float(getattr(config, "cosmos_latent_epsilon", 0.001)),
-        student_steps=args.student_steps,
+        model_role=request.model_role,
+        video_steps=request.video_steps,
+        action_steps=request.action_steps,
+        checkpoint_contract_identity=resolved_checkpoint.checkpoint_contract_identity,
     )
     service = CosmosProgressiveS4Service(
         engine=engine,
-        checkpoint_identifier=str(Path(args.checkpoint_transformer).resolve()),
+        checkpoint_identifier=resolved_checkpoint.transformer_path,
+        checkpoint_contract_identity=resolved_checkpoint.checkpoint_contract_identity,
         anchor_record_dir=args.anchor_record_dir,
     )
     return service, teacher
@@ -601,6 +668,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.serve_stdio:
         seed_live_rollout(args.env_seed)
 
+    request = resolve_cli_inference_request(args)
     service, teacher = build_live_service(args)
     try:
         if args.serve_stdio:
@@ -609,8 +677,15 @@ def main(argv: list[str] | None = None) -> int:
         client = CosmosProgressiveS4Client(
             service,
             output_dir=args.output_dir,
-            student_steps=args.student_steps,
-            expected_s4_checkpoint=str(Path(args.checkpoint_transformer).resolve()),
+            student_steps=request.student_steps,
+            expected_s4_checkpoint=getattr(
+                service,
+                "checkpoint_identifier",
+                str(Path(args.checkpoint_transformer).resolve()),
+            ),
+            expected_checkpoint_contract_identity=getattr(
+                service, "checkpoint_contract_identity", None
+            ),
             warmup_steps=args.warmup_steps,
             warmup_gripper=args.warmup_gripper,
             skip_first_action=args.skip_first_action,

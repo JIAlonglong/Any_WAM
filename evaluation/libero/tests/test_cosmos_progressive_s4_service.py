@@ -142,7 +142,10 @@ def test_every_infer_request_queries_a_fresh_cosmos_raw_anchor(tmp_path):
     second = service.infer({"obs": OBS, "prompt": "open the drawer"})
 
     assert len(teacher.calls) == 2
-    assert [call["k_steps"] for call in joint_calls] == [2, 2]
+    assert [(call["video_steps"], call["action_steps"]) for call in joint_calls] == [
+        (2, 2),
+        (2, 2),
+    ]
     assert all(call["include_cdiff"] is False for call in teacher.calls)
     assert first["action"].shape == (16, 7)
     assert first["action"].dtype == np.float32
@@ -505,6 +508,59 @@ def test_client_rejects_reset_student_steps_mismatch_before_infer(tmp_path):
     assert persisted["student_steps"] == 2
 
 
+def test_engine_uses_explicit_matched_video_and_action_budgets_and_reports_them():
+    teacher = _RecordingTeacher()
+    calls = []
+
+    def run_joint_student(_video_x0, _action_x0, _text_emb, **kwargs):
+        calls.append(kwargs)
+        return np.zeros((1, 7, 4, 4, 1), dtype=np.float32)
+
+    engine = CosmosProgressiveS4Engine(
+        cosmos_teacher=teacher,
+        prompt_table=PromptEmbeddingTable(
+            {"open the drawer": np.zeros((1, 512, 4096), dtype=np.float32)}
+        ),
+        action_template=_template(),
+        action_encoder=lambda raw_actions: raw_actions,
+        joint_s4_runner=run_joint_student,
+        anchor_noise_factory=lambda: np.ones((1, 16, 9, 28, 28), dtype=np.float32),
+        video_steps=2,
+        action_steps=2,
+    )
+    service = CosmosProgressiveS4Service(
+        engine=engine,
+        checkpoint_identifier="s4-checkpoint",
+    )
+
+    response = service.infer({"obs": OBS, "prompt": "open the drawer"})
+
+    assert calls[0]["video_steps"] == 2
+    assert calls[0]["action_steps"] == 2
+    assert "k_steps" not in calls[0]
+    assert response["video_steps"] == 2
+    assert response["action_steps"] == 2
+    assert response["student_steps"] == 2
+
+
+def test_engine_rejects_mismatched_or_ambiguous_legacy_step_arguments():
+    common = dict(
+        cosmos_teacher=_RecordingTeacher(),
+        prompt_table=PromptEmbeddingTable(
+            {"open the drawer": np.zeros((1, 512, 4096), dtype=np.float32)}
+        ),
+        action_template=_template(),
+        action_encoder=lambda raw_actions: raw_actions,
+        joint_s4_runner=lambda *_args, **_kwargs: np.zeros((1, 7, 4, 4, 1), dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match="video_steps.*action_steps"):
+        CosmosProgressiveS4Engine(**common, video_steps=1, action_steps=2)
+    with pytest.raises(ValueError, match="student_steps"):
+        CosmosProgressiveS4Engine(
+            **common, video_steps=2, action_steps=2, student_steps=2
+        )
+
+
 class _MissingResetStepsService:
     def __init__(self):
         self.calls = 0
@@ -798,6 +854,46 @@ def test_live_runtime_preflight_rejects_cpu_with_actionable_error(tmp_path):
             device="cpu",
             checkpoint_transformer=tmp_path / "s4-checkpoint",
         )
+
+
+def test_cosmos_policy_python_has_no_machine_local_fallback(monkeypatch):
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    monkeypatch.delenv("COSMOS_POLICY_PYTHON", raising=False)
+    with pytest.raises(RuntimeError, match="COSMOS_POLICY_PYTHON must explicitly"):
+        rollout.resolve_cosmos_policy_python()
+
+
+def test_live_service_resolves_checkpoint_role_before_cuda_preflight(monkeypatch):
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    events = []
+    args = SimpleNamespace(
+        model_role="stage2_target",
+        video_steps=2,
+        action_steps=2,
+        student_steps=None,
+        checkpoint_transformer="/untrusted/checkpoint",
+        device="cuda:0",
+    )
+
+    resolved = SimpleNamespace(transformer_path="/validated/target/transformer")
+    monkeypatch.setattr(
+        rollout,
+        "resolve_cosmos_inference_checkpoint",
+        lambda **kwargs: events.append(("resolve", kwargs)) or resolved,
+    )
+
+    def stop_at_preflight(**kwargs):
+        events.append(("preflight", kwargs))
+        raise RuntimeError("stop before model construction")
+
+    monkeypatch.setattr(rollout, "require_live_s4_prerequisites", stop_at_preflight)
+    with pytest.raises(RuntimeError, match="stop before model construction"):
+        rollout.build_live_service(args)
+
+    assert [name for name, _kwargs in events] == ["resolve", "preflight"]
+    assert events[1][1]["checkpoint_transformer"] == "/validated/target/transformer"
 
 
 def _cuda_available_torch(*, device_count=1):
@@ -1198,7 +1294,7 @@ def test_stdio_builds_service_without_seeding(monkeypatch):
     ]
 
 
-def test_cli_defaults_joint_student_steps_to_four():
+def test_cli_exposes_explicit_video_and_action_budgets_without_implicit_default():
     from evaluation.libero.rollout_cosmos_progressive_s4 import parse_args
 
     args = parse_args(
@@ -1210,9 +1306,24 @@ def test_cli_defaults_joint_student_steps_to_four():
         ]
     )
 
-    assert args.student_steps == 4
+    assert args.student_steps is None
+    assert args.video_steps is None
+    assert args.action_steps is None
     assert args.save_video is False
     assert args.episode_index_offset == 0
+
+    explicit = parse_args(
+        [
+            "--checkpoint-transformer", "/tmp/s4-transformer",
+            "--prompt-table", "/tmp/training-prompt-table.pt",
+            "--model-role", "stage2_target",
+            "--video-steps", "4",
+            "--action-steps", "4",
+        ]
+    )
+    assert (explicit.model_role, explicit.video_steps, explicit.action_steps) == (
+        "stage2_target", 4, 4
+    )
 
 
 @pytest.mark.parametrize("steps", [0, 3, 5])
@@ -1260,6 +1371,43 @@ def test_s4_action_encoder_preserves_sixteen_decodable_actions_after_downsample(
     assert captured["target_shape"] == (1, 7, 16, 4, 1)
     assert captured["packing_schema"] == "downsample_survivor_v2"
     assert captured["downsample_factor"] == 4
+
+
+def test_action_packing_and_service_decode_round_trip_all_sixteen_actions():
+    """The 4x4 carrier must preserve distinct raw actions, not merely its shape."""
+    import torch
+
+    from evaluation.libero.rollout_cosmos_progressive_s4 import FlowMapActionAnchorEncoder
+
+    raw_actions = torch.linspace(-0.9, 0.9, 16 * 7, dtype=torch.float32).reshape(1, 16, 7)
+    seen = {}
+
+    def converter(actions, *, target_shape, **kwargs):
+        seen.update(kwargs)
+        seen["target_shape"] = target_shape
+        seen["actions"] = actions.clone()
+        packed = torch.zeros(target_shape, dtype=actions.dtype)
+        packed[:, :, ::4, :, 0] = actions.reshape(1, 4, 4, 7).permute(0, 3, 1, 2)
+        return packed
+
+    config = SimpleNamespace(
+        inverse_used_action_channel_ids=list(range(7)),
+        action_per_frame=4,
+        action_packing_schema="downsample_survivor_v2",
+        action_downsample_factor=4,
+        norm_stat={"q01": [-1.0] * 7, "q99": [1.0] * 7},
+    )
+    encoder = FlowMapActionAnchorEncoder(
+        config=config, device="cpu", torch_module=torch, converter=converter
+    )
+    packed = encoder(raw_actions)
+    decoded = decode_student_action(packed[:, :, ::4], _template())
+
+    assert seen["actions"].shape == (1, 16, 7)
+    assert seen["target_shape"] == (1, 7, 16, 4, 1)
+    assert seen["downsample_factor"] == 4
+    assert config.action_per_frame == 4
+    np.testing.assert_allclose(decoded, raw_actions[0].numpy(), rtol=0, atol=1e-6)
 
 
 @pytest.mark.parametrize("steps", [1, 2, 4])
@@ -1350,7 +1498,8 @@ def test_joint_runner_uses_requested_steps_for_video_and_action(steps):
         noise=video_noise,
         t1000=np.ones((1, 9), dtype=np.float32),
         t0=np.zeros((1, 9), dtype=np.float32),
-        k_steps=steps,
+        video_steps=steps,
+        action_steps=steps,
     )
 
     assert len(harness.calls) == 1
@@ -1378,3 +1527,83 @@ def test_joint_runner_uses_requested_steps_for_video_and_action(steps):
     decoded = decode_student_action(final_action, _template())
     assert decoded.shape == (16, 7)
     assert decoded.dtype == np.float32
+
+
+@pytest.mark.parametrize("steps", [1, 2, 4])
+def test_joint_runner_cpu_nonlinear_trajectory_matches_training_integrator(steps):
+    """Service must expose the exact states produced by the shared integrator."""
+    import torch
+
+    from evaluation.libero.rollout_cosmos_progressive_s4 import FlowMapJointS4Runner
+
+    class NonlinearHarness:
+        def __init__(self):
+            self.calls = []
+            self.action_trajectories = []
+
+        def _student_euler_integrate(self, **kwargs):
+            self.calls.append(kwargs)
+            state = kwargs["noisy_latents"].float()
+            trajectory = []
+            action_state = kwargs["base_input_dict"]["action_dict"]["noisy_latents"].float()
+            action_trajectory = []
+            for index in range(kwargs["K_steps"]):
+                state = state + torch.tanh(state + float(index + 1)) / float(index + 1)
+                trajectory.append(state.clone())
+                action_state = action_state + torch.sin(action_state + float(index + 1)) / float(index + 2)
+                action_trajectory.append(action_state.clone())
+            self.action_trajectories.append(tuple(action_trajectory))
+            return state, torch.zeros_like(state), None, action_state, tuple(trajectory)
+
+    def prepare_base_dict(_batch, _config, _device):
+        return {"latent_dict": {}, "action_dict": {}, "chunk_size": 1, "window_size": 1}
+
+    def paired(**kwargs):
+        return (
+            torch.full((1, kwargs["video_frames"]), float(kwargs["t"])),
+            torch.full((1, kwargs["video_frames"]), float(kwargs["r"])),
+            torch.full((1, kwargs["action_frames"]), float(kwargs["t"])),
+            torch.full((1, kwargs["action_frames"]), float(kwargs["r"])),
+        )
+
+    def student_input(batch, base, video_x0, video_noise, video_t, action_noise, action_t, action_downsample):
+        return ({"latent_dict": {"noisy_latents": video_noise, "timesteps": video_t},
+                 "action_dict": {"noisy_latents": batch["actions"][:, :, ::action_downsample]},
+                 "chunk_size": 1, "window_size": 1}, action_noise)
+
+    harness = NonlinearHarness()
+    runner = FlowMapJointS4Runner(
+        harness=harness, config=SimpleNamespace(action_downsample_factor=4), device="cpu",
+        torch_module=torch, prepare_base_dict=prepare_base_dict, student_input=student_input,
+        build_paired_eval_timesteps=paired, empty_embedding=None, cfg_scale=1.0,
+    )
+    video = torch.full((1, 16, 9, 28, 28), 0.2)
+    action = torch.zeros((1, 7, 16, 4, 1))
+    text = torch.zeros((1, 512, 4096))
+    service_action, service_trajectory = runner(
+        video, action, text, noise=video, t1000=np.ones((1, 9)), t0=np.zeros((1, 9)),
+        video_steps=steps, action_steps=steps, return_trajectory=True,
+    )
+    _final, _field, _sequence, training_action, training_trajectory = (
+        harness._student_euler_integrate(**harness.calls[0])
+    )
+    assert len(service_trajectory) == steps
+    assert len(training_trajectory) == steps
+    for service_state, training_state in zip(service_trajectory, training_trajectory):
+        torch.testing.assert_close(service_state, training_state, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(service_action, training_action, rtol=1e-4, atol=1e-4)
+    for service_action_state, training_action_state in zip(
+        harness.action_trajectories[0], harness.action_trajectories[1]
+    ):
+        torch.testing.assert_close(
+            service_action_state, training_action_state, rtol=1e-4, atol=1e-4
+        )
+    service_call = harness.calls[0]
+    training_call = harness.calls[1]
+    torch.testing.assert_close(service_call["timesteps"], training_call["timesteps"])
+    torch.testing.assert_close(
+        service_call["action_target_r"], training_call["action_target_r"]
+    )
+    assert service_call["base_input_dict"]["action_dict"]["noisy_latents"].shape == (
+        1, 7, 4, 4, 1
+    )

@@ -18,6 +18,10 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from distillation_flowmap.cosmos_training_contract import (
+    normalize_cosmos_inference_request,
+)
+
 
 S4_ACTION_STEPS = 16
 S4_ACTION_DIM = 7
@@ -361,7 +365,11 @@ class CosmosProgressiveS4Engine:
         joint_s4_runner: Callable[..., Any],
         anchor_noise_factory: Callable[[], Any] | None = None,
         anchor_epsilon: float = 0.001,
-        student_steps: int = 4,
+        model_role: str = "stage2_target",
+        video_steps: int | None = None,
+        action_steps: int | None = None,
+        student_steps: int | None = None,
+        checkpoint_contract_identity: str | None = None,
     ) -> None:
         self.anchor_worker = SharedNpzCosmosAnchorWorker(cosmos_teacher)
         self.prompt_table = prompt_table
@@ -370,7 +378,19 @@ class CosmosProgressiveS4Engine:
         self.joint_s4_runner = joint_s4_runner
         self.anchor_noise_factory = anchor_noise_factory or self._default_anchor_noise
         self.anchor_epsilon = float(anchor_epsilon)
-        self.student_steps = normalize_student_steps(student_steps)
+        if video_steps is None and action_steps is None and student_steps is None:
+            student_steps = 4
+        request = normalize_cosmos_inference_request(
+            model_role=model_role,
+            video_steps=video_steps,
+            action_steps=action_steps,
+            student_steps=student_steps,
+        )
+        self.model_role = request.model_role
+        self.video_steps = request.video_steps
+        self.action_steps = request.action_steps
+        self.student_steps = request.student_steps
+        self.checkpoint_contract_identity = checkpoint_contract_identity
         if self.anchor_epsilon <= 0:
             raise ValueError("anchor_epsilon must be positive")
 
@@ -429,7 +449,8 @@ class CosmosProgressiveS4Engine:
             noise=noise,
             t1000=t1000,
             t0=t0,
-            k_steps=self.student_steps,
+            video_steps=self.video_steps,
+            action_steps=self.action_steps,
         )
         action = decode_student_action(student_action, self.action_template)
         return S4Decision(
@@ -477,10 +498,12 @@ class CosmosProgressiveS4Service:
         *,
         engine: CosmosProgressiveS4Engine,
         checkpoint_identifier: str,
+        checkpoint_contract_identity: str | None = None,
         anchor_record_dir: str | Path | None = None,
     ) -> None:
         self.engine = engine
         self.checkpoint_identifier = _require_prompt(str(checkpoint_identifier))
+        self.checkpoint_contract_identity = checkpoint_contract_identity or engine.checkpoint_contract_identity
         self.anchor_ledger = RawAnchorLedger(anchor_record_dir)
 
     def infer(self, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -491,6 +514,10 @@ class CosmosProgressiveS4Service:
                 "ok": True,
                 "reset": True,
                 "s4_checkpoint": self.checkpoint_identifier,
+                "checkpoint_contract_identity": self.checkpoint_contract_identity,
+                "model_role": self.engine.model_role,
+                "video_steps": self.engine.video_steps,
+                "action_steps": self.engine.action_steps,
                 "student_steps": self.engine.student_steps,
             }
         prompt = _require_prompt(request.get("prompt", request.get("task")))
@@ -519,6 +546,10 @@ class CosmosProgressiveS4Service:
             "raw_anchor_record": anchor_record,
             "raw_anchor_shape": list(COSMOS_VIDEO_SHAPE),
             "s4_checkpoint": self.checkpoint_identifier,
+            "checkpoint_contract_identity": self.checkpoint_contract_identity,
+            "model_role": self.engine.model_role,
+            "video_steps": self.engine.video_steps,
+            "action_steps": self.engine.action_steps,
             "student_steps": self.engine.student_steps,
         }
 

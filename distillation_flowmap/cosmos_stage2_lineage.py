@@ -20,6 +20,19 @@ class ValidatedStage1Parent:
     contract_identity: str
 
 
+@dataclass(frozen=True)
+class ResolvedCosmosInferenceCheckpoint:
+    """A student checkpoint whose role and ancestry have been verified."""
+
+    model_role: str
+    training_stage: str
+    transformer_path: str
+    checkpoint_path: str
+    parent_stage1_path: str | None
+    cosmos_base_model_path: str
+    checkpoint_contract_identity: str
+
+
 def _reject_symlink_components(path: Path, *, label: str) -> None:
     absolute = path if path.is_absolute() else Path.cwd() / path
     anchor = Path(absolute.anchor)
@@ -319,3 +332,126 @@ def validate_stage2_path_isolation(
             raise ValueError(
                 f"resume checkpoint must remain within its own output arm: {output}"
             )
+
+
+def resolve_cosmos_inference_checkpoint(
+    *, model_role: str, checkpoint_transformer: Path
+) -> ResolvedCosmosInferenceCheckpoint:
+    """Resolve a model role to an independently validated student checkpoint.
+
+    This is deliberately called before constructing a model.  It makes the
+    variant (Stage-1 target, Stage-2 online, Stage-2 target) explicit and
+    rejects the official teacher until a real matched-K adapter exists.
+    """
+
+    allowed = {
+        "stage1_target": ("raw_stage1", "target_student"),
+        "stage2_online": ("progressive_stage2", "online_student"),
+        "stage2_target": ("progressive_stage2", "target_student"),
+    }
+    if model_role == "official_teacher":
+        raise ValueError(
+            "official_teacher matched-K inference is unavailable: no verified "
+            "Cosmos matched-K adapter is configured"
+        )
+    if model_role not in allowed:
+        raise ValueError(f"unsupported Cosmos inference model_role: {model_role!r}")
+
+    expected_stage, expected_variant = allowed[model_role]
+    transformer = Path(checkpoint_transformer)
+    _require_plain_directory(transformer, label="inference transformer")
+    if transformer.name != "transformer" or transformer.parent.name != expected_variant:
+        raise ValueError(
+            f"{model_role} must reference its {expected_variant}/transformer directory"
+        )
+    canonical_transformer = transformer.resolve(strict=True)
+
+    if expected_stage == "raw_stage1":
+        stage1_root = transformer.parent.parent
+        parent = validate_stage1_parent(stage1_root, expected_step=5000)
+        cosmos_base_model_path = _validated_cosmos_base_model_path(parent)
+        expected_transformer = (
+            Path(parent.canonical_path) / "target_student" / "transformer"
+        )
+        if canonical_transformer != expected_transformer:
+            raise ValueError("stage1_target does not match the validated Stage-1 target")
+        return ResolvedCosmosInferenceCheckpoint(
+            model_role=model_role,
+            training_stage=expected_stage,
+            transformer_path=str(canonical_transformer),
+            checkpoint_path=parent.canonical_path,
+            parent_stage1_path=None,
+            cosmos_base_model_path=cosmos_base_model_path,
+            checkpoint_contract_identity=parent.contract_identity,
+        )
+
+    checkpoint = transformer.parent.parent
+    _, payload = _read_json_object(
+        transformer / "config.json", label="inference transformer config.json"
+    )
+    step = payload.get("checkpoint_step")
+    if type(step) is not int:
+        raise ValueError("inference transformer checkpoint_step must be a plain integer")
+    parent_path = payload.get("parent_stage1_path")
+    if not isinstance(parent_path, str) or not parent_path:
+        raise ValueError("Stage-2 inference checkpoint is missing parent_stage1_path")
+    parent = validate_stage1_parent(Path(parent_path), expected_step=5000)
+    cosmos_base_model_path = _validated_cosmos_base_model_path(parent)
+    arm_root = checkpoint.parent.parent
+    canonical_checkpoint = validate_stage2_resume(
+        checkpoint,
+        arm_root=arm_root,
+        expected_step=step,
+        expected_parent=parent,
+    )
+    checkpoint_configs: dict[str, dict[str, object]] = {}
+    for variant in ("online_student", "target_student"):
+        _, variant_payload = _read_json_object(
+            canonical_checkpoint / variant / "transformer" / "config.json",
+            label=f"{variant} inference config.json",
+        )
+        if variant_payload.get("teacher_backend") != "cosmos_policy":
+            raise ValueError(
+                f"{variant} teacher_backend must be exactly 'cosmos_policy'"
+            )
+        checkpoint_configs[variant] = variant_payload
+        expected_stage1_student = Path(parent.canonical_path) / "target_student"
+        configured_student = variant_payload.get("student_base_model_path")
+        if (
+            not isinstance(configured_student, str)
+            or Path(configured_student).resolve(strict=False)
+            != expected_stage1_student.resolve(strict=True)
+        ):
+            raise ValueError(
+                f"{variant} student_base_model_path must exactly reference the "
+                "validated Stage-1 target_student"
+            )
+    return ResolvedCosmosInferenceCheckpoint(
+        model_role=model_role,
+        training_stage=expected_stage,
+        transformer_path=str(canonical_transformer),
+        checkpoint_path=str(canonical_checkpoint),
+        parent_stage1_path=parent.canonical_path,
+        cosmos_base_model_path=cosmos_base_model_path,
+        checkpoint_contract_identity=_canonical_json_digest(
+            {"checkpoint_path": str(canonical_checkpoint), "configs": checkpoint_configs}
+        ),
+    )
+
+
+def _validated_cosmos_base_model_path(parent: ValidatedStage1Parent) -> str:
+    """Read the original Cosmos policy base from verified Stage-1 metadata."""
+
+    _, payload = _read_json_object(
+        Path(parent.canonical_path) / "target_student" / "transformer" / "config.json",
+        label="Stage-1 target inference config.json",
+    )
+    configured = payload.get("student_base_model_path")
+    if not isinstance(configured, str) or not configured:
+        raise ValueError(
+            "Stage-1 target student_base_model_path must be a non-empty string"
+        )
+    base = Path(configured)
+    _require_plain_directory(base, label="student_base_model_path")
+    _require_plain_file(base / "config.json", label="student_base_model_path config.json")
+    return str(base.resolve(strict=True))

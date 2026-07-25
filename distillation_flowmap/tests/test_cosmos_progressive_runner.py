@@ -21,7 +21,12 @@ from distillation_flowmap.danceopd_query import (
     sample_nonterminal_semantic_query_indices,
     select_per_sample_trajectory_state,
 )
-from distillation_flowmap.distributed_safety import all_ranks_finite
+from distillation_flowmap.distributed_safety import (
+    NONFINITE_ORIGINS,
+    all_ranks_finite,
+    reduce_nonfinite_origins,
+)
+import distillation_flowmap.flowmap_step as flowmap_step_module
 from distillation_flowmap.opd_rollout_grad import (
     SUPPORTED_ROLLOUT_GRAD_MODES,
     rollout_step_requires_grad,
@@ -640,3 +645,509 @@ def test_aligned_cosmos_video_opd_reuses_one_generated_canonical_joint_state():
     assert result["opd_canonical_state_verified"].item() == 1
     assert "opd_action_endpoint_loss" not in result
     assert "opd_action_field_loss" not in result
+
+
+class _AlignedRecorderStudent(nn.Module):
+    def __init__(self, events=None):
+        super().__init__()
+        self.rollout_scale = nn.Parameter(torch.tensor(1.0))
+        self.field_scale = nn.Parameter(torch.tensor(0.5))
+        self.anchor_scale = nn.Parameter(torch.tensor(-0.5))
+        self.calls = []
+        self.events = events
+
+
+class _AlignedRecorderTeacher:
+    raw_inference_enabled = True
+
+    def __init__(
+        self,
+        *,
+        events=None,
+        canonical_mismatch=False,
+        endpoint_mask_mismatch=False,
+    ):
+        self.events = events
+        self.canonical_mismatch = canonical_mismatch
+        self.endpoint_mask_mismatch = endpoint_mask_mismatch
+        self.endpoint_call = None
+
+    def predict_raw_joint_latent_velocity(
+        self, batch, query_latent, query_action, t
+    ):
+        del batch
+        if self.events is not None:
+            self.events.append("teacher:field")
+        self.field_call = SimpleNamespace(
+            video=query_latent,
+            action=query_action,
+            t=t,
+        )
+        canonical = query_latent
+        if self.canonical_mismatch:
+            canonical = query_latent.clone()
+            canonical[0, :, 0] += 1.0
+        mask = torch.ones(
+            query_latent.shape[0],
+            query_latent.shape[2],
+            dtype=torch.bool,
+            device=query_latent.device,
+        )
+        return {
+            "cosmos_joint_query": canonical,
+            "cosmos_latent_velocity": torch.full_like(query_latent, 2.0),
+            "cosmos_video_frame_mask": mask,
+        }
+
+    def predict_raw_same_prior_endpoint(
+        self, batch, *, video_prior, action_prior, teacher_steps
+    ):
+        del batch
+        if self.events is not None:
+            self.events.append("teacher:endpoint")
+        self.endpoint_call = SimpleNamespace(
+            video_prior=video_prior,
+            action_prior=action_prior,
+            teacher_steps=teacher_steps,
+        )
+        mask = torch.ones(
+            video_prior.shape[0],
+            video_prior.shape[2],
+            dtype=torch.bool,
+            device=video_prior.device,
+        )
+        if self.endpoint_mask_mismatch:
+            mask = mask.clone()
+            mask[0, 0] = False
+        return {
+            "endpoint_video": torch.full_like(video_prior, -2.0),
+            "video_frame_mask": mask,
+            "effective_teacher_steps": 8,
+            "video_prior_sha256": "provider-verified",
+            "action_prior_sha256": "provider-verified",
+        }
+
+
+class _AlignedRecorderHarness:
+    def __init__(self, batch_size, teacher, events=None):
+        self.device = torch.device("cpu")
+        self.student = _AlignedRecorderStudent(events)
+        self._action_teacher_model = teacher
+        self.empty_emb = torch.zeros(1, 1, 1)
+        self.config = SimpleNamespace(
+            rank=0,
+            num_train_timesteps=1000,
+            cosmos_latent_channels=1,
+            cosmos_latent_frames=3,
+            cosmos_latent_height=1,
+            cosmos_latent_width=1,
+            action_downsample_factor=4,
+            action_packing_schema="downsample_survivor_v2",
+            used_action_channel_ids=list(range(7)),
+            snr_shift=5.0,
+            action_snr_shift=0.05,
+            opd_danceopd_rollout_steps=(2, 4),
+            cfg_min=1.0,
+            cfg_max=1.0,
+        )
+        self.batch_size = batch_size
+
+    @staticmethod
+    def convert_input_format(batch):
+        return batch
+
+    @staticmethod
+    def _prepare_base_dict(batch):
+        batch_size = batch["latents"].shape[0]
+        return {
+            "latent_dict": {
+                "latent": batch["latents"],
+                "cond_timesteps": torch.zeros(batch_size, 3),
+                "text_emb": torch.zeros(batch_size, 1, 1),
+                "grid_id": None,
+            },
+            "action_dict": {
+                "latent": batch["actions"],
+                "cond_timesteps": torch.zeros(batch_size, 16),
+                "text_emb": torch.zeros(batch_size, 1, 1),
+                "grid_id": None,
+                "actions_mask": torch.ones_like(batch["actions"][:, :1]),
+            },
+            "chunk_size": 1,
+            "window_size": 1,
+        }
+
+    @staticmethod
+    def _mechanism_joint_input(video, action, video_t, action_t, context):
+        return {
+            "latent_dict": {
+                **context["video_base"],
+                "noisy_latents": video,
+                "timesteps": video_t,
+            },
+            "action_dict": {
+                "noisy_latents": action,
+                "latent": context["action_latent"],
+                "timesteps": action_t,
+                "cond_timesteps": context["action_cond_t"],
+                "text_emb": context["action_text"],
+            },
+            "chunk_size": 1,
+            "window_size": 1,
+        }
+
+    @staticmethod
+    def _init_joint_mask(_joint_input):
+        return None
+
+    @staticmethod
+    def _extract_action_v(action, _frames):
+        return action
+
+    @staticmethod
+    def _timestep_to_sigma_5d(t):
+        return t[:, None, :, None, None] / 1000.0
+
+    def _student_joint_forward(
+        self,
+        model,
+        joint_input,
+        _empty,
+        video_r,
+        action_r,
+        *,
+        require_action,
+        **_kwargs,
+    ):
+        video = joint_input["latent_dict"]["noisy_latents"]
+        action = joint_input["action_dict"]["noisy_latents"]
+        kind = (
+            "rollout"
+            if require_action
+            else ("anchor" if bool((video_r == 0).all()) else "field")
+        )
+        model.calls.append(
+            SimpleNamespace(
+                kind=kind,
+                video=video,
+                action=action,
+                video_t=joint_input["latent_dict"]["timesteps"],
+                action_t=joint_input["action_dict"]["timesteps"],
+                video_r=video_r,
+                action_r=action_r,
+            )
+        )
+        if require_action:
+            return (
+                torch.ones_like(video) * model.rollout_scale,
+                torch.ones_like(action) * model.rollout_scale,
+            )
+        scale = model.anchor_scale if kind == "anchor" else model.field_scale
+        return torch.ones_like(video) * scale
+
+    def _joint_euler_update(
+        self, video, action, video_v, action_v, vt, vr, at, ar
+    ):
+        return (
+            video
+            + video_v
+            * (self._timestep_to_sigma_5d(vr) - self._timestep_to_sigma_5d(vt)),
+            action
+            + action_v
+            * (self._timestep_to_sigma_5d(ar) - self._timestep_to_sigma_5d(at)),
+        )
+
+
+class _ScriptedAllRanksFinite:
+    def __init__(self, outcomes=None, events=None):
+        self.outcomes = list(outcomes or ())
+        self.events = events
+        self.calls = []
+
+    def __call__(self, local_finite, *, device):
+        del device
+        call_index = len(self.calls)
+        local_finite = bool(local_finite)
+        self.calls.append(local_finite)
+        if self.events is not None:
+            self.events.append(f"gate:{call_index}")
+        if self.outcomes:
+            return bool(self.outcomes.pop(0))
+        return local_finite
+
+
+class _ScriptedOriginDist:
+    class ReduceOp:
+        MAX = "max"
+
+    def __init__(self, *, remote_origin=None, events=None):
+        self.remote_origin = remote_origin
+        self.events = events
+        self.call_index = 0
+
+    @staticmethod
+    def is_available():
+        return True
+
+    @staticmethod
+    def is_initialized():
+        return True
+
+    def all_reduce(self, value, op):
+        assert op == self.ReduceOp.MAX
+        origin = NONFINITE_ORIGINS[self.call_index]
+        if self.events is not None:
+            self.events.append(f"origin:{origin}")
+        if origin == self.remote_origin:
+            value.fill_(1)
+        self.call_index += 1
+
+
+def _aligned_recording_case(
+    *,
+    batch_size=1,
+    query_indices=None,
+    all_rank_outcomes=None,
+    events=None,
+    canonical_mismatch=False,
+    endpoint_mask_mismatch=False,
+):
+    teacher = _AlignedRecorderTeacher(
+        events=events,
+        canonical_mismatch=canonical_mismatch,
+        endpoint_mask_mismatch=endpoint_mask_mismatch,
+    )
+    gate = _ScriptedAllRanksFinite(all_rank_outcomes, events)
+    overrides = {"all_ranks_finite": gate}
+    if query_indices is not None:
+        forced = torch.as_tensor(query_indices, dtype=torch.long)
+        overrides["sample_nonterminal_semantic_query_indices"] = (
+            lambda _sigmas, batch_size: forced.clone()
+        )
+
+    class Harness(_AlignedRecorderHarness):
+        pass
+
+    Harness._cosmos_aligned_video_opd_step = _flowmap_method(
+        "_cosmos_aligned_video_opd_step",
+        **overrides,
+    )
+    harness = Harness(batch_size, teacher, events)
+    batch = {
+        "latents": torch.full((batch_size, 1, 3, 1, 1), 91.0),
+        "actions": torch.full((batch_size, 7, 16, 4, 1), 73.0),
+    }
+    return harness, batch, gate
+
+
+def _install_scripted_origin_reducer(monkeypatch, *, remote_origin, events):
+    scripted_dist = _ScriptedOriginDist(
+        remote_origin=remote_origin,
+        events=events,
+    )
+
+    def scripted_reduce(flags, *, device):
+        return reduce_nonfinite_origins(
+            flags,
+            device=device,
+            dist_module=scripted_dist,
+        )
+
+    monkeypatch.setattr(
+        flowmap_step_module,
+        "reduce_nonfinite_origins",
+        scripted_reduce,
+    )
+    return scripted_dist
+
+
+def test_aligned_cosmos_gathers_distinct_per_sample_joint_states_and_shifted_times(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        torch,
+        "randint",
+        lambda *args, **kwargs: torch.tensor([1], device=kwargs.get("device")),
+    )
+    harness, batch, _ = _aligned_recording_case(
+        batch_size=2,
+        query_indices=[1, 2],
+    )
+
+    result = harness._cosmos_aligned_video_opd_step(batch, 0)
+
+    rollout = [call for call in harness.student.calls if call.kind == "rollout"]
+    field = next(call for call in harness.student.calls if call.kind == "field")
+    anchor = next(call for call in harness.student.calls if call.kind == "anchor")
+    video_sigmas = build_shifted_terminal_path(
+        steps=4,
+        shift=5.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    action_sigmas = build_shifted_terminal_path(
+        steps=4,
+        shift=0.05,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    expected_video_t = torch.stack(
+        [
+            video_sigmas[1].expand(3),
+            video_sigmas[2].expand(3),
+        ]
+    ) * 1000
+    expected_action_t = torch.stack(
+        [
+            action_sigmas[1].expand(4),
+            action_sigmas[2].expand(4),
+        ]
+    ) * 1000
+
+    assert len(rollout) == 4
+    assert torch.equal(field.video[0], rollout[1].video[0])
+    assert torch.equal(field.video[1], rollout[2].video[1])
+    assert torch.equal(field.action[0], rollout[1].action[0])
+    assert torch.equal(field.action[1], rollout[2].action[1])
+    torch.testing.assert_close(field.video_t, expected_video_t)
+    torch.testing.assert_close(field.video_r, expected_video_t)
+    torch.testing.assert_close(field.action_t, expected_action_t)
+    torch.testing.assert_close(field.action_r, expected_action_t)
+    torch.testing.assert_close(anchor.video_t, expected_video_t)
+    torch.testing.assert_close(anchor.action_t, expected_action_t)
+    assert torch.equal(anchor.video_r, torch.zeros_like(expected_video_t))
+    assert torch.equal(anchor.action_r, torch.zeros_like(expected_action_t))
+    assert result["opd_query_index"].item() == pytest.approx(1.5)
+
+
+def test_aligned_cosmos_rejects_canonical_valid_video_mismatch_before_queries():
+    harness, batch, _ = _aligned_recording_case(canonical_mismatch=True)
+
+    with pytest.raises(RuntimeError, match="canonical valid-video frames differ"):
+        harness._cosmos_aligned_video_opd_step(batch, 0)
+
+    assert {call.kind for call in harness.student.calls} == {"rollout"}
+    assert harness.student.field_scale.grad is None
+    assert harness.student.anchor_scale.grad is None
+
+
+def test_aligned_cosmos_rejects_endpoint_field_mask_disagreement_before_queries():
+    harness, batch, _ = _aligned_recording_case(endpoint_mask_mismatch=True)
+
+    with pytest.raises(RuntimeError, match="shape, mask, or step contract"):
+        harness._cosmos_aligned_video_opd_step(batch, 0)
+
+    assert {call.kind for call in harness.student.calls} == {"rollout"}
+    assert harness.student.field_scale.grad is None
+    assert harness.student.anchor_scale.grad is None
+
+
+def test_aligned_cosmos_remote_teacher_failure_raises_before_student_queries():
+    events = []
+    harness, batch, gate = _aligned_recording_case(
+        all_rank_outcomes=[False],
+        events=events,
+    )
+
+    with pytest.raises(RuntimeError, match="same-state Teacher query failed"):
+        harness._cosmos_aligned_video_opd_step(batch, 0)
+
+    assert gate.calls == [True]
+    assert events[-2:] == ["teacher:field", "gate:0"]
+    assert harness._action_teacher_model.endpoint_call is None
+    assert {call.kind for call in harness.student.calls} == {"rollout"}
+
+
+def test_aligned_cosmos_remote_contract_failure_raises_before_backward():
+    events = []
+    harness, batch, gate = _aligned_recording_case(
+        all_rank_outcomes=[True, True, False],
+        events=events,
+    )
+
+    with pytest.raises(RuntimeError, match="response contract mismatch"):
+        harness._cosmos_aligned_video_opd_step(batch, 0)
+
+    assert gate.calls == [True, True, True]
+    assert events[-1] == "gate:2"
+    assert {call.kind for call in harness.student.calls} == {"rollout"}
+    assert harness.student.field_scale.grad is None
+    assert harness.student.anchor_scale.grad is None
+
+
+def test_aligned_cosmos_remote_nonfinite_skips_backward_and_reduces_origins(
+    monkeypatch,
+):
+    events = []
+    scripted_dist = _install_scripted_origin_reducer(
+        monkeypatch,
+        remote_origin="opd_compositional",
+        events=events,
+    )
+    harness, batch, gate = _aligned_recording_case(
+        all_rank_outcomes=[True] * 5,
+        events=events,
+    )
+
+    result = harness._cosmos_aligned_video_opd_step(batch, 0)
+
+    assert gate.calls == [True] * 5
+    assert scripted_dist.call_index == len(NONFINITE_ORIGINS)
+    assert result["skip_step"] is True
+    assert result["nonfinite_origins"]["opd_compositional"] is True
+    assert harness.student.field_scale.grad is None
+    assert harness.student.anchor_scale.grad is None
+    assert "backward" not in events
+    assert events[:7] == [
+        "teacher:field",
+        "gate:0",
+        "teacher:endpoint",
+        "gate:1",
+        "gate:2",
+        "gate:3",
+        "gate:4",
+    ]
+    assert [
+        event for event in events if event.startswith("origin:")
+    ] == [f"origin:{origin}" for origin in NONFINITE_ORIGINS]
+
+
+def test_aligned_cosmos_collective_order_precedes_successful_backward(monkeypatch):
+    events = []
+    scripted_dist = _install_scripted_origin_reducer(
+        monkeypatch,
+        remote_origin=None,
+        events=events,
+    )
+    harness, batch, gate = _aligned_recording_case(
+        all_rank_outcomes=[True] * 5,
+        events=events,
+    )
+    harness.student.field_scale.register_hook(
+        lambda grad: events.append("backward") or grad
+    )
+
+    result = harness._cosmos_aligned_video_opd_step(batch, 0)
+
+    assert result["skip_step"] is False
+    assert gate.calls == [True] * 5
+    assert scripted_dist.call_index == len(NONFINITE_ORIGINS)
+    assert [event for event in events if event.startswith("gate:")] == [
+        f"gate:{index}" for index in range(5)
+    ]
+    assert events[:7] == [
+        "teacher:field",
+        "gate:0",
+        "teacher:endpoint",
+        "gate:1",
+        "gate:2",
+        "gate:3",
+        "gate:4",
+    ]
+    origin_events = [event for event in events if event.startswith("origin:")]
+    assert origin_events == [
+        f"origin:{origin}" for origin in NONFINITE_ORIGINS
+    ]
+    assert events.index("backward") > max(
+        events.index(event) for event in origin_events
+    )

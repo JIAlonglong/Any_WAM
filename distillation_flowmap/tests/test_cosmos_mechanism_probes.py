@@ -137,6 +137,31 @@ def test_shared_cosmos_joint_builder_replaces_video_and_holds_action_state():
     assert joint["action_dict"]["actions_mask"] is context["action_mask"]
 
 
+def test_mechanism_preflight_rejects_teacher_without_same_prior_endpoint():
+    harness = _BuilderHarness()
+
+    class LegacyTeacher:
+        raw_inference_enabled = True
+
+        @staticmethod
+        def predict_raw_latent_target(*args, **kwargs):
+            raise AssertionError("preflight must not run inference")
+
+        @staticmethod
+        def predict_raw_joint_latent_velocity(*args, **kwargs):
+            raise AssertionError("preflight must not run inference")
+
+    harness.teacher = LegacyTeacher()
+    batch = {
+        "latents": torch.zeros(1, 1, 1),
+        "actions": torch.zeros(1, 1, 1),
+    }
+    with pytest.raises(RuntimeError, match="same-prior"):
+        harness._validate_cosmos_mechanism_preflight(
+            batch, teacher_steps=8, student_steps=2
+        )
+
+
 def test_context_action_routes_use_actual_replacement_before_no_grad_forward():
     harness = _BuilderHarness()
     context = _joint_context()
@@ -163,10 +188,10 @@ def test_context_action_routes_use_actual_replacement_before_no_grad_forward():
 
 def test_g_metrics_are_route_geometry_and_not_opd_weight_aliases():
     common = dict(
-        teacher_cont_video=torch.tensor([[[2.0, 4.0]]]),
-        teacher_endpoint_video=torch.tensor([[[1.0, 1.0]]]),
-        student_direct_video=torch.tensor([[[5.0, 7.0]]]),
-        student_composed_video=torch.tensor([[[4.0, 5.0]]]),
+        teacher_continuation_video=torch.tensor([[[2.0, 4.0]]]),
+        same_prior_teacher_endpoint_video=torch.tensor([[[1.0, 1.0]]]),
+        direct_route_video=torch.tensor([[[5.0, 7.0]]]),
+        composed_route_video=torch.tensor([[[4.0, 5.0]]]),
         student_field_video=torch.tensor([[[9.0, 11.0]]]),
         teacher_field_video=torch.tensor([[[8.0, 8.0]]]),
         video_frame_mask=torch.tensor([[True, False]]),
@@ -200,10 +225,10 @@ def test_g_metrics_are_route_geometry_and_not_opd_weight_aliases():
 def test_all_video_metrics_ignore_worker_excluded_frames():
     mask = torch.tensor([[True, False]])
     common = dict(
-        teacher_cont_video=torch.tensor([[[[2.0]], [[9999.0]]]]).permute(0, 2, 1, 3),
-        teacher_endpoint_video=torch.tensor([[[[1.0]], [[-9999.0]]]]).permute(0, 2, 1, 3),
-        student_direct_video=torch.tensor([[[[3.0]], [[7777.0]]]]).permute(0, 2, 1, 3),
-        student_composed_video=torch.tensor([[[[1.0]], [[-7777.0]]]]).permute(0, 2, 1, 3),
+        teacher_continuation_video=torch.tensor([[[[2.0]], [[9999.0]]]]).permute(0, 2, 1, 3),
+        same_prior_teacher_endpoint_video=torch.tensor([[[[1.0]], [[-9999.0]]]]).permute(0, 2, 1, 3),
+        direct_route_video=torch.tensor([[[[3.0]], [[7777.0]]]]).permute(0, 2, 1, 3),
+        composed_route_video=torch.tensor([[[[1.0]], [[-7777.0]]]]).permute(0, 2, 1, 3),
         student_field_video=torch.tensor([[[[4.0]], [[5555.0]]]]).permute(0, 2, 1, 3),
         teacher_field_video=torch.tensor([[[[1.0]], [[-5555.0]]]]).permute(0, 2, 1, 3),
         video_frame_mask=mask,
@@ -320,10 +345,10 @@ def test_materialize_moves_model_tensors_but_keeps_raw_teacher_payload_on_cpu():
 
 def test_three_context_action_errors_and_finite_counts_reach_log_mapping():
     samples = compute_mechanism_metric_samples(
-        teacher_cont_video=torch.zeros(1, 1, 1),
-        teacher_endpoint_video=torch.zeros(1, 1, 1),
-        student_direct_video=torch.zeros(1, 1, 1),
-        student_composed_video=torch.zeros(1, 1, 1),
+        teacher_continuation_video=torch.zeros(1, 1, 1),
+        same_prior_teacher_endpoint_video=torch.zeros(1, 1, 1),
+        direct_route_video=torch.zeros(1, 1, 1),
+        composed_route_video=torch.zeros(1, 1, 1),
         teacher_endpoint_action=torch.zeros(1, 1, 1, 1, 1),
         action_gt_context=torch.full((1, 1, 1, 1, 1), 0.25),
         action_student_context=torch.ones(1, 1, 1, 1, 1),
@@ -704,6 +729,187 @@ def test_teacher_direct_and_composed_routes_share_start_and_endpoint_time():
         t_max=t_max,
     )
     assert not torch.allclose(mismatched_endpoint, composed)
+
+
+def test_live_probe_feeds_same_prior_endpoint_and_verified_provenance(monkeypatch):
+    import distillation_flowmap.flowmap_step as flowmap_step_module
+
+    endpoint_video = torch.full((1, 1, 2, 1, 1), 9.0)
+    captured_metrics = {}
+
+    class Teacher:
+        raw_inference_enabled = True
+
+        def __init__(self):
+            self.same_prior_calls = 0
+            self.video_prior = None
+            self.action_prior = None
+
+        def predict_raw_latent_target(self, *args, **kwargs):
+            return {
+                "cosmos_latent_x0": torch.zeros(1, 1, 2, 1, 1),
+                "actions": torch.zeros(1, 1, 1),
+            }
+
+        def predict_raw_joint_latent_velocity(self, *args, **kwargs):
+            raise AssertionError("the harness replaces the field probe")
+
+        def predict_raw_same_prior_endpoint(
+            self, batch, *, video_prior, action_prior, teacher_steps
+        ):
+            del batch
+            self.same_prior_calls += 1
+            self.video_prior = video_prior
+            self.action_prior = action_prior
+            return {
+                "endpoint_video": endpoint_video,
+                "video_frame_mask": torch.ones(1, 2, dtype=torch.bool),
+                "effective_teacher_steps": teacher_steps,
+                "video_prior_sha256": "verified-by-adapter",
+                "action_prior_sha256": "verified-by-adapter",
+            }
+
+    class Harness(_BuilderHarness):
+        def __init__(self):
+            super().__init__()
+            self.teacher = Teacher()
+            self.student_rollout_video_prior = None
+            self.student_rollout_action_prior = None
+            self.teacher_field_query = None
+            self.config = SimpleNamespace(
+                num_train_timesteps=1000,
+                attn_mode="flex",
+                action_downsample_factor=1,
+                cosmos_latent_epsilon=1e-3,
+                norm_stat={"q01": 0.0, "q99": 1.0},
+                inverse_used_action_channel_ids=None,
+                used_action_channel_ids=tuple(range(7)),
+                action_packing_schema="unused",
+                mechanism_cosmos_t_min=4.0 / 5.0,
+                mechanism_cosmos_t_max=80.0 / 81.0,
+                mechanism_diagnostic_r=500,
+                mechanism_diagnostic_s=250,
+            )
+
+        def _validate_cosmos_mechanism_preflight(self, *args, **kwargs):
+            return None
+
+        def _prepare_cosmos_mechanism_context(self, batch):
+            return {
+                "batch": batch,
+                "input_dict": {
+                    "latent_dict": {},
+                    "action_dict": {
+                        "latent": batch["actions"],
+                        "cond_timesteps": torch.zeros(1, 1),
+                        "text_emb": torch.zeros(1, 1, 1),
+                        "grid_id": None,
+                        "actions_mask": torch.ones(1, 1, 1, 1, 1),
+                    },
+                    "chunk_size": 1,
+                    "window_size": 1,
+                },
+                "batch_size": 1,
+                "ref_shape": (1, 1, 2, 1, 1),
+                "action_clean": batch["actions"],
+                "action_frames": 1,
+                "action_mask": torch.ones(1, 1, 1, 1, 1),
+                "action_latent": batch["actions"],
+                "action_cond_t": torch.zeros(1, 1),
+                "action_text": torch.zeros(1, 1, 1),
+                "action_grid": None,
+                "empty_emb": torch.zeros(1, 1, 1),
+                "chunk_size": 1,
+                "window_size": 1,
+                "student_model": self.student,
+                "cfg_scale": 1.0,
+                "video_base": {},
+            }
+
+        def _student_euler_integrate(self, **kwargs):
+            self.student_rollout_video_prior = kwargs["noisy_latents"]
+            self.student_rollout_action_prior = kwargs["base_input_dict"][
+                "action_dict"
+            ]["noisy_latents"]
+            return (
+                torch.full((1, 1, 2, 1, 1), 2.0),
+                None,
+                None,
+                torch.zeros(1, 7, 1, 1, 1),
+            )
+
+        def _cosmos_teacher_field_probe(self, **kwargs):
+            self.teacher_field_query = kwargs["query_latent"]
+            return {
+                "student_query_video": kwargs["query_latent"],
+                "teacher_field_video": torch.zeros(1, 1, 2, 1, 1),
+                "video_frame_mask": torch.ones(1, 2, dtype=torch.bool),
+                "student_direct_video": torch.full((1, 1, 2, 1, 1), 4.0),
+                "student_field_video": torch.zeros(1, 1, 2, 1, 1),
+            }
+
+        def _cosmos_student_joint_map(self, *args, **kwargs):
+            value = 5.0 if len(self.captured) == 0 else 6.0
+            self.captured.append(value)
+            return (
+                torch.full((1, 1, 2, 1, 1), value),
+                torch.zeros(1, 1, 1, 1, 1),
+                torch.zeros(1, 1, 2, 1, 1),
+                torch.zeros(1, 1, 1, 1, 1),
+            )
+
+        def _cosmos_teacher_video_continuation(self, **kwargs):
+            return torch.full((1, 1, 2, 1, 1), 7.0)
+
+        def _cosmos_action_context_predictions(self, *args, **kwargs):
+            zero = torch.zeros(1, 1, 1, 1, 1)
+            return {"gt": zero, "student": zero, "teacher_video": zero}
+
+    def capture_samples(**kwargs):
+        captured_metrics.update(kwargs)
+        return {"mechanism/g_anchor": torch.zeros(1)}
+
+    monkeypatch.setattr(
+        flowmap_step_module,
+        "cosmos_actions_to_flowmap_x0",
+        lambda *args, **kwargs: torch.zeros(1, 7, 1, 1, 1),
+    )
+    packed_action_inputs = []
+
+    def fake_pack_actions(aligned_prior, *args, **kwargs):
+        packed_action_inputs.append(aligned_prior)
+        return torch.zeros(1, 7, 1, 1, 1)
+
+    monkeypatch.setattr(
+        flowmap_step_module, "pack_actions_for_downsample", fake_pack_actions
+    )
+    monkeypatch.setattr(
+        flowmap_step_module, "compute_mechanism_metric_samples", capture_samples
+    )
+    harness = Harness()
+    batch = {
+        "latents": torch.zeros(1, 1, 2, 1, 1),
+        "actions": torch.zeros(1, 7, 1, 1, 1),
+    }
+    harness._run_cosmos_mechanism_probe(
+        batch, seed=7, teacher_steps=8, student_steps=2
+    )
+
+    assert harness.teacher.same_prior_calls == 1
+    assert harness.teacher.video_prior is harness.student_rollout_video_prior
+    assert harness.teacher_field_query.data_ptr() != batch["latents"].data_ptr()
+    assert harness.teacher_field_query.requires_grad is False
+    assert harness.student_rollout_action_prior.requires_grad is False
+    torch.testing.assert_close(
+        packed_action_inputs[0][..., tuple(range(7))],
+        harness.teacher.action_prior,
+    )
+    torch.testing.assert_close(
+        captured_metrics["same_prior_teacher_endpoint_video"], endpoint_video
+    )
+    assert captured_metrics["shared_state_verified"] is True
+    assert captured_metrics["same_prior_verified"] is True
+    assert captured_metrics["effective_teacher_steps"] == 8
 
 
 def test_probe_interface_is_observation_only_and_capability_gates_teacher_joint():

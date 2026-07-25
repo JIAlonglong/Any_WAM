@@ -4429,9 +4429,11 @@ class FlowMapStepMixin:
             getattr(teacher, "raw_inference_enabled", False)
             and hasattr(teacher, "predict_raw_latent_target")
             and hasattr(teacher, "predict_raw_joint_latent_velocity")
+            and hasattr(teacher, "predict_raw_same_prior_endpoint")
         ):
             raise RuntimeError(
-                "Cosmos mechanism diagnostics require the official raw teacher"
+                "Cosmos mechanism diagnostics require the official raw teacher "
+                "with a same-prior endpoint"
             )
         self._validate_cosmos_mechanism_teacher_band(
             getattr(self.config, "mechanism_cosmos_t_min", 4.0 / 5.0),
@@ -4596,15 +4598,48 @@ class FlowMapStepMixin:
         video_noise = torch.randn(
             context["ref_shape"],
             device=self.device,
-            dtype=batch["latents"].dtype,
+            dtype=torch.float32,
             generator=generator,
         )
-        action_noise = torch.randn(
-            context["action_clean"].shape,
+        native_action_prior = torch.randn(
+            B,
+            16,
+            7,
             device=self.device,
-            dtype=context["action_clean"].dtype,
+            dtype=torch.float32,
             generator=generator,
         )
+        action_channels = int(batch["actions"].shape[1])
+        used_action_channel_ids = torch.as_tensor(
+            self.config.used_action_channel_ids,
+            device=self.device,
+            dtype=torch.long,
+        )
+        if (
+            used_action_channel_ids.numel() != 7
+            or int(used_action_channel_ids.min().item()) < 0
+            or int(used_action_channel_ids.max().item()) >= action_channels
+        ):
+            raise ValueError(
+                "Cosmos mechanism diagnostics require seven valid action "
+                "channel IDs"
+            )
+        aligned_action_prior = torch.zeros(
+            B,
+            16,
+            action_channels,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        aligned_action_prior[..., used_action_channel_ids] = native_action_prior
+        action_downsample = int(self.config.action_downsample_factor)
+        full_action_prior = pack_actions_for_downsample(
+            aligned_action_prior,
+            tuple(batch["actions"].shape),
+            downsample_factor=action_downsample,
+            schema=self.config.action_packing_schema,
+        )
+        action_noise = full_action_prior[:, :, ::action_downsample]
         t_max_norm = torch.full(
             (B, video_frames), t_max, device=self.device, dtype=torch.float32
         )
@@ -4631,35 +4666,47 @@ class FlowMapStepMixin:
             packing_schema=self.config.action_packing_schema,
             downsample_factor=self.config.action_downsample_factor,
         )
-        action_downsample = int(self.config.action_downsample_factor)
         teacher_endpoint_action = teacher_endpoint_action_full[
             :, :, ::action_downsample
         ]
 
-        # Deployment context remains the shared full normalized 1 -> 0 student
-        # integrator; the official teacher is not queried on this path.
+        # The mechanism routes depart from one Student-reached z_r generated
+        # from the exact terminal priors later supplied to the same-prior
+        # Teacher endpoint.
         terminal_video_t = torch.full(
             (B, video_frames),
             float(self.config.num_train_timesteps),
             device=self.device,
         )
-        zero_video_t = torch.zeros_like(terminal_video_t)
+        raw_t_max = t_max_norm * self.config.num_train_timesteps
+        raw_t_min = t_min_norm * self.config.num_train_timesteps
         terminal_action_t = torch.full(
             (B, batch["actions"].shape[2]),
             float(self.config.num_train_timesteps),
             device=self.device,
         )
-        zero_action_t = torch.zeros_like(terminal_action_t)
+        full_action_t_max = torch.full_like(
+            terminal_action_t, t_max * self.config.num_train_timesteps
+        )
+        raw_action_t_max = torch.full(
+            (B, action_frames),
+            t_max * self.config.num_train_timesteps,
+            device=self.device,
+        )
+        raw_action_t_min = torch.full_like(
+            raw_action_t_max, t_min * self.config.num_train_timesteps
+        )
         deployment_input = {
             "latent_dict": {
                 **context["input_dict"]["latent_dict"],
+                "latent": video_noise,
                 "noisy_latents": video_noise,
                 "timesteps": terminal_video_t,
             },
             "action_dict": {
                 **context["input_dict"]["action_dict"],
                 "noisy_latents": action_noise,
-                "latent": context["action_latent"],
+                "latent": action_noise,
                 "timesteps": terminal_action_t[:, ::action_downsample],
                 "cond_timesteps": context["action_cond_t"],
                 "grid_id": context["action_grid"],
@@ -4671,7 +4718,7 @@ class FlowMapStepMixin:
         deployment_result = self._student_euler_integrate(
             noisy_latents=video_noise,
             timesteps=terminal_video_t,
-            target_r=zero_video_t,
+            target_r=raw_t_max,
             base_input_dict=deployment_input,
             empty_emb=context["empty_emb"],
             cfg_scale=context["cfg_scale"],
@@ -4679,37 +4726,18 @@ class FlowMapStepMixin:
             B=B,
             num_frames=video_frames,
             K_steps=student_steps,
-            action_target_r=zero_action_t,
+            action_target_r=full_action_t_max,
             return_final_action=True,
             return_final_action_state=True,
             force_no_grad=True,
         )
-        student_deployment_video = deployment_result[0].detach()
-
-        # Teacher-supervised geometry is a separate calibrated-band route.
-        band_video = self._cosmos_calibrated_noisy_state(
-            teacher_x0=teacher_clean_video,
-            noise=video_noise,
-            normalized_t=t_max,
-        )
-        band_action = (
-            (1.0 - t_max) * teacher_endpoint_action + t_max * action_noise
-        )
-        raw_t_max = t_max_norm * self.config.num_train_timesteps
-        raw_t_min = t_min_norm * self.config.num_train_timesteps
-        raw_action_t_max = torch.full(
-            (B, action_frames),
-            t_max * self.config.num_train_timesteps,
-            device=self.device,
-        )
-        raw_action_t_min = torch.full_like(
-            raw_action_t_max, t_min * self.config.num_train_timesteps
-        )
+        shared_student_video = deployment_result[0].detach()
+        shared_student_action = deployment_result[3].detach()
         field_result = self._cosmos_teacher_field_probe(
             teacher=teacher,
             batch=batch,
-            query_latent=band_video,
-            query_action=band_action,
+            query_latent=shared_student_video,
+            query_action=shared_student_action,
             t_norm=t_max_norm,
             raw_video_t=raw_t_max,
             raw_video_r=raw_t_min,
@@ -4722,12 +4750,54 @@ class FlowMapStepMixin:
         video_frame_mask = field_result["video_frame_mask"]
         student_direct_video = field_result["student_direct_video"]
         student_field_video = field_result["student_field_video"]
-        teacher_direct_video = self._cosmos_teacher_direct_endpoint(
-            start_video=joint_video,
-            teacher_field_video=teacher_field_video,
-            t_min=t_min,
-            t_max=t_max,
+        expanded_mask = video_frame_mask[:, None, :, None, None].expand_as(
+            joint_video
         )
+        shared_state_verified = torch.equal(
+            joint_video.masked_select(expanded_mask),
+            shared_student_video.to(joint_video).masked_select(expanded_mask),
+        )
+        if not shared_state_verified:
+            raise RuntimeError(
+                "Cosmos mechanism Teacher canonicalization changed valid "
+                "shared Student-state frames"
+            )
+        same_prior_result = teacher.predict_raw_same_prior_endpoint(
+            batch,
+            video_prior=video_noise,
+            action_prior=native_action_prior,
+            teacher_steps=teacher_steps,
+        )
+        required_same_prior = (
+            "endpoint_video",
+            "video_frame_mask",
+            "effective_teacher_steps",
+            "video_prior_sha256",
+            "action_prior_sha256",
+        )
+        if not all(key in same_prior_result for key in required_same_prior):
+            raise RuntimeError(
+                "Cosmos mechanism same-prior Teacher response is incomplete"
+            )
+        same_prior_teacher_endpoint_video = same_prior_result[
+            "endpoint_video"
+        ].to(device=self.device, dtype=joint_video.dtype)
+        same_prior_mask = same_prior_result["video_frame_mask"].to(
+            device=self.device, dtype=torch.bool
+        )
+        effective_teacher_steps = same_prior_result["effective_teacher_steps"]
+        same_prior_verified = (
+            same_prior_teacher_endpoint_video.shape == joint_video.shape
+            and same_prior_mask.shape == video_frame_mask.shape
+            and torch.equal(same_prior_mask, video_frame_mask)
+            and type(effective_teacher_steps) is int
+            and effective_teacher_steps == 8
+        )
+        if not same_prior_verified:
+            raise RuntimeError(
+                "Cosmos mechanism same-prior endpoint shape, mask, or "
+                "effective eight-step contract mismatch"
+            )
         midpoint = (t_min + t_max) / 2.0
         raw_mid_video = torch.full_like(
             raw_t_max, midpoint * self.config.num_train_timesteps
@@ -4737,7 +4807,7 @@ class FlowMapStepMixin:
         )
         mid_video, mid_action, _, _ = self._cosmos_student_joint_map(
             joint_video,
-            band_action,
+            shared_student_action,
             raw_t_max,
             raw_action_t_max,
             raw_mid_video,
@@ -4757,7 +4827,7 @@ class FlowMapStepMixin:
             teacher=teacher,
             batch=batch,
             start_video=joint_video,
-            held_action=band_action,
+            held_action=shared_student_action,
             t_min=t_min,
             t_max=t_max,
             teacher_steps=teacher_steps,
@@ -4779,7 +4849,7 @@ class FlowMapStepMixin:
         action_predictions = self._cosmos_action_context_predictions(
             {
                 "gt": dataset_gt_video,
-                "student": student_deployment_video,
+                "student": student_direct_video,
                 "teacher_video": teacher_clean_video,
             },
             common_action=common_action,
@@ -4788,10 +4858,12 @@ class FlowMapStepMixin:
             context=context,
         )
         samples = compute_mechanism_metric_samples(
-            teacher_cont_video=teacher_cont_video,
-            teacher_endpoint_video=teacher_direct_video,
-            student_direct_video=student_direct_video,
-            student_composed_video=student_composed_video,
+            teacher_continuation_video=teacher_cont_video,
+            same_prior_teacher_endpoint_video=(
+                same_prior_teacher_endpoint_video
+            ),
+            direct_route_video=student_direct_video,
+            composed_route_video=student_composed_video,
             student_field_video=student_field_video,
             teacher_field_video=teacher_field_video,
             video_frame_mask=video_frame_mask,
@@ -4802,6 +4874,9 @@ class FlowMapStepMixin:
             action_teacher_joint_context=None,
             action_mask=context["action_mask"],
             teacher_joint_available=False,
+            shared_state_verified=shared_state_verified,
+            same_prior_verified=same_prior_verified,
+            effective_teacher_steps=effective_teacher_steps,
         )
         stats = pack_finite_metric_stats(samples)
         stats["mechanism/teacher_steps_sum"] = torch.as_tensor(

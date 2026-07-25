@@ -106,10 +106,10 @@ def _finite_safe_divide(
 
 def compute_mechanism_metric_samples(
     *,
-    teacher_cont_video: torch.Tensor,
-    teacher_endpoint_video: torch.Tensor,
-    student_direct_video: torch.Tensor,
-    student_composed_video: torch.Tensor,
+    teacher_continuation_video: torch.Tensor,
+    same_prior_teacher_endpoint_video: torch.Tensor,
+    direct_route_video: torch.Tensor,
+    composed_route_video: torch.Tensor,
     teacher_endpoint_action: torch.Tensor,
     action_student_context: torch.Tensor,
     action_teacher_video_context: torch.Tensor,
@@ -120,19 +120,26 @@ def compute_mechanism_metric_samples(
     teacher_field_video: torch.Tensor | None = None,
     video_frame_mask: torch.Tensor | None = None,
     teacher_joint_available: bool = True,
+    shared_state_verified: bool = False,
+    same_prior_verified: bool = False,
+    effective_teacher_steps: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Return per-sample metrics; callers retain raw non-finite values for validity."""
     anchor = masked_video_squared_l2_per_sample(
-        teacher_cont_video, teacher_endpoint_video, video_frame_mask
+        teacher_continuation_video,
+        same_prior_teacher_endpoint_video,
+        video_frame_mask,
     )
     anchor_mse = masked_video_mse_per_sample(
-        teacher_cont_video, teacher_endpoint_video, video_frame_mask
+        teacher_continuation_video,
+        same_prior_teacher_endpoint_video,
+        video_frame_mask,
     )
     comp = masked_video_squared_l2_per_sample(
-        student_direct_video, student_composed_video, video_frame_mask
+        direct_route_video, composed_route_video, video_frame_mask
     )
     comp_mse = masked_video_mse_per_sample(
-        student_direct_video, student_composed_video, video_frame_mask
+        direct_route_video, composed_route_video, video_frame_mask
     )
     action_error_student = masked_action_mse_per_sample(
         action_student_context, teacher_endpoint_action, action_mask
@@ -151,7 +158,9 @@ def compute_mechanism_metric_samples(
             anchor_mse, comp_mse
         ),
         "mechanism/video_endpoint_error": masked_video_squared_l2_per_sample(
-            student_direct_video, teacher_endpoint_video, video_frame_mask
+            direct_route_video,
+            same_prior_teacher_endpoint_video,
+            video_frame_mask,
         ),
         "mechanism/action_error_student_context": action_error_student,
         "mechanism/action_error_teacher_video_context": action_error_teacher_video,
@@ -177,6 +186,19 @@ def compute_mechanism_metric_samples(
         ).to(anchor_mse),
         "mechanism/teacher_joint_available": torch.full_like(
             action_error_student, float(bool(teacher_joint_available))
+        ),
+        "mechanism/shared_state_verified": torch.full_like(
+            anchor, float(bool(shared_state_verified))
+        ),
+        "mechanism/same_prior_verified": torch.full_like(
+            anchor, float(bool(same_prior_verified))
+        ),
+        "mechanism/effective_teacher_steps_verified": torch.full_like(
+            anchor,
+            float(
+                type(effective_teacher_steps) is int
+                and effective_teacher_steps == 8
+            ),
         ),
     }
     if action_gt_context is not None:

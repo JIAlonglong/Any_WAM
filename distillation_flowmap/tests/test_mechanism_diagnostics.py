@@ -9,6 +9,7 @@ from unittest import mock
 import pytest
 import torch
 
+from distillation_flowmap.danceopd_query import aligned_anchor_mse
 from distillation_flowmap.mechanism_diagnostics import (
     MECHANISM_RATIO_EPS,
     MechanismDiagnosticScheduler,
@@ -22,12 +23,51 @@ from distillation_flowmap.mechanism_diagnostics import (
 )
 
 
+def test_aligned_anchor_is_squared_l2_while_training_endpoint_remains_mse():
+    teacher_continuation = torch.tensor([[1.0, 2.0]])
+    same_prior_endpoint = torch.tensor([[4.0, 6.0]])
+    direct_route = torch.tensor([[1.0, 4.0]])
+    composed_route = torch.tensor([[3.0, 1.0]])
+    samples = compute_mechanism_metric_samples(
+        teacher_continuation_video=teacher_continuation,
+        same_prior_teacher_endpoint_video=same_prior_endpoint,
+        direct_route_video=direct_route,
+        composed_route_video=composed_route,
+        teacher_endpoint_action=torch.zeros(1, 1),
+        action_student_context=torch.zeros(1, 1),
+        action_teacher_video_context=torch.zeros(1, 1),
+        action_teacher_joint_context=None,
+        action_mask=None,
+        teacher_joint_available=False,
+        shared_state_verified=True,
+        same_prior_verified=True,
+        effective_teacher_steps=8,
+    )
+
+    assert samples["mechanism/g_anchor"].item() == 25.0
+    assert samples["mechanism/g_anchor_mse"].item() == 12.5
+    assert samples["mechanism/g_comp"].item() == 13.0
+    assert samples["mechanism/g_comp_mse"].item() == 6.5
+    assert samples["mechanism/shared_state_verified"].item() == 1.0
+    assert samples["mechanism/same_prior_verified"].item() == 1.0
+    assert samples["mechanism/effective_teacher_steps_verified"].item() == 1.0
+
+    training_endpoint = aligned_anchor_mse(
+        torch.zeros_like(teacher_continuation),
+        torch.zeros(1),
+        torch.zeros_like(teacher_continuation),
+        same_prior_endpoint,
+    )
+    assert training_endpoint.item() == 26.0
+    assert training_endpoint.item() != samples["mechanism/g_anchor"].item()
+
+
 def _samples(**overrides):
     values = {
-        "teacher_cont_video": torch.tensor([[3.0, 4.0], [2.0, 2.0]]),
-        "teacher_endpoint_video": torch.zeros(2, 2),
-        "student_direct_video": torch.tensor([[2.0, 0.0], [1.0, 1.0]]),
-        "student_composed_video": torch.zeros(2, 2),
+        "teacher_continuation_video": torch.tensor([[3.0, 4.0], [2.0, 2.0]]),
+        "same_prior_teacher_endpoint_video": torch.zeros(2, 2),
+        "direct_route_video": torch.tensor([[2.0, 0.0], [1.0, 1.0]]),
+        "composed_route_video": torch.zeros(2, 2),
         "teacher_endpoint_action": torch.zeros(2, 1),
         "action_student_context": torch.tensor([[3.0], [1.0]]),
         "action_teacher_video_context": torch.tensor([[1.0], [1.0]]),
@@ -55,10 +95,10 @@ def test_exact_g_formulas_and_anchor_to_comp_ratio_direction():
 
 def test_action_gains_are_masked_signed_and_exact():
     samples = _samples(
-        teacher_cont_video=torch.zeros(1, 2),
-        teacher_endpoint_video=torch.zeros(1, 2),
-        student_direct_video=torch.zeros(1, 2),
-        student_composed_video=torch.zeros(1, 2),
+        teacher_continuation_video=torch.zeros(1, 2),
+        same_prior_teacher_endpoint_video=torch.zeros(1, 2),
+        direct_route_video=torch.zeros(1, 2),
+        composed_route_video=torch.zeros(1, 2),
         teacher_endpoint_action=torch.zeros(1, 2, 1),
         action_student_context=torch.tensor([[[3.0], [99.0]]]),
         action_teacher_video_context=torch.tensor([[[1.0], [88.0]]]),
@@ -77,8 +117,8 @@ def test_action_gains_are_masked_signed_and_exact():
 def test_named_ratio_clamp_handles_zero_denominators():
     assert MECHANISM_RATIO_EPS > 0
     samples = _samples(
-        student_direct_video=torch.ones(2, 2),
-        student_composed_video=torch.ones(2, 2),
+        direct_route_video=torch.ones(2, 2),
+        composed_route_video=torch.ones(2, 2),
         action_student_context=torch.zeros(2, 1),
         action_teacher_video_context=torch.zeros(2, 1),
     )
@@ -98,7 +138,7 @@ def test_named_ratio_clamp_handles_zero_denominators():
 
 def test_nonfinite_inputs_mark_invalid_but_ratio_leaves_remain_finite():
     contaminated = torch.tensor([[float("nan"), 0.0], [1.0, 1.0]])
-    samples = _samples(teacher_cont_video=contaminated)
+    samples = _samples(teacher_continuation_video=contaminated)
     stats = pack_finite_metric_stats(samples)
 
     assert torch.isfinite(

@@ -23,6 +23,9 @@ require_env() {
     [[ -n "${!name:-}" ]] || die "set ${name}"
 }
 emit_kv() { printf '%s=%s\n' "$1" "$2"; }
+positive() {
+    [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "$1 must be a positive integer"
+}
 
 emit_command() {
     local student_gpu="$1" worker_gpu="$2"
@@ -458,6 +461,9 @@ case "${S4_STUDENT_STEPS}" in
     1|2|4) ;;
     *) die "S4_STUDENT_STEPS must be 1, 2, or 4" ;;
 esac
+S4_EPISODES_PER_TASK="${S4_EPISODES_PER_TASK:-50}"
+positive S4_EPISODES_PER_TASK "$S4_EPISODES_PER_TASK"
+export S4_EPISODES_PER_TASK
 S4_MODEL_ROLE="${S4_MODEL_ROLE:-stage2_target}"
 case "${S4_MODEL_ROLE}" in
     stage2_online|stage2_target) ;;
@@ -530,6 +536,7 @@ emit_kv "DRY_RUN" "${DRY_RUN}"
 emit_kv "S4_CKPT_ROOT" "${S4_CKPT_ROOT}"
 emit_kv "EVAL_ROOT" "${EVAL_ROOT}"
 emit_kv "S4_STUDENT_STEPS" "${S4_STUDENT_STEPS}"
+emit_kv "S4_EPISODES_PER_TASK" "${S4_EPISODES_PER_TASK}"
 emit_kv "S4_FORMAL_NUM_SHARDS" "${S4_FORMAL_NUM_SHARDS}"
 emit_kv "S4_VIDEO_SEEDS" "${S4_VIDEO_SEEDS}"
 emit_kv "EVALUATION_CLASSIFICATION" "${S4_EVAL_CLASSIFICATION}"
@@ -545,12 +552,12 @@ case "${MODE}" in
         ;;
     formal)
         require_env "S4_EMPTY_EMBEDDING"
-        run_live_evaluation formal 50
+        run_live_evaluation formal "${S4_EPISODES_PER_TASK}"
         ;;
     dry-run)
         require_env "S4_PROMPT_TABLE"
         require_env "S4_EMPTY_EMBEDDING"
         emit_kv "PLAN_MODE" "formal"
-        run_live_evaluation formal 50
+        run_live_evaluation formal "${S4_EPISODES_PER_TASK}"
         ;;
 esac

@@ -163,14 +163,20 @@ from model_flowmap import setup_flowmap_model, patch_model_forward
 def _select_progressive_training_objective(
     config,
     *,
-    step,
+    completed_updates,
     deployment_enabled,
     raw_auxiliary_enabled,
 ):
+    completed_updates = int(completed_updates)
+    if completed_updates < 0:
+        raise ValueError("completed_updates must be non-negative")
+    optimizer_update = completed_updates + 1
     selected = select_progressive_training_objective(
-        step=step,
+        step=optimizer_update,
         deployment_enabled=deployment_enabled,
-        deployment_interval=int(getattr(config, "opd_aux_interval", 4)),
+        deployment_interval=int(getattr(
+            config, "aligned_video_opd_interval", 4
+        )),
         raw_auxiliary_enabled=raw_auxiliary_enabled,
         raw_auxiliary_warmup=int(getattr(config, "opd_aux_warmup_steps", 0)),
         raw_auxiliary_interval=int(getattr(config, "opd_aux_interval", 4)),
@@ -2766,7 +2772,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
             scheduled_kind = _select_progressive_training_objective(
                 self.config,
-                step=self.step,
+                completed_updates=self.step,
                 deployment_enabled=aligned_video_opd_enabled,
                 raw_auxiliary_enabled=standalone_opd,
             )
@@ -2781,7 +2787,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     else:
                         use_opd_aux_now = torch.rand(1).item() < opd_aux_prob
                     if not use_opd_aux_now:
-                        scheduled_kind = "main"
+                        scheduled_kind = "main_anyflow"
 
             def _run_opd_aux():
                 if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
@@ -3063,7 +3069,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                            and result["should_sync"]
                            and accumulation_backward_allowed(self)
                            and not use_onpolicy_now
-                           and scheduled_kind == "main")
+                           and scheduled_kind == "main_anyflow")
 
             if use_dmd_now:
                 if self.step >= dmd_warmup_steps + dmd_discriminator_warmup:
@@ -3418,22 +3424,6 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         log_dict["grad_norm/video_branch"] = grad_branch_norms["video"]
                         log_dict["grad_norm/action_branch"] = grad_branch_norms["action"]
                         log_dict["grad_norm/shared_branch"] = grad_branch_norms["shared"]
-                    if scheduled_kind == "deployment":
-                        postfix["dep"] = f"{avg_deployment_total_loss:.4f}"
-                        log_dict["deployment/video_endpoint_loss"] = (
-                            avg_deployment_video_endpoint_loss
-                        )
-                        log_dict["deployment/action_endpoint_loss"] = (
-                            avg_deployment_action_endpoint_loss
-                        )
-                        log_dict["deployment/total_loss"] = (
-                            avg_deployment_total_loss
-                        )
-                        log_dict["deployment/student_steps"] = (
-                            avg_deployment_student_steps
-                        )
-                        log_dict["deployment/t_start"] = avg_deployment_t_start
-                        log_dict["deployment/t_end"] = avg_deployment_t_end
                     if self.distill_video:
                         if use_onpolicy_now:
                             postfix["vt"] = f"{avg_video_loss:.4f}"

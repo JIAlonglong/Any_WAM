@@ -301,6 +301,27 @@ cfg.opd_aux_interval = int(os.environ.get("OPD_AUX_INTERVAL", 4))
 cfg.opd_aux_phase = 2
 if cfg.opd_aux_interval <= 0:
     raise ValueError("OPD_AUX_INTERVAL must be a positive integer")
+cfg.aligned_video_opd_interval = int(
+    os.environ.get("ALIGNED_VIDEO_OPD_INTERVAL", 4)
+)
+if cfg.aligned_video_opd_interval != 4:
+    raise ValueError(
+        "ALIGNED_VIDEO_OPD_INTERVAL must be exactly 4 for the aligned "
+        "Cosmos video OPD protocol"
+    )
+_video_action_bridge_raw = os.environ.get(
+    "VIDEO_ACTION_BRIDGE", "0"
+).strip().lower()
+if _video_action_bridge_raw not in (
+    "0", "false", "no", "off", "1", "true", "yes", "on"
+):
+    raise ValueError("VIDEO_ACTION_BRIDGE must be a boolean")
+if _video_action_bridge_raw in ("1", "true", "yes", "on"):
+    raise ValueError(
+        "VIDEO_ACTION_BRIDGE must remain disabled for the audited "
+        "factor-4 action packing contract"
+    )
+cfg.video_action_bridge = 0
 cfg.opd_aux_prob = float(os.environ.get("OPD_AUX_PROB", 1.0))
 cfg.opd_aux_gradient_checkpointing = _env_bool(
     "OPD_AUX_GRADIENT_CHECKPOINTING", True

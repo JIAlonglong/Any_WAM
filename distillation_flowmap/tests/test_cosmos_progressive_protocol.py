@@ -116,15 +116,18 @@ def test_trainer_schedules_aligned_video_action_and_anyflow_disjointly():
         opd_aux_phase=2,
     )
 
-    def scheduled_kind(step, *, action_enabled=True):
+    def scheduled_kind(completed_updates, *, action_enabled=True):
         return namespace["_select_progressive_training_objective"](
             config,
-            step=step,
+            completed_updates=completed_updates,
             deployment_enabled=True,
             raw_auxiliary_enabled=action_enabled,
         )
 
-    objectives = [scheduled_kind(step) for step in range(1, 17)]
+    objectives = [
+        scheduled_kind(completed_updates)
+        for completed_updates in range(16)
+    ]
     assert objectives[3] == "aligned_video_opd"
     assert objectives[7] == "aligned_video_opd"
     assert objectives[0] == "main_anyflow"
@@ -164,25 +167,25 @@ def test_trainer_call_site_delegates_schedule_to_the_shared_selector():
         namespace,
     )
     config = SimpleNamespace(
-        deployment_joint_rollout_interval=4,
+        aligned_video_opd_interval=4,
         opd_aux_warmup_steps=0,
-        opd_aux_interval=4,
+        opd_aux_interval=7,
         opd_aux_phase=2,
     )
 
     assert namespace["_select_progressive_training_objective"](
         config,
-        step=12,
+        completed_updates=12,
         deployment_enabled=True,
         raw_auxiliary_enabled=True,
     ) == "sentinel"
     assert calls == [{
-        "step": 12,
+        "step": 13,
         "deployment_enabled": True,
         "deployment_interval": 4,
         "raw_auxiliary_enabled": True,
         "raw_auxiliary_warmup": 0,
-        "raw_auxiliary_interval": 4,
+        "raw_auxiliary_interval": 7,
         "raw_auxiliary_phase": 2,
     }]
 
@@ -218,13 +221,13 @@ def test_trainer_selector_supports_legacy_configs_without_deployment_fields():
 
     assert selector(
         legacy_config,
-        step=11,
+        completed_updates=10,
         deployment_enabled=False,
         raw_auxiliary_enabled=False,
     ) == "main_anyflow"
     assert selector(
         legacy_config,
-        step=10,
+        completed_updates=9,
         deployment_enabled=False,
         raw_auxiliary_enabled=True,
     ) == "action_opd"
@@ -263,6 +266,61 @@ def test_real_train_loop_calls_shared_schedule_adapter_once_before_branches():
     assert adapter_calls[0].lineno < min(
         branch.lineno for branch in objective_branches
     )
+    assert any(
+        keyword.arg == "completed_updates"
+        and isinstance(keyword.value, ast.Attribute)
+        and isinstance(keyword.value.value, ast.Name)
+        and keyword.value.value.id == "self"
+        and keyword.value.attr == "step"
+        for keyword in adapter_calls[0].keywords
+    )
+    assert not any(
+        keyword.arg == "step" for keyword in adapter_calls[0].keywords
+    )
+
+
+def test_train_loop_uses_only_completed_objective_names():
+    source = (
+        Path(__file__).resolve().parents[1] / "flowmap_trainer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    trainer = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "FlowMapDistiller"
+    )
+    train = next(
+        node for node in trainer.body
+        if isinstance(node, ast.FunctionDef) and node.name == "train"
+    )
+    objective_names = set()
+    for node in ast.walk(train):
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "scheduled_kind"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            objective_names.add(node.value.value)
+        if (
+            isinstance(node, ast.Compare)
+            and isinstance(node.left, ast.Name)
+            and node.left.id == "scheduled_kind"
+        ):
+            objective_names.update(
+                comparator.value
+                for comparator in node.comparators
+                if isinstance(comparator, ast.Constant)
+                and isinstance(comparator.value, str)
+            )
+    assert objective_names <= {
+        "aligned_video_opd",
+        "action_opd",
+        "main_anyflow",
+    }
 
 
 def test_aligned_video_objective_is_the_only_scheduled_video_opd_route():

@@ -151,3 +151,97 @@ Additional verification:
 bridge values printed and exported as required. The audited Stage-1/Stage-2
 checkpoint action packing contract remains `downsample_survivor_v2` with factor
 4; this task does not mutate that prior contract.
+
+## Review fix round
+
+This section supersedes the launcher/downsample statements above.
+
+### Scheduler and objective names
+
+The trainer adapter now receives `completed_updates=self.step`, converts that
+counter to the one-based optimizer update being executed, and passes the
+one-based value to the shared selector. A loop-convention test covers completed
+updates 0 through 15 and confirms aligned video OPD on updates 4/8/12/16,
+action OPD on 10/14, and `main_anyflow` elsewhere.
+
+Aligned video cadence is a separate fixed config contract:
+`ALIGNED_VIDEO_OPD_INTERVAL` must equal 4. `OPD_AUX_INTERVAL` remains the
+independent action-OPD cadence. The remaining runtime fallbacks and guards now
+use `main_anyflow`; the stale unreachable `deployment` logging guard was
+removed.
+
+### Packing and bridge contract
+
+The launcher now prints, exports, and preflights the audited
+`ACTION_DOWNSAMPLE_FACTOR=4`. It no longer advertises factor 1. The config and
+Stage-2 preflight expose `video_action_bridge=0`; the launcher and config reject
+an enabled bridge because no bridge exists in the audited factor-4 packing
+contract.
+
+### Authentic read-only chain and evaluation count
+
+Read-only output now prints the real Stage-1 wrapper, provenance lock preparer,
+Stage-2 wrapper, and joint evaluator commands. Each command is shell escaped
+and prefixed with its resolved environment inputs. The synthetic detached
+`ALIGNED_TRAIN_COMMAND` was removed. Both real training wrappers still contain
+exactly one eight-rank launch.
+
+`--episodes` now means episodes per LIBERO task, defaults to 50, and is
+propagated as `S4_EPISODES_PER_TASK`. Thus the default remains 500 episodes per
+matched K, while `--episodes 1` produces a real 10-episode-per-K smoke plan.
+The joint K=1/2/4 evaluator validates child record counts dynamically and
+records both `episodes_per_task` and `episodes_per_k` in its matrix summary.
+
+### Fix-round TDD and verification
+
+The scheduler/config RED was:
+
+```text
+8 failed, 14 passed
+```
+
+The focused scheduler/config GREEN was:
+
+```text
+22 passed in 22.37s
+```
+
+Launcher RED was three expected failures: incomplete/misleading read-only
+output and missing evaluator episode propagation. Launcher GREEN was:
+
+```text
+3 passed in 0.29s
+```
+
+The complete focused Task 4 fix suite passed:
+
+```text
+61 passed in 83.73s
+```
+
+Final post-edit regression runs passed:
+
+```text
+112 passed in 82.97s
+56 passed in 10.52s
+```
+
+The second run covers the formal evaluator, suite launcher, and joint K=1/2/4
+matrix, including a live sentinel test with three episodes per task.
+
+Final static and operational checks also passed:
+
+- Python compilation for the trainer and progressive config.
+- Shell syntax validation for both training wrappers and both evaluator
+  launchers.
+- Exactly one `--nproc_per_node=8` occurrence in each training wrapper.
+- `git diff --check`.
+- Explicit-path `--phase check` and
+  `--phase all --steps 1 --save-interval 1 --episodes 1 --dry-run`.
+- Before/after assertions confirmed neither explicit-path read-only invocation
+  created its run root or launched a child process.
+
+### Remaining concerns
+
+None identified within the Task 4 scope. Formal training and evaluation were
+not launched; the requested verification is read-only plus automated tests.

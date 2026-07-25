@@ -10,7 +10,7 @@ usage() {
     cat <<'USAGE'
 Usage: bash evaluation/libero/run_cosmos_progressive_joint_124_eval_8gpu.sh run|dry-run
 Required: MATRIX_ROOT, S4_CKPT_ROOT, S4_DATASET_PATH, S4_EMPTY_EMBEDDING.
-Each K evaluates all 10 LIBERO tasks with 50 shared seeds (500 episodes).
+S4_EPISODES_PER_TASK defaults to 50, so each K evaluates 500 episodes.
 USAGE
 }
 
@@ -20,6 +20,9 @@ require_env() {
     [[ -n "${!name:-}" ]] || die "set ${name}"
 }
 emit_kv() { printf '%s=%s\n' "$1" "$2"; }
+positive() {
+    [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "$1 must be a positive integer"
+}
 
 [[ $# -eq 1 ]] || { usage >&2; exit 2; }
 MODE="$1"
@@ -39,6 +42,9 @@ require_env "S4_EMPTY_EMBEDDING"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 S4_FORMAL_LAUNCHER="${S4_FORMAL_LAUNCHER:-${SCRIPT_DIR}/run_cosmos_progressive_s4_eval.sh}"
 [[ -x "${S4_FORMAL_LAUNCHER}" ]] || die "formal launcher is not executable: ${S4_FORMAL_LAUNCHER}"
+S4_EPISODES_PER_TASK="${S4_EPISODES_PER_TASK:-50}"
+positive S4_EPISODES_PER_TASK "$S4_EPISODES_PER_TASK"
+export S4_EPISODES_PER_TASK
 
 readonly STEPS=(1 2 4)
 S4_ALIGNMENT_VERIFIED="${S4_ALIGNMENT_VERIFIED:-0}"
@@ -69,6 +75,7 @@ fi
 
 emit_kv "MATRIX_MODE" "${MODE}"
 emit_kv "MATRIX_ROOT" "${MATRIX_ROOT}"
+emit_kv "EPISODES_PER_TASK" "${S4_EPISODES_PER_TASK}"
 emit_kv "ALIGNMENT_BLOCKED" "${ALIGNMENT_BLOCKED}"
 emit_kv "EVALUATION_CLASSIFICATION" "${S4_EVAL_CLASSIFICATION}"
 emit_kv "EVALUATION_IS_FORMAL" "${S4_EVAL_IS_FORMAL}"
@@ -97,7 +104,8 @@ if [[ "${MODE}" == "dry-run" ]]; then
 fi
 
 "${PYTHON_BIN}" - "${MATRIX_ROOT}" "${S4_CKPT_ROOT}" \
-    "${S4_EVAL_CLASSIFICATION}" "${S4_EVAL_IS_FORMAL}" "${S4_MODEL_ROLE:-stage2_target}" <<'PY'
+    "${S4_EVAL_CLASSIFICATION}" "${S4_EVAL_IS_FORMAL}" \
+    "${S4_MODEL_ROLE:-stage2_target}" "${S4_EPISODES_PER_TASK}" <<'PY'
 import json
 import os
 import sys
@@ -108,6 +116,8 @@ expected_checkpoint = str(Path(sys.argv[2]).resolve())
 expected_classification = sys.argv[3]
 expected_is_formal = sys.argv[4] == "1"
 expected_model_role = sys.argv[5]
+episodes_per_task = int(sys.argv[6])
+expected_records = 10 * episodes_per_task
 steps = (1, 2, 4)
 summary_paths = {
     str(step): root / f"k{step}" / "formal_summary.json" for step in steps
@@ -118,10 +128,16 @@ for step in steps:
     if not path.is_file():
         raise SystemExit(f"missing child summary for K={step}: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if int(payload.get("num_records", -1)) != 500:
+    if int(payload.get("num_records", -1)) != expected_records:
         raise SystemExit(
             f"num_records mismatch for K={step}: "
-            f"expected=500 got={payload.get('num_records')!r}"
+            f"expected={expected_records} got={payload.get('num_records')!r}"
+        )
+    if int(payload.get("seeds_per_task", -1)) != episodes_per_task:
+        raise SystemExit(
+            f"seeds_per_task mismatch for K={step}: "
+            f"expected={episodes_per_task} "
+            f"got={payload.get('seeds_per_task')!r}"
         )
     if int(payload.get("student_steps", -1)) != step:
         raise SystemExit(
@@ -164,6 +180,8 @@ matrix_summary = {
     "evaluation_classification": expected_classification,
     "is_formal": expected_is_formal,
     "steps": list(steps),
+    "episodes_per_task": episodes_per_task,
+    "episodes_per_k": expected_records,
     "model_role": expected_model_role,
     "checkpoint_contract_identity": next(iter(identities)),
     "summaries": {key: str(path) for key, path in summary_paths.items()},

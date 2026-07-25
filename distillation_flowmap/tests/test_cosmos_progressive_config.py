@@ -439,6 +439,9 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
     assert module.cfg.opd_danceopd_endpoint_weight == 1.0
     assert module.cfg.opd_danceopd_velocity_weight == 1.0
     assert module.cfg.aligned_video_opd_enabled is True
+    assert module.cfg.aligned_video_opd_interval == 4
+    assert module.cfg.action_downsample_factor == 4
+    assert module.cfg.video_action_bridge == 0
     assert module.cfg.opd_serial_student_cfg is True
     assert module.cfg.opd_aux_standalone_step is True
     assert module.cfg.opd_aux_gradient_checkpointing is True
@@ -526,6 +529,12 @@ def test_progressive_universal_retains_original_lingbotva_definition(monkeypatch
         ("OPD_DANCEOPD_ENDPOINT_WEIGHT", "0", "OPD_DANCEOPD_ENDPOINT_WEIGHT"),
         ("OPD_DANCEOPD_VELOCITY_WEIGHT", "-1", "OPD_DANCEOPD_VELOCITY_WEIGHT"),
         ("OPD_AUX_INTERVAL", "0", "OPD_AUX_INTERVAL"),
+        (
+            "ALIGNED_VIDEO_OPD_INTERVAL",
+            "7",
+            "ALIGNED_VIDEO_OPD_INTERVAL",
+        ),
+        ("VIDEO_ACTION_BRIDGE", "1", "VIDEO_ACTION_BRIDGE"),
     ],
 )
 def test_progressive_config_rejects_invalid_aligned_video_opd_controls(

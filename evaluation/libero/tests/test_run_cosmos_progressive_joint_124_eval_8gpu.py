@@ -39,6 +39,7 @@ def _base_env(tmp_path):
     env.pop("S4_STUDENT_STEPS", None)
     env.pop("S4_MODEL_ROLE", None)
     env.pop("S4_DRY_RUN", None)
+    env.pop("S4_EPISODES_PER_TASK", None)
     env.pop("S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH", None)
     return env
 
@@ -108,6 +109,7 @@ def _write_child_sentinel(path, *, fail_step=None, corrupt_step=None):
         "assert sys.argv[1:] == ['formal']\n"
         "root = pathlib.Path(os.environ['EVAL_ROOT'])\n"
         "step = int(os.environ['S4_STUDENT_STEPS'])\n"
+        "episodes_per_task = int(os.environ['S4_EPISODES_PER_TASK'])\n"
         "with pathlib.Path(os.environ['SENTINEL_LOG']).open('a', encoding='utf-8') as f:\n"
         "    f.write(f'{step}\\n')\n"
         + (
@@ -134,12 +136,13 @@ def _write_child_sentinel(path, *, fail_step=None, corrupt_step=None):
         "    'action_steps': step,\n"
         "    'model_role': os.environ.get('S4_MODEL_ROLE', 'stage2_target'),\n"
         "    'checkpoint_contract_identity': 'contract-v1',\n"
-        "    'num_records': 500,\n"
+        "    'num_records': 10 * episodes_per_task,\n"
+        "    'seeds_per_task': episodes_per_task,\n"
         "    'evaluation_classification': os.environ['S4_EVAL_CLASSIFICATION'],\n"
         "    'is_formal': os.environ['S4_EVAL_IS_FORMAL'] == '1',\n"
         "}\n"
         "if step == 2 and os.environ.get('CORRUPTION') == 'records':\n"
-        "    summary['num_records'] = 499\n"
+        "    summary['num_records'] -= 1\n"
         "if step == 2 and os.environ.get('CORRUPTION') == 'checkpoint':\n"
         "    summary['checkpoint'] = '/wrong/checkpoint'\n"
         "if step == 2 and os.environ.get('CORRUPTION') == 'classification':\n"
@@ -192,6 +195,8 @@ def test_live_matrix_runs_serially_reuses_k1_prompt_and_writes_summary(tmp_path)
         "evaluation_classification": "formal_verified",
         "is_formal": True,
         "steps": [1, 2, 4],
+        "episodes_per_task": 50,
+        "episodes_per_k": 500,
         "model_role": "stage2_target",
         "checkpoint_contract_identity": "contract-v1",
         "summaries": {
@@ -200,6 +205,38 @@ def test_live_matrix_runs_serially_reuses_k1_prompt_and_writes_summary(tmp_path)
             "4": str(root / "k4" / "formal_summary.json"),
         },
     }
+
+
+def test_live_matrix_propagates_nondefault_episode_count_to_every_k(tmp_path):
+    env = _base_env(tmp_path)
+    env["S4_EPISODES_PER_TASK"] = "3"
+    log = tmp_path / "child-order.log"
+    child = tmp_path / "child.py"
+    _write_child_sentinel(child)
+    env.update(
+        {
+            "S4_FORMAL_LAUNCHER": str(child),
+            "SENTINEL_LOG": str(log),
+        }
+    )
+
+    result = _run("run", env=env)
+    _assert_success(result)
+
+    root = Path(env["MATRIX_ROOT"])
+    for step in (1, 2, 4):
+        child_payload = json.loads(
+            (root / f"k{step}" / "formal_summary.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert child_payload["seeds_per_task"] == 3
+        assert child_payload["num_records"] == 30
+    matrix = json.loads(
+        (root / "matrix_summary.json").read_text(encoding="utf-8")
+    )
+    assert matrix["episodes_per_task"] == 3
+    assert matrix["episodes_per_k"] == 30
 
 
 def test_unverified_run_stops_before_any_child(tmp_path):

@@ -12,7 +12,7 @@ Options:
   --stage1-steps N          default: 5000
   --stage2-steps N          default: 10000
   --steps N                 smoke alias: use N for both training stages
-  --episodes N              resolved evaluation episode count (read-only modes)
+  --episodes N              episodes per LIBERO task (default: 50)
   --save-interval N         default: 1000
   --stage1-master-port PORT default: 29671
   --stage2-master-port PORT default: 29672
@@ -102,7 +102,7 @@ STAGE2_MASTER_PORT=29672
 RESUME_STAGE=""
 RESUME_STEP=""
 READ_ONLY_MODE=""
-EVAL_EPISODES=500
+EVAL_EPISODES=50
 
 while (( $# > 0 )); do
     case "$1" in
@@ -251,6 +251,55 @@ lock_command+=(
     --stage1-target-root "$STAGE1_TARGET"
 )
 eval_command=("$EVAL_LAUNCHER" run)
+stage1_environment=(
+    env
+    "CLEAN_STUDENT_BASE_MODEL_PATH=$CLEAN_STUDENT_BASE_MODEL_PATH"
+    "DATASET_PATH=$DATASET_PATH"
+    "EMPTY_EMB_PATH=$EMPTY_EMB_PATH"
+    "COSMOS_POLICY_PATH=$COSMOS_POLICY_PATH"
+    "COSMOS_PREDICT2_REPO=$COSMOS_PREDICT2_REPO"
+    "COSMOS_PREDICT25_LOCAL_MODEL_DIR=$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
+    "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+)
+stage2_environment=(
+    env
+    "COSMOS_STAGE1_ROOT=$STAGE1_CHECKPOINT"
+    "STUDENT_BASE_MODEL_PATH=$STAGE1_TARGET"
+    "COSMOS_PROVENANCE_LOCK_ROOT=$LOCK_ROOT"
+    "VERIFY_LARGE_ARTIFACT_DIGESTS=1"
+    "DATASET_PATH=$DATASET_PATH"
+    "COSMOS_POLICY_PATH=$COSMOS_POLICY_PATH"
+    "COSMOS_PREDICT2_REPO=$COSMOS_PREDICT2_REPO"
+    "COSMOS_PREDICT25_LOCAL_MODEL_DIR=$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
+    "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    "ALIGNED_VIDEO_OPD_INTERVAL=4"
+    "OPD_AUX_INTERVAL=4"
+    "OPD_DANCEOPD_ROLLOUT_STEPS=2,4"
+    "OPD_DANCEOPD_ANCHOR_TEACHER_STEPS=8"
+    "OPD_DANCEOPD_ENDPOINT_WEIGHT=1.0"
+    "OPD_DANCEOPD_VELOCITY_WEIGHT=1.0"
+    "ACTION_DOWNSAMPLE_FACTOR=4"
+    "VIDEO_ACTION_BRIDGE=0"
+)
+eval_environment=(
+    env
+    "MATRIX_ROOT=$MATRIX_ROOT"
+    "S4_CKPT_ROOT=$EVAL_TRANSFORMER"
+    "S4_MODEL_ROLE=stage2_target"
+    "S4_DATASET_PATH=$DATASET_PATH"
+    "S4_EMPTY_EMBEDDING=$EMPTY_EMB_PATH"
+    "S4_ALIGNMENT_VERIFIED=1"
+    "S4_EPISODES_PER_TASK=$EVAL_EPISODES"
+)
+stage1_dry_command=("${stage1_command[@]}")
+stage1_dry_command[1]=dry-run
+stage1_execution=("${stage1_environment[@]}" "${stage1_command[@]}")
+stage1_plan=("${stage1_environment[@]}" "${stage1_dry_command[@]}")
+lock_plan=("${lock_command[@]}" --dry-run)
+stage2_execution=("${stage2_environment[@]}" "${stage2_command[@]}")
+stage2_plan=("${stage2_environment[@]}" "${stage2_command[@]}" --dry-run)
+eval_execution=("${eval_environment[@]}" "${eval_command[@]}")
+eval_plan=("${eval_environment[@]}" "$EVAL_LAUNCHER" dry-run)
 
 printf 'PIPELINE_SEMANTICS=LingBotVA/Wan student init + Cosmos teacher\n'
 printf 'PHASE=%s\n' "$PHASE"
@@ -258,29 +307,30 @@ printf 'RUN_ROOT=%s\n' "$RUN_ROOT"
 printf 'STAGE1_CHECKPOINT=%s\n' "$STAGE1_CHECKPOINT"
 printf 'STAGE2_CHECKPOINT=%s\n' "$STAGE2_CHECKPOINT"
 printf 'EVAL_CHECKPOINT_ROLE=stage2_target\n'
-printf 'EVAL_PROTOCOL=LIBERO-10 matched joint 1/2/4, 500 episodes per K\n'
+printf 'EVAL_PROTOCOL=LIBERO-10 matched joint 1/2/4, %s episodes per K\n' \
+    "$((10#$EVAL_EPISODES * 10))"
 printf 'EVAL_EPISODES=%s\n' "$EVAL_EPISODES"
+printf 'ALIGNED_VIDEO_OPD_INTERVAL=4\n'
 printf 'OPD_AUX_INTERVAL=4\n'
 printf 'OPD_DANCEOPD_ROLLOUT_STEPS=2,4\n'
 printf 'OPD_DANCEOPD_ANCHOR_TEACHER_STEPS=8\n'
 printf 'OPD_DANCEOPD_ENDPOINT_WEIGHT=1.0\n'
 printf 'OPD_DANCEOPD_VELOCITY_WEIGHT=1.0\n'
-printf 'ACTION_DOWNSAMPLE_FACTOR=1\n'
+printf 'ACTION_DOWNSAMPLE_FACTOR=4\n'
 printf 'VIDEO_ACTION_BRIDGE=0\n'
-print_command STAGE1_COMMAND "${stage1_command[@]}"
-print_command LOCK_COMMAND "${lock_command[@]}"
-print_command STAGE2_COMMAND "${stage2_command[@]}"
-print_command EVAL_COMMAND "${eval_command[@]}"
 
 if [[ -n "$READ_ONLY_MODE" ]]; then
     printf 'PIPELINE_MODE=%s\n' "$READ_ONLY_MODE"
-    print_command ALIGNED_TRAIN_COMMAND \
-        torchrun --nproc_per_node=8 \
-        --master_port "$STAGE2_MASTER_PORT" \
-        distillation_flowmap/train.py \
-        --output-dir "$STAGE2_OUTPUT"
+    print_command STAGE1_COMMAND "${stage1_plan[@]}"
+    print_command LOCK_COMMAND "${lock_plan[@]}"
+    print_command STAGE2_COMMAND "${stage2_plan[@]}"
+    print_command EVAL_COMMAND "${eval_plan[@]}"
     exit 0
 fi
+print_command STAGE1_COMMAND "${stage1_execution[@]}"
+print_command LOCK_COMMAND "${lock_command[@]}"
+print_command STAGE2_COMMAND "${stage2_execution[@]}"
+print_command EVAL_COMMAND "${eval_execution[@]}"
 
 if [[ "$PHASE" == all ]]; then
     [[ ! -e "$RUN_ROOT" && ! -L "$RUN_ROOT" ]] || die "RUN_ROOT already exists: $RUN_ROOT"
@@ -310,16 +360,17 @@ fi
 
 export PIPELINE_RUN_ROOT="$RUN_ROOT"
 export PIPELINE_STAGE2_STEPS="$STAGE2_STEPS"
+export ALIGNED_VIDEO_OPD_INTERVAL=4
 export OPD_AUX_INTERVAL=4
 export OPD_DANCEOPD_ROLLOUT_STEPS=2,4
 export OPD_DANCEOPD_ANCHOR_TEACHER_STEPS=8
 export OPD_DANCEOPD_ENDPOINT_WEIGHT=1.0
 export OPD_DANCEOPD_VELOCITY_WEIGHT=1.0
-export ACTION_DOWNSAMPLE_FACTOR=1
+export ACTION_DOWNSAMPLE_FACTOR=4
 export VIDEO_ACTION_BRIDGE=0
 
 if [[ "$PHASE" == all || "$PHASE" == stage1 ]]; then
-    run_child "${stage1_command[@]}"
+    run_child "${stage1_execution[@]}"
     require_transformer Stage1-target "$STAGE1_TARGET/transformer"
 fi
 [[ "$PHASE" != stage1 ]] || exit 0
@@ -335,7 +386,7 @@ if [[ "$PHASE" == all || "$PHASE" == stage2 ]]; then
     export STUDENT_BASE_MODEL_PATH="$STAGE1_TARGET"
     export COSMOS_PROVENANCE_LOCK_ROOT="$LOCK_ROOT"
     export VERIFY_LARGE_ARTIFACT_DIGESTS=1
-    run_child "${stage2_command[@]}"
+    run_child "${stage2_execution[@]}"
     require_transformer Stage2-target "$EVAL_TRANSFORMER"
 fi
 [[ "$PHASE" != stage2 ]] || exit 0
@@ -346,4 +397,5 @@ export S4_MODEL_ROLE=stage2_target
 export S4_DATASET_PATH="$DATASET_PATH"
 export S4_EMPTY_EMBEDDING="$EMPTY_EMB_PATH"
 export S4_ALIGNMENT_VERIFIED=1
-run_child "${eval_command[@]}"
+export S4_EPISODES_PER_TASK="$EVAL_EPISODES"
+run_child "${eval_execution[@]}"

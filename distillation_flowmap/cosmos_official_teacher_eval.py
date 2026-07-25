@@ -47,6 +47,9 @@ def _require_plain(path: Path, *, directory: bool, label: str) -> None:
 
 def resolve_cosmos_official_teacher_root(
     path: str | Path,
+    *,
+    verified_contract_identity: str | None = None,
+    provenance_lock_path: str | Path | None = None,
 ) -> ResolvedCosmosOfficialTeacher:
     """Validate the uploaded official Cosmos Policy monolithic checkpoint."""
 
@@ -109,13 +112,32 @@ def resolve_cosmos_official_teacher_root(
             "official teacher action contract must be horizon=16 and dim=7"
         )
 
-    weight_stat = weights[0].stat()
-    identity = hashlib.sha256()
-    identity.update(config_bytes)
-    identity.update(weights[0].name.encode("utf-8"))
-    identity.update(str(weight_stat.st_size).encode("ascii"))
-    identity.update(stats_path.read_bytes())
-    identity.update(embeddings_path.read_bytes())
+    if verified_contract_identity is not None and provenance_lock_path is not None:
+        raise ValueError(
+            "provide either verified_contract_identity or provenance_lock_path, not both"
+        )
+    if provenance_lock_path is not None:
+        from distillation_flowmap.cosmos_libero_provenance import (
+            verify_artifact_lock,
+        )
+
+        lock_path = Path(provenance_lock_path)
+        _require_plain(lock_path, directory=False, label="official teacher provenance lock")
+        verify_artifact_lock(
+            canonical_root,
+            lock_path,
+            verify_large_artifact_digests=False,
+        )
+        verified_contract_identity = hashlib.sha256(lock_path.read_bytes()).hexdigest()
+    if (
+        not isinstance(verified_contract_identity, str)
+        or len(verified_contract_identity) != 64
+        or any(character not in "0123456789abcdef" for character in verified_contract_identity)
+    ):
+        raise ValueError(
+            "official teacher requires a verified 64-hex provenance contract identity "
+            "or teacher lock"
+        )
     return ResolvedCosmosOfficialTeacher(
         model_role="official_teacher",
         backend="cosmos_policy",
@@ -124,7 +146,7 @@ def resolve_cosmos_official_teacher_root(
         config_path=str(config_path),
         dataset_stats_path=str(stats_path),
         t5_embeddings_path=str(embeddings_path),
-        contract_identity=identity.hexdigest(),
+        contract_identity=verified_contract_identity,
     )
 
 
@@ -137,6 +159,7 @@ class OfficialTeacherMatchedBudgetAdapter:
         "effective_video_steps",
         "effective_action_steps",
         "matched_budget_verified",
+        "observed_joint_nfe",
     )
 
     def __init__(
@@ -183,6 +206,15 @@ class OfficialTeacherMatchedBudgetAdapter:
         )
         if not isinstance(result, Mapping):
             raise TypeError("official teacher result must be a mapping")
+        leaked = sorted(
+            key
+            for key in result
+            if key == "student_steps" or key.startswith("student_")
+        )
+        if leaked:
+            raise RuntimeError(
+                f"official teacher response leaked student metadata: {leaked}"
+            )
         missing = [
             name for name in self._REQUIRED_PROOF_FIELDS if name not in result
         ]
@@ -200,7 +232,13 @@ class OfficialTeacherMatchedBudgetAdapter:
             or not proof["matched_budget_verified"]
             or any(
                 type(proof[name]) is not int or proof[name] != expected
-                for name in self._REQUIRED_PROOF_FIELDS[:-1]
+                for name in (
+                    "requested_video_steps",
+                    "requested_action_steps",
+                    "effective_video_steps",
+                    "effective_action_steps",
+                    "observed_joint_nfe",
+                )
             )
         ):
             raise RuntimeError(
@@ -287,5 +325,6 @@ class OfficialTeacherEvaluationService:
             "effective_video_steps": result["effective_video_steps"],
             "effective_action_steps": result["effective_action_steps"],
             "matched_budget_verified": result["matched_budget_verified"],
+            "observed_joint_nfe": result["observed_joint_nfe"],
             "future_prediction_keys": future_keys,
         }

@@ -52,6 +52,7 @@ export S4_EPISODES_PER_TASK
 readonly STEPS=(1 2 4)
 readonly SUITES=(libero_10 libero_spatial libero_object libero_goal)
 COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-}"
+COSMOS_POLICY_TEACHER_LOCK="${COSMOS_POLICY_TEACHER_LOCK:-}"
 S4_MATRIX_ROLES="${S4_MATRIX_ROLES:-stage2_target,official_teacher}"
 case "${S4_MATRIX_ROLES}" in
     stage2_target)
@@ -60,11 +61,13 @@ case "${S4_MATRIX_ROLES}" in
         ;;
     official_teacher)
         require_env "COSMOS_POLICY_PATH"
+        require_env "COSMOS_POLICY_TEACHER_LOCK"
         ROLES=(official_teacher)
         DUAL_ROLE_MATRIX=0
         ;;
     stage2_target,official_teacher)
         require_env "COSMOS_POLICY_PATH"
+        require_env "COSMOS_POLICY_TEACHER_LOCK"
         ROLES=(stage2_target official_teacher)
         DUAL_ROLE_MATRIX=1
         ;;

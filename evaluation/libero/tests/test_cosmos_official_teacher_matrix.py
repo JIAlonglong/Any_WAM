@@ -32,6 +32,7 @@ class _Adapter:
             "effective_video_steps": 2,
             "effective_action_steps": 2,
             "matched_budget_verified": True,
+            "observed_joint_nfe": 2,
             "future_image_predictions": [{"primary": np.zeros((2, 2, 3), dtype=np.uint8)}],
         }
 
@@ -102,6 +103,8 @@ def _matrix_env(tmp_path):
     dataset.mkdir()
     teacher = tmp_path / "teacher"
     teacher.mkdir()
+    teacher_lock = tmp_path / "teacher.lock.json"
+    teacher_lock.write_text("{}", encoding="utf-8")
     empty = dataset / "empty.pt"
     empty.write_bytes(b"x")
     prompts = dataset / "prompts.pt"
@@ -111,6 +114,7 @@ def _matrix_env(tmp_path):
         MATRIX_ROOT=str(tmp_path / "matrix"),
         S4_CKPT_ROOT=str(checkpoint),
         COSMOS_POLICY_PATH=str(teacher),
+        COSMOS_POLICY_TEACHER_LOCK=str(teacher_lock),
         S4_DATASET_PATH=str(dataset),
         S4_EMPTY_EMBEDDING=str(empty),
         S4_PROMPT_TABLE=str(prompts),

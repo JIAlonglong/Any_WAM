@@ -208,7 +208,10 @@ preflight_shard() {
         --preflight
     )
     if [[ "${S4_MODEL_ROLE}" == "official_teacher" ]]; then
-        command+=(--cosmos-policy-path "${COSMOS_POLICY_PATH}")
+        command+=(
+            --cosmos-policy-path "${COSMOS_POLICY_PATH}"
+            --teacher-provenance-lock "${COSMOS_POLICY_TEACHER_LOCK}"
+        )
     else
         command+=(--checkpoint-transformer "${S4_CKPT_ROOT}")
     fi
@@ -243,7 +246,10 @@ launch_shard() {
             --action-steps "${S4_STUDENT_STEPS}"
         )
         if [[ "${S4_MODEL_ROLE}" == "official_teacher" ]]; then
-            command+=(--cosmos-policy-path "${COSMOS_POLICY_PATH}")
+            command+=(
+                --cosmos-policy-path "${COSMOS_POLICY_PATH}"
+                --teacher-provenance-lock "${COSMOS_POLICY_TEACHER_LOCK}"
+            )
         else
             command+=(--checkpoint-transformer "${S4_CKPT_ROOT}")
         fi
@@ -360,6 +366,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 S4_CKPT_ROOT="${S4_CKPT_ROOT:-}"
 S4_CONFIG="${S4_CONFIG:-distillation_flowmap.config_libero_cosmos_policy_stage2_progressive}"
 COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B}"
+COSMOS_POLICY_TEACHER_LOCK="${COSMOS_POLICY_TEACHER_LOCK:-}"
 S4_PROMPT_TABLE="${S4_PROMPT_TABLE:-}"
 S4_DATASET_PATH="${S4_DATASET_PATH:-}"
 S4_EMPTY_EMBEDDING="${S4_EMPTY_EMBEDDING:-}"
@@ -389,6 +396,7 @@ case "${S4_MODEL_ROLE}" in
         ;;
     official_teacher)
         : "${COSMOS_POLICY_PATH:?set the official monolithic Cosmos Policy root}"
+        : "${COSMOS_POLICY_TEACHER_LOCK:?set the verified teacher provenance lock}"
         ROLE_CHECKPOINT="${COSMOS_POLICY_PATH}"
         ;;
     *) die "S4_MODEL_ROLE must be stage2_online, stage2_target, or official_teacher" ;;

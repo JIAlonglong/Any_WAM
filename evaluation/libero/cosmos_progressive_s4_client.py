@@ -186,6 +186,7 @@ class CosmosProgressiveS4Client:
             if not bool(response.get("reset", False)) and (
                 int(response.get("effective_video_steps", -1)) != self.video_steps
                 or int(response.get("effective_action_steps", -1)) != self.action_steps
+                or int(response.get("observed_joint_nfe", -1)) != self.action_steps
             ):
                 raise ValueError("official_teacher effective video/action K mismatch")
             return
@@ -347,6 +348,7 @@ class CosmosProgressiveS4Client:
                         "effective_video_steps",
                         "effective_action_steps",
                         "matched_budget_verified",
+                        "observed_joint_nfe",
                         "future_prediction_keys",
                     )
                     if key in response

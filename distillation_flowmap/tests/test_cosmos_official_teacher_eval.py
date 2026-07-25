@@ -8,6 +8,7 @@ from distillation_flowmap.cosmos_official_teacher_eval import (
     resolve_cosmos_official_teacher_root,
 )
 from distillation_flowmap.cosmos_policy_raw_worker import (
+    _call_get_action_with_observed_joint_nfe,
     _official_matched_budget_response_fields,
 )
 from distillation_flowmap.cosmos_training_contract import (
@@ -54,7 +55,8 @@ def _write_official_teacher_root(root: Path) -> Path:
 
 def test_official_teacher_root_resolves_monolithic_policy_not_student(tmp_path):
     resolved = resolve_cosmos_official_teacher_root(
-        _write_official_teacher_root(tmp_path / "teacher")
+        _write_official_teacher_root(tmp_path / "teacher"),
+        verified_contract_identity="a" * 64,
     )
 
     assert resolved.model_role == "official_teacher"
@@ -82,7 +84,9 @@ def test_official_teacher_root_rejects_wrong_backend_contract(
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
     with pytest.raises(ValueError, match=message):
-        resolve_cosmos_official_teacher_root(root)
+        resolve_cosmos_official_teacher_root(
+            root, verified_contract_identity="a" * 64
+        )
 
 
 def test_official_teacher_root_rejects_student_transformer_directory(tmp_path):
@@ -91,7 +95,16 @@ def test_official_teacher_root_rejects_student_transformer_directory(tmp_path):
     (transformer / "config.json").write_text("{}", encoding="utf-8")
 
     with pytest.raises(ValueError, match="monolithic"):
-        resolve_cosmos_official_teacher_root(transformer)
+        resolve_cosmos_official_teacher_root(
+            transformer, verified_contract_identity="a" * 64
+        )
+
+
+def test_official_teacher_root_requires_verified_provenance_identity(tmp_path):
+    root = _write_official_teacher_root(tmp_path / "teacher")
+
+    with pytest.raises(ValueError, match="provenance contract identity"):
+        resolve_cosmos_official_teacher_root(root)
 
 
 @pytest.mark.parametrize("budget", (1, 2, 4))
@@ -104,6 +117,7 @@ def test_worker_budget_contract_reports_requested_and_effective_k(budget):
         configured_action_steps=budget,
         configured_future_steps=budget,
         include_future=True,
+        observed_joint_nfe=budget,
     )
 
     assert fields == {
@@ -112,6 +126,7 @@ def test_worker_budget_contract_reports_requested_and_effective_k(budget):
         "effective_video_steps": np.int64(budget),
         "effective_action_steps": np.int64(budget),
         "matched_budget_verified": np.bool_(True),
+        "observed_joint_nfe": np.int64(budget),
     }
 
 
@@ -134,6 +149,7 @@ def test_worker_budget_contract_rejects_missing_mismatched_or_fixed_five(
             configured_action_steps=2,
             configured_future_steps=2,
             include_future=True,
+            observed_joint_nfe=2,
         )
 
 
@@ -144,7 +160,44 @@ def test_worker_budget_contract_rejects_silent_configured_five_fallback():
             configured_action_steps=5,
             configured_future_steps=2,
             include_future=True,
+            observed_joint_nfe=2,
         )
+
+
+def test_worker_budget_contract_rejects_observed_sampler_nfe_mismatch():
+    with pytest.raises(RuntimeError, match="observed joint"):
+        _official_matched_budget_response_fields(
+            {"requested_video_steps": 2, "requested_action_steps": 2},
+            configured_action_steps=2,
+            configured_future_steps=2,
+            include_future=True,
+            observed_joint_nfe=5,
+        )
+
+
+def test_official_runtime_counts_actual_joint_denoiser_calls_and_restores_model():
+    class Model:
+        def get_x0_fn_from_batch(self, _batch):
+            return lambda value: value
+
+    model = Model()
+    original = model.get_x0_fn_from_batch
+
+    def get_action(*, model, requested_steps):
+        denoiser = model.get_x0_fn_from_batch({})
+        for step in range(requested_steps):
+            denoiser(step)
+        return {"actions": "sentinel"}
+
+    result, observed = _call_get_action_with_observed_joint_nfe(
+        get_action,
+        model=model,
+        get_action_kwargs={"requested_steps": 4},
+    )
+
+    assert result == {"actions": "sentinel"}
+    assert observed == 4
+    assert model.get_x0_fn_from_batch.__func__ is original.__func__
 
 
 class _Teacher:
@@ -167,6 +220,7 @@ def _verified_result(budget=2):
         "effective_video_steps": budget,
         "effective_action_steps": budget,
         "matched_budget_verified": True,
+        "observed_joint_nfe": budget,
     }
 
 
@@ -228,6 +282,34 @@ def test_official_adapter_rejects_missing_effective_k_metadata():
     )
 
     with pytest.raises(RuntimeError, match="missing"):
+        adapter.infer_raw({})
+
+
+def test_official_adapter_rejects_config_echo_without_observed_joint_nfe():
+    result = _verified_result(2)
+    result.pop("observed_joint_nfe")
+    adapter = OfficialTeacherMatchedBudgetAdapter(
+        teacher=_Teacher(result),
+        video_steps=2,
+        action_steps=2,
+        include_future=True,
+    )
+
+    with pytest.raises(RuntimeError, match="missing"):
+        adapter.infer_raw({})
+
+
+def test_official_adapter_rejects_student_metadata_leakage():
+    result = _verified_result(2)
+    result["student_steps"] = 2
+    adapter = OfficialTeacherMatchedBudgetAdapter(
+        teacher=_Teacher(result),
+        video_steps=2,
+        action_steps=2,
+        include_future=True,
+    )
+
+    with pytest.raises(RuntimeError, match="student"):
         adapter.infer_raw({})
 
 

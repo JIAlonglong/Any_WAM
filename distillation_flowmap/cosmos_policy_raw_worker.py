@@ -35,6 +35,7 @@ def _official_matched_budget_response_fields(
     configured_action_steps,
     configured_future_steps,
     include_future,
+    observed_joint_nfe,
 ):
     supported = (1, 2, 4)
     missing = [
@@ -76,13 +77,67 @@ def _official_matched_budget_response_fields(
             "official worker configured future-video steps "
             f"{configured_future_steps!r} do not match requested {video_steps}"
         )
+    if type(observed_joint_nfe) is not int or observed_joint_nfe != action_steps:
+        raise RuntimeError(
+            "official worker observed joint sampler NFE "
+            f"{observed_joint_nfe!r}, expected exactly {action_steps}"
+        )
     return {
         "requested_video_steps": np.int64(video_steps),
         "requested_action_steps": np.int64(action_steps),
-        "effective_video_steps": np.int64(effective_video_steps),
-        "effective_action_steps": np.int64(configured_action_steps),
+        "effective_video_steps": np.int64(observed_joint_nfe),
+        "effective_action_steps": np.int64(observed_joint_nfe),
         "matched_budget_verified": np.bool_(True),
+        "observed_joint_nfe": np.int64(observed_joint_nfe),
     }
+
+
+def _call_get_action_with_observed_joint_nfe(
+    get_action,
+    *,
+    model,
+    get_action_kwargs,
+):
+    """Count actual official joint denoiser calls, restoring the model exactly."""
+
+    observed = 0
+    restorations = []
+    for method_name in ("get_x0_fn_from_batch", "get_velocity_fn_from_batch"):
+        original = getattr(model, method_name, None)
+        if original is None:
+            continue
+        marker = object()
+        previous_instance = model.__dict__.get(method_name, marker)
+
+        def instrumented(*args, __original=original, **kwargs):
+            result = __original(*args, **kwargs)
+            if isinstance(result, tuple):
+                denoiser, *rest = result
+            else:
+                denoiser, rest = result, None
+
+            def counted(*fn_args, **fn_kwargs):
+                nonlocal observed
+                observed += 1
+                return denoiser(*fn_args, **fn_kwargs)
+
+            return counted if rest is None else (counted, *rest)
+
+        setattr(model, method_name, instrumented)
+        restorations.append((method_name, previous_instance, marker))
+    if not restorations:
+        raise RuntimeError(
+            "official Cosmos model exposes no auditable denoiser factory"
+        )
+    try:
+        result = get_action(model=model, **get_action_kwargs)
+    finally:
+        for method_name, previous_instance, marker in restorations:
+            if previous_instance is marker:
+                delattr(model, method_name)
+            else:
+                setattr(model, method_name, previous_instance)
+    return result, observed
 
 
 def _parse_args():
@@ -1248,16 +1303,7 @@ def main():
                 name in request
                 for name in ("requested_video_steps", "requested_action_steps")
             )
-            matched_budget_fields = (
-                _official_matched_budget_response_fields(
-                    request,
-                    configured_action_steps=args.num_denoising_steps_action,
-                    configured_future_steps=cfg.num_denoising_steps_future_state,
-                    include_future=include_future,
-                )
-                if has_budget_request
-                else {}
-            )
+            matched_budget_fields = {}
             include_latent_x0 = bool(request.get("include_latent_x0", False))
             include_latent_cdiff = bool(request.get("include_latent_cdiff", False))
             include_latent_velocity_query = bool(request.get("include_latent_velocity_query", False))
@@ -1281,6 +1327,7 @@ def main():
             latent_query_velocities = []
             joint_queries = []
             video_frame_masks = []
+            observed_joint_nfes = []
             with torch.no_grad():
                 for idx, task in enumerate(tasks):
                     sample_t0 = time.perf_counter() if profile else None
@@ -1290,19 +1337,23 @@ def main():
                         "proprio": proprio[idx],
                     }
                     action_t0 = time.perf_counter() if profile else None
-                    result = get_action(
-                        cfg,
-                        model,
-                        dataset_stats,
-                        obs,
-                        task,
-                        seed=int(request.get("seed", args.seed)),
-                        randomize_seed=False,
-                        num_denoising_steps_action=args.num_denoising_steps_action,
-                        generate_future_state_and_value_in_parallel=include_future,
-                        worker_id=0,
-                        batch_size=1,
+                    result, observed_joint_nfe = _call_get_action_with_observed_joint_nfe(
+                        get_action,
+                        model=model,
+                        get_action_kwargs={
+                            "cfg": cfg,
+                            "dataset_stats": dataset_stats,
+                            "obs": obs,
+                            "task_label_or_embedding": task,
+                            "seed": int(request.get("seed", args.seed)),
+                            "randomize_seed": False,
+                            "num_denoising_steps_action": args.num_denoising_steps_action,
+                            "generate_future_state_and_value_in_parallel": include_future,
+                            "worker_id": 0,
+                            "batch_size": 1,
+                        },
                     )
+                    observed_joint_nfes.append(observed_joint_nfe)
                     if profile:
                         print(
                             "[cosmos_worker_profile] "
@@ -1414,6 +1465,19 @@ def main():
                         )
 
             actions = np.stack(actions, axis=0)
+            if has_budget_request:
+                if not observed_joint_nfes or len(set(observed_joint_nfes)) != 1:
+                    raise RuntimeError(
+                        "official worker observed inconsistent joint sampler NFE "
+                        f"across batch: {observed_joint_nfes!r}"
+                    )
+                matched_budget_fields = _official_matched_budget_response_fields(
+                    request,
+                    configured_action_steps=args.num_denoising_steps_action,
+                    configured_future_steps=cfg.num_denoising_steps_future_state,
+                    include_future=include_future,
+                    observed_joint_nfe=observed_joint_nfes[0],
+                )
             actions_path = request["actions_path"]
             fields = {"actions": actions, **matched_budget_fields}
             if include_future:

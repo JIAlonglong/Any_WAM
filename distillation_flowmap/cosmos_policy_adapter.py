@@ -616,6 +616,10 @@ class CosmosPolicyActionTeacher:
         actions = []
         future_predictions = []
         value_predictions = []
+        observed_joint_nfes = []
+        from distillation_flowmap.cosmos_policy_raw_worker import (
+            _call_get_action_with_observed_joint_nfe,
+        )
         with torch.no_grad():
             for idx, task in enumerate(tasks):
                 obs = {
@@ -623,19 +627,23 @@ class CosmosPolicyActionTeacher:
                     "wrist_image": wrist[idx],
                     "proprio": proprio[idx],
                 }
-                result = self._official_get_action(
-                    self._official_cfg,
-                    self._official_model,
-                    self._official_dataset_stats,
-                    obs,
-                    task,
-                    seed=self.raw_seed,
-                    randomize_seed=False,
-                    num_denoising_steps_action=self.num_denoising_steps_action,
-                    generate_future_state_and_value_in_parallel=bool(include_future),
-                    worker_id=self.device.index or 0,
-                    batch_size=1,
+                result, observed_joint_nfe = _call_get_action_with_observed_joint_nfe(
+                    self._official_get_action,
+                    model=self._official_model,
+                    get_action_kwargs={
+                        "cfg": self._official_cfg,
+                        "dataset_stats": self._official_dataset_stats,
+                        "obs": obs,
+                        "task_label_or_embedding": task,
+                        "seed": self.raw_seed,
+                        "randomize_seed": False,
+                        "num_denoising_steps_action": self.num_denoising_steps_action,
+                        "generate_future_state_and_value_in_parallel": bool(include_future),
+                        "worker_id": self.device.index or 0,
+                        "batch_size": 1,
+                    },
                 )
+                observed_joint_nfes.append(observed_joint_nfe)
                 actions.append(np.asarray(result["actions"], dtype=np.float32))
                 if include_future:
                     future_predictions.append(self._future_predictions_from_official_result(result))
@@ -648,6 +656,8 @@ class CosmosPolicyActionTeacher:
                 or video_steps != action_steps
                 or action_steps != self.num_denoising_steps_action
                 or action_steps not in (1, 2, 4)
+                or not observed_joint_nfes
+                or any(value != action_steps for value in observed_joint_nfes)
             ):
                 raise RuntimeError(
                     "official in-process matched-budget request does not match "
@@ -659,6 +669,7 @@ class CosmosPolicyActionTeacher:
                 effective_video_steps=video_steps,
                 effective_action_steps=action_steps,
                 matched_budget_verified=True,
+                observed_joint_nfe=observed_joint_nfes[0],
             )
         if include_future:
             output["future_image_predictions"] = future_predictions
@@ -819,7 +830,11 @@ class CosmosPolicyActionTeacher:
         response = json.loads(line)
         if not response.get("ok", False):
             raise RuntimeError("Cosmos Policy raw worker failed:\n" + response.get("error", "unknown error"))
-        with np.load(response["actions_path"]) as data:
+        if response.get("actions_path") != actions_path:
+            raise RuntimeError(
+                "Cosmos Policy raw worker returned an unexpected response path"
+            )
+        with np.load(actions_path) as data:
             actions = torch.from_numpy(data["actions"].astype(np.float32))
             result = {"actions": actions}
             for field in (
@@ -828,6 +843,7 @@ class CosmosPolicyActionTeacher:
                 "effective_video_steps",
                 "effective_action_steps",
                 "matched_budget_verified",
+                "observed_joint_nfe",
             ):
                 if field in data.files:
                     result[field] = data[field].item()
@@ -843,7 +859,7 @@ class CosmosPolicyActionTeacher:
                     result["value_prediction"] = [
                         float(value) for value in data["value_prediction"].astype(np.float32).tolist()
                     ]
-        for path in (npz_path, response["actions_path"]):
+        for path in (npz_path, actions_path):
             try:
                 os.remove(path)
             except OSError:

@@ -13,8 +13,6 @@ import cv2
 import imageio
 import numpy as np
 import torch
-from libero.libero import benchmark
-from libero.libero.envs import OffScreenRenderEnv
 from tqdm import tqdm
 
 
@@ -39,6 +37,20 @@ TASK_MAX_STEPS = {
     "libero_10": 520,
     "libero_90": 400,
 }
+
+
+def _load_libero_runtime():
+    """Load simulator-only dependencies when a live environment is requested."""
+    try:
+        benchmark_module = importlib.import_module("libero.libero.benchmark")
+        envs_module = importlib.import_module("libero.libero.envs")
+    except ImportError as exc:
+        raise RuntimeError(
+            "LIBERO simulator dependencies are required to construct an evaluation "
+            "environment. Install the compatible LIBERO and robosuite runtime before "
+            "running live rollouts."
+        ) from exc
+    return benchmark_module, envs_module.OffScreenRenderEnv
 
 
 def save_video(real_obs_list, save_path, fps=15):
@@ -244,10 +256,11 @@ def resolve_initial_state(benchmark_instance, task_idx, episode_idx, prompt, arg
 
 
 def construct_single_env(env_args, env_seed=None):
+    _, offscreen_render_env = _load_libero_runtime()
     last_error = None
     for _ in range(5):
         try:
-            env = OffScreenRenderEnv(**env_args)
+            env = offscreen_render_env(**env_args)
             if env_seed is not None:
                 env.seed(int(env_seed))
             return env
@@ -318,7 +331,8 @@ def configure_cosmos(args):
 
 
 def rollout_one(teacher, libero_benchmark, task_idx, episode_idx, out_dir, args):
-    benchmark_dict = benchmark.get_benchmark_dict()
+    benchmark_module, _ = _load_libero_runtime()
+    benchmark_dict = benchmark_module.get_benchmark_dict()
     benchmark_instance = benchmark_dict[libero_benchmark]()
     prompt = benchmark_instance.get_task(task_idx).language
     env_args = {

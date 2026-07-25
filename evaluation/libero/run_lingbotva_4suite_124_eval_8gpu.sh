@@ -100,6 +100,8 @@ run_budget() {
             PORT="$ws_port" \
             MASTER_PORT="$master_port" \
             SAVE_ROOT="$save_root" \
+            MODEL_NAME="$MODEL_NAME" \
+            LATENCY_JSONL="${save_root}/sampler_latency.jsonl" \
             bash "$EVAL_SCRIPT" "external" "$MODEL_NAME"
         ) >"${save_root}.log" 2>&1 &
         pids+=("$!")
@@ -121,6 +123,9 @@ run_budget() {
     "$SERVER_PYTHON" "$MERGE_SCRIPT" \
         --input-root "$budget_root" \
         --expected-episodes "$EPISODES" \
+        --expected-model "$MODEL_NAME" \
+        --expected-video-steps "$steps" \
+        --expected-action-steps "$steps" \
         --output "${budget_root}/summary.json"
 }
 

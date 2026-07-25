@@ -7,6 +7,14 @@ import os
 import sys
 from pathlib import Path
 
+try:
+    from evaluation.libero.sampler_latency import (
+        latency_p50_ms,
+        load_sampler_latency_records,
+    )
+except ModuleNotFoundError:
+    from sampler_latency import latency_p50_ms, load_sampler_latency_records
+
 
 SUITES = ("libero_10", "libero_spatial", "libero_object", "libero_goal")
 
@@ -15,6 +23,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-root", type=Path, required=True)
     parser.add_argument("--expected-episodes", type=int, required=True)
+    parser.add_argument("--expected-model", required=True)
+    parser.add_argument("--expected-video-steps", type=int, required=True)
+    parser.add_argument("--expected-action-steps", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -35,6 +46,8 @@ def main():
     args = parse_args()
     if args.expected_episodes <= 0:
         raise ValueError("--expected-episodes must be positive")
+    if args.expected_video_steps <= 0 or args.expected_action_steps <= 0:
+        raise ValueError("expected sampler steps must be positive")
 
     suites = {}
     tasks = []
@@ -82,6 +95,50 @@ def main():
         total_successes += suite_successes
         total_episodes += suite_episodes
 
+    latency_paths = sorted(args.input_root.rglob("sampler_latency.jsonl"))
+    latency_records = load_sampler_latency_records(latency_paths)
+    covered_episodes = set()
+    for record in latency_records:
+        if record["model"] != args.expected_model:
+            raise ValueError(
+                f"latency model mismatch: expected {args.expected_model}, "
+                f"got {record['model']}"
+            )
+        if record["video_steps"] != args.expected_video_steps:
+            raise ValueError(
+                f"latency video_steps mismatch: expected "
+                f"{args.expected_video_steps}, got {record['video_steps']}"
+            )
+        if record["action_steps"] != args.expected_action_steps:
+            raise ValueError(
+                f"latency action_steps mismatch: expected "
+                f"{args.expected_action_steps}, got {record['action_steps']}"
+            )
+        if record["suite"] not in SUITES:
+            raise ValueError(f"unexpected latency suite: {record['suite']}")
+        if not 0 <= record["task_idx"] < 10:
+            raise ValueError(f"unexpected latency task_idx: {record['task_idx']}")
+        if not 0 <= record["episode_idx"] < args.expected_episodes:
+            raise ValueError(
+                f"unexpected latency episode_idx: {record['episode_idx']}"
+            )
+        covered_episodes.add(
+            (record["suite"], record["task_idx"], record["episode_idx"])
+        )
+    expected_coverage = {
+        (suite, task_idx, episode_idx)
+        for suite in SUITES
+        for task_idx in range(10)
+        for episode_idx in range(args.expected_episodes)
+    }
+    if covered_episodes != expected_coverage:
+        missing = sorted(expected_coverage - covered_episodes)
+        unexpected = sorted(covered_episodes - expected_coverage)
+        raise ValueError(
+            "sampler latency episode coverage mismatch: "
+            f"missing={missing[:5]} unexpected={unexpected[:5]}"
+        )
+
     summary = {
         "num_suites": len(SUITES),
         "num_tasks": len(tasks),
@@ -93,6 +150,15 @@ def main():
             suite["macro_task_success_rate"] for suite in suites.values()
         )
         / len(suites),
+        "latency": {
+            "measurement_scope": "joint_sampler_call",
+            "record_count": len(latency_records),
+            "p50_ms": latency_p50_ms(latency_records),
+            "source_files": [str(path) for path in latency_paths],
+            "model": args.expected_model,
+            "video_steps": args.expected_video_steps,
+            "action_steps": args.expected_action_steps,
+        },
         "suites": suites,
         "tasks": tasks,
     }

@@ -47,6 +47,13 @@ def test_dry_run_covers_40_tasks_and_matched_124_budgets(tmp_path):
         assert len(suite_lines) == 6
         assert {line.split("tasks=")[1].split()[0] for line in suite_lines} == {"0:5", "5:10"}
 
+    source = SCRIPT.read_text()
+    assert 'MODEL_NAME="$MODEL_NAME"' in source
+    assert 'LATENCY_JSONL="${save_root}/sampler_latency.jsonl"' in source
+    assert '--expected-model "$MODEL_NAME"' in source
+    assert '--expected-video-steps "$steps"' in source
+    assert '--expected-action-steps "$steps"' in source
+
 
 def test_requires_exactly_eight_unique_gpus(tmp_path):
     ckpt = tmp_path / "transformer"

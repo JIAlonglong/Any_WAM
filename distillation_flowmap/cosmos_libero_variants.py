@@ -314,7 +314,7 @@ def resolve_variant(
         "opd_endpoint_focus_prob": spec["opd_endpoint_focus_prob"],
         "opd_danceopd_query_alpha": 5.0,
         "opd_danceopd_query_beta": 2.0,
-        "opd_aux_interval": 8,
+        "opd_aux_interval": 4,
         "opd_aux_phase": 2,
         "opd_action_rollout_grad_mode": spec["opd_rollout_grad_mode"],
         "opd_danceopd_verify_terminal_prior": True,

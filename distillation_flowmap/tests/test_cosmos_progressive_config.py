@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from distillation_flowmap.cosmos_stage2_lineage import validate_stage1_parent
+from distillation_flowmap.cosmos_libero_variants import resolve_variant
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -433,9 +434,11 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
     assert module.cfg.consistency_ratio == 0.25
     assert module.cfg.flowmap_ratio == 0.25
     assert module.cfg.opd_endpoint_focus_prob > 0
-    assert module.cfg.opd_danceopd_rollout_steps == 4
-    assert module.cfg.opd_danceopd_endpoint_weight > 0
+    assert module.cfg.opd_danceopd_rollout_steps == (2, 4)
+    assert module.cfg.opd_danceopd_anchor_teacher_steps == 8
+    assert module.cfg.opd_danceopd_endpoint_weight == 1.0
     assert module.cfg.opd_danceopd_velocity_weight == 1.0
+    assert module.cfg.aligned_video_opd_enabled is True
     assert module.cfg.opd_serial_student_cfg is True
     assert module.cfg.opd_aux_standalone_step is True
     assert module.cfg.opd_aux_gradient_checkpointing is True
@@ -450,21 +453,20 @@ def test_progressive_s4_defaults_to_full_cosmos_opd(monkeypatch):
     assert module.cfg.deployment_timestep_end == 0
     assert module.cfg.deployment_action_weight == 1.0
     assert module.cfg.raw_teacher_window_is_auxiliary is True
-    assert module.cfg.opd_aux_interval == 8
+    assert module.cfg.opd_aux_interval == 4
     assert module.cfg.opd_aux_phase == 2
 
 
-def test_progressive_raw_auxiliary_schedule_ignores_conflicting_environment(
+def test_progressive_auxiliary_schedule_accepts_a_positive_integer_interval(
     monkeypatch,
 ):
     monkeypatch.setenv("COSMOS_PROGRESSIVE_STAGE", "s4")
-    monkeypatch.setenv("OPD_AUX_INTERVAL", "4")
-    monkeypatch.setenv("OPD_AUX_PHASE", "0")
+    monkeypatch.setenv("OPD_AUX_INTERVAL", "7")
     module = importlib.reload(importlib.import_module(
         "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive"
     ))
 
-    assert module.cfg.opd_aux_interval == 8
+    assert module.cfg.opd_aux_interval == 7
     assert module.cfg.opd_aux_phase == 2
 
 
@@ -479,8 +481,8 @@ def test_progressive_k1_is_endpoint_only(monkeypatch):
 
     assert module.cfg.opd_rollout_step_pairs == [[4, 1]]
     assert module.cfg.opd_endpoint_focus_prob > 0
-    assert module.cfg.opd_danceopd_rollout_steps == 1
-    assert module.cfg.opd_danceopd_velocity_weight == 0.0
+    assert module.cfg.opd_danceopd_rollout_steps == (2, 4)
+    assert module.cfg.opd_danceopd_velocity_weight == 1.0
 
 
 def test_progressive_k2_uses_a_two_step_danceopd_query_grid(monkeypatch):
@@ -493,7 +495,7 @@ def test_progressive_k2_uses_a_two_step_danceopd_query_grid(monkeypatch):
     module = importlib.reload(module)
 
     assert module.cfg.opd_rollout_step_pairs == [[4, 2]]
-    assert module.cfg.opd_danceopd_rollout_steps == 2
+    assert module.cfg.opd_danceopd_rollout_steps == (2, 4)
     assert module.cfg.opd_danceopd_velocity_weight == 1.0
 
 
@@ -508,8 +510,56 @@ def test_progressive_universal_retains_original_lingbotva_definition(monkeypatch
     )
     assert OPD_ROLLOUT_STEP_PAIRS == ((8, 1), (8, 2), (8, 4))
     assert module.cfg.opd_danceopd_rollout_step_choices == (2, 4)
-    assert module.cfg.opd_danceopd_rollout_steps == 2
+    assert module.cfg.opd_danceopd_rollout_steps == (2, 4)
     assert module.cfg.opd_danceopd_velocity_weight == 1.0
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("OPD_DANCEOPD_ROLLOUT_STEPS", "2,3", "OPD_DANCEOPD_ROLLOUT_STEPS"),
+        (
+            "OPD_DANCEOPD_ANCHOR_TEACHER_STEPS",
+            "7",
+            "OPD_DANCEOPD_ANCHOR_TEACHER_STEPS",
+        ),
+        ("OPD_DANCEOPD_ENDPOINT_WEIGHT", "0", "OPD_DANCEOPD_ENDPOINT_WEIGHT"),
+        ("OPD_DANCEOPD_VELOCITY_WEIGHT", "-1", "OPD_DANCEOPD_VELOCITY_WEIGHT"),
+        ("OPD_AUX_INTERVAL", "0", "OPD_AUX_INTERVAL"),
+    ],
+)
+def test_progressive_config_rejects_invalid_aligned_video_opd_controls(
+    _explicit_cosmos_paths, name, value, message
+):
+    env = dict(_explicit_cosmos_paths["env"])
+    env[name] = value
+    result = _import_progressive(env)
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_aligned_video_config_rejects_a_grid_without_teacher_band_query(
+    monkeypatch,
+):
+    monkeypatch.setenv("COSMOS_PROGRESSIVE_STAGE", "universal")
+    module = importlib.reload(importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive"
+    ))
+
+    with pytest.raises(ValueError, match="Teacher-band query"):
+        module._validate_aligned_query_grids((2, 4), shift=1.0)
+
+
+def test_universal_launcher_variant_resolves_aligned_video_interval(tmp_path):
+    resolved = resolve_variant(
+        "universal-video-action",
+        output_root=tmp_path,
+        run_tag="aligned",
+        steps=1,
+        save_interval=1,
+        master_port=29672,
+    )
+    assert resolved["opd_aux_interval"] == 4
 
 
 def test_main_anyflow_branch_boundaries_preserve_arbitrary_intervals():

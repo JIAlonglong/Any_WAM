@@ -53,6 +53,29 @@ def _parse_positive_step_choices(text, *, env_name):
     return choices
 
 
+def _validate_aligned_query_grids(
+    rollout_steps, *, shift, sigma_min=4.0 / 5.0, sigma_max=80.0 / 81.0
+):
+    if not math.isfinite(shift) or shift <= 0:
+        raise ValueError("aligned video OPD shift must be finite and positive")
+    for student_steps in rollout_steps:
+        legal_query_sigmas = []
+        for query_index in range(1, student_steps):
+            raw_sigma = 1.0 - query_index / student_steps
+            shifted_sigma = (
+                shift
+                * raw_sigma
+                / (1.0 + (shift - 1.0) * raw_sigma)
+            )
+            if sigma_min <= shifted_sigma <= sigma_max:
+                legal_query_sigmas.append(shifted_sigma)
+        if not legal_query_sigmas:
+            raise ValueError(
+                "OPD_DANCEOPD_ROLLOUT_STEPS contains a grid without a legal "
+                f"Cosmos Teacher-band query: K={student_steps}"
+            )
+
+
 _stage = os.environ.get("COSMOS_PROGRESSIVE_STAGE", "s4").strip().lower()
 _stage_specs = {
     "s4": {
@@ -62,7 +85,7 @@ _stage_specs = {
         "velocity_weight": 1.0,
         "grad_mode": "suffix",
         "grad_steps": 2,
-        "danceopd_rollout_steps": "4",
+        "danceopd_rollout_steps": "2,4",
     },
     "s2": {
         "max_steps": 3000,
@@ -71,16 +94,16 @@ _stage_specs = {
         "velocity_weight": 1.0,
         "grad_mode": "last_step",
         "grad_steps": 1,
-        "danceopd_rollout_steps": "2",
+        "danceopd_rollout_steps": "2,4",
     },
     "s1": {
         "max_steps": 3000,
         "rollout_step_pairs": [[4, 1]],
         "focus_prob": 0.90,
-        "velocity_weight": 0.0,
+        "velocity_weight": 1.0,
         "grad_mode": "last_step",
         "grad_steps": 1,
-        "danceopd_rollout_steps": "1",
+        "danceopd_rollout_steps": "2,4",
     },
     "universal": {
         "max_steps": 5000,
@@ -274,8 +297,10 @@ cfg.opd_aux_variant = "default"
 cfg.opd_teacher_target_mode = "cosmos_latent_full"
 cfg.opd_aux_weight = float(os.environ.get("OPD_AUX_WEIGHT", 0.10))
 cfg.opd_aux_warmup_steps = int(os.environ.get("OPD_AUX_WARMUP_STEPS", 8))
-cfg.opd_aux_interval = 8
+cfg.opd_aux_interval = int(os.environ.get("OPD_AUX_INTERVAL", 4))
 cfg.opd_aux_phase = 2
+if cfg.opd_aux_interval <= 0:
+    raise ValueError("OPD_AUX_INTERVAL must be a positive integer")
 cfg.opd_aux_prob = float(os.environ.get("OPD_AUX_PROB", 1.0))
 cfg.opd_aux_gradient_checkpointing = _env_bool(
     "OPD_AUX_GRADIENT_CHECKPOINTING", True
@@ -316,7 +341,20 @@ cfg.opd_danceopd_rollout_step_choices = _parse_positive_step_choices(
     os.environ.get("OPD_DANCEOPD_ROLLOUT_STEPS", _spec["danceopd_rollout_steps"]),
     env_name="OPD_DANCEOPD_ROLLOUT_STEPS",
 )
-cfg.opd_danceopd_rollout_steps = cfg.opd_danceopd_rollout_step_choices[0]
+if cfg.opd_danceopd_rollout_step_choices != (2, 4):
+    raise ValueError(
+        "OPD_DANCEOPD_ROLLOUT_STEPS must resolve exactly to the aligned "
+        "Student budgets 2,4"
+    )
+cfg.opd_danceopd_rollout_steps = cfg.opd_danceopd_rollout_step_choices
+cfg.opd_danceopd_anchor_teacher_steps = int(
+    os.environ.get("OPD_DANCEOPD_ANCHOR_TEACHER_STEPS", 8)
+)
+if cfg.opd_danceopd_anchor_teacher_steps != 8:
+    raise ValueError(
+        "OPD_DANCEOPD_ANCHOR_TEACHER_STEPS must be 8 for the official "
+        "Cosmos Teacher"
+    )
 cfg.opd_danceopd_query_alpha = float(
     os.environ.get("OPD_DANCEOPD_QUERY_ALPHA", 5.0)
 )
@@ -355,6 +393,17 @@ cfg.opd_danceopd_action_endpoint_weight = float(
 )
 cfg.opd_danceopd_velocity_weight = float(
     os.environ.get("OPD_DANCEOPD_VELOCITY_WEIGHT", _spec["velocity_weight"])
+)
+for _weight_name, _weight_value in (
+    ("OPD_DANCEOPD_ENDPOINT_WEIGHT", cfg.opd_danceopd_endpoint_weight),
+    ("OPD_DANCEOPD_VELOCITY_WEIGHT", cfg.opd_danceopd_velocity_weight),
+):
+    if not math.isfinite(_weight_value) or _weight_value <= 0:
+        raise ValueError(f"{_weight_name} must be finite and positive")
+
+_validate_aligned_query_grids(
+    cfg.opd_danceopd_rollout_steps,
+    shift=float(cfg.snr_shift),
 )
 cfg.opd_joint_action_rollout = _env_bool("OPD_JOINT_ACTION_ROLLOUT", True)
 
@@ -509,6 +558,7 @@ if _cosmos_libero_variant_payload is not None:
             )
     cfg.cosmos_libero_variant_identity = dict(_variant_expected)
 
+cfg.aligned_video_opd_enabled = True
 cfg.deployment_joint_rollout_enabled = True
 cfg.deployment_joint_rollout_interval = 4
 cfg.deployment_joint_steps = (1, 2, 4)

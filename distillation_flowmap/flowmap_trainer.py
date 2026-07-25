@@ -86,6 +86,68 @@ try:
 except ImportError:
     HAS_TENSORBOARD = False
 
+
+_ALIGNED_VIDEO_OPD_METRIC_KEYS = (
+    "opd_endpoint_loss",
+    "opd_same_state_velocity_loss",
+    "opd_endpoint_contrib",
+    "opd_same_state_velocity_contrib",
+    "opd_endpoint_ratio",
+    "opd_same_state_velocity_ratio",
+    "opd_query_sigma",
+    "opd_query_index",
+    "opd_student_steps",
+    "opd_teacher_steps",
+    "opd_valid_video_frames",
+    "opd_same_prior_verified",
+    "opd_canonical_state_verified",
+)
+
+
+def _aligned_video_opd_metrics(result, zero_tensor):
+    metrics = {
+        key: result.get(key, zero_tensor)
+        for key in _ALIGNED_VIDEO_OPD_METRIC_KEYS
+        if key not in ("opd_endpoint_ratio", "opd_same_state_velocity_ratio")
+    }
+    denominator = (
+        metrics["opd_endpoint_contrib"].detach().abs()
+        + metrics["opd_same_state_velocity_contrib"].detach().abs()
+    ).clamp(min=1e-12)
+    metrics["opd_endpoint_ratio"] = (
+        metrics["opd_endpoint_contrib"].detach().abs() / denominator
+    )
+    metrics["opd_same_state_velocity_ratio"] = (
+        metrics["opd_same_state_velocity_contrib"].detach().abs() / denominator
+    )
+    return metrics
+
+
+def _aligned_video_opd_log_values(metrics):
+    return {
+        "loss/opd_endpoint": metrics["opd_endpoint_loss"],
+        "loss/opd_same_state_velocity": metrics[
+            "opd_same_state_velocity_loss"
+        ],
+        "loss_weighted/opd_endpoint": metrics["opd_endpoint_contrib"],
+        "loss_weighted/opd_same_state_velocity": metrics[
+            "opd_same_state_velocity_contrib"
+        ],
+        "loss_ratio/opd_endpoint": metrics["opd_endpoint_ratio"],
+        "loss_ratio/opd_same_state_velocity": metrics[
+            "opd_same_state_velocity_ratio"
+        ],
+        "opd/query_sigma": metrics["opd_query_sigma"],
+        "opd/query_index": metrics["opd_query_index"],
+        "opd/student_steps": metrics["opd_student_steps"],
+        "opd/teacher_steps": metrics["opd_teacher_steps"],
+        "opd/valid_video_frames": metrics["opd_valid_video_frames"],
+        "opd/same_prior_verified": metrics["opd_same_prior_verified"],
+        "opd/canonical_state_verified": metrics[
+            "opd_canonical_state_verified"
+        ],
+    }
+
 try:
     from peft import LoraConfig, get_peft_model
     HAS_PEFT = True
@@ -105,17 +167,20 @@ def _select_progressive_training_objective(
     deployment_enabled,
     raw_auxiliary_enabled,
 ):
-    return select_progressive_training_objective(
+    selected = select_progressive_training_objective(
         step=step,
         deployment_enabled=deployment_enabled,
-        deployment_interval=int(getattr(
-            config, "deployment_joint_rollout_interval", 4
-        )),
+        deployment_interval=int(getattr(config, "opd_aux_interval", 4)),
         raw_auxiliary_enabled=raw_auxiliary_enabled,
         raw_auxiliary_warmup=int(getattr(config, "opd_aux_warmup_steps", 0)),
-        raw_auxiliary_interval=int(getattr(config, "opd_aux_interval", 8)),
+        raw_auxiliary_interval=int(getattr(config, "opd_aux_interval", 4)),
         raw_auxiliary_phase=int(getattr(config, "opd_aux_phase", 2)),
     )
+    return {
+        "deployment": "aligned_video_opd",
+        "raw_auxiliary": "action_opd",
+        "main": "main_anyflow",
+    }.get(selected, selected)
 
 
 def _write_json_atomic(path, payload):
@@ -2619,6 +2684,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         acc_opd_anchor_scales = []
         acc_opd_transition_group_ratios = []
         acc_opd_anchor_group_ratios = []
+        acc_aligned_video_opd_metrics = {
+            key: [] for key in _ALIGNED_VIDEO_OPD_METRIC_KEYS
+        }
         acc_kto_good_ratios = []
         acc_kto_weight_means = []
         acc_kto_weight_mins = []
@@ -2674,14 +2742,20 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 and self.use_opd_aux
                 and not use_onpolicy_now
             )
-            deployment_enabled = (
+            aligned_video_opd_enabled = (
                 bool(getattr(
-                    self.config, "deployment_joint_rollout_enabled", False
+                    self.config,
+                    "aligned_video_opd_enabled",
+                    getattr(
+                        self.config,
+                        "deployment_joint_rollout_enabled",
+                        False,
+                    ),
                 ))
                 and not use_onpolicy_now
             )
             if (
-                (standalone_opd or deployment_enabled)
+                (standalone_opd or aligned_video_opd_enabled)
                 and self.gradient_accumulation_steps != 1
             ):
                 raise ValueError(
@@ -2693,10 +2767,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             scheduled_kind = _select_progressive_training_objective(
                 self.config,
                 step=self.step,
-                deployment_enabled=deployment_enabled,
+                deployment_enabled=aligned_video_opd_enabled,
                 raw_auxiliary_enabled=standalone_opd,
             )
-            use_opd_aux_now = scheduled_kind == "raw_auxiliary"
+            use_opd_aux_now = scheduled_kind == "action_opd"
             if use_opd_aux_now:
                 opd_aux_prob = float(getattr(self.config, 'opd_aux_prob', 1.0))
                 if opd_aux_prob < 1.0:
@@ -2714,17 +2788,27 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     return self._opd_aux_transition_step_kto_paopd(batch, step_in_acc)
                 return self._opd_aux_transition_step(batch, step_in_acc)
 
-            if scheduled_kind == "deployment":
+            if scheduled_kind == "aligned_video_opd":
                 if hasattr(self.student, 'set_requires_gradient_sync'):
                     self.student.set_requires_gradient_sync(True)
-                update_index = (
-                    self.step
-                    // int(self.config.deployment_joint_rollout_interval)
+                result = self._cosmos_aligned_video_opd_step(batch, step_in_acc)
+                aligned_metrics = _aligned_video_opd_metrics(
+                    result, zero_tensor
                 )
-                student_steps = deployment_joint_step_for_update(update_index)
-                result = self._cosmos_deployment_joint_rollout_step(
-                    batch, step_in_acc, student_steps=student_steps
-                )
+                opd_aux_result = {
+                    **result,
+                    **aligned_metrics,
+                    "opd_aux_loss": result.get("loss", zero_tensor),
+                    "opd_endpoint_aux_loss": result.get(
+                        "opd_endpoint_loss", zero_tensor
+                    ),
+                    "opd_endpoint_aux_contrib": result.get(
+                        "opd_endpoint_contrib", zero_tensor
+                    ),
+                    "opd_endpoint_aux_ratio": aligned_metrics[
+                        "opd_endpoint_ratio"
+                    ],
+                }
                 for metric_name in (
                     'video_loss',
                     'cosmos_video_endpoint_loss',
@@ -2741,7 +2825,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     'raw_teacher_enabled',
                 ):
                     result.setdefault(metric_name, zero_tensor)
-            elif scheduled_kind == "raw_auxiliary":
+            elif scheduled_kind == "action_opd":
                 if hasattr(self.student, 'set_requires_gradient_sync'):
                     self.student.set_requires_gradient_sync(True)
                 if (bool(getattr(self.config, 'opd_aux_empty_cache', False))
@@ -2815,7 +2899,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         opd_aux_result.get("skip_step", False)
                     )
 
-            if scheduled_kind in ("deployment", "raw_auxiliary"):
+            if scheduled_kind in ("aligned_video_opd", "action_opd"):
                 record_nonfinite_origins(
                     self,
                     result.get("nonfinite_origins", {}),
@@ -2938,6 +3022,14 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             acc_opd_anchor_group_ratios.append(
                 opd_aux_result.get("opd_anchor_group_ratio", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
+            aligned_video_metrics = _aligned_video_opd_metrics(
+                result if scheduled_kind == "aligned_video_opd" else {},
+                zero_tensor,
+            )
+            for metric_name in _ALIGNED_VIDEO_OPD_METRIC_KEYS:
+                acc_aligned_video_opd_metrics[metric_name].append(
+                    aligned_video_metrics[metric_name]
+                )
             acc_kto_good_ratios.append(
                 opd_aux_result.get("kto_good_ratio", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
@@ -3104,6 +3196,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     torch.stack(acc_opd_transition_group_ratios).sum(),
                     torch.stack(acc_opd_anchor_group_ratios).sum(),
                 ]
+                metric_tensors.extend(
+                    torch.stack(acc_aligned_video_opd_metrics[key]).sum()
+                    for key in _ALIGNED_VIDEO_OPD_METRIC_KEYS
+                )
                 kto_main_enabled = bool(getattr(self.config, 'kto_main_video_reweight', False))
                 if kto_main_enabled:
                     metric_tensors.extend([
@@ -3175,6 +3271,14 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     avg_opd_anchor_group_ratio,
                 ) = metric_results[:base_metric_count]
                 metric_cursor = base_metric_count
+                avg_aligned_video_opd_metrics = dict(zip(
+                    _ALIGNED_VIDEO_OPD_METRIC_KEYS,
+                    metric_results[
+                        metric_cursor:
+                        metric_cursor + len(_ALIGNED_VIDEO_OPD_METRIC_KEYS)
+                    ],
+                ))
+                metric_cursor += len(_ALIGNED_VIDEO_OPD_METRIC_KEYS)
                 if kto_main_enabled:
                     (
                         avg_kto_main_active,
@@ -3265,6 +3369,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_opd_anchor_scales = []
                 acc_opd_transition_group_ratios = []
                 acc_opd_anchor_group_ratios = []
+                acc_aligned_video_opd_metrics = {
+                    key: [] for key in _ALIGNED_VIDEO_OPD_METRIC_KEYS
+                }
                 acc_kto_good_ratios = []
                 acc_kto_weight_means = []
                 acc_kto_weight_mins = []
@@ -3367,6 +3474,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         postfix["aa"] = f"{avg_action_aware_loss:.4f}"
                         log_dict["loss/action_local_fm"] = avg_action_local_fm_loss
                         log_dict["loss/action_aware"] = avg_action_aware_loss
+                    if scheduled_kind == "aligned_video_opd":
+                        log_dict.update(_aligned_video_opd_log_values(
+                            avg_aligned_video_opd_metrics
+                        ))
                     if avg_opd_aux_loss > 0:
                         postfix["opd"] = f"{avg_opd_aux_loss:.4f}"
                         postfix["ovt"] = f"{avg_opd_video_transition_loss:.2e}"

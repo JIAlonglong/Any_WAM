@@ -6,11 +6,13 @@ usage() {
     cat <<'EOF'
 Usage:
   bash distillation_flowmap/run_cosmos_stage1_stage2_eval_8gpu.sh \
-    --phase all|stage1|stage2|eval --output-root PATH --run-tag TAG [options]
+    --phase all|stage1|stage2|eval|check --output-root PATH --run-tag TAG [options]
 
 Options:
   --stage1-steps N          default: 5000
   --stage2-steps N          default: 10000
+  --steps N                 smoke alias: use N for both training stages
+  --episodes N              resolved evaluation episode count (read-only modes)
   --save-interval N         default: 1000
   --stage1-master-port PORT default: 29671
   --stage2-master-port PORT default: 29672
@@ -90,7 +92,7 @@ run_child() {
 }
 
 PHASE=""
-OUTPUT_ROOT=""
+OUTPUT_ROOT="${OUTPUT_ROOT:-}"
 RUN_TAG=""
 STAGE1_STEPS=5000
 STAGE2_STEPS=10000
@@ -100,6 +102,7 @@ STAGE2_MASTER_PORT=29672
 RESUME_STAGE=""
 RESUME_STEP=""
 READ_ONLY_MODE=""
+EVAL_EPISODES=500
 
 while (( $# > 0 )); do
     case "$1" in
@@ -108,6 +111,12 @@ while (( $# > 0 )); do
         --run-tag) RUN_TAG="${2:-}"; shift 2 ;;
         --stage1-steps) STAGE1_STEPS="${2:-}"; shift 2 ;;
         --stage2-steps) STAGE2_STEPS="${2:-}"; shift 2 ;;
+        --steps)
+            STAGE1_STEPS="${2:-}"
+            STAGE2_STEPS="${2:-}"
+            shift 2
+            ;;
+        --episodes) EVAL_EPISODES="${2:-}"; shift 2 ;;
         --save-interval) SAVE_INTERVAL="${2:-}"; shift 2 ;;
         --stage1-master-port) STAGE1_MASTER_PORT="${2:-}"; shift 2 ;;
         --stage2-master-port) STAGE2_MASTER_PORT="${2:-}"; shift 2 ;;
@@ -128,12 +137,21 @@ while (( $# > 0 )); do
     esac
 done
 
-case "$PHASE" in all|stage1|stage2|eval) ;; *) die "--phase must be all, stage1, stage2, or eval" ;; esac
+if [[ "$PHASE" == check ]]; then
+    [[ -z "$READ_ONLY_MODE" ]] || die "--phase check is already read-only"
+    READ_ONLY_MODE=check-only
+    PHASE=all
+fi
+case "$PHASE" in all|stage1|stage2|eval) ;; *) die "--phase must be all, stage1, stage2, eval, or check" ;; esac
+if [[ -z "$OUTPUT_ROOT" && -n "$READ_ONLY_MODE" ]]; then
+    OUTPUT_ROOT="$(pwd -P)/output_cosmos_stage1_stage2_eval"
+fi
 [[ -n "$OUTPUT_ROOT" ]] || die "--output-root is required"
 [[ "$RUN_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "--run-tag must be one path-safe component"
 positive STAGE1_STEPS "$STAGE1_STEPS"
 positive STAGE2_STEPS "$STAGE2_STEPS"
 positive SAVE_INTERVAL "$SAVE_INTERVAL"
+positive EVAL_EPISODES "$EVAL_EPISODES"
 port STAGE1_MASTER_PORT "$STAGE1_MASTER_PORT"
 port STAGE2_MASTER_PORT "$STAGE2_MASTER_PORT"
 (( 10#$STAGE1_STEPS % 10#$SAVE_INTERVAL == 0 )) || die "Stage-1 steps must be divisible by save interval"
@@ -241,6 +259,14 @@ printf 'STAGE1_CHECKPOINT=%s\n' "$STAGE1_CHECKPOINT"
 printf 'STAGE2_CHECKPOINT=%s\n' "$STAGE2_CHECKPOINT"
 printf 'EVAL_CHECKPOINT_ROLE=stage2_target\n'
 printf 'EVAL_PROTOCOL=LIBERO-10 matched joint 1/2/4, 500 episodes per K\n'
+printf 'EVAL_EPISODES=%s\n' "$EVAL_EPISODES"
+printf 'OPD_AUX_INTERVAL=4\n'
+printf 'OPD_DANCEOPD_ROLLOUT_STEPS=2,4\n'
+printf 'OPD_DANCEOPD_ANCHOR_TEACHER_STEPS=8\n'
+printf 'OPD_DANCEOPD_ENDPOINT_WEIGHT=1.0\n'
+printf 'OPD_DANCEOPD_VELOCITY_WEIGHT=1.0\n'
+printf 'ACTION_DOWNSAMPLE_FACTOR=1\n'
+printf 'VIDEO_ACTION_BRIDGE=0\n'
 print_command STAGE1_COMMAND "${stage1_command[@]}"
 print_command LOCK_COMMAND "${lock_command[@]}"
 print_command STAGE2_COMMAND "${stage2_command[@]}"
@@ -248,6 +274,11 @@ print_command EVAL_COMMAND "${eval_command[@]}"
 
 if [[ -n "$READ_ONLY_MODE" ]]; then
     printf 'PIPELINE_MODE=%s\n' "$READ_ONLY_MODE"
+    print_command ALIGNED_TRAIN_COMMAND \
+        torchrun --nproc_per_node=8 \
+        --master_port "$STAGE2_MASTER_PORT" \
+        distillation_flowmap/train.py \
+        --output-dir "$STAGE2_OUTPUT"
     exit 0
 fi
 
@@ -279,6 +310,13 @@ fi
 
 export PIPELINE_RUN_ROOT="$RUN_ROOT"
 export PIPELINE_STAGE2_STEPS="$STAGE2_STEPS"
+export OPD_AUX_INTERVAL=4
+export OPD_DANCEOPD_ROLLOUT_STEPS=2,4
+export OPD_DANCEOPD_ANCHOR_TEACHER_STEPS=8
+export OPD_DANCEOPD_ENDPOINT_WEIGHT=1.0
+export OPD_DANCEOPD_VELOCITY_WEIGHT=1.0
+export ACTION_DOWNSAMPLE_FACTOR=1
+export VIDEO_ACTION_BRIDGE=0
 
 if [[ "$PHASE" == all || "$PHASE" == stage1 ]]; then
     run_child "${stage1_command[@]}"

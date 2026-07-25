@@ -308,13 +308,15 @@ def test_inference_request_supports_student_steps_only_as_unambiguous_alias():
         )
 
 
-def test_official_teacher_matched_k_request_fails_closed_before_runtime_load():
+def test_official_teacher_matched_k_request_is_explicit_before_runtime_load():
     import distillation_flowmap.cosmos_training_contract as contract
 
-    with pytest.raises(ValueError, match="official_teacher.*matched-K"):
-        contract.normalize_cosmos_inference_request(
-            model_role="official_teacher",
-            video_steps=2,
-            action_steps=2,
-            student_steps=None,
-        )
+    request = contract.normalize_cosmos_inference_request(
+        model_role="official_teacher",
+        video_steps=2,
+        action_steps=2,
+        student_steps=None,
+    )
+
+    assert request.model_role == "official_teacher"
+    assert (request.video_steps, request.action_steps) == (2, 2)

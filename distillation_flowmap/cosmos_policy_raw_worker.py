@@ -29,6 +29,62 @@ _COSMOS_LAYOUT_SOURCE = Path(
 )
 
 
+def _official_matched_budget_response_fields(
+    request,
+    *,
+    configured_action_steps,
+    configured_future_steps,
+    include_future,
+):
+    supported = (1, 2, 4)
+    missing = [
+        name
+        for name in ("requested_video_steps", "requested_action_steps")
+        if name not in request
+    ]
+    if missing:
+        raise ValueError(
+            f"official matched-budget request is missing requested fields: {missing}"
+        )
+    video_steps = request["requested_video_steps"]
+    action_steps = request["requested_action_steps"]
+    if (
+        type(video_steps) is not int
+        or type(action_steps) is not int
+        or video_steps not in supported
+        or action_steps not in supported
+    ):
+        raise ValueError(
+            "official requested video/action steps must be one of 1, 2, 4"
+        )
+    if video_steps != action_steps:
+        raise ValueError(
+            "official matched-budget request requires equal video/action steps"
+        )
+    if not include_future:
+        raise ValueError(
+            "official matched video/action budget requires future-video generation"
+        )
+    if configured_action_steps != action_steps:
+        raise RuntimeError(
+            "official worker configured action steps "
+            f"{configured_action_steps!r} do not match requested {action_steps}"
+        )
+    effective_video_steps = configured_future_steps
+    if effective_video_steps != video_steps:
+        raise RuntimeError(
+            "official worker configured future-video steps "
+            f"{configured_future_steps!r} do not match requested {video_steps}"
+        )
+    return {
+        "requested_video_steps": np.int64(video_steps),
+        "requested_action_steps": np.int64(action_steps),
+        "effective_video_steps": np.int64(effective_video_steps),
+        "effective_action_steps": np.int64(configured_action_steps),
+        "matched_budget_verified": np.bool_(True),
+    }
+
+
 def _parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint-dir", required=True)
@@ -64,7 +120,7 @@ def _make_cfg(args):
         ar_value_prediction=False,
         ar_qvalue_prediction=False,
         num_denoising_steps_action=args.num_denoising_steps_action,
-        num_denoising_steps_future_state=1,
+        num_denoising_steps_future_state=args.num_denoising_steps_action,
         num_denoising_steps_value=1,
         shift=5,
         unnormalize_actions=True,
@@ -1188,6 +1244,20 @@ def main():
                 raise ValueError(f"unsupported Cosmos raw worker mode: {mode!r}")
             actions = []
             include_future = bool(request.get("include_future_predictions", False))
+            has_budget_request = any(
+                name in request
+                for name in ("requested_video_steps", "requested_action_steps")
+            )
+            matched_budget_fields = (
+                _official_matched_budget_response_fields(
+                    request,
+                    configured_action_steps=args.num_denoising_steps_action,
+                    configured_future_steps=cfg.num_denoising_steps_future_state,
+                    include_future=include_future,
+                )
+                if has_budget_request
+                else {}
+            )
             include_latent_x0 = bool(request.get("include_latent_x0", False))
             include_latent_cdiff = bool(request.get("include_latent_cdiff", False))
             include_latent_velocity_query = bool(request.get("include_latent_velocity_query", False))
@@ -1345,7 +1415,7 @@ def main():
 
             actions = np.stack(actions, axis=0)
             actions_path = request["actions_path"]
-            fields = {"actions": actions}
+            fields = {"actions": actions, **matched_budget_fields}
             if include_future:
                 keys = sorted(
                     {

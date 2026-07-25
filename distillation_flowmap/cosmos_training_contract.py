@@ -42,8 +42,9 @@ def normalize_cosmos_inference_request(
     """Validate an explicit matched video/action inference budget.
 
     The historical scalar ``student_steps`` is accepted only as an
-    unambiguous alias.  The official Cosmos teacher has no verified
-    matched-K rollout adapter, so requests for it fail before model loading.
+    unambiguous alias. Official-teacher requests use the same explicit
+    matched-budget contract; their separate runtime adapter proves the
+    effective budget returned by the official worker.
     """
 
     if model_role not in SUPPORTED_COSMOS_MODEL_ROLES:
@@ -77,11 +78,6 @@ def normalize_cosmos_inference_request(
         raise ValueError(
             "video_steps and action_steps must be equal for matched-budget "
             f"evaluation, got {video_steps!r} and {action_steps!r}"
-        )
-    if model_role == "official_teacher":
-        raise ValueError(
-            "official_teacher matched-K inference is unavailable: no verified "
-            "Cosmos matched-K adapter is configured"
         )
     return CosmosInferenceRequest(
         model_role=model_role,

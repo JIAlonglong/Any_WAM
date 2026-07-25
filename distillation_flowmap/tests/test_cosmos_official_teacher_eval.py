@@ -1,0 +1,243 @@
+import json
+from pathlib import Path
+import numpy as np
+import pytest
+
+from distillation_flowmap.cosmos_official_teacher_eval import (
+    OfficialTeacherMatchedBudgetAdapter,
+    resolve_cosmos_official_teacher_root,
+)
+from distillation_flowmap.cosmos_policy_raw_worker import (
+    _official_matched_budget_response_fields,
+)
+from distillation_flowmap.cosmos_training_contract import (
+    normalize_cosmos_inference_request,
+)
+
+
+@pytest.mark.parametrize("budget", (1, 2, 4))
+def test_official_teacher_accepts_explicit_matched_budgets(budget):
+    request = normalize_cosmos_inference_request(
+        model_role="official_teacher",
+        video_steps=budget,
+        action_steps=budget,
+        student_steps=None,
+    )
+
+    assert request.model_role == "official_teacher"
+    assert request.video_steps == budget
+    assert request.action_steps == budget
+    assert request.student_steps == budget
+
+
+def _write_official_teacher_root(root: Path) -> Path:
+    root.mkdir()
+    (root / "Cosmos-Policy-LIBERO-Predict2-2B.pt").write_bytes(b"teacher")
+    (root / "libero_dataset_statistics.json").write_text("{}", encoding="utf-8")
+    (root / "libero_t5_embeddings.pkl").write_bytes(b"embeddings")
+    (root / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "cosmos-policy",
+                "architecture": "diffusion-transformer",
+                "diffusion_config": {
+                    "generation_mode": "parallel",
+                    "denoising_steps": 5,
+                },
+                "output_spec": {"actions": {"dim": 7, "horizon": 16}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_official_teacher_root_resolves_monolithic_policy_not_student(tmp_path):
+    resolved = resolve_cosmos_official_teacher_root(
+        _write_official_teacher_root(tmp_path / "teacher")
+    )
+
+    assert resolved.model_role == "official_teacher"
+    assert resolved.backend == "cosmos_policy"
+    assert resolved.root_path == str((tmp_path / "teacher").resolve())
+    assert resolved.weight_path.endswith("Cosmos-Policy-LIBERO-Predict2-2B.pt")
+    assert resolved.transformer_path is None
+    assert len(resolved.contract_identity) == 64
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("model_type", "wan", "model_type"),
+        ("architecture", "student-transformer", "architecture"),
+    ),
+)
+def test_official_teacher_root_rejects_wrong_backend_contract(
+    tmp_path, field, value, message
+):
+    root = _write_official_teacher_root(tmp_path / "teacher")
+    config_path = root / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config[field] = value
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        resolve_cosmos_official_teacher_root(root)
+
+
+def test_official_teacher_root_rejects_student_transformer_directory(tmp_path):
+    transformer = tmp_path / "target_student" / "transformer"
+    transformer.mkdir(parents=True)
+    (transformer / "config.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="monolithic"):
+        resolve_cosmos_official_teacher_root(transformer)
+
+
+@pytest.mark.parametrize("budget", (1, 2, 4))
+def test_worker_budget_contract_reports_requested_and_effective_k(budget):
+    fields = _official_matched_budget_response_fields(
+        {
+            "requested_video_steps": budget,
+            "requested_action_steps": budget,
+        },
+        configured_action_steps=budget,
+        configured_future_steps=budget,
+        include_future=True,
+    )
+
+    assert fields == {
+        "requested_video_steps": np.int64(budget),
+        "requested_action_steps": np.int64(budget),
+        "effective_video_steps": np.int64(budget),
+        "effective_action_steps": np.int64(budget),
+        "matched_budget_verified": np.bool_(True),
+    }
+
+
+@pytest.mark.parametrize(
+    "budget_request",
+    (
+        {},
+        {"requested_video_steps": 2},
+        {"requested_action_steps": 2},
+        {"requested_video_steps": 2, "requested_action_steps": 4},
+        {"requested_video_steps": 5, "requested_action_steps": 5},
+    ),
+)
+def test_worker_budget_contract_rejects_missing_mismatched_or_fixed_five(
+    budget_request,
+):
+    with pytest.raises(ValueError, match="matched|requested|1, 2, 4"):
+        _official_matched_budget_response_fields(
+            budget_request,
+            configured_action_steps=2,
+            configured_future_steps=2,
+            include_future=True,
+        )
+
+
+def test_worker_budget_contract_rejects_silent_configured_five_fallback():
+    with pytest.raises(RuntimeError, match="configured action steps"):
+        _official_matched_budget_response_fields(
+            {"requested_video_steps": 2, "requested_action_steps": 2},
+            configured_action_steps=5,
+            configured_future_steps=2,
+            include_future=True,
+        )
+
+
+class _Teacher:
+    def __init__(self, result, *, configured_steps=2):
+        self.result = result
+        self.num_denoising_steps_action = configured_steps
+        self.calls = []
+
+    def predict_raw_action_result(self, raw_batch, include_future=False, **kwargs):
+        self.calls.append((raw_batch, include_future, kwargs))
+        return dict(self.result)
+
+
+def _verified_result(budget=2):
+    return {
+        "actions": np.zeros((1, 16, 7), dtype=np.float32),
+        "future_image_predictions": [{"primary": np.zeros((4, 4, 3), dtype=np.uint8)}],
+        "requested_video_steps": budget,
+        "requested_action_steps": budget,
+        "effective_video_steps": budget,
+        "effective_action_steps": budget,
+        "matched_budget_verified": True,
+    }
+
+
+@pytest.mark.parametrize("budget", (1, 2, 4))
+def test_official_adapter_returns_raw_actions_and_verified_metadata(budget):
+    teacher = _Teacher(_verified_result(budget), configured_steps=budget)
+    adapter = OfficialTeacherMatchedBudgetAdapter(
+        teacher=teacher,
+        video_steps=budget,
+        action_steps=budget,
+        include_future=True,
+    )
+
+    result = adapter.infer_raw({"obs": "raw"})
+
+    assert result["actions"].shape == (1, 16, 7)
+    assert result["effective_action_steps"] == budget
+    assert result["effective_video_steps"] == budget
+    assert "future_image_predictions" in result
+    assert teacher.calls == [
+        (
+            {"obs": "raw"},
+            True,
+            {"video_steps": budget, "action_steps": budget},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("effective_action_steps", 4),
+        ("effective_video_steps", 4),
+        ("matched_budget_verified", False),
+    ),
+)
+def test_official_adapter_rejects_response_budget_mismatch(field, value):
+    result = _verified_result(2)
+    result[field] = value
+    adapter = OfficialTeacherMatchedBudgetAdapter(
+        teacher=_Teacher(result),
+        video_steps=2,
+        action_steps=2,
+        include_future=True,
+    )
+
+    with pytest.raises(RuntimeError, match="verified matched budget"):
+        adapter.infer_raw({})
+
+
+def test_official_adapter_rejects_missing_effective_k_metadata():
+    result = _verified_result(2)
+    result.pop("effective_action_steps")
+    adapter = OfficialTeacherMatchedBudgetAdapter(
+        teacher=_Teacher(result),
+        video_steps=2,
+        action_steps=2,
+        include_future=True,
+    )
+
+    with pytest.raises(RuntimeError, match="missing"):
+        adapter.infer_raw({})
+
+
+def test_official_adapter_refuses_teacher_configured_with_default_five():
+    adapter = OfficialTeacherMatchedBudgetAdapter(
+        teacher=_Teacher(_verified_result(2), configured_steps=5),
+        video_steps=2,
+        action_steps=2,
+        include_future=True,
+    )
+
+    with pytest.raises(RuntimeError, match="configured"):
+        adapter.infer_raw({})

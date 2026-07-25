@@ -533,7 +533,7 @@ class CosmosPolicyActionTeacher:
             ar_value_prediction=False,
             ar_qvalue_prediction=False,
             num_denoising_steps_action=self.num_denoising_steps_action,
-            num_denoising_steps_future_state=1,
+            num_denoising_steps_future_state=self.num_denoising_steps_action,
             num_denoising_steps_value=1,
             shift=int(getattr(self.config, "cosmos_policy_shift", 5)) if self.config is not None else 5,
             unnormalize_actions=True,
@@ -603,7 +603,14 @@ class CosmosPolicyActionTeacher:
             if value is not None
         }
 
-    def _predict_raw_action_result_inprocess(self, raw_batch, include_future=False):
+    def _predict_raw_action_result_inprocess(
+        self,
+        raw_batch,
+        include_future=False,
+        *,
+        video_steps=None,
+        action_steps=None,
+    ):
         primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
         self._ensure_official_inprocess()
         actions = []
@@ -634,6 +641,25 @@ class CosmosPolicyActionTeacher:
                     future_predictions.append(self._future_predictions_from_official_result(result))
                     value_predictions.append(result.get("value_prediction"))
         output = {"actions": torch.from_numpy(np.stack(actions, axis=0))}
+        if video_steps is not None or action_steps is not None:
+            if (
+                type(video_steps) is not int
+                or type(action_steps) is not int
+                or video_steps != action_steps
+                or action_steps != self.num_denoising_steps_action
+                or action_steps not in (1, 2, 4)
+            ):
+                raise RuntimeError(
+                    "official in-process matched-budget request does not match "
+                    "the configured Cosmos action/future steps"
+                )
+            output.update(
+                requested_video_steps=video_steps,
+                requested_action_steps=action_steps,
+                effective_video_steps=video_steps,
+                effective_action_steps=action_steps,
+                matched_budget_verified=True,
+            )
         if include_future:
             output["future_image_predictions"] = future_predictions
             output["value_prediction"] = value_predictions
@@ -751,7 +777,14 @@ class CosmosPolicyActionTeacher:
                 except OSError:
                     pass
 
-    def _predict_raw_action_result_subprocess(self, raw_batch, include_future=False):
+    def _predict_raw_action_result_subprocess(
+        self,
+        raw_batch,
+        include_future=False,
+        *,
+        video_steps=None,
+        action_steps=None,
+    ):
         primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
         self._ensure_raw_worker()
         req_dir = self._raw_worker_tmpdir or tempfile.mkdtemp(prefix="cosmos_policy_raw_")
@@ -766,6 +799,11 @@ class CosmosPolicyActionTeacher:
             "seed": self.raw_seed,
             "include_future_predictions": bool(include_future),
         }
+        if video_steps is not None or action_steps is not None:
+            payload.update(
+                requested_video_steps=video_steps,
+                requested_action_steps=action_steps,
+            )
         try:
             self._raw_worker.stdin.write(json.dumps(payload) + "\n")
             self._raw_worker.stdin.flush()
@@ -784,6 +822,15 @@ class CosmosPolicyActionTeacher:
         with np.load(response["actions_path"]) as data:
             actions = torch.from_numpy(data["actions"].astype(np.float32))
             result = {"actions": actions}
+            for field in (
+                "requested_video_steps",
+                "requested_action_steps",
+                "effective_video_steps",
+                "effective_action_steps",
+                "matched_budget_verified",
+            ):
+                if field in data.files:
+                    result[field] = data[field].item()
             if include_future and "future_prediction_keys" in data.files:
                 keys = [str(key) for key in data["future_prediction_keys"].tolist()]
                 futures = [dict() for _ in range(actions.shape[0])]
@@ -1277,13 +1324,30 @@ class CosmosPolicyActionTeacher:
             "edm_sigma": torch.from_numpy(edm_sigma.copy()),
         }
 
-    def predict_raw_action_result(self, raw_batch, include_future=False):
+    def predict_raw_action_result(
+        self,
+        raw_batch,
+        include_future=False,
+        *,
+        video_steps=None,
+        action_steps=None,
+    ):
         if self._raw_action_provider is not None:
             return self._coerce_raw_action_result(self._raw_action_provider(raw_batch))
         if self.raw_inference_mode == "inprocess":
-            return self._predict_raw_action_result_inprocess(raw_batch, include_future=include_future)
+            return self._predict_raw_action_result_inprocess(
+                raw_batch,
+                include_future=include_future,
+                video_steps=video_steps,
+                action_steps=action_steps,
+            )
         if self.raw_inference_mode == "subprocess":
-            return self._predict_raw_action_result_subprocess(raw_batch, include_future=include_future)
+            return self._predict_raw_action_result_subprocess(
+                raw_batch,
+                include_future=include_future,
+                video_steps=video_steps,
+                action_steps=action_steps,
+            )
         raise ValueError(
             f"Unsupported cosmos_policy_inference_mode={self.raw_inference_mode!r}; "
             "expected 'subprocess' or 'inprocess'."

@@ -34,6 +34,7 @@ def _base_env(tmp_path):
             "S4_PROMPT_TABLE": str(prompt_table),
             "PYTHON_BIN": sys.executable,
             "S4_ALIGNMENT_VERIFIED": "1",
+            "S4_MATRIX_ROLES": "stage2_target",
         }
     )
     env.pop("S4_VIDEO_SEEDS", None)

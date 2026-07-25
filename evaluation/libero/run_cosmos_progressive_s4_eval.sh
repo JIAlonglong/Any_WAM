@@ -93,11 +93,11 @@ PY
 verify_formal_results() {
     local seed_count="$1" shard_plan="$2"
     emit_local_command \
-        "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" \
+        "${PYTHON_BIN}" - "${EVAL_ROOT}" "${ROLE_CHECKPOINT}" "${seed_count}" \
         "${S4_STUDENT_STEPS}" "${shard_plan}" "${S4_EVAL_CLASSIFICATION}" \
         "${S4_EVAL_IS_FORMAL}" "<merge-formal-records>"
     (( DRY_RUN )) && return 0
-    "${PYTHON_BIN}" - "${EVAL_ROOT}" "${S4_CKPT_ROOT}" "${seed_count}" \
+    "${PYTHON_BIN}" - "${EVAL_ROOT}" "${ROLE_CHECKPOINT}" "${seed_count}" \
         "${S4_STUDENT_STEPS}" "${shard_plan}" "${S4_EVAL_CLASSIFICATION}" \
         "${S4_EVAL_IS_FORMAL}" <<'PY'
 import os
@@ -197,7 +197,6 @@ preflight_shard() {
     local shard="$1" student_gpu="$2" worker_gpu="$3"
     local -a command=(
         "${PYTHON_BIN}" -m evaluation.libero.rollout_cosmos_progressive_s4
-        --checkpoint-transformer "${S4_CKPT_ROOT}"
         --config "${S4_CONFIG}"
         --prompt-table "${S4_PROMPT_TABLE}"
         --empty-embedding "${S4_EMPTY_EMBEDDING}"
@@ -208,6 +207,11 @@ preflight_shard() {
         --action-steps "${S4_STUDENT_STEPS}"
         --preflight
     )
+    if [[ "${S4_MODEL_ROLE}" == "official_teacher" ]]; then
+        command+=(--cosmos-policy-path "${COSMOS_POLICY_PATH}")
+    else
+        command+=(--checkpoint-transformer "${S4_CKPT_ROOT}")
+    fi
     emit_kv "PREFLIGHT_SHARD" "${shard}"
     run_live_command "${student_gpu}" "${worker_gpu}" "${command[@]}"
 }
@@ -222,7 +226,6 @@ launch_shard() {
         local seed_root="${EVAL_ROOT}/shard_${shard}/seed_${seed}"
         local -a command=(
             "${PYTHON_BIN}" -m evaluation.libero.rollout_cosmos_progressive_s4
-            --checkpoint-transformer "${S4_CKPT_ROOT}"
             --config "${S4_CONFIG}"
             --prompt-table "${S4_PROMPT_TABLE}"
             --empty-embedding "${S4_EMPTY_EMBEDDING}"
@@ -239,6 +242,11 @@ launch_shard() {
             --video-steps "${S4_STUDENT_STEPS}"
             --action-steps "${S4_STUDENT_STEPS}"
         )
+        if [[ "${S4_MODEL_ROLE}" == "official_teacher" ]]; then
+            command+=(--cosmos-policy-path "${COSMOS_POLICY_PATH}")
+        else
+            command+=(--checkpoint-transformer "${S4_CKPT_ROOT}")
+        fi
         if [[ -n "${S4_VIDEO_SEED_SET[${seed}]:-}" ]]; then
             command+=(--save-video)
         fi
@@ -347,9 +355,9 @@ run_smoke() {
 MODE="$1"
 case "${MODE}" in smoke|gate|formal|dry-run) ;; *) usage >&2; die "mode must be smoke, gate, formal, or dry-run" ;; esac
 
-: "${S4_CKPT_ROOT:?set the downloaded public S4 transformer root}"
 : "${EVAL_ROOT:?set a new empty result root}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+S4_CKPT_ROOT="${S4_CKPT_ROOT:-}"
 S4_CONFIG="${S4_CONFIG:-distillation_flowmap.config_libero_cosmos_policy_stage2_progressive}"
 COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B}"
 S4_PROMPT_TABLE="${S4_PROMPT_TABLE:-}"
@@ -375,8 +383,15 @@ positive S4_EPISODES_PER_TASK "$S4_EPISODES_PER_TASK"
 export S4_EPISODES_PER_TASK
 S4_MODEL_ROLE="${S4_MODEL_ROLE:-stage2_target}"
 case "${S4_MODEL_ROLE}" in
-    stage2_online|stage2_target) ;;
-    *) die "S4_MODEL_ROLE must be stage2_online or stage2_target" ;;
+    stage2_online|stage2_target)
+        : "${S4_CKPT_ROOT:?set the downloaded public S4 transformer root}"
+        ROLE_CHECKPOINT="${S4_CKPT_ROOT}"
+        ;;
+    official_teacher)
+        : "${COSMOS_POLICY_PATH:?set the official monolithic Cosmos Policy root}"
+        ROLE_CHECKPOINT="${COSMOS_POLICY_PATH}"
+        ;;
+    *) die "S4_MODEL_ROLE must be stage2_online, stage2_target, or official_teacher" ;;
 esac
 export S4_MODEL_ROLE
 S4_EVAL_CLASSIFICATION="${S4_EVAL_CLASSIFICATION:-unclassified}"
@@ -443,6 +458,8 @@ fi
 emit_kv "MODE" "${MODE}"
 emit_kv "DRY_RUN" "${DRY_RUN}"
 emit_kv "S4_CKPT_ROOT" "${S4_CKPT_ROOT}"
+emit_kv "ROLE_CHECKPOINT" "${ROLE_CHECKPOINT}"
+emit_kv "S4_MODEL_ROLE" "${S4_MODEL_ROLE}"
 emit_kv "EVAL_ROOT" "${EVAL_ROOT}"
 emit_kv "S4_STUDENT_STEPS" "${S4_STUDENT_STEPS}"
 emit_kv "S4_LIBERO_BENCHMARK" "${S4_LIBERO_BENCHMARK}"

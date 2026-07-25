@@ -9,7 +9,7 @@ cd "${PROJECT_ROOT}"
 usage() {
     cat <<'USAGE'
 Usage: bash evaluation/libero/run_cosmos_progressive_joint_124_eval_8gpu.sh run|dry-run
-Required: MATRIX_ROOT, S4_CKPT_ROOT, S4_DATASET_PATH, S4_EMPTY_EMBEDDING,
+Required: MATRIX_ROOT, S4_CKPT_ROOT, COSMOS_POLICY_PATH, S4_DATASET_PATH, S4_EMPTY_EMBEDDING,
 and an S4_PROMPT_TABLE covering all 40 tasks.
 S4_EPISODES_PER_TASK defaults to 50, so each K evaluates 2,000 episodes
 across the four ten-task LIBERO suites.
@@ -51,6 +51,25 @@ export S4_EPISODES_PER_TASK
 
 readonly STEPS=(1 2 4)
 readonly SUITES=(libero_10 libero_spatial libero_object libero_goal)
+COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-}"
+S4_MATRIX_ROLES="${S4_MATRIX_ROLES:-stage2_target,official_teacher}"
+case "${S4_MATRIX_ROLES}" in
+    stage2_target)
+        ROLES=(stage2_target)
+        DUAL_ROLE_MATRIX=0
+        ;;
+    official_teacher)
+        require_env "COSMOS_POLICY_PATH"
+        ROLES=(official_teacher)
+        DUAL_ROLE_MATRIX=0
+        ;;
+    stage2_target,official_teacher)
+        require_env "COSMOS_POLICY_PATH"
+        ROLES=(stage2_target official_teacher)
+        DUAL_ROLE_MATRIX=1
+        ;;
+    *) die "S4_MATRIX_ROLES must be stage2_target, official_teacher, or stage2_target,official_teacher" ;;
+esac
 S4_ALIGNMENT_VERIFIED="${S4_ALIGNMENT_VERIFIED:-0}"
 S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH="${S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH:-0}"
 export S4_ALIGNMENT_VERIFIED S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH
@@ -87,15 +106,22 @@ if [[ "${MODE}" == "run" && "${ALIGNMENT_BLOCKED}" == "1" ]]; then
     die "known training/action alignment mismatch: set S4_ALIGNMENT_VERIFIED=1 only after verification, or S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH=1 for a non-formal diagnostic run"
 fi
 
-for k in "${STEPS[@]}"; do
-    export S4_STUDENT_STEPS="${k}"
-    emit_kv "MATRIX_STEP" "${k}"
-    for suite in "${SUITES[@]}"; do
-        export S4_LIBERO_BENCHMARK="${suite}"
-        export EVAL_ROOT="${MATRIX_ROOT}/k${k}/${suite}"
-        emit_kv "MATRIX_SUITE" "${suite}"
-        "${S4_FORMAL_LAUNCHER}" formal
-
+for role in "${ROLES[@]}"; do
+    export S4_MODEL_ROLE="${role}"
+    emit_kv "MATRIX_ROLE" "${role}"
+    for k in "${STEPS[@]}"; do
+        export S4_STUDENT_STEPS="${k}"
+        emit_kv "MATRIX_STEP" "${k}"
+        for suite in "${SUITES[@]}"; do
+            export S4_LIBERO_BENCHMARK="${suite}"
+            if (( DUAL_ROLE_MATRIX )); then
+                export EVAL_ROOT="${MATRIX_ROOT}/${role}/k${k}/${suite}"
+            else
+                export EVAL_ROOT="${MATRIX_ROOT}/k${k}/${suite}"
+            fi
+            emit_kv "MATRIX_SUITE" "${suite}"
+            "${S4_FORMAL_LAUNCHER}" formal
+        done
     done
 done
 
@@ -105,28 +131,44 @@ if [[ "${MODE}" == "dry-run" ]]; then
     exit 0
 fi
 
-"${PYTHON_BIN}" - "${MATRIX_ROOT}" "${S4_CKPT_ROOT}" \
+"${PYTHON_BIN}" - "${MATRIX_ROOT}" "${S4_CKPT_ROOT}" "${COSMOS_POLICY_PATH}" \
     "${S4_EVAL_CLASSIFICATION}" "${S4_EVAL_IS_FORMAL}" \
-    "${S4_MODEL_ROLE:-stage2_target}" "${S4_EPISODES_PER_TASK}" <<'PY'
+    "${S4_EPISODES_PER_TASK}" "${S4_MATRIX_ROLES}" <<'PY'
 import sys
 from pathlib import Path
 
-from evaluation.libero.cosmos_progressive_eval_summary import merge_student_matrix
+from evaluation.libero.cosmos_progressive_eval_summary import (
+    merge_complete_matrix,
+    merge_student_matrix,
+)
 
 root = Path(sys.argv[1])
-expected_checkpoint = str(Path(sys.argv[2]).resolve())
-expected_classification = sys.argv[3]
-expected_is_formal = sys.argv[4] == "1"
-expected_model_role = sys.argv[5]
+checkpoints = {
+    "stage2_target": str(Path(sys.argv[2]).resolve()),
+    "official_teacher": str(Path(sys.argv[3]).resolve()),
+}
+expected_classification = sys.argv[4]
+expected_is_formal = sys.argv[5] == "1"
 episodes_per_task = int(sys.argv[6])
-merge_student_matrix(
-    root=root,
-    checkpoint=expected_checkpoint,
-    evaluation_classification=expected_classification,
-    is_formal=expected_is_formal,
-    model_role=expected_model_role,
-    episodes_per_task=episodes_per_task,
-)
+roles = sys.argv[7]
+if roles == "stage2_target,official_teacher":
+    merge_complete_matrix(
+        root=root,
+        checkpoints=checkpoints,
+        evaluation_classification=expected_classification,
+        is_formal=expected_is_formal,
+        episodes_per_task=episodes_per_task,
+    )
+else:
+    role = roles
+    merge_student_matrix(
+        root=root,
+        checkpoint=checkpoints[role],
+        evaluation_classification=expected_classification,
+        is_formal=expected_is_formal,
+        model_role=role,
+        episodes_per_task=episodes_per_task,
+    )
 print(f"MATRIX_SUMMARY={root / 'matrix_summary.json'}")
 print(f"MATRIX_SUMMARY_CSV={root / 'matrix_summary.csv'}")
 PY

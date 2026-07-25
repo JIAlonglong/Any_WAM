@@ -19,6 +19,9 @@ from evaluation.libero.cosmos_progressive_s4_server import (
     S4_ACTION_STEPS,
     normalize_student_steps,
 )
+from distillation_flowmap.cosmos_training_contract import (
+    normalize_cosmos_inference_request,
+)
 
 
 class S4CheckpointMismatchError(ValueError):
@@ -78,18 +81,32 @@ class CosmosProgressiveS4Client:
             raise TypeError("service must provide infer(request)")
         self.service = service
         self.output_dir = Path(output_dir)
-        self.student_steps = normalize_student_steps(student_steps)
         self.model_role = str(model_role)
-        self.video_steps = normalize_student_steps(
-            self.student_steps if video_steps is None else video_steps
-        )
-        self.action_steps = normalize_student_steps(
-            self.student_steps if action_steps is None else action_steps
-        )
+        if self.model_role == "official_teacher":
+            alias = student_steps if video_steps is None and action_steps is None else None
+            request = normalize_cosmos_inference_request(
+                model_role=self.model_role,
+                video_steps=video_steps,
+                action_steps=action_steps,
+                student_steps=alias,
+            )
+            self.student_steps = None
+            self.video_steps = request.video_steps
+            self.action_steps = request.action_steps
+        else:
+            self.student_steps = normalize_student_steps(student_steps)
+            self.video_steps = normalize_student_steps(
+                self.student_steps if video_steps is None else video_steps
+            )
+            self.action_steps = normalize_student_steps(
+                self.student_steps if action_steps is None else action_steps
+            )
         self.libero_benchmark = (
             str(libero_benchmark) if libero_benchmark is not None else None
         )
-        if self.video_steps != self.action_steps or self.video_steps != self.student_steps:
+        if self.video_steps != self.action_steps or (
+            self.student_steps is not None and self.video_steps != self.student_steps
+        ):
             raise ValueError(
                 "Cosmos Progressive client requires matched student/video/action budgets"
             )
@@ -112,8 +129,9 @@ class CosmosProgressiveS4Client:
             "model_role": self.model_role,
             "video_steps": self.video_steps,
             "action_steps": self.action_steps,
-            "student_steps": self.student_steps,
         }
+        if self.student_steps is not None:
+            contract["student_steps"] = self.student_steps
         if self.libero_benchmark is not None:
             contract["libero_benchmark"] = self.libero_benchmark
         return contract
@@ -147,6 +165,36 @@ class CosmosProgressiveS4Client:
         return action
 
     def _validate_service_student_steps(self, response: Mapping[str, Any]) -> None:
+        if self.model_role == "official_teacher":
+            if response.get("model_role") != self.model_role:
+                raise ValueError(
+                    "S4 service model_role mismatch: "
+                    f"client={self.model_role!r}, service={response.get('model_role')!r}"
+                )
+            if (
+                int(response.get("video_steps", -1)) != self.video_steps
+                or int(response.get("action_steps", -1)) != self.action_steps
+            ):
+                raise ValueError("S4 service video/action steps mismatch")
+            if "student_steps" in response:
+                raise ValueError("official_teacher response must not claim student_steps")
+            if (
+                response.get("matched_budget_verified") is not True
+                and not bool(response.get("reset", False))
+            ):
+                raise ValueError("official_teacher response lacks matched-budget proof")
+            if not bool(response.get("reset", False)) and (
+                int(response.get("effective_video_steps", -1)) != self.video_steps
+                or int(response.get("effective_action_steps", -1)) != self.action_steps
+            ):
+                raise ValueError("official_teacher effective video/action K mismatch")
+            return
+        if "model_role" in response and response["model_role"] != self.model_role:
+            raise ValueError("S4 service model_role mismatch")
+        if "video_steps" in response and int(response["video_steps"]) != self.video_steps:
+            raise ValueError("S4 service video_steps mismatch")
+        if "action_steps" in response and int(response["action_steps"]) != self.action_steps:
+            raise ValueError("S4 service action_steps mismatch")
         if "student_steps" not in response:
             if self.student_steps != 4:
                 raise ValueError(
@@ -294,6 +342,12 @@ class CosmosProgressiveS4Client:
                         "s4_checkpoint",
                         "decision_duration_s",
                         "raw_anchor_record",
+                        "requested_video_steps",
+                        "requested_action_steps",
+                        "effective_video_steps",
+                        "effective_action_steps",
+                        "matched_budget_verified",
+                        "future_prediction_keys",
                     )
                     if key in response
                     and not (

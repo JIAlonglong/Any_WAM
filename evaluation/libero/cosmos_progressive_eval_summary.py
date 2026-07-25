@@ -131,7 +131,16 @@ def merge_formal_records(
             _fail(f"seed mismatch: invalid record seed={record.get('seed')!r}")
         if payload_seed != path_seed:
             _fail(f"seed mismatch: record seed={payload_seed} path seed={path_seed}")
-        if int(record.get("student_steps", -1)) != requested_steps:
+        if model_role == "official_teacher":
+            if "student_steps" in record:
+                _fail("official_teacher record must not claim student_steps")
+            if (
+                int(record.get("effective_video_steps", -1)) != requested_steps
+                or int(record.get("effective_action_steps", -1)) != requested_steps
+                or record.get("matched_budget_verified") is not True
+            ):
+                _fail("official_teacher effective matched-budget proof is missing")
+        elif int(record.get("student_steps", -1)) != requested_steps:
             _fail(
                 f"step mismatch: expected={requested_steps} got={record.get('student_steps')!r}"
             )
@@ -188,7 +197,6 @@ def merge_formal_records(
         "schema": "cosmos_progressive_s4_formal_eval_v2",
         "checkpoint": expected_checkpoint,
         "libero_benchmark": suite,
-        "student_steps": requested_steps,
         "model_role": model_role,
         "video_steps": requested_steps,
         "action_steps": requested_steps,
@@ -205,6 +213,8 @@ def merge_formal_records(
             bootstrap[int(0.975 * len(bootstrap))],
         ],
     }
+    if model_role != "official_teacher":
+        summary["student_steps"] = requested_steps
     _atomic_json(root / "formal_summary.json", summary)
     _atomic_csv(
         root / "formal_summary.csv",
@@ -265,10 +275,14 @@ def merge_student_matrix(
             if payload.get("model_role") != model_role:
                 _fail(f"model_role mismatch for {suite} K={step}")
             if (
-                int(payload.get("student_steps", -1)) != step
-                or int(payload.get("video_steps", -1)) != step
+                int(payload.get("video_steps", -1)) != step
                 or int(payload.get("action_steps", -1)) != step
             ):
+                _fail(f"video/action step mismatch for {suite} K={step}")
+            if model_role == "official_teacher":
+                if "student_steps" in payload:
+                    _fail(f"official_teacher child must not claim student_steps for {suite} K={step}")
+            elif int(payload.get("student_steps", -1)) != step:
                 _fail(f"video/action step mismatch for {suite} K={step}")
             if int(payload.get("num_tasks", -1)) != 10:
                 _fail(f"task count mismatch for {suite} K={step}")
@@ -344,6 +358,107 @@ def merge_student_matrix(
         [
             "libero_benchmark",
             "model_role",
+            "video_steps",
+            "action_steps",
+            "tasks",
+            "episodes_per_task",
+            "num_records",
+            "macro_success",
+            "summary_json",
+        ],
+        rows,
+    )
+    return summary
+
+
+def merge_complete_matrix(
+    *,
+    root: str | Path,
+    checkpoints: dict[str, str | Path],
+    evaluation_classification: str,
+    is_formal: bool,
+    episodes_per_task: int,
+) -> dict[str, Any]:
+    """Validate the independent Student and official-Teacher 40-task matrices."""
+
+    root = Path(root)
+    roles = ("stage2_target", "official_teacher")
+    if set(checkpoints) != set(roles):
+        _fail(f"complete matrix checkpoints must be exactly {roles}")
+    expected_child_paths = {
+        (root / role / f"k{step}" / suite / "formal_summary.json").resolve()
+        for role in roles
+        for step in STUDENT_STEPS
+        for suite in LIBERO_SUITES
+    }
+    actual_child_paths = {
+        path.resolve() for path in root.rglob("formal_summary.json")
+    }
+    unexpected_paths = actual_child_paths - expected_child_paths
+    if unexpected_paths:
+        _fail(
+            "unexpected duplicate/foreign formal summary: "
+            f"{sorted(map(str, unexpected_paths))[:3]}"
+        )
+    missing_paths = expected_child_paths - actual_child_paths
+    if missing_paths:
+        _fail(
+            "missing role/suite/K formal summary: "
+            f"{sorted(map(str, missing_paths))[:3]}"
+        )
+    rows: list[dict[str, Any]] = []
+    summaries: dict[str, str] = {}
+    for role in roles:
+        role_root = root / role
+        role_summary = merge_student_matrix(
+            root=role_root,
+            checkpoint=checkpoints[role],
+            evaluation_classification=evaluation_classification,
+            is_formal=is_formal,
+            model_role=role,
+            episodes_per_task=episodes_per_task,
+        )
+        for cell, path in role_summary["summaries"].items():
+            key = f"{role}/{cell}"
+            if key in summaries:
+                _fail(f"duplicate role/suite/K summary: {key}")
+            summaries[key] = path
+            child = json.loads(Path(path).read_text(encoding="utf-8"))
+            rows.append(
+                {
+                    "model_role": role,
+                    "libero_benchmark": child["libero_benchmark"],
+                    "video_steps": child["video_steps"],
+                    "action_steps": child["action_steps"],
+                    "tasks": child["num_tasks"],
+                    "episodes_per_task": child["seeds_per_task"],
+                    "num_records": child["num_records"],
+                    "macro_success": child.get("macro_success", ""),
+                    "summary_json": path,
+                }
+            )
+    if len(summaries) != 24:
+        _fail(f"complete matrix requires 24 role/suite/K summaries, got {len(summaries)}")
+    summary = {
+        "schema": "cosmos_progressive_student_teacher_124_matrix_v1",
+        "roles": list(roles),
+        "suites": list(LIBERO_SUITES),
+        "steps": list(STUDENT_STEPS),
+        "episodes_per_task": int(episodes_per_task),
+        "role_task_budget_cells": 2 * 40 * 3,
+        "checkpoints": {
+            role: str(Path(checkpoints[role]).resolve()) for role in roles
+        },
+        "summaries": summaries,
+        "evaluation_classification": evaluation_classification,
+        "is_formal": bool(is_formal),
+    }
+    _atomic_json(root / "matrix_summary.json", summary)
+    _atomic_csv(
+        root / "matrix_summary.csv",
+        [
+            "model_role",
+            "libero_benchmark",
             "video_steps",
             "action_steps",
             "tasks",

@@ -40,12 +40,28 @@ resolve, or advertise a FlowMap/Wan student transformer.
   `Cosmos-Policy-LIBERO-Predict2-2B.pt` with backend `cosmos_policy`, a
   64-character contract identity, and no student transformer path.
 
-## Deliberately deferred integration
+## Evaluation integration
 
-The top-level LIBERO matrix/client/rollout files were concurrently owned by
-another task and were not edited here. The integration point is
-`OfficialTeacherMatchedBudgetAdapter`; the outer matrix should construct one
-worker/service per K and persist the returned effective-K metadata.
+- Added an official Teacher service that returns the raw official action chunk,
+  effective-K proof, role/checkpoint identity, and available future-prediction
+  keys without student metadata.
+- The client persists requested/effective video/action K and rejects a missing
+  or mismatched official runtime proof.
+- The formal evaluator supports the monolithic `--cosmos-policy-path` branch
+  without passing a student transformer.
+- The default matrix is now two independent roles (`stage2_target` and
+  `official_teacher`) × four suites × K={1,2,4}. Role-specific directories,
+  JSON, and CSV prevent result mixing.
+- The merger requires all 240 role/task/K cells and rejects missing,
+  duplicate/foreign, wrong-role, wrong-suite, wrong-K, wrong-task, and
+  wrong-episode artifacts.
+- Limited video selection and dry-run no-write behavior are preserved.
+
+Focused eval-side integration regression: `109 passed`.
+
+The outer Stage-1 → Stage-2 → evaluation wrapper is committed by a separate
+task and is integrated in a follow-up commit so this change never overwrites
+concurrent lineage work.
 
 No live model evaluation, training, checkpoint mutation, or simulator run was
 performed.

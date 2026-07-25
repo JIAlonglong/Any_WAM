@@ -36,6 +36,12 @@ from evaluation.libero.cosmos_progressive_s4_server import (
     S4_ACTION_DIM,
     S4_ACTION_STEPS,
     SUPPORTED_STUDENT_STEPS,
+    build_cosmos_raw_request,
+)
+from distillation_flowmap.cosmos_official_teacher_eval import (
+    OfficialTeacherEvaluationService,
+    OfficialTeacherMatchedBudgetAdapter,
+    resolve_cosmos_official_teacher_root,
 )
 from distillation_flowmap.cosmos_training_contract import (
     normalize_cosmos_inference_request,
@@ -186,7 +192,8 @@ def require_live_s4_prerequisites(*, device: str, checkpoint_transformer: str | 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint-transformer", required=True)
+    parser.add_argument("--checkpoint-transformer", default=None)
+    parser.add_argument("--cosmos-policy-path", default=None)
     parser.add_argument(
         "--config",
         default="distillation_flowmap.config_libero_cosmos_policy_stage2_progressive",
@@ -202,7 +209,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--model-role",
         choices=("stage1_target", "stage2_online", "stage2_target", "official_teacher"),
         default="stage2_target",
-        help="Checkpoint role; official_teacher is rejected until a matched-K adapter exists.",
+        help="Checkpoint role; official_teacher uses --cosmos-policy-path, never a student transformer.",
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--cfg-scale", type=float, default=3.0)
@@ -549,6 +556,50 @@ def run_joint_s4_student(
 def build_live_service(args: argparse.Namespace) -> tuple[CosmosProgressiveS4Service, Any]:
     """Construct the live service without running any LIBERO environment."""
     request = resolve_cli_inference_request(args)
+    if request.model_role == "official_teacher":
+        resolved_teacher = resolve_cosmos_official_teacher_root(
+            args.cosmos_policy_path or args.teacher_model_path
+        )
+        require_live_s4_prerequisites(
+            device=args.device,
+            checkpoint_transformer=resolved_teacher.root_path,
+        )
+        import torch
+        from distillation_flowmap.cosmos_policy_adapter import (
+            CosmosPolicyActionTeacher,
+            resolve_cosmos_policy_assets,
+        )
+
+        device = torch.device(args.device)
+        torch.cuda.set_device(device)
+        args.teacher_model_path = resolved_teacher.root_path
+        config = _configure_live_config(
+            args,
+            {"resolve_cosmos_policy_assets": resolve_cosmos_policy_assets},
+        )
+        config.cosmos_policy_num_denoising_steps_action = request.action_steps
+        teacher = CosmosPolicyActionTeacher(
+            resolved_teacher.root_path,
+            dtype=torch.bfloat16,
+            device=str(device),
+            config=config,
+        )
+        adapter = OfficialTeacherMatchedBudgetAdapter(
+            teacher=teacher,
+            video_steps=request.video_steps,
+            action_steps=request.action_steps,
+            include_future=True,
+        )
+        service = OfficialTeacherEvaluationService(
+            adapter=adapter,
+            resolved_teacher=resolved_teacher,
+            raw_request_builder=lambda obs, prompt: build_cosmos_raw_request(
+                libero_obs=obs, prompt=prompt
+            ),
+        )
+        return service, teacher
+    if args.checkpoint_transformer is None:
+        raise ValueError("student roles require --checkpoint-transformer")
     resolved_checkpoint = resolve_cosmos_inference_checkpoint(
         model_role=request.model_role,
         checkpoint_transformer=args.checkpoint_transformer,
@@ -643,9 +694,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.episode_index_offset < 0:
         raise ValueError("--episode-index-offset must be non-negative")
     if args.preflight:
+        request = resolve_cli_inference_request(args)
+        preflight_checkpoint = (
+            resolve_cosmos_official_teacher_root(
+                args.cosmos_policy_path or args.teacher_model_path
+            ).root_path
+            if request.model_role == "official_teacher"
+            else args.checkpoint_transformer
+        )
         require_live_s4_prerequisites(
             device=args.device,
-            checkpoint_transformer=args.checkpoint_transformer,
+            checkpoint_transformer=preflight_checkpoint,
         )
         print(
             json.dumps(

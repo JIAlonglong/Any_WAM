@@ -220,3 +220,72 @@ class OfficialTeacherMatchedBudgetAdapter:
         output.update(proof)
         output["model_role"] = "official_teacher"
         return output
+
+
+class OfficialTeacherEvaluationService:
+    """LIBERO service facade for raw official-policy actions."""
+
+    def __init__(
+        self,
+        *,
+        adapter: OfficialTeacherMatchedBudgetAdapter,
+        resolved_teacher: ResolvedCosmosOfficialTeacher,
+        raw_request_builder: Any,
+    ) -> None:
+        self.adapter = adapter
+        self.resolved_teacher = resolved_teacher
+        self.raw_request_builder = raw_request_builder
+        self.model_role = "official_teacher"
+        self.video_steps = adapter.video_steps
+        self.action_steps = adapter.action_steps
+        self.student_steps = None
+        self.checkpoint_identifier = resolved_teacher.root_path
+        self.checkpoint_contract_identity = resolved_teacher.contract_identity
+
+    def _metadata(self) -> dict[str, Any]:
+        return {
+            "model_role": self.model_role,
+            "video_steps": self.video_steps,
+            "action_steps": self.action_steps,
+            "s4_checkpoint": self.checkpoint_identifier,
+            "checkpoint_contract_identity": self.checkpoint_contract_identity,
+        }
+
+    def infer(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(request, Mapping):
+            raise TypeError("official teacher service request must be a mapping")
+        if bool(request.get("reset", False)):
+            return {"ok": True, "reset": True, **self._metadata()}
+        if "obs" not in request:
+            raise KeyError("official teacher infer request needs 'obs'")
+        prompt = request.get("prompt", request.get("task"))
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("official teacher infer request needs a prompt")
+        raw_batch = self.raw_request_builder(request["obs"], prompt)
+        result = self.adapter.infer_raw(raw_batch)
+        actions = np.asarray(result["actions"], dtype=np.float32)
+        if actions.shape != (1, 16, 7):
+            raise RuntimeError(
+                f"official teacher service expected [1,16,7], got {actions.shape}"
+            )
+        futures = result.get("future_image_predictions")
+        future_keys = sorted(
+            {
+                str(key)
+                for prediction in (futures or [])
+                if isinstance(prediction, Mapping)
+                for key in prediction
+            }
+        )
+        return {
+            "ok": True,
+            "action": np.ascontiguousarray(actions[0]),
+            "actions": np.ascontiguousarray(actions[0]),
+            **self._metadata(),
+            "requested_video_steps": result["requested_video_steps"],
+            "requested_action_steps": result["requested_action_steps"],
+            "effective_video_steps": result["effective_video_steps"],
+            "effective_action_steps": result["effective_action_steps"],
+            "matched_budget_verified": result["matched_budget_verified"],
+            "future_prediction_keys": future_keys,
+        }

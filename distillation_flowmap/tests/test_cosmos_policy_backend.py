@@ -1,3 +1,4 @@
+import hashlib
 import importlib
 import json
 import os
@@ -346,6 +347,109 @@ def test_joint_velocity_subprocess_payload_carries_normalized_action(tmp_path):
     )
 
     np.testing.assert_array_equal(captured["action"], action.numpy())
+
+
+def _sha256_array(value):
+    array = np.ascontiguousarray(value)
+    return hashlib.sha256(array.view(np.uint8)).hexdigest()
+
+
+def _make_same_prior_teacher(tmp_path):
+    from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+    teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32)
+    teacher._raw_batch_to_numpy = lambda raw_batch: (
+        np.zeros((1, 2, 2, 3), np.uint8),
+        np.zeros((1, 2, 2, 3), np.uint8),
+        np.zeros((1, 9), np.float32),
+        ["task"],
+    )
+    return teacher
+
+
+def test_same_prior_endpoint_request_round_trips_exact_priors_and_eight_steps(
+    tmp_path,
+):
+    teacher = _make_same_prior_teacher(tmp_path)
+    video_prior = torch.randn(1, 16, 9, 2, 2)
+    action_prior = torch.randn(1, 16, 7)
+    captured = {}
+
+    def fake_worker(payload, arrays):
+        captured.update(payload)
+        torch.testing.assert_close(torch.from_numpy(arrays["video_prior"]), video_prior)
+        torch.testing.assert_close(torch.from_numpy(arrays["action_prior"]), action_prior)
+        return {
+            "endpoint_video": np.zeros_like(arrays["video_prior"]),
+            "video_frame_mask": np.ones((1, video_prior.shape[2]), dtype=bool),
+            "effective_teacher_steps": 8,
+            "video_prior_sha256": _sha256_array(arrays["video_prior"]),
+            "action_prior_sha256": _sha256_array(arrays["action_prior"]),
+        }
+
+    teacher._request_raw_worker_npz = fake_worker
+    result = teacher.predict_raw_same_prior_endpoint(
+        {"raw_task": ["task"]},
+        video_prior=video_prior,
+        action_prior=action_prior,
+        teacher_steps=8,
+    )
+
+    assert captured["mode"] == "same_prior_endpoint"
+    assert captured["teacher_steps"] == 8
+    assert result["effective_teacher_steps"] == 8
+    assert result["endpoint_video"].dtype == torch.float32
+    assert result["video_frame_mask"].dtype == torch.bool
+
+
+def test_same_prior_endpoint_rejects_non_eight_steps_before_worker_start(tmp_path):
+    teacher = _make_same_prior_teacher(tmp_path)
+    teacher._ensure_raw_worker = lambda: pytest.fail("worker must not start")
+
+    with pytest.raises(ValueError, match="exactly 8"):
+        teacher.predict_raw_same_prior_endpoint(
+            {"raw_task": ["task"]},
+            video_prior=torch.zeros(1, 16, 9, 2, 2),
+            action_prior=torch.zeros(1, 16, 7),
+            teacher_steps=7,
+        )
+
+
+@pytest.mark.parametrize(
+    "response_override,match",
+    [
+        ({"video_prior_sha256": "wrong"}, "video prior fingerprint"),
+        ({"action_prior_sha256": "wrong"}, "action prior fingerprint"),
+        ({"effective_teacher_steps": 7}, "effective teacher steps"),
+    ],
+)
+def test_same_prior_endpoint_rejects_worker_contract_mismatch(
+    tmp_path, response_override, match
+):
+    teacher = _make_same_prior_teacher(tmp_path)
+    video_prior = torch.zeros(1, 16, 9, 2, 2)
+    action_prior = torch.zeros(1, 16, 7)
+
+    def fake_worker(payload, arrays):
+        response = {
+            "endpoint_video": np.zeros_like(arrays["video_prior"]),
+            "video_frame_mask": np.ones((1, video_prior.shape[2]), dtype=bool),
+            "effective_teacher_steps": 8,
+            "video_prior_sha256": _sha256_array(arrays["video_prior"]),
+            "action_prior_sha256": _sha256_array(arrays["action_prior"]),
+        }
+        response.update(response_override)
+        return response
+
+    teacher._request_raw_worker_npz = fake_worker
+    with pytest.raises(RuntimeError, match=match):
+        teacher.predict_raw_same_prior_endpoint(
+            {"raw_task": ["task"]},
+            video_prior=video_prior,
+            action_prior=action_prior,
+        )
 
 
 def test_cosmos_latent_target_mode_controls_cdiff_requests():

@@ -7,6 +7,7 @@ one narrow adapter.
 """
 
 import atexit
+import hashlib
 import inspect
 import json
 import os
@@ -119,6 +120,11 @@ def _as_numpy(value):
             value = value.float()
         return value.numpy()
     return np.asarray(value)
+
+
+def _array_sha256(value):
+    array = np.ascontiguousarray(value)
+    return hashlib.sha256(array.view(np.uint8)).hexdigest()
 
 
 def _as_task_list(value, batch_size):
@@ -670,6 +676,53 @@ class CosmosPolicyActionTeacher:
     def _predict_raw_actions_subprocess(self, raw_batch):
         return self._predict_raw_action_result_subprocess(raw_batch, include_future=False)["actions"]
 
+    def _request_raw_worker_npz(self, payload, arrays):
+        """Exchange one NPZ request/response with the persistent raw worker."""
+        self._ensure_raw_worker()
+        req_dir = self._raw_worker_tmpdir or tempfile.mkdtemp(prefix="cosmos_policy_raw_")
+        fd, npz_path = tempfile.mkstemp(prefix="request_", suffix=".npz", dir=req_dir)
+        os.close(fd)
+        response_path = npz_path.replace("request_", "actions_")
+        np.savez_compressed(npz_path, **arrays)
+        request = dict(payload)
+        request.update(npz_path=npz_path, actions_path=response_path)
+        try:
+            self._raw_worker.stdin.write(json.dumps(request) + "\n")
+            self._raw_worker.stdin.flush()
+            line = self._raw_worker.stdout.readline()
+        except BrokenPipeError as exc:
+            raise RuntimeError("Cosmos Policy raw worker exited before responding.") from exc
+        if not line:
+            try:
+                code = self._raw_worker.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                code = self._raw_worker.poll()
+            raise RuntimeError(
+                f"Cosmos Policy raw worker produced no response; exit code={code}"
+            )
+        response = json.loads(line)
+        if not response.get("ok", False):
+            raise RuntimeError(
+                "Cosmos Policy raw worker failed:\n"
+                + response.get("error", "unknown error")
+            )
+        actual_response_path = response.get("actions_path")
+        if actual_response_path != response_path:
+            raise RuntimeError("Cosmos Policy raw worker returned an unexpected response path")
+        try:
+            with np.load(actual_response_path) as data:
+                result = {}
+                for key in data.files:
+                    value = data[key]
+                    result[key] = value.item() if value.ndim == 0 else value.copy()
+        finally:
+            for path in (npz_path, actual_response_path):
+                try:
+                    os.remove(path)
+                except (OSError, TypeError):
+                    pass
+        return result
+
     def _predict_raw_action_result_subprocess(self, raw_batch, include_future=False):
         primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
         self._ensure_raw_worker()
@@ -936,6 +989,108 @@ class CosmosPolicyActionTeacher:
 
     def predict_raw_actions(self, raw_batch):
         return self.predict_raw_action_result(raw_batch, include_future=False)["actions"]
+
+    def predict_raw_same_prior_endpoint(
+        self,
+        raw_batch,
+        *,
+        video_prior,
+        action_prior,
+        teacher_steps=8,
+    ):
+        """Run the official eight-step Cosmos teacher from caller-owned priors."""
+        teacher_steps = int(teacher_steps)
+        if teacher_steps != 8:
+            raise ValueError("same-prior endpoint requires exactly 8 teacher steps")
+
+        primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
+        video_prior_np = np.ascontiguousarray(_as_numpy(video_prior))
+        action_prior_np = np.ascontiguousarray(_as_numpy(action_prior))
+        if video_prior_np.dtype != np.float32:
+            raise ValueError("video_prior must use float32 without conversion")
+        if action_prior_np.dtype != np.float32:
+            raise ValueError("action_prior must use float32 without conversion")
+        if video_prior_np.ndim != 5:
+            raise ValueError(
+                "video_prior must have Cosmos joint latent shape [B,C,T,H,W]"
+            )
+        if action_prior_np.ndim != 3 or action_prior_np.shape[1:] != (16, 7):
+            raise ValueError(
+                "action_prior must be native Cosmos-normalized shape [B,16,7]"
+            )
+        if video_prior_np.shape[0] != len(tasks):
+            raise ValueError(
+                "video_prior batch size must match the raw observation batch"
+            )
+        if action_prior_np.shape[0] != len(tasks):
+            raise ValueError(
+                "action_prior batch size must match the raw observation batch"
+            )
+        if not np.isfinite(video_prior_np).all():
+            raise ValueError("video_prior must contain only finite values")
+        if not np.isfinite(action_prior_np).all():
+            raise ValueError("action_prior must contain only finite values")
+
+        arrays = {
+            "primary_image": primary,
+            "wrist_image": wrist,
+            "proprio": proprio,
+            "video_prior": video_prior_np,
+            "action_prior": action_prior_np,
+        }
+        result = self._request_raw_worker_npz(
+            {
+                "mode": "same_prior_endpoint",
+                "tasks": tasks,
+                "teacher_steps": teacher_steps,
+            },
+            arrays,
+        )
+        required = (
+            "endpoint_video",
+            "video_frame_mask",
+            "effective_teacher_steps",
+            "video_prior_sha256",
+            "action_prior_sha256",
+        )
+        missing = [key for key in required if key not in result]
+        if missing:
+            raise RuntimeError(
+                f"same-prior worker response missing required fields: {missing}"
+            )
+        if int(result["effective_teacher_steps"]) != teacher_steps:
+            raise RuntimeError(
+                "same-prior worker returned an invalid effective teacher steps count"
+            )
+        if str(result["video_prior_sha256"]) != _array_sha256(video_prior_np):
+            raise RuntimeError("same-prior worker video prior fingerprint mismatch")
+        if str(result["action_prior_sha256"]) != _array_sha256(action_prior_np):
+            raise RuntimeError("same-prior worker action prior fingerprint mismatch")
+
+        endpoint = np.asarray(result["endpoint_video"])
+        frame_mask = np.asarray(result["video_frame_mask"])
+        if endpoint.shape != video_prior_np.shape:
+            raise RuntimeError(
+                "same-prior worker endpoint shape does not match video_prior"
+            )
+        if not np.issubdtype(endpoint.dtype, np.floating):
+            raise RuntimeError("same-prior worker endpoint must be floating point")
+        if not np.isfinite(endpoint).all():
+            raise RuntimeError("same-prior worker endpoint contains non-finite values")
+        expected_mask_shape = (video_prior_np.shape[0], video_prior_np.shape[2])
+        if frame_mask.dtype != np.bool_:
+            raise RuntimeError("same-prior worker video frame mask must be boolean")
+        if frame_mask.shape != expected_mask_shape:
+            raise RuntimeError(
+                "same-prior worker video frame mask has an invalid shape"
+            )
+        return {
+            "endpoint_video": torch.from_numpy(endpoint.astype(np.float32)),
+            "video_frame_mask": torch.from_numpy(frame_mask.copy()),
+            "effective_teacher_steps": teacher_steps,
+            "video_prior_sha256": str(result["video_prior_sha256"]),
+            "action_prior_sha256": str(result["action_prior_sha256"]),
+        }
 
     def predict_raw_action_result(self, raw_batch, include_future=False):
         if self._raw_action_provider is not None:

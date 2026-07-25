@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from distillation_flowmap.cosmos_training_contract import validate_contract_metadata
+from distillation_flowmap.cosmos_hybrid_backend import (
+    STUDENT_BACKEND,
+    TEACHER_BACKEND,
+    validate_cosmos_teacher_model_path,
+    validate_wan_student_base_model_path,
+)
 
 
 _MONOLITHIC_WEIGHTS = "diffusion_pytorch_model.safetensors"
@@ -29,7 +35,10 @@ class ResolvedCosmosInferenceCheckpoint:
     transformer_path: str
     checkpoint_path: str
     parent_stage1_path: str | None
-    cosmos_base_model_path: str
+    student_backend: str
+    teacher_backend: str
+    wan_student_base_model_path: str
+    cosmos_teacher_model_path: str
     checkpoint_contract_identity: str
 
 
@@ -189,6 +198,10 @@ def validate_stage1_parent(
             raise ValueError(
                 f"{variant} teacher_backend must be exactly 'cosmos_policy'"
             )
+        if payload.get("student_backend") != STUDENT_BACKEND:
+            raise ValueError(
+                f"{variant} student_backend must be exactly {STUDENT_BACKEND!r}"
+            )
         _validate_step(payload, expected_step=expected_step, label=variant)
         contract = _contract_payload(payload)
         weights = _validate_weights(transformer, label=variant)
@@ -270,6 +283,14 @@ def validate_stage2_resume(
             config, label=f"{variant} config.json"
         )
         validate_contract_metadata(payload, required_stage="progressive_stage2")
+        if payload.get("student_backend") != STUDENT_BACKEND:
+            raise ValueError(
+                f"{variant} student_backend must be exactly {STUDENT_BACKEND!r}"
+            )
+        if payload.get("teacher_backend") != TEACHER_BACKEND:
+            raise ValueError(
+                f"{variant} teacher_backend must be exactly {TEACHER_BACKEND!r}"
+            )
         _validate_step(payload, expected_step=expected_step, label=variant)
         weights = _validate_weights(transformer, label=variant)
         payloads[variant] = payload
@@ -369,7 +390,7 @@ def resolve_cosmos_inference_checkpoint(
     if expected_stage == "raw_stage1":
         stage1_root = transformer.parent.parent
         parent = validate_stage1_parent(stage1_root, expected_step=5000)
-        cosmos_base_model_path = _validated_cosmos_base_model_path(parent)
+        wan_base, cosmos_teacher = _validated_hybrid_model_paths(parent)
         expected_transformer = (
             Path(parent.canonical_path) / "target_student" / "transformer"
         )
@@ -381,7 +402,10 @@ def resolve_cosmos_inference_checkpoint(
             transformer_path=str(canonical_transformer),
             checkpoint_path=parent.canonical_path,
             parent_stage1_path=None,
-            cosmos_base_model_path=cosmos_base_model_path,
+            student_backend=STUDENT_BACKEND,
+            teacher_backend=TEACHER_BACKEND,
+            wan_student_base_model_path=wan_base,
+            cosmos_teacher_model_path=cosmos_teacher,
             checkpoint_contract_identity=parent.contract_identity,
         )
 
@@ -396,7 +420,7 @@ def resolve_cosmos_inference_checkpoint(
     if not isinstance(parent_path, str) or not parent_path:
         raise ValueError("Stage-2 inference checkpoint is missing parent_stage1_path")
     parent = validate_stage1_parent(Path(parent_path), expected_step=5000)
-    cosmos_base_model_path = _validated_cosmos_base_model_path(parent)
+    wan_base, cosmos_teacher = _validated_hybrid_model_paths(parent)
     arm_root = checkpoint.parent.parent
     canonical_checkpoint = validate_stage2_resume(
         checkpoint,
@@ -432,26 +456,43 @@ def resolve_cosmos_inference_checkpoint(
         transformer_path=str(canonical_transformer),
         checkpoint_path=str(canonical_checkpoint),
         parent_stage1_path=parent.canonical_path,
-        cosmos_base_model_path=cosmos_base_model_path,
+        student_backend=STUDENT_BACKEND,
+        teacher_backend=TEACHER_BACKEND,
+        wan_student_base_model_path=wan_base,
+        cosmos_teacher_model_path=cosmos_teacher,
         checkpoint_contract_identity=_canonical_json_digest(
             {"checkpoint_path": str(canonical_checkpoint), "configs": checkpoint_configs}
         ),
     )
 
 
-def _validated_cosmos_base_model_path(parent: ValidatedStage1Parent) -> str:
-    """Read the original Cosmos policy base from verified Stage-1 metadata."""
+def _validated_hybrid_model_paths(
+    parent: ValidatedStage1Parent,
+) -> tuple[str, str]:
+    """Read and independently validate the Student and Teacher roots."""
 
     _, payload = _read_json_object(
         Path(parent.canonical_path) / "target_student" / "transformer" / "config.json",
         label="Stage-1 target inference config.json",
     )
-    configured = payload.get("student_base_model_path")
-    if not isinstance(configured, str) or not configured:
+    if payload.get("student_backend") != STUDENT_BACKEND:
+        raise ValueError(
+            f"Stage-1 target student_backend must be exactly {STUDENT_BACKEND!r}"
+        )
+    if payload.get("teacher_backend") != TEACHER_BACKEND:
+        raise ValueError(
+            f"Stage-1 target teacher_backend must be exactly {TEACHER_BACKEND!r}"
+        )
+    student_path = payload.get("student_base_model_path")
+    if not isinstance(student_path, str) or not student_path:
         raise ValueError(
             "Stage-1 target student_base_model_path must be a non-empty string"
         )
-    base = Path(configured)
-    _require_plain_directory(base, label="student_base_model_path")
-    _require_plain_file(base / "config.json", label="student_base_model_path config.json")
-    return str(base.resolve(strict=True))
+    teacher_path = payload.get("teacher_model_path")
+    if not isinstance(teacher_path, str) or not teacher_path:
+        raise ValueError(
+            "Stage-1 target teacher_model_path must be a non-empty string"
+        )
+    wan_base = validate_wan_student_base_model_path(student_path)
+    cosmos_teacher = validate_cosmos_teacher_model_path(teacher_path)
+    return str(wan_base), str(cosmos_teacher)

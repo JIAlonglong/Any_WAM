@@ -1206,6 +1206,7 @@ def test_convert_input_format_preserves_raw_non_tensor_fields():
 
 def test_libero_cosmos_policy_configs_are_action_only(monkeypatch):
     monkeypatch.setenv("COSMOS_POLICY_PATH", "/tmp/cosmos-policy")
+    monkeypatch.setenv("WAN_STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")
     monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")
     sys.modules.pop("distillation_flowmap.config_libero_cosmos_policy_stage1", None)
     sys.modules.pop("distillation_flowmap.config_libero_cosmos_policy_stage2", None)
@@ -1214,6 +1215,7 @@ def test_libero_cosmos_policy_configs_are_action_only(monkeypatch):
     stage2 = importlib.import_module("distillation_flowmap.config_libero_cosmos_policy_stage2").cfg
 
     for cfg in (stage1, stage2):
+        assert cfg.student_backend == "wan_flowmap"
         assert cfg.teacher_backend == "cosmos_policy"
         assert cfg.teacher_model_path == "/tmp/cosmos-policy"
         assert cfg.student_base_model_path == "/tmp/wanva-base"

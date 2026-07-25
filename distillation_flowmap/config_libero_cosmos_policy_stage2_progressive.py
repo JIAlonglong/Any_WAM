@@ -29,6 +29,7 @@ cfg.action_packing_schema = ACTION_PACKING_SCHEMA
 cfg.action_downsample_factor = 4
 cfg.action_chunk_shape = [4, 4]
 cfg.training_contract_stage = "progressive_stage2"
+cfg.student_backend = "wan_flowmap"
 
 
 def _env_bool(name, default):

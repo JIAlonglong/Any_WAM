@@ -259,12 +259,22 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
         "done\n",
     )
     init = tmp_path / "lingbotva-init"
-    _plain_file(init / "transformer" / "config.json", b"{}")
+    _plain_file(
+        init / "transformer" / "config.json",
+        b'{"_class_name":"WanTransformer3DModel"}\n',
+    )
     _plain_file(init / "transformer" / "diffusion_pytorch_model.safetensors")
     dataset = tmp_path / "dataset"
     _plain_file(dataset / "empty_emb.pt")
     teacher = tmp_path / "teacher"
     teacher.mkdir()
+    _plain_file(teacher / "config.json", b'{"model_type":"cosmos-policy"}\n')
+    for name in (
+        "Cosmos-Policy-LIBERO-Predict2-2B.pt",
+        "libero_dataset_statistics.json",
+        "libero_t5_embeddings.pkl",
+    ):
+        _plain_file(teacher / name)
     local_model = tmp_path / "local-model"
     local_model.mkdir()
     repo = tmp_path / "clean-cosmos-repo"
@@ -285,7 +295,7 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
     env = os.environ.copy()
     env.update(
         {
-            "CLEAN_STUDENT_BASE_MODEL_PATH": str(init),
+            "WAN_STUDENT_BASE_MODEL_PATH": str(init),
             "COSMOS_PREDICT2_REPO": str(repo),
             "DATASET_PATH": str(dataset),
             "COSMOS_POLICY_PATH": str(teacher),
@@ -360,10 +370,10 @@ def test_pipeline_read_only_modes_write_nothing(tmp_path, mode):
 
 def test_pipeline_requires_explicit_student_init_and_clean_cosmos_repo(tmp_path):
     env, output_root = _pipeline_env(tmp_path)
-    env.pop("CLEAN_STUDENT_BASE_MODEL_PATH")
+    env.pop("WAN_STUDENT_BASE_MODEL_PATH")
     missing_init = _pipeline(env, output_root, "--dry-run")
     assert missing_init.returncode != 0
-    assert "CLEAN_STUDENT_BASE_MODEL_PATH" in missing_init.stderr
+    assert "WAN_STUDENT_BASE_MODEL_PATH" in missing_init.stderr
 
     env, output_root = _pipeline_env(tmp_path / "second")
     env.pop("COSMOS_PREDICT2_REPO")

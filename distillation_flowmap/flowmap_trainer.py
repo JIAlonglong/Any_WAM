@@ -51,6 +51,11 @@ from distillation_flowmap.cosmos_deployment_rollout import (
     mechanism_diagnostic_joint_step_for_update,
 )
 from distillation_flowmap.cosmos_training_contract import contract_metadata
+from distillation_flowmap.cosmos_hybrid_backend import (
+    STUDENT_BACKEND,
+    validate_cosmos_teacher_model_path,
+    validate_wan_student_base_model_path,
+)
 from distillation_flowmap.cosmos_teacher_roles import resolve_teacher_roles
 from distillation_flowmap.ablation.robotwin_diagnostics import (
     classify_parameter_branch,
@@ -606,22 +611,27 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # 三个模型的初始化
         # ==============================================================
         if self.is_cosmos_policy_teacher:
+            student_backend = getattr(config, "student_backend", None)
+            if student_backend != STUDENT_BACKEND:
+                raise ValueError(
+                    "teacher_backend='cosmos_policy' hybrid training requires "
+                    f"cfg.student_backend={STUDENT_BACKEND!r}, got "
+                    f"{student_backend!r}"
+                )
             student_base_model_path = getattr(config, 'student_base_model_path', None)
             if student_base_model_path is None:
                 raise ValueError(
                     "teacher_backend='cosmos_policy' requires cfg.student_base_model_path "
-                    "pointing to a WanVA teacher/checkpoint root for student initialization."
+                    "pointing to the explicit Wan FlowMap Student base."
                 )
-            student_base_model_path = os.path.abspath(os.path.expanduser(student_base_model_path))
-            if os.path.basename(student_base_model_path) == "transformer":
-                teacher_path = student_base_model_path
-            else:
-                teacher_path = os.path.join(student_base_model_path, "transformer")
-            if not os.path.isfile(os.path.join(teacher_path, "config.json")):
-                raise FileNotFoundError(
-                    "Invalid student_base_model_path for Cosmos Policy backend: "
-                    f"expected {os.path.join(teacher_path, 'config.json')}"
-                )
+            student_base_model_path = str(
+                validate_wan_student_base_model_path(student_base_model_path)
+            )
+            config.student_base_model_path = student_base_model_path
+            config.teacher_model_path = str(
+                validate_cosmos_teacher_model_path(config.teacher_model_path)
+            )
+            teacher_path = os.path.join(student_base_model_path, "transformer")
         else:
             teacher_path = os.path.join(config.teacher_model_path, "transformer")
 
@@ -1435,6 +1445,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         "online_student_snapshot"
                     )
                 for metadata_field in (
+                    "student_backend",
                     "teacher_backend",
                     "student_base_model_path",
                     "teacher_model_path",

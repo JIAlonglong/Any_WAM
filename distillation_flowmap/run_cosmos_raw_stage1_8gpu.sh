@@ -206,7 +206,20 @@ SHARED_ROOT="$(cd "$(dirname "$GIT_COMMON")" && pwd -P)"
 PYTHON_BIN="${PYTHON_BIN:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python}"
 PREFLIGHT_BIN="${PREFLIGHT_BIN:-$PYTHON_BIN}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/torchrun}"
-CLEAN_STUDENT_BASE_MODEL_PATH="${CLEAN_STUDENT_BASE_MODEL_PATH:-/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero}"
+WAN_STUDENT_BASE_MODEL_PATH="${WAN_STUDENT_BASE_MODEL_PATH:-}"
+LEGACY_CLEAN_STUDENT_BASE_MODEL_PATH="${CLEAN_STUDENT_BASE_MODEL_PATH:-}"
+if [[ -z "$WAN_STUDENT_BASE_MODEL_PATH" ]]; then
+    [[ -n "$LEGACY_CLEAN_STUDENT_BASE_MODEL_PATH" ]] || die \
+        "WAN_STUDENT_BASE_MODEL_PATH must be set explicitly"
+    WAN_STUDENT_BASE_MODEL_PATH="$LEGACY_CLEAN_STUDENT_BASE_MODEL_PATH"
+    printf '%s\n' \
+        "WARNING: CLEAN_STUDENT_BASE_MODEL_PATH is deprecated; use WAN_STUDENT_BASE_MODEL_PATH" \
+        >&2
+elif [[ -n "$LEGACY_CLEAN_STUDENT_BASE_MODEL_PATH" ]]; then
+    [[ "$WAN_STUDENT_BASE_MODEL_PATH" == "$LEGACY_CLEAN_STUDENT_BASE_MODEL_PATH" ]] || die \
+        "WAN_STUDENT_BASE_MODEL_PATH and deprecated CLEAN_STUDENT_BASE_MODEL_PATH disagree"
+fi
+CLEAN_STUDENT_BASE_MODEL_PATH="$WAN_STUDENT_BASE_MODEL_PATH"
 DATASET_PATH="${DATASET_PATH:-${SHARED_ROOT}/training_data/libero-long-lerobot}"
 EMPTY_EMB_PATH="${EMPTY_EMB_PATH:-${DATASET_PATH}/empty_emb.pt}"
 COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B}"
@@ -236,11 +249,28 @@ validate_devices COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES \
 [[ -x "$PYTHON_BIN" ]] || die "PYTHON_BIN is not executable: $PYTHON_BIN"
 [[ -x "$PREFLIGHT_BIN" ]] || die "PREFLIGHT_BIN is not executable: $PREFLIGHT_BIN"
 [[ -x "$TORCHRUN_BIN" ]] || die "TORCHRUN_BIN is not executable: $TORCHRUN_BIN"
+require_dir CLEAN_STUDENT_BASE_MODEL_PATH "$WAN_STUDENT_BASE_MODEL_PATH"
+require_dir COSMOS_POLICY_PATH "$COSMOS_POLICY_PATH"
+if ! (
+    cd "$PROJECT_ROOT"
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:${PYTHONPATH:-}" \
+        "$PYTHON_BIN" -c \
+        'import sys
+from distillation_flowmap.cosmos_hybrid_backend import (
+    validate_cosmos_teacher_model_path,
+    validate_wan_student_base_model_path,
+)
+validate_wan_student_base_model_path(sys.argv[1])
+validate_cosmos_teacher_model_path(sys.argv[2])' \
+        "$WAN_STUDENT_BASE_MODEL_PATH" "$COSMOS_POLICY_PATH"
+); then
+    die "hybrid Student/Teacher backend validation failed"
+fi
 require_transformer "CLEAN_STUDENT_BASE_MODEL_PATH/transformer" \
     "$CLEAN_STUDENT_BASE_MODEL_PATH/transformer"
 require_dir DATASET_PATH "$DATASET_PATH"
 require_file empty_emb.pt "$EMPTY_EMB_PATH"
-require_dir COSMOS_POLICY_PATH "$COSMOS_POLICY_PATH"
 [[ -x "$COSMOS_POLICY_PYTHON" ]] || die \
     "COSMOS_POLICY_PYTHON is not executable: $COSMOS_POLICY_PYTHON"
 require_dir COSMOS_PREDICT2_REPO "$COSMOS_PREDICT2_REPO"
@@ -364,6 +394,8 @@ CONFIG_FILE="distillation_flowmap.config_libero_cosmos_policy_stage1"
 launch_env=(
     "CONFIG_FILE=$CONFIG_FILE"
     "OUTPUT_DIR=$OUTPUT_DIR"
+    "STUDENT_BACKEND=wan_flowmap"
+    "WAN_STUDENT_BASE_MODEL_PATH=$WAN_STUDENT_BASE_MODEL_PATH"
     "STUDENT_BASE_MODEL_PATH=$CLEAN_STUDENT_BASE_MODEL_PATH"
     "RESUME_FROM_PATH=$RESUME_FROM_PATH"
     "RESUME_ONLINE_FROM_TARGET=$RESUME_ONLINE_FROM_TARGET"
@@ -430,9 +462,10 @@ metadata = contract_metadata(cfg, stage="raw_stage1")
 validate_contract_metadata(metadata, required_stage="raw_stage1")
 resume_path = os.environ["RESUME_FROM_PATH"] or None
 expected = {
+    "student_backend": "wan_flowmap",
     "teacher_backend": "cosmos_policy",
     "training_contract_stage": "raw_stage1",
-    "student_base_model_path": os.environ["STUDENT_BASE_MODEL_PATH"],
+    "student_base_model_path": os.environ["WAN_STUDENT_BASE_MODEL_PATH"],
     "teacher_model_path": os.environ["COSMOS_POLICY_PATH"],
     "resume_from_path": resume_path,
     "resume_online_from_target": False,

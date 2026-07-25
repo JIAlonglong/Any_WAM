@@ -30,6 +30,7 @@ def _explicit_cosmos_paths(monkeypatch, tmp_path):
         "action_chunk_shape": [4, 4],
         "checkpoint_step": 5000,
         "teacher_backend": "cosmos_policy",
+        "student_backend": "wan_flowmap",
     }
     for variant in ("online_student", "target_student"):
         transformer = stage1 / variant / "transformer"

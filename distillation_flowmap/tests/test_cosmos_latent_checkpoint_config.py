@@ -76,6 +76,7 @@ def _set_valid_progressive_lineage(monkeypatch, tmp_path):
         "action_chunk_shape": [4, 4],
         "checkpoint_step": 5000,
         "teacher_backend": "cosmos_policy",
+        "student_backend": "wan_flowmap",
     }
     for variant in ("online_student", "target_student"):
         transformer = stage1 / variant / "transformer"
@@ -95,6 +96,7 @@ def _set_valid_progressive_lineage(monkeypatch, tmp_path):
     )
     for name, value in {
         "STUDENT_BASE_MODEL_PATH": str(stage1 / "target_student"),
+        "WAN_STUDENT_BASE_MODEL_PATH": str(stage1 / "target_student"),
         "RESUME_FROM_PATH": str(stage1),
         "PARENT_STAGE1_PATH": parent.canonical_path,
         "PARENT_STAGE1_CONTRACT_IDENTITY": parent.contract_identity,
@@ -118,7 +120,9 @@ def test_stage_configs_identify_their_persisted_training_contract(
     )
 
     assert stage1.cfg.training_contract_stage == "raw_stage1"
+    assert stage1.cfg.student_backend == "wan_flowmap"
     assert stage2.cfg.training_contract_stage == "progressive_stage2"
+    assert stage2.cfg.student_backend == "wan_flowmap"
     assert stage1.cfg.action_chunk_shape == [4, 4]
     assert stage2.cfg.action_chunk_shape == [4, 4]
 
@@ -183,6 +187,7 @@ def test_real_checkpoint_writer_persists_stage1_backend_and_stage2_lineage(
         action_downsample_factor=4,
         action_chunk_shape=[4, 4],
         teacher_backend="cosmos_policy",
+        student_backend="wan_flowmap",
         student_base_model_path="/explicit/cosmos-base",
         teacher_model_path="/explicit/cosmos-teacher",
     )
@@ -203,6 +208,7 @@ def test_real_checkpoint_writer_persists_stage1_backend_and_stage2_lineage(
         ).read_text()
     )
     assert stage1_payload["teacher_backend"] == "cosmos_policy"
+    assert stage1_payload["student_backend"] == "wan_flowmap"
     assert stage1_payload["student_base_model_path"] == "/explicit/cosmos-base"
     assert stage1_payload["teacher_model_path"] == "/explicit/cosmos-teacher"
 
@@ -246,6 +252,7 @@ def test_real_checkpoint_writer_persists_stage1_backend_and_stage2_lineage(
         deployment_joint_rollout_interval=4,
         deployment_action_weight=1.0,
         raw_teacher_window_is_auxiliary=True,
+        student_backend="wan_flowmap",
         teacher_backend="cosmos_policy",
         student_base_model_path=str(stage1_checkpoint / "target_student"),
         teacher_model_path="/explicit/cosmos-teacher",
@@ -336,6 +343,7 @@ def test_checkpoint_config_persists_stage2_contract_atomically(tmp_path, monkeyp
         deployment_joint_rollout_interval=4,
         deployment_action_weight=1.0,
         raw_teacher_window_is_auxiliary=True,
+        student_backend="wan_flowmap",
     )
     monkeypatch.setattr(
         trainer_module,
@@ -438,6 +446,7 @@ def test_invalid_contract_prevents_all_checkpoint_writes(tmp_path, monkeypatch):
         deployment_joint_rollout_interval=4,
         deployment_action_weight=2.0,
         raw_teacher_window_is_auxiliary=True,
+        student_backend="wan_flowmap",
     )
     writes = []
     monkeypatch.setattr(

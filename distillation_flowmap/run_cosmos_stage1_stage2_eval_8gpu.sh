@@ -21,7 +21,7 @@ Options:
   --check-only              validate static inputs and print the plan; write nothing
 
 This is not a pure-Cosmos student run. It explicitly initializes the Flash-WAM/
-Wan student from CLEAN_STUDENT_BASE_MODEL_PATH and uses a Cosmos policy teacher.
+Wan student from WAN_STUDENT_BASE_MODEL_PATH and uses a Cosmos policy teacher.
 Formal evaluation is LIBERO-10 only: 500 episodes for each matched K=1,2,4.
 EOF
 }
@@ -164,12 +164,22 @@ if [[ -n "$RESUME_STAGE" || -n "$RESUME_STEP" ]]; then
         "--phase must equal --resume-stage for an exact resume"
 fi
 
-require_env CLEAN_STUDENT_BASE_MODEL_PATH
+if [[ -z "${WAN_STUDENT_BASE_MODEL_PATH:-}" ]]; then
+    [[ -n "${CLEAN_STUDENT_BASE_MODEL_PATH:-}" ]] || \
+        die "WAN_STUDENT_BASE_MODEL_PATH must be set explicitly"
+    WAN_STUDENT_BASE_MODEL_PATH="$CLEAN_STUDENT_BASE_MODEL_PATH"
+    printf '%s\n' \
+        "WARNING: CLEAN_STUDENT_BASE_MODEL_PATH is deprecated; use WAN_STUDENT_BASE_MODEL_PATH" \
+        >&2
+elif [[ -n "${CLEAN_STUDENT_BASE_MODEL_PATH:-}" && \
+        "$WAN_STUDENT_BASE_MODEL_PATH" != "$CLEAN_STUDENT_BASE_MODEL_PATH" ]]; then
+    die "WAN_STUDENT_BASE_MODEL_PATH and deprecated CLEAN_STUDENT_BASE_MODEL_PATH disagree"
+fi
 require_env COSMOS_PREDICT2_REPO
-require_dir CLEAN_STUDENT_BASE_MODEL_PATH "$CLEAN_STUDENT_BASE_MODEL_PATH"
+require_dir WAN_STUDENT_BASE_MODEL_PATH "$WAN_STUDENT_BASE_MODEL_PATH"
 require_transformer \
-    CLEAN_STUDENT_BASE_MODEL_PATH/transformer \
-    "$CLEAN_STUDENT_BASE_MODEL_PATH/transformer"
+    WAN_STUDENT_BASE_MODEL_PATH/transformer \
+    "$WAN_STUDENT_BASE_MODEL_PATH/transformer"
 require_dir COSMOS_PREDICT2_REPO "$COSMOS_PREDICT2_REPO"
 
 git_status="$(
@@ -201,6 +211,22 @@ require_dir DATASET_PATH "$DATASET_PATH"
 [[ -f "$EMPTY_EMB_PATH" ]] || die "EMPTY_EMB_PATH is missing: $EMPTY_EMB_PATH"
 require_dir COSMOS_POLICY_PATH "$COSMOS_POLICY_PATH"
 require_dir COSMOS_PREDICT25_LOCAL_MODEL_DIR "$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
+if ! (
+    cd "$PROJECT_ROOT"
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:${PYTHONPATH:-}" \
+        "$PYTHON_BIN" -c \
+        'import sys
+from distillation_flowmap.cosmos_hybrid_backend import (
+    validate_cosmos_teacher_model_path,
+    validate_wan_student_base_model_path,
+)
+validate_wan_student_base_model_path(sys.argv[1])
+validate_cosmos_teacher_model_path(sys.argv[2])' \
+        "$WAN_STUDENT_BASE_MODEL_PATH" "$COSMOS_POLICY_PATH"
+); then
+    die "hybrid Student/Teacher backend validation failed"
+fi
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 IFS=',' read -r -a devices <<< "$CUDA_VISIBLE_DEVICES"
@@ -253,7 +279,7 @@ lock_command+=(
 eval_command=("$EVAL_LAUNCHER" run)
 stage1_environment=(
     env
-    "CLEAN_STUDENT_BASE_MODEL_PATH=$CLEAN_STUDENT_BASE_MODEL_PATH"
+    "WAN_STUDENT_BASE_MODEL_PATH=$WAN_STUDENT_BASE_MODEL_PATH"
     "DATASET_PATH=$DATASET_PATH"
     "EMPTY_EMB_PATH=$EMPTY_EMB_PATH"
     "COSMOS_POLICY_PATH=$COSMOS_POLICY_PATH"

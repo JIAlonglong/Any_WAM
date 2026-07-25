@@ -22,6 +22,7 @@ RAW_CONTRACT = {
     "action_downsample_factor": 4,
     "action_chunk_shape": [4, 4],
     "teacher_backend": "cosmos_policy",
+    "student_backend": "wan_flowmap",
 }
 STAGE2_CONTRACT = {
     "contract_version": 2,
@@ -35,6 +36,8 @@ STAGE2_CONTRACT = {
     "deployment_joint_rollout_interval": 4,
     "deployment_action_weight": 1.0,
     "raw_teacher_window_is_auxiliary": True,
+    "teacher_backend": "cosmos_policy",
+    "student_backend": "wan_flowmap",
 }
 
 
@@ -499,15 +502,33 @@ def test_stage2_resume_rejects_symlinked_config_weight_or_state(
         validate_stage2_resume(checkpoint, arm_root=arm, expected_step=1000)
 
 
-def _lineaged_stage2(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+def _lineaged_stage2(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
     stage1 = _stage1(tmp_path)
-    cosmos_base = tmp_path / "cosmos-policy-base"
-    cosmos_base.mkdir()
-    (cosmos_base / "config.json").write_text("{}\n", encoding="utf-8")
+    wan_base = tmp_path / "lingbotva-base"
+    (wan_base / "transformer").mkdir(parents=True)
+    (wan_base / "transformer" / "config.json").write_text(
+        json.dumps({"_class_name": "WanTransformer3DModel"}) + "\n",
+        encoding="utf-8",
+    )
+    cosmos_teacher = tmp_path / "cosmos-policy-teacher"
+    cosmos_teacher.mkdir()
+    (cosmos_teacher / "config.json").write_text(
+        json.dumps({"model_type": "cosmos-policy"}) + "\n",
+        encoding="utf-8",
+    )
+    for name in (
+        "Cosmos-Policy-LIBERO-Predict2-2B.pt",
+        "libero_dataset_statistics.json",
+        "libero_t5_embeddings.pkl",
+    ):
+        (cosmos_teacher / name).write_bytes(b"fixture")
     for variant in ("online_student", "target_student"):
         _rewrite(
             _config(stage1, variant),
-            student_base_model_path=str(cosmos_base.resolve()),
+            student_backend="wan_flowmap",
+            student_base_model_path=str(wan_base.resolve()),
+            teacher_backend="cosmos_policy",
+            teacher_model_path=str(cosmos_teacher.resolve()),
         )
     parent = validate_stage1_parent(stage1)
     arm, checkpoint = _stage2(tmp_path)
@@ -515,15 +536,16 @@ def _lineaged_stage2(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         _rewrite(
             _config(checkpoint, variant),
             teacher_backend="cosmos_policy",
+            student_backend="wan_flowmap",
             parent_stage1_path=parent.canonical_path,
             parent_stage1_contract_identity=parent.contract_identity,
             student_base_model_path=str(stage1 / "target_student"),
         )
-    return stage1, arm, checkpoint, cosmos_base
+    return stage1, arm, checkpoint, wan_base, cosmos_teacher
 
 
 def test_inference_resolver_accepts_only_explicit_validated_student_roles(tmp_path):
-    stage1, _arm, checkpoint, cosmos_base = _lineaged_stage2(tmp_path)
+    stage1, _arm, checkpoint, wan_base, _cosmos_teacher = _lineaged_stage2(tmp_path)
 
     stage1_target = resolve_cosmos_inference_checkpoint(
         model_role="stage1_target",
@@ -548,11 +570,12 @@ def test_inference_resolver_accepts_only_explicit_validated_student_roles(tmp_pa
         (checkpoint / "online_student" / "transformer").resolve()
     )
     assert stage2_target.parent_stage1_path == str(stage1.resolve())
-    assert stage2_target.cosmos_base_model_path == str(cosmos_base.resolve())
+    assert stage2_target.student_backend == "wan_flowmap"
+    assert stage2_target.wan_student_base_model_path == str(wan_base.resolve())
 
 
 def test_inference_resolver_rejects_role_component_mismatch_and_teacher(tmp_path):
-    stage1, _arm, checkpoint, _cosmos_base = _lineaged_stage2(tmp_path)
+    stage1, _arm, checkpoint, _wan_base, _cosmos_teacher = _lineaged_stage2(tmp_path)
 
     with pytest.raises(ValueError, match="stage1_target"):
         resolve_cosmos_inference_checkpoint(
@@ -572,18 +595,18 @@ def test_inference_resolver_rejects_role_component_mismatch_and_teacher(tmp_path
 
 
 def test_inference_resolver_rejects_missing_or_mismatched_base_model_metadata(tmp_path):
-    stage1, _arm, checkpoint, _cosmos_base = _lineaged_stage2(tmp_path)
+    stage1, _arm, checkpoint, _wan_base, _cosmos_teacher = _lineaged_stage2(tmp_path)
     for variant in ("online_student", "target_student"):
         _rewrite(_config(stage1, variant), student_base_model_path="/root/nas/unknown")
 
-    with pytest.raises((FileNotFoundError, ValueError), match="student_base_model_path"):
+    with pytest.raises((FileNotFoundError, ValueError), match="wan_flowmap"):
         resolve_cosmos_inference_checkpoint(
             model_role="stage1_target",
             checkpoint_transformer=stage1 / "target_student" / "transformer",
         )
 
     # Rebuild a valid pair and prove Stage-2 cannot silently point at another parent.
-    stage1, _arm, checkpoint, _cosmos_base = _lineaged_stage2(tmp_path / "second")
+    stage1, _arm, checkpoint, _wan_base, _cosmos_teacher = _lineaged_stage2(tmp_path / "second")
     for variant in ("online_student", "target_student"):
         _rewrite(_config(checkpoint, variant), student_base_model_path="/wrong/stage1")
     with pytest.raises(ValueError, match="student_base_model_path"):

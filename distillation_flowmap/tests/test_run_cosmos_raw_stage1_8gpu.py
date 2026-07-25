@@ -42,7 +42,9 @@ def _write_executable(path: Path, body: str) -> None:
 
 def _transformer(root: Path, *, step: int | None = None) -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    payload = {} if step is None else {**RAW_CONTRACT, "checkpoint_step": step}
+    payload = {"_class_name": "WanTransformer3DModel"}
+    if step is not None:
+        payload.update({**RAW_CONTRACT, "checkpoint_step": step})
     (root / "config.json").write_text(json.dumps(payload) + "\n", encoding="utf-8")
     (root / "diffusion_pytorch_model.safetensors").write_bytes(b"test")
     return root
@@ -56,6 +58,16 @@ def _layout(tmp_path: Path) -> dict[str, str]:
     (dataset / "empty_emb.pt").write_bytes(b"test")
     policy = tmp_path / "cosmos-policy"
     policy.mkdir()
+    (policy / "config.json").write_text(
+        json.dumps({"model_type": "cosmos-policy"}) + "\n",
+        encoding="utf-8",
+    )
+    for name in (
+        "Cosmos-Policy-LIBERO-Predict2-2B.pt",
+        "libero_dataset_statistics.json",
+        "libero_t5_embeddings.pkl",
+    ):
+        (policy / name).write_bytes(b"fixture")
     worker_repo = tmp_path / "cosmos-predict2.5"
     worker_repo.mkdir()
     for relative in ("packages/cosmos-cuda", "packages/cosmos-oss"):
@@ -183,6 +195,7 @@ def _import_stage1_config(
             "RESET_RESUME_STEP": "0",
             "RESUME_OPTIMIZER_STATE": "0",
             "TRAIN_SEED": "42",
+            "WAN_STUDENT_BASE_MODEL_PATH": "/explicit/wan-flowmap-base",
             **updates,
         }
     )
@@ -194,6 +207,8 @@ print(json.dumps({
     "reset_resume_step": cfg.reset_resume_step,
     "resume_optimizer_state": cfg.resume_optimizer_state,
     "seed": cfg.seed,
+    "student_backend": cfg.student_backend,
+    "student_base_model_path": cfg.student_base_model_path,
 }))
 """
     return subprocess.run(
@@ -225,6 +240,8 @@ def test_stage1_config_explicitly_parses_fresh_resume_controls_and_seed():
         "reset_resume_step": False,
         "resume_optimizer_state": False,
         "seed": 17,
+        "student_backend": "wan_flowmap",
+        "student_base_model_path": "/explicit/wan-flowmap-base",
     }
 
 
@@ -246,6 +263,8 @@ def test_stage1_config_explicitly_parses_resume_controls_and_seed(tmp_path):
         "reset_resume_step": False,
         "resume_optimizer_state": True,
         "seed": 23,
+        "student_backend": "wan_flowmap",
+        "student_base_model_path": "/explicit/wan-flowmap-base",
     }
 
 
@@ -302,6 +321,11 @@ def test_dry_run_prints_corrected_raw_contract_without_mutation(tmp_path):
     assert "--nproc_per_node=8" in result.stdout
     assert "--master_port=29671" in result.stdout
     assert f"STUDENT_BASE_MODEL_PATH={env['CLEAN_STUDENT_BASE_MODEL_PATH']}" in result.stdout
+    assert "STUDENT_BACKEND=wan_flowmap" in result.stdout
+    assert (
+        f"WAN_STUDENT_BASE_MODEL_PATH={env['CLEAN_STUDENT_BASE_MODEL_PATH']}"
+        in result.stdout
+    )
     assert "RESUME_FROM_PATH=" in result.stdout
     assert "raw_stage1_5000" not in result.stdout
     assert not Path(env["STAGE1_OUTPUT"]).exists()
@@ -357,6 +381,36 @@ def test_rejects_missing_declared_worker_cuda_library_directory(tmp_path):
     assert result.returncode != 0
     assert str(missing) in result.stderr
     assert not Path(env["WORKER_PREFLIGHT_LOG"]).exists()
+
+
+def test_primary_wan_path_is_explicit_and_conflicting_legacy_alias_is_rejected(
+    tmp_path,
+):
+    env = _env(tmp_path)
+    wan_base = env.pop("CLEAN_STUDENT_BASE_MODEL_PATH")
+    env["WAN_STUDENT_BASE_MODEL_PATH"] = wan_base
+
+    accepted = _run("dry-run", env=env)
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert f"WAN_STUDENT_BASE_MODEL_PATH={wan_base}" in accepted.stdout
+    assert "deprecated" not in accepted.stderr
+
+    env["CLEAN_STUDENT_BASE_MODEL_PATH"] = str(tmp_path / "different")
+    rejected = _run("dry-run", env=env)
+    assert rejected.returncode != 0
+    assert "disagree" in rejected.stderr
+
+
+def test_rejects_cosmos_teacher_root_as_wan_student(tmp_path):
+    env = _env(tmp_path)
+    env["WAN_STUDENT_BASE_MODEL_PATH"] = env["COSMOS_POLICY_PATH"]
+    env.pop("CLEAN_STUDENT_BASE_MODEL_PATH")
+
+    result = _run("dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "wan_flowmap" in result.stderr
+    assert "hybrid Student/Teacher backend validation failed" in result.stderr
 
 
 def test_full_cosmos_utils_worker_import_failure_is_fail_closed(tmp_path):

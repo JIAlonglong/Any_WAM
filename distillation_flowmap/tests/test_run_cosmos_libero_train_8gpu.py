@@ -15,7 +15,11 @@ from pathlib import Path
 
 import pytest
 
-from distillation_flowmap.cosmos_libero_variants import canonical_variant_json, resolve_variant
+from distillation_flowmap.cosmos_libero_variants import (
+    canonical_variant_json,
+    resolve_variant,
+    validate_aligned_opd_arm_contract,
+)
 from distillation_flowmap.cosmos_libero_provenance import (
     build_artifact_lock,
     canonical_json,
@@ -35,6 +39,7 @@ RAW_CONTRACT = {
     "action_downsample_factor": 4,
     "action_chunk_shape": [4, 4],
     "checkpoint_step": 5000,
+    "student_backend": "wan_flowmap",
     "teacher_backend": "cosmos_policy",
 }
 STAGE2_CONTRACT = {
@@ -49,6 +54,7 @@ STAGE2_CONTRACT = {
     "deployment_joint_rollout_interval": 4,
     "deployment_action_weight": 1.0,
     "raw_teacher_window_is_auxiliary": True,
+    "student_backend": "wan_flowmap",
     "teacher_backend": "cosmos_policy",
 }
 
@@ -58,6 +64,39 @@ def _transformer(root: Path, payload: dict) -> Path:
     (root / "config.json").write_text(json.dumps(payload), encoding="utf-8")
     (root / "diffusion_pytorch_model.safetensors").write_bytes(b"test")
     return root
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_each_arm_has_one_exact_aligned_opd_contract(arm, tmp_path):
+    record = resolve_variant(arm, output_root=tmp_path)
+    validate_aligned_opd_arm_contract(
+        arm,
+        rollout_steps=record["danceopd_rollout_steps"],
+        endpoint_weight=record["video_endpoint_weight"],
+        velocity_weight=record["video_velocity_weight"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("arm", "rollout_steps", "endpoint_weight", "velocity_weight"),
+    [
+        ("s1", (2,), 1.0, 0.0),
+        ("s2", (2,), 1.0, 0.0),
+        ("stage1_only", (2, 4), 1.0, 0.0),
+        ("anchor_only", (2, 4), 1.0, 1.0),
+        ("field_only", (2, 4), 1.0, 1.0),
+    ],
+)
+def test_aligned_opd_contract_rejects_cross_arm_settings(
+    arm, rollout_steps, endpoint_weight, velocity_weight
+):
+    with pytest.raises(ValueError, match="does not match variant"):
+        validate_aligned_opd_arm_contract(
+            arm,
+            rollout_steps=rollout_steps,
+            endpoint_weight=endpoint_weight,
+            velocity_weight=velocity_weight,
+        )
 
 
 def _layout(tmp_path: Path):
@@ -84,12 +123,22 @@ def _layout(tmp_path: Path):
     (dataset / "empty_emb.pt").write_bytes(b"test")
     policy = tmp_path / "policy"
     policy.mkdir()
-    (policy / "config.json").write_text('{"revision":1}', encoding="utf-8")
+    (policy / "config.json").write_text(
+        '{"model_type":"cosmos-policy","revision":1}', encoding="utf-8"
+    )
     (policy / "libero_dataset_statistics.json").write_text(
         '{"revision":1}', encoding="utf-8"
     )
     (policy / "Cosmos-Policy-LIBERO-Predict2-2B.pt").write_bytes(b"policy")
     (policy / "libero_t5_embeddings.pkl").write_bytes(b"embeddings")
+    stage1_payload = {
+        **RAW_CONTRACT,
+        "_class_name": "WanTransformer3DModel",
+        "student_base_model_path": str(stage1 / "target_student"),
+        "teacher_model_path": str(policy),
+    }
+    for variant in ("online_student", "target_student"):
+        _transformer(stage1 / variant / "transformer", stage1_payload)
     repo = tmp_path / "cosmos-predict2.5"
     repo.mkdir()
     (repo / "packages" / "cosmos-cuda").mkdir(parents=True)
@@ -754,7 +803,7 @@ def test_entire_inherited_config_environment_is_sealed_against_hostile_ambient(
         "COSMOS_LATENT_TARGET_MODE": "hybrid_cdiff",
         "COSMOS_LATENT_CDIFF_INTERVAL": "4",
         "OPD_ACTION_ROLLOUT_GRAD_MODE": "last_step",
-        "OPD_AUX_INTERVAL": "8",
+            "OPD_AUX_INTERVAL": "4",
         "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR": "1",
         "OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE": "2e-06",
         "OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR": "0.5",
@@ -890,6 +939,17 @@ def _write_resume_checkpoint(
         "checkpoint_step": step,
         "parent_stage1_path": parent.canonical_path,
         "parent_stage1_contract_identity": parent.contract_identity,
+        "student_base_model_path": str(
+            Path(parent.canonical_path) / "target_student"
+        ),
+        "teacher_model_path": json.loads(
+            (
+                Path(parent.canonical_path)
+                / "target_student"
+                / "transformer"
+                / "config.json"
+            ).read_text(encoding="utf-8")
+        )["teacher_model_path"],
         "cosmos_libero_variant_json": variant_json,
         "cosmos_libero_provenance_json": provenance_json,
     }

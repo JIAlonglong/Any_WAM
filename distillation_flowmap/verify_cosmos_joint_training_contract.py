@@ -101,8 +101,8 @@ def _verify_deployment_contract(config) -> dict[str, object]:
     raw_phase = getattr(config, "opd_aux_phase")
     if type(raw_warmup) is not int or raw_warmup != 8:
         raise RuntimeError(f"raw auxiliary warmup must be int 8, got {raw_warmup!r}")
-    if type(raw_interval) is not int or raw_interval != 8:
-        raise RuntimeError(f"raw auxiliary interval must be int 8, got {raw_interval!r}")
+    if type(raw_interval) is not int or raw_interval != 4:
+        raise RuntimeError(f"raw auxiliary interval must be int 4, got {raw_interval!r}")
     if type(raw_phase) is not int or raw_phase != 2:
         raise RuntimeError(f"raw auxiliary phase must be int 2, got {raw_phase!r}")
     raw_auxiliary_schedule_steps = [
@@ -115,7 +115,7 @@ def _verify_deployment_contract(config) -> dict[str, object]:
             phase=raw_phase,
         )
     ]
-    if raw_auxiliary_schedule_steps != [10, 18]:
+    if raw_auxiliary_schedule_steps != [10, 14, 18, 22]:
         raise RuntimeError(
             f"production raw auxiliary cadence is {raw_auxiliary_schedule_steps!r}"
         )

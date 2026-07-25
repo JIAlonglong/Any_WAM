@@ -20,6 +20,7 @@ RAW_CONTRACT = {
     "action_downsample_factor": 4,
     "action_chunk_shape": [4, 4],
     "checkpoint_step": 5000,
+    "student_backend": "wan_flowmap",
     "teacher_backend": "cosmos_policy",
 }
 STAGE2_CONTRACT = {
@@ -34,6 +35,7 @@ STAGE2_CONTRACT = {
     "deployment_joint_rollout_interval": 4,
     "deployment_action_weight": 1.0,
     "raw_teacher_window_is_auxiliary": True,
+    "student_backend": "wan_flowmap",
     "teacher_backend": "cosmos_policy",
 }
 
@@ -59,6 +61,22 @@ def _layout(tmp_path: Path):
 
     policy = tmp_path / "policy"
     policy.mkdir()
+    (policy / "config.json").write_text(
+        '{"model_type":"cosmos-policy"}\n', encoding="utf-8"
+    )
+    (policy / "libero_dataset_statistics.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    (policy / "Cosmos-Policy-LIBERO-Predict2-2B.pt").write_bytes(b"policy")
+    (policy / "libero_t5_embeddings.pkl").write_bytes(b"embeddings")
+    stage1_payload = {
+        **RAW_CONTRACT,
+        "_class_name": "WanTransformer3DModel",
+        "student_base_model_path": str(stage1 / "target_student"),
+        "teacher_model_path": str(policy),
+    }
+    for variant in ("online_student", "target_student"):
+        _transformer(stage1 / variant / "transformer", stage1_payload)
     repo = tmp_path / "cosmos-predict2.5"
     repo.mkdir()
     local_model = tmp_path / "local-model"
@@ -97,6 +115,19 @@ def _resume_checkpoint(env, output: Path, stage: str, step: int) -> Path:
         "checkpoint_step": step,
         "parent_stage1_path": parent.canonical_path,
         "parent_stage1_contract_identity": parent.contract_identity,
+        "student_base_model_path": str(
+            Path(parent.canonical_path) / "target_student"
+        ),
+        "teacher_model_path": str(
+            json.loads(
+                (
+                    Path(parent.canonical_path)
+                    / "target_student"
+                    / "transformer"
+                    / "config.json"
+                ).read_text(encoding="utf-8")
+            )["teacher_model_path"]
+        ),
     }
     for variant in ("online_student", "target_student"):
         _transformer(checkpoint / variant / "transformer", payload)

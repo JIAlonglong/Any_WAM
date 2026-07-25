@@ -100,9 +100,47 @@ VARIANT_NAMES = (
     "apm",
 )
 
+_ALIGNED_OPD_ARM_CONTRACTS = MappingProxyType(
+    {
+        "s1": ((1,), 1.0, 0.0),
+        "s2": ((2,), 1.0, 1.0),
+        "s4": ((4,), 1.0, 1.0),
+        "universal": ((2, 4), 1.0, 1.0),
+        "universal-video-action": ((2, 4), 1.0, 1.0),
+        "stage1_only": ((2, 4), 0.0, 0.0),
+        "anchor_only": ((2, 4), 1.0, 0.0),
+        "field_only": ((2, 4), 0.0, 1.0),
+        "apm": ((2, 4), 1.0, 1.0),
+    }
+)
+
 
 class VariantError(ValueError):
     """Raised when an experiment record cannot be normalized safely."""
+
+
+def validate_aligned_opd_arm_contract(
+    name: str,
+    *,
+    rollout_steps: Sequence[int],
+    endpoint_weight: float,
+    velocity_weight: float,
+) -> None:
+    """Reject any DanceOPD geometry/loss tuple that crosses experiment arms."""
+
+    expected = _ALIGNED_OPD_ARM_CONTRACTS.get(name)
+    if expected is None:
+        raise VariantError(f"unknown variant name: {name!r}")
+    actual = (
+        tuple(rollout_steps),
+        endpoint_weight,
+        velocity_weight,
+    )
+    if actual != expected:
+        raise VariantError(
+            "DanceOPD rollout/endpoint/field contract does not match variant "
+            f"{name!r}: expected {expected!r}, got {actual!r}"
+        )
 
 
 class FrozenVariant(Mapping[str, Any]):

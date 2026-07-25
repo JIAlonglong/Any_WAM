@@ -22,7 +22,10 @@ from distillation_flowmap.cosmos_stage2_lineage import (
 from distillation_flowmap.cosmos_hybrid_backend import (
     validate_cosmos_teacher_model_path,
 )
-from distillation_flowmap.cosmos_libero_variants import canonical_variant_json
+from distillation_flowmap.cosmos_libero_variants import (
+    canonical_variant_json,
+    validate_aligned_opd_arm_contract,
+)
 
 
 cfg = copy.deepcopy(_base_cfg)
@@ -381,11 +384,6 @@ cfg.opd_danceopd_rollout_step_choices = _parse_positive_step_choices(
     os.environ.get("OPD_DANCEOPD_ROLLOUT_STEPS", _spec["danceopd_rollout_steps"]),
     env_name="OPD_DANCEOPD_ROLLOUT_STEPS",
 )
-if cfg.opd_danceopd_rollout_step_choices != (2, 4):
-    raise ValueError(
-        "OPD_DANCEOPD_ROLLOUT_STEPS must resolve exactly to the aligned "
-        "Student budgets 2,4"
-    )
 cfg.opd_danceopd_rollout_steps = cfg.opd_danceopd_rollout_step_choices
 cfg.opd_danceopd_anchor_teacher_steps = int(
     os.environ.get("OPD_DANCEOPD_ANCHOR_TEACHER_STEPS", 8)
@@ -438,13 +436,28 @@ for _weight_name, _weight_value in (
     ("OPD_DANCEOPD_ENDPOINT_WEIGHT", cfg.opd_danceopd_endpoint_weight),
     ("OPD_DANCEOPD_VELOCITY_WEIGHT", cfg.opd_danceopd_velocity_weight),
 ):
-    if not math.isfinite(_weight_value) or _weight_value <= 0:
-        raise ValueError(f"{_weight_name} must be finite and positive")
+    if not math.isfinite(_weight_value) or _weight_value < 0:
+        raise ValueError(f"{_weight_name} must be finite and non-negative")
 
-_validate_aligned_query_grids(
-    cfg.opd_danceopd_rollout_steps,
-    shift=float(cfg.snr_shift),
-)
+if _cosmos_libero_variant_payload is not None:
+    _variant_name = _cosmos_libero_variant_payload.get("name")
+    validate_aligned_opd_arm_contract(
+        _variant_name,
+        rollout_steps=cfg.opd_danceopd_rollout_step_choices,
+        endpoint_weight=cfg.opd_danceopd_endpoint_weight,
+        velocity_weight=cfg.opd_danceopd_velocity_weight,
+    )
+elif cfg.opd_danceopd_rollout_step_choices != (2, 4):
+    raise ValueError(
+        "OPD_DANCEOPD_ROLLOUT_STEPS must resolve exactly to 2,4 when no "
+        "canonical variant identity is provided"
+    )
+
+if cfg.opd_danceopd_velocity_weight > 0:
+    _validate_aligned_query_grids(
+        cfg.opd_danceopd_rollout_steps,
+        shift=float(cfg.snr_shift),
+    )
 cfg.opd_joint_action_rollout = _env_bool("OPD_JOINT_ACTION_ROLLOUT", True)
 
 if _cosmos_libero_variant_payload is not None:

@@ -1,8 +1,9 @@
 import json
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -49,6 +50,25 @@ def _stage2_config(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def _install_verifier_stage2_config(monkeypatch):
+    module_name = (
+        "distillation_flowmap."
+        "config_libero_cosmos_policy_stage2_progressive"
+    )
+    module = ModuleType(module_name)
+    module.cfg = _stage2_config(
+        opd_aux_warmup_steps=8,
+        opd_aux_interval=4,
+        opd_aux_phase=2,
+        norm_stat={
+            "q01": [-1.0] * 7 + [0.0] * 23,
+            "q99": [1.0] * 7 + [0.0] * 23,
+        },
+        inverse_used_action_channel_ids=list(range(7)) + [7] * 23,
+    )
+    monkeypatch.setitem(sys.modules, module_name, module)
 
 
 def test_stage1_contract_contains_packing_but_not_stage2_attestation():
@@ -165,14 +185,14 @@ def test_stage1_validator_rejects_stage2_only_fields(field):
 def test_verifier_executes_exact_production_deployment_contract():
     evidence = _verifier_module()._verify_deployment_contract(_stage2_config(
         opd_aux_warmup_steps=8,
-        opd_aux_interval=8,
+        opd_aux_interval=4,
         opd_aux_phase=2,
     ))
 
     assert evidence == {
         "joint_student_step_cycle": [1, 2, 4, 1, 2, 4],
         "deployment_schedule_steps": [8, 12, 16, 20, 24],
-        "raw_auxiliary_schedule_steps": [10, 18],
+        "raw_auxiliary_schedule_steps": [10, 14, 18, 22],
         "schedules_disjoint": True,
         "endpoint_losses": {
             "video": 1.0,
@@ -182,7 +202,10 @@ def test_verifier_executes_exact_production_deployment_contract():
     }
 
 
-def test_contract_verifier_runs_production_action_round_trip(tmp_path):
+def test_contract_verifier_runs_production_action_round_trip(
+    tmp_path, monkeypatch
+):
+    _install_verifier_stage2_config(monkeypatch)
     output = tmp_path / "attestation.json"
 
     assert _verifier_module().main(["--output", str(output)]) == 0
@@ -201,7 +224,10 @@ def test_contract_verifier_runs_production_action_round_trip(tmp_path):
     validate_contract_metadata(payload, required_stage="progressive_stage2")
 
 
-def test_contract_verifier_refuses_to_overwrite_existing_attestation(tmp_path):
+def test_contract_verifier_refuses_to_overwrite_existing_attestation(
+    tmp_path, monkeypatch
+):
+    _install_verifier_stage2_config(monkeypatch)
     output = tmp_path / "attestation.json"
     output.write_text('{"sentinel": true}\n')
 
@@ -252,6 +278,7 @@ def test_concurrent_attestation_publication_has_one_complete_winner(tmp_path):
 
 
 def test_verifier_resolves_git_commit_from_unrelated_cwd(tmp_path, monkeypatch):
+    _install_verifier_stage2_config(monkeypatch)
     unrelated = tmp_path / "unrelated"
     unrelated.mkdir()
     output = tmp_path / "attestation.json"

@@ -3435,6 +3435,22 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         log_dict["grad_norm/video_branch"] = grad_branch_norms["video"]
                         log_dict["grad_norm/action_branch"] = grad_branch_norms["action"]
                         log_dict["grad_norm/shared_branch"] = grad_branch_norms["shared"]
+                    if scheduled_kind == "aligned_video_opd":
+                        postfix["dep"] = f"{avg_deployment_total_loss:.4f}"
+                        log_dict["deployment/video_endpoint_loss"] = (
+                            avg_deployment_video_endpoint_loss
+                        )
+                        log_dict["deployment/action_endpoint_loss"] = (
+                            avg_deployment_action_endpoint_loss
+                        )
+                        log_dict["deployment/total_loss"] = (
+                            avg_deployment_total_loss
+                        )
+                        log_dict["deployment/student_steps"] = (
+                            avg_deployment_student_steps
+                        )
+                        log_dict["deployment/t_start"] = avg_deployment_t_start
+                        log_dict["deployment/t_end"] = avg_deployment_t_end
                     if self.distill_video:
                         if use_onpolicy_now:
                             postfix["vt"] = f"{avg_video_loss:.4f}"

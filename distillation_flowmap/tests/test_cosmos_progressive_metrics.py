@@ -72,7 +72,9 @@ def test_trainer_reduces_all_deployment_metrics_in_a_fixed_position():
     reset_block = source.split("# 重置累积器", 1)[1].split(
         "step_in_acc = 0", 1
     )[0]
-    logging_block = source.split('postfix["dep"]', 1)[1].split(
+    logging_block = source.split(
+        'if scheduled_kind == "aligned_video_opd":', 1
+    )[1].split(
         "if self.distill_video:", 1
     )[0]
     stages = (

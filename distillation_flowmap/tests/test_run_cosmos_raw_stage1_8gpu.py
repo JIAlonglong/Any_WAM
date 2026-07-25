@@ -805,6 +805,28 @@ def test_run_creates_output_only_after_preflight_and_executes_fake_torchrun(tmp_
     assert "--resume-from-path" not in log
 
 
+def test_run_exports_validated_cuda_libraries_to_torchrun_and_preserves_suffix(
+    tmp_path,
+):
+    env = _env(tmp_path)
+    inherited = "/caller/cuda/lib:/caller/vendor/lib"
+    env["LD_LIBRARY_PATH"] = inherited
+
+    result = _run("run", "--steps", "20", "--save-interval", "10", env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    values = _assignments(result.stdout)
+    torchrun_env = {
+        key: value
+        for line in Path(env["TORCHRUN_LOG"]).read_text(encoding="utf-8").splitlines()
+        if "=" in line
+        for key, value in [line.split("=", 1)]
+    }
+    assert torchrun_env["LD_LIBRARY_PATH"] == (
+        f"{values['COSMOS_WORKER_CUDA_LIBRARY_PATH']}:{inherited}"
+    )
+
+
 def test_resume_run_executes_fake_torchrun_with_exact_restore_contract(tmp_path):
     env = _env(tmp_path)
     checkpoint = _checkpoint(Path(env["STAGE1_OUTPUT"]), 10)

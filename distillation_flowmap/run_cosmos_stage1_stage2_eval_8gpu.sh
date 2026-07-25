@@ -22,7 +22,8 @@ Options:
 
 This is not a pure-Cosmos student run. It explicitly initializes the Flash-WAM/
 Wan student from WAN_STUDENT_BASE_MODEL_PATH and uses a Cosmos policy teacher.
-Formal evaluation is LIBERO-10 only: 500 episodes for each matched K=1,2,4.
+Formal evaluation covers all 40 LIBERO tasks for both Stage-2 Student and
+official Teacher at matched K=1,2,4.
 EOF
 }
 
@@ -205,10 +206,14 @@ done
 
 DATASET_PATH="${DATASET_PATH:-$PROJECT_ROOT/training_data/libero-long-lerobot}"
 EMPTY_EMB_PATH="${EMPTY_EMB_PATH:-$DATASET_PATH/empty_emb.pt}"
+S4_PROMPT_TABLE="${S4_PROMPT_TABLE:-}"
 COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B}"
 COSMOS_PREDICT25_LOCAL_MODEL_DIR="${COSMOS_PREDICT25_LOCAL_MODEL_DIR:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/local_hf/Cosmos-Predict2-2B-Video2World}"
 require_dir DATASET_PATH "$DATASET_PATH"
 [[ -f "$EMPTY_EMB_PATH" ]] || die "EMPTY_EMB_PATH is missing: $EMPTY_EMB_PATH"
+require_env S4_PROMPT_TABLE
+[[ -f "$S4_PROMPT_TABLE" && ! -L "$S4_PROMPT_TABLE" ]] || \
+    die "S4_PROMPT_TABLE must be a plain all-40 prompt table: $S4_PROMPT_TABLE"
 require_dir COSMOS_POLICY_PATH "$COSMOS_POLICY_PATH"
 require_dir COSMOS_PREDICT25_LOCAL_MODEL_DIR "$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
 if ! (
@@ -241,7 +246,7 @@ LOCK_ROOT="$RUN_ROOT/provenance-locks"
 STAGE2_OUTPUT="$RUN_ROOT/universal-video-action"
 STAGE2_CHECKPOINT="$STAGE2_OUTPUT/checkpoints/step_$STAGE2_STEPS"
 EVAL_TRANSFORMER="$STAGE2_CHECKPOINT/target_student/transformer"
-MATRIX_ROOT="$RUN_ROOT/eval/stage2_target"
+MATRIX_ROOT="$RUN_ROOT/eval/student_teacher"
 
 stage1_command=(
     "$STAGE1_LAUNCHER" run
@@ -311,9 +316,11 @@ eval_environment=(
     env
     "MATRIX_ROOT=$MATRIX_ROOT"
     "S4_CKPT_ROOT=$EVAL_TRANSFORMER"
-    "S4_MODEL_ROLE=stage2_target"
+    "COSMOS_POLICY_PATH=$COSMOS_POLICY_PATH"
+    "S4_MATRIX_ROLES=stage2_target,official_teacher"
     "S4_DATASET_PATH=$DATASET_PATH"
     "S4_EMPTY_EMBEDDING=$EMPTY_EMB_PATH"
+    "S4_PROMPT_TABLE=$S4_PROMPT_TABLE"
     "S4_ALIGNMENT_VERIFIED=1"
     "S4_EPISODES_PER_TASK=$EVAL_EPISODES"
 )
@@ -332,9 +339,10 @@ printf 'PHASE=%s\n' "$PHASE"
 printf 'RUN_ROOT=%s\n' "$RUN_ROOT"
 printf 'STAGE1_CHECKPOINT=%s\n' "$STAGE1_CHECKPOINT"
 printf 'STAGE2_CHECKPOINT=%s\n' "$STAGE2_CHECKPOINT"
-printf 'EVAL_CHECKPOINT_ROLE=stage2_target\n'
-printf 'EVAL_PROTOCOL=LIBERO-10 matched joint 1/2/4, %s episodes per K\n' \
-    "$((10#$EVAL_EPISODES * 10))"
+printf 'EVAL_CHECKPOINT_ROLES=stage2_target,official_teacher\n'
+printf 'EVAL_PROTOCOL=40 tasks, matched joint 1/2/4, %s episodes per role/K\n' \
+    "$((10#$EVAL_EPISODES * 40))"
+printf 'EVAL_TOTAL_EPISODES=%s\n' "$((10#$EVAL_EPISODES * 40 * 3 * 2))"
 printf 'EVAL_EPISODES=%s\n' "$EVAL_EPISODES"
 printf 'ALIGNED_VIDEO_OPD_INTERVAL=4\n'
 printf 'OPD_AUX_INTERVAL=4\n'
@@ -419,9 +427,11 @@ fi
 
 export MATRIX_ROOT
 export S4_CKPT_ROOT="$EVAL_TRANSFORMER"
-export S4_MODEL_ROLE=stage2_target
+export COSMOS_POLICY_PATH
+export S4_MATRIX_ROLES=stage2_target,official_teacher
 export S4_DATASET_PATH="$DATASET_PATH"
 export S4_EMPTY_EMBEDDING="$EMPTY_EMB_PATH"
+export S4_PROMPT_TABLE
 export S4_ALIGNMENT_VERIFIED=1
 export S4_EPISODES_PER_TASK="$EVAL_EPISODES"
 run_child "${eval_execution[@]}"

@@ -266,6 +266,7 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
     _plain_file(init / "transformer" / "diffusion_pytorch_model.safetensors")
     dataset = tmp_path / "dataset"
     _plain_file(dataset / "empty_emb.pt")
+    prompt_table = _plain_file(dataset / "all_40_prompt_embeddings.pt")
     teacher = tmp_path / "teacher"
     teacher.mkdir()
     _plain_file(teacher / "config.json", b'{"model_type":"cosmos-policy"}\n')
@@ -299,6 +300,7 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
             "COSMOS_PREDICT2_REPO": str(repo),
             "DATASET_PATH": str(dataset),
             "COSMOS_POLICY_PATH": str(teacher),
+            "S4_PROMPT_TABLE": str(prompt_table),
             "COSMOS_PREDICT25_LOCAL_MODEL_DIR": str(local_model),
             "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
             "CALLS_LOG": str(calls),
@@ -351,8 +353,11 @@ def test_pipeline_formal_calls_stage1_locks_stage2_eval_in_order(tmp_path):
     assert "universal-video-action --steps 10000 --save-interval 1000" in lines[2]
     assert "--master-port 29672" in lines[2]
     assert "stage2_target" in result.stdout
-    assert "LIBERO-10" in result.stdout
-    assert "500" in result.stdout
+    assert "official_teacher" in result.stdout
+    assert "40 tasks" in result.stdout
+    assert "2000 episodes per role/K" in result.stdout
+    eval_call = lines[3]
+    assert "run" in eval_call
 
 
 @pytest.mark.parametrize("mode", ("--dry-run", "--check-only"))
@@ -366,6 +371,19 @@ def test_pipeline_read_only_modes_write_nothing(tmp_path, mode):
     assert not Path(env["CALLS_LOG"]).exists()
     assert "universal-video-action" in result.stdout
     assert "stage2_target" in result.stdout
+    assert "official_teacher" in result.stdout
+    assert "COSMOS_POLICY_PATH=" in result.stdout
+    assert "S4_PROMPT_TABLE=" in result.stdout
+
+
+def test_pipeline_requires_explicit_all_40_prompt_table(tmp_path):
+    env, output_root = _pipeline_env(tmp_path)
+    env.pop("S4_PROMPT_TABLE")
+
+    result = _pipeline(env, output_root, "--dry-run")
+
+    assert result.returncode != 0
+    assert "S4_PROMPT_TABLE must be set explicitly" in result.stderr
 
 
 def test_pipeline_requires_explicit_student_init_and_clean_cosmos_repo(tmp_path):

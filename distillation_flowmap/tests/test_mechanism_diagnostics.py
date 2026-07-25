@@ -202,7 +202,7 @@ def test_distributed_reducer_uses_one_packed_global_sum_and_count():
     assert means["mechanism/diagnostic_valid"] == 1.0
 
 
-def test_zero_global_count_returns_finite_zero_and_invalid_flag():
+def test_zero_global_count_omits_unmeasured_mean_and_marks_unavailable():
     means = means_from_reduced_stats(
         {
             "diagnostic_batch_count": torch.tensor(1.0),
@@ -212,9 +212,48 @@ def test_zero_global_count_returns_finite_zero_and_invalid_flag():
         }
     )
 
-    assert means["mechanism/g_anchor"] == 0.0
+    assert "mechanism/g_anchor" not in means
+    assert means["mechanism/g_anchor_finite_count"] == 0.0
+    assert means["mechanism/g_anchor_available"] == 0.0
     assert means["mechanism/diagnostic_valid"] == 0.0
     assert all(math.isfinite(value) for value in means.values())
+
+
+def test_mixed_clock_anchor_is_unavailable_not_a_zero_measurement(tmp_path):
+    samples = _samples(
+        teacher_continuation_video=None,
+        anchor_available=False,
+        anchor_unavailable_mixed_clock=True,
+        continuation_verified=False,
+        effective_teacher_steps=None,
+    )
+    stats = pack_finite_metric_stats(samples)
+    means = means_from_reduced_stats(stats)
+
+    assert stats["mechanism/g_anchor_count"].item() == 0
+    assert stats["mechanism/g_anchor_mse_count"].item() == 0
+    assert "mechanism/g_anchor" not in means
+    assert "mechanism/g_anchor_mse" not in means
+    assert means["mechanism/g_anchor_finite_count"] == 0.0
+    assert means["mechanism/g_anchor_available"] == 0.0
+    assert means["mechanism/g_anchor_unavailable_mixed_clock"] == 1.0
+    assert means["mechanism/g_comp"] > 0
+    assert means["mechanism/diagnostic_valid"] == 1.0
+
+    jsonl = tmp_path / "mixed-clock.jsonl"
+    fan_out_mechanism_metrics(
+        means,
+        step=10,
+        rank=0,
+        tb_writer=None,
+        wandb_module=None,
+        jsonl_path=jsonl,
+    )
+    logged = json.loads(jsonl.read_text())
+    assert "mechanism/g_anchor" not in logged
+    assert logged["mechanism/g_anchor_available"] == 0.0
+    assert logged["mechanism/g_anchor_finite_count"] == 0.0
+    assert logged["mechanism/g_anchor_unavailable_mixed_clock"] == 1.0
 
 
 def test_scheduler_runs_due_only_after_success_and_defers_skipped_once():

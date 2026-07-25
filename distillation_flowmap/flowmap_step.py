@@ -4978,12 +4978,6 @@ class FlowMapStepMixin:
             action_prior=shared["native_action_prior"],
             teacher_steps=teacher_steps,
         )
-        continuation_result = teacher.predict_raw_joint_continuation_endpoint(
-            batch,
-            canonical_joint_state=canonical_video.float(),
-            normalized_t=query_sigma_frames.float(),
-            teacher_steps=teacher_steps,
-        )
         required_same_prior = (
             "endpoint_video",
             "video_frame_mask",
@@ -4991,56 +4985,104 @@ class FlowMapStepMixin:
             "video_prior_sha256",
             "action_prior_sha256",
         )
-        required_continuation = (
-            "endpoint_video",
-            "video_frame_mask",
-            "effective_teacher_steps",
-            "joint_state_sha256",
-            "normalized_t_sha256",
-            "normalized_t",
-            "edm_sigma",
-        )
         if not all(key in same_prior_result for key in required_same_prior):
             raise RuntimeError(
                 "Cosmos mechanism same-prior Teacher response is incomplete"
             )
-        if not all(key in continuation_result for key in required_continuation):
-            raise RuntimeError(
-                "Cosmos mechanism continuation Teacher response is incomplete"
-            )
         same_prior_endpoint = same_prior_result["endpoint_video"].to(
-            device=self.device, dtype=canonical_video.dtype
-        ).detach()
-        teacher_continuation = continuation_result["endpoint_video"].to(
             device=self.device, dtype=canonical_video.dtype
         ).detach()
         same_prior_mask = same_prior_result["video_frame_mask"].to(
             device=self.device, dtype=torch.bool
         )
-        continuation_mask = continuation_result["video_frame_mask"].to(
-            device=self.device, dtype=torch.bool
-        )
         same_prior_steps = same_prior_result["effective_teacher_steps"]
-        continuation_steps = continuation_result["effective_teacher_steps"]
-        endpoints_verified = (
+        same_prior_verified = (
             same_prior_endpoint.shape == canonical_video.shape
-            and teacher_continuation.shape == canonical_video.shape
             and same_prior_mask.shape == video_frame_mask.shape
-            and continuation_mask.shape == video_frame_mask.shape
             and bool(same_prior_mask.any(dim=1).all().item())
-            and bool(continuation_mask.any(dim=1).all().item())
             and torch.equal(same_prior_mask, video_frame_mask)
-            and torch.equal(continuation_mask, video_frame_mask)
             and type(same_prior_steps) is int
             and same_prior_steps == 8
-            and type(continuation_steps) is int
-            and continuation_steps == 8
         )
-        if not endpoints_verified:
+        if not same_prior_verified:
             raise RuntimeError(
-                "Cosmos mechanism endpoint mask or observed eight-step "
+                "Cosmos mechanism same-prior mask or observed eight-step "
                 "provenance mismatch"
             )
+
+        normalized_action_clock = query_action_t / float(
+            self.config.num_train_timesteps
+        )
+        video_clock_per_sample = query_sigma_frames[:, :1]
+        action_clock_per_sample = normalized_action_clock[:, :1]
+        if not torch.equal(
+            query_sigma_frames,
+            video_clock_per_sample.expand_as(query_sigma_frames),
+        ):
+            raise RuntimeError(
+                "Cosmos mechanism video clock differs across frames"
+            )
+        if not torch.equal(
+            normalized_action_clock,
+            action_clock_per_sample.expand_as(normalized_action_clock),
+        ):
+            raise RuntimeError(
+                "Cosmos mechanism action clock differs across frames"
+            )
+        anchor_available = torch.equal(
+            video_clock_per_sample, action_clock_per_sample
+        )
+        mixed_clock = not anchor_available
+        teacher_continuation = None
+        continuation_steps = None
+        continuation_verified = False
+        if anchor_available:
+            continuation_result = (
+                teacher.predict_raw_joint_continuation_endpoint(
+                    batch,
+                    canonical_joint_state=canonical_video.float(),
+                    normalized_t=query_sigma_frames.float(),
+                    teacher_steps=teacher_steps,
+                )
+            )
+            required_continuation = (
+                "endpoint_video",
+                "video_frame_mask",
+                "effective_teacher_steps",
+                "joint_state_sha256",
+                "normalized_t_sha256",
+                "normalized_t",
+                "edm_sigma",
+            )
+            if not all(
+                key in continuation_result for key in required_continuation
+            ):
+                raise RuntimeError(
+                    "Cosmos mechanism continuation Teacher response is "
+                    "incomplete"
+                )
+            teacher_continuation = continuation_result["endpoint_video"].to(
+                device=self.device, dtype=canonical_video.dtype
+            ).detach()
+            continuation_mask = continuation_result["video_frame_mask"].to(
+                device=self.device, dtype=torch.bool
+            )
+            continuation_steps = continuation_result[
+                "effective_teacher_steps"
+            ]
+            continuation_verified = (
+                teacher_continuation.shape == canonical_video.shape
+                and continuation_mask.shape == video_frame_mask.shape
+                and bool(continuation_mask.any(dim=1).all().item())
+                and torch.equal(continuation_mask, video_frame_mask)
+                and type(continuation_steps) is int
+                and continuation_steps == 8
+            )
+            if not continuation_verified:
+                raise RuntimeError(
+                    "Cosmos mechanism continuation mask or observed "
+                    "eight-step provenance mismatch"
+                )
 
         route_context = shared["joint_context"](canonical_video, query_action)
         field_input = self._mechanism_joint_input(
@@ -5176,14 +5218,16 @@ class FlowMapStepMixin:
             action_mask=context["action_mask"],
             teacher_joint_available=False,
             shared_state_verified=shared_state_verified,
-            same_prior_verified=endpoints_verified,
-            continuation_verified=endpoints_verified,
+            same_prior_verified=same_prior_verified,
+            continuation_verified=continuation_verified,
             effective_teacher_steps=continuation_steps,
+            anchor_available=anchor_available,
+            anchor_unavailable_mixed_clock=mixed_clock,
         )
         stats = pack_finite_metric_stats(samples)
         batch_size = shared["batch_size"]
         for name, value in (
-            ("teacher_steps", continuation_steps),
+            ("teacher_steps", same_prior_steps),
             ("student_steps", shared["student_steps"]),
         ):
             stats[f"mechanism/{name}_sum"] = torch.as_tensor(

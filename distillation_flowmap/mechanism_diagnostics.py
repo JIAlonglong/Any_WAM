@@ -106,7 +106,7 @@ def _finite_safe_divide(
 
 def compute_mechanism_metric_samples(
     *,
-    teacher_continuation_video: torch.Tensor,
+    teacher_continuation_video: torch.Tensor | None,
     same_prior_teacher_endpoint_video: torch.Tensor,
     direct_route_video: torch.Tensor,
     composed_route_video: torch.Tensor,
@@ -124,24 +124,60 @@ def compute_mechanism_metric_samples(
     same_prior_verified: bool = False,
     continuation_verified: bool = False,
     effective_teacher_steps: int | None = None,
+    anchor_available: bool = True,
+    anchor_unavailable_mixed_clock: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Return per-sample metrics; callers retain raw non-finite values for validity."""
-    anchor = masked_video_squared_l2_per_sample(
-        teacher_continuation_video,
-        same_prior_teacher_endpoint_video,
-        video_frame_mask,
-    )
-    anchor_mse = masked_video_mse_per_sample(
-        teacher_continuation_video,
-        same_prior_teacher_endpoint_video,
-        video_frame_mask,
-    )
     comp = masked_video_squared_l2_per_sample(
         direct_route_video, composed_route_video, video_frame_mask
     )
     comp_mse = masked_video_mse_per_sample(
         direct_route_video, composed_route_video, video_frame_mask
     )
+    if anchor_available:
+        if teacher_continuation_video is None:
+            raise ValueError(
+                "anchor_available=True requires a Teacher continuation"
+            )
+        if anchor_unavailable_mixed_clock:
+            raise ValueError(
+                "available anchor cannot be marked unavailable for mixed clocks"
+            )
+        anchor = masked_video_squared_l2_per_sample(
+            teacher_continuation_video,
+            same_prior_teacher_endpoint_video,
+            video_frame_mask,
+        )
+        anchor_mse = masked_video_mse_per_sample(
+            teacher_continuation_video,
+            same_prior_teacher_endpoint_video,
+            video_frame_mask,
+        )
+        anchor_to_comp = _finite_safe_divide(anchor_mse, comp_mse)
+        anchor_near_zero = (
+            anchor_mse <= MECHANISM_NEAR_ZERO_THRESHOLD
+        ).to(anchor_mse)
+        anchor_exploded = (
+            anchor_mse >= MECHANISM_EXPLOSION_THRESHOLD
+        ).to(anchor_mse)
+        branch_dominance = (
+            (anchor_to_comp >= MECHANISM_DOMINANCE_THRESHOLD)
+            | (
+                _finite_safe_divide(comp_mse, anchor_mse)
+                >= MECHANISM_DOMINANCE_THRESHOLD
+            )
+        ).to(anchor_mse)
+    else:
+        if teacher_continuation_video is not None:
+            raise ValueError(
+                "anchor_available=False requires no Teacher continuation"
+            )
+        anchor = comp.new_empty((0,))
+        anchor_mse = comp.new_empty((0,))
+        anchor_to_comp = comp.new_empty((0,))
+        anchor_near_zero = comp.new_empty((0,))
+        anchor_exploded = comp.new_empty((0,))
+        branch_dominance = comp.new_empty((0,))
     action_error_student = masked_action_mse_per_sample(
         action_student_context, teacher_endpoint_action, action_mask
     )
@@ -155,9 +191,7 @@ def compute_mechanism_metric_samples(
         "mechanism/g_comp": comp,
         "mechanism/g_comp_mse": comp_mse,
         # Direction is intentionally anchor / comp, not its reciprocal.
-        "mechanism/g_anchor_to_comp_ratio": _finite_safe_divide(
-            anchor_mse, comp_mse
-        ),
+        "mechanism/g_anchor_to_comp_ratio": anchor_to_comp,
         "mechanism/video_endpoint_error": masked_video_squared_l2_per_sample(
             direct_route_video,
             same_prior_teacher_endpoint_video,
@@ -169,36 +203,35 @@ def compute_mechanism_metric_samples(
         "mechanism/video_to_action_recoverable_fraction": _finite_safe_divide(
             oracle_gain.clamp_min(0), action_error_student
         ),
-        "mechanism/g_anchor_near_zero": (
-            anchor_mse <= MECHANISM_NEAR_ZERO_THRESHOLD
-        ).to(anchor_mse),
+        "mechanism/g_anchor_near_zero": anchor_near_zero,
         "mechanism/g_comp_near_zero": (
             comp_mse <= MECHANISM_NEAR_ZERO_THRESHOLD
         ).to(comp_mse),
-        "mechanism/g_anchor_exploded": (
-            anchor_mse >= MECHANISM_EXPLOSION_THRESHOLD
-        ).to(anchor_mse),
+        "mechanism/g_anchor_exploded": anchor_exploded,
         "mechanism/g_comp_exploded": (
             comp_mse >= MECHANISM_EXPLOSION_THRESHOLD
         ).to(comp_mse),
-        "mechanism/branch_dominance": (
-            (_finite_safe_divide(anchor_mse, comp_mse) >= MECHANISM_DOMINANCE_THRESHOLD)
-            | (_finite_safe_divide(comp_mse, anchor_mse) >= MECHANISM_DOMINANCE_THRESHOLD)
-        ).to(anchor_mse),
+        "mechanism/branch_dominance": branch_dominance,
+        "mechanism/g_anchor_available": torch.full_like(
+            comp, float(bool(anchor_available))
+        ),
+        "mechanism/g_anchor_unavailable_mixed_clock": torch.full_like(
+            comp, float(bool(anchor_unavailable_mixed_clock))
+        ),
         "mechanism/teacher_joint_available": torch.full_like(
             action_error_student, float(bool(teacher_joint_available))
         ),
         "mechanism/shared_state_verified": torch.full_like(
-            anchor, float(bool(shared_state_verified))
+            comp, float(bool(shared_state_verified))
         ),
         "mechanism/same_prior_verified": torch.full_like(
-            anchor, float(bool(same_prior_verified))
+            comp, float(bool(same_prior_verified))
         ),
         "mechanism/continuation_verified": torch.full_like(
-            anchor, float(bool(continuation_verified))
+            comp, float(bool(continuation_verified))
         ),
         "mechanism/effective_teacher_steps_verified": torch.full_like(
-            anchor,
+            comp,
             float(
                 type(effective_teacher_steps) is int
                 and effective_teacher_steps == 8
@@ -251,7 +284,7 @@ def pack_finite_metric_stats(
         raise ValueError("mechanism diagnostic samples must not be empty")
     stats: dict[str, torch.Tensor] = {}
     finite_groups = []
-    reference = next(iter(samples.values()))
+    reference = max(samples.values(), key=lambda values: values.shape[0])
     for name, values in samples.items():
         finite = torch.isfinite(values)
         finite_groups.append(finite.flatten())
@@ -261,7 +294,7 @@ def pack_finite_metric_stats(
         stats[f"{name}_count"] = finite.sum().to(dtype=values.dtype)
 
     all_finite = torch.cat(finite_groups).all()
-    batch_count = reference.shape[0]
+    batch_count = max(values.shape[0] for values in samples.values())
     stats["diagnostic_batch_count"] = torch.as_tensor(
         float(batch_count), device=reference.device, dtype=reference.dtype
     )
@@ -291,13 +324,24 @@ def reduce_metric_stats(
 def means_from_reduced_stats(stats: Mapping[str, torch.Tensor]) -> dict[str, float]:
     """Reconstruct finite global means from global sum/counts."""
     means: dict[str, float] = {}
+    omit_when_unmeasured = {
+        "mechanism/g_anchor",
+        "mechanism/g_anchor_mse",
+        "mechanism/g_anchor_to_comp_ratio",
+        "mechanism/g_anchor_near_zero",
+        "mechanism/g_anchor_exploded",
+        "mechanism/branch_dominance",
+    }
     for name in sorted(stats):
         if not name.endswith("_sum"):
             continue
         metric_name = name.removesuffix("_sum")
         count = float(stats[f"{metric_name}_count"].item())
         total = float(stats[name].item())
-        means[metric_name] = total / count if count > 0 else 0.0
+        if count > 0:
+            means[metric_name] = total / count
+        elif metric_name not in omit_when_unmeasured:
+            means[metric_name] = 0.0
         means[f"{metric_name}_finite_count"] = count
         means[f"{metric_name}_available"] = float(count > 0)
     batch_count = float(stats.get("diagnostic_batch_count", torch.tensor(0.0)).item())
@@ -305,15 +349,31 @@ def means_from_reduced_stats(stats: Mapping[str, torch.Tensor]) -> dict[str, flo
     teacher_joint_available = means.get(
         "mechanism/teacher_joint_available", 1.0
     )
-    capability_gated = (
-        {
-            "mechanism/action_error_teacher_joint_context",
-            "mechanism/video_to_action_full_joint_gain",
-            "mechanism/video_to_action_residual_action_gap",
-        }
-        if teacher_joint_available == 0.0
-        else set()
-    )
+    capability_gated = set()
+    if teacher_joint_available == 0.0:
+        capability_gated.update(
+            {
+                "mechanism/action_error_teacher_joint_context",
+                "mechanism/video_to_action_full_joint_gain",
+                "mechanism/video_to_action_residual_action_gap",
+            }
+        )
+    if (
+        means.get(
+            "mechanism/g_anchor_unavailable_mixed_clock", 0.0
+        )
+        == 1.0
+    ):
+        capability_gated.update(
+            {
+                "mechanism/g_anchor",
+                "mechanism/g_anchor_mse",
+                "mechanism/g_anchor_to_comp_ratio",
+                "mechanism/g_anchor_near_zero",
+                "mechanism/g_anchor_exploded",
+                "mechanism/branch_dominance",
+            }
+        )
     every_metric_has_samples = all(
         (
             float(stats[f"{name.removesuffix('_sum')}_count"].item()) > 0

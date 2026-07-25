@@ -220,6 +220,34 @@ def test_same_prior_model_load_accepts_only_audited_clean_layout_commit(
     assert loader_calls == [cfg]
 
 
+def test_joint_continuation_model_load_uses_same_audited_layout_gate(
+    monkeypatch, tmp_path
+):
+    import distillation_flowmap.cosmos_policy_raw_worker as worker
+
+    repo = tmp_path / "cosmos"
+    cosmos_utils = _cosmos_layout_module(repo)
+    _install_git_provenance(
+        monkeypatch,
+        worker,
+        repo,
+        head="0000000000000000000000000000000000000000",
+    )
+    loader_calls = []
+
+    with pytest.raises(RuntimeError, match="audited commit"):
+        worker._model_for_request(
+            None,
+            mode="joint_continuation_endpoint",
+            repo=str(repo),
+            cosmos_utils=cosmos_utils,
+            cfg=SimpleNamespace(),
+            get_model=lambda cfg: loader_calls.append(cfg),
+        )
+
+    assert loader_calls == []
+
+
 @pytest.mark.parametrize(
     ("git_fields", "match"),
     [
@@ -604,6 +632,174 @@ def test_joint_continuation_rejects_empty_video_mask_before_sampler():
         )
 
     assert captured.get("calls", []) == []
+
+
+def test_worker_main_dispatches_joint_continuation_with_audited_response(
+    monkeypatch, tmp_path
+):
+    import distillation_flowmap.cosmos_policy_raw_worker as worker
+
+    canonical = np.stack(
+        (
+            np.full((16, 9, 28, 28), 2.0, dtype=np.float32),
+            np.full((16, 9, 28, 28), 3.0, dtype=np.float32),
+        )
+    )
+    normalized_t = np.asarray(
+        [[5.0 / 6.0] * 9, [15.0 / 16.0] * 9],
+        dtype=np.float32,
+    )
+    request_path = tmp_path / "request.npz"
+    response_path = tmp_path / "response.npz"
+    np.savez_compressed(
+        request_path,
+        primary_image=np.zeros((2, 2, 2, 3), dtype=np.uint8),
+        wrist_image=np.zeros((2, 2, 2, 3), dtype=np.uint8),
+        proprio=np.zeros((2, 9), dtype=np.float32),
+        canonical_joint_state=canonical,
+        normalized_t=normalized_t,
+    )
+    request = {
+        "npz_path": str(request_path),
+        "actions_path": str(response_path),
+        "tasks": ["task-a", "task-b"],
+        "mode": "joint_continuation_endpoint",
+        "teacher_steps": 8,
+    }
+    monkeypatch.setattr(
+        worker,
+        "_parse_args",
+        lambda: SimpleNamespace(
+            checkpoint_dir="checkpoint",
+            repo="/audited/cosmos",
+            config_name="config",
+            config_file="config.py",
+            dataset_stats_path="stats.json",
+            t5_embeddings_path="t5.pkl",
+            extra_pythonpath="",
+            num_denoising_steps_action=5,
+            seed=1,
+        ),
+    )
+
+    robot_name = (
+        "cosmos_predict2._src.predict2.cosmos_policy.experiments.robot"
+    )
+    cosmos_utils = ModuleType(f"{robot_name}.cosmos_utils")
+    cosmos_utils.get_action = lambda *args, **kwargs: None
+    cosmos_utils.get_model = lambda cfg: (object(), None)
+    cosmos_utils.init_t5_text_embeddings_cache = lambda *args, **kwargs: None
+    cosmos_utils.load_dataset_stats = lambda path: {}
+    robot_module = ModuleType(robot_name)
+    robot_module.cosmos_utils = cosmos_utils
+    for name in (
+        "cosmos_predict2",
+        "cosmos_predict2._src",
+        "cosmos_predict2._src.predict2",
+        "cosmos_predict2._src.predict2.cosmos_policy",
+        "cosmos_predict2._src.predict2.cosmos_policy.experiments",
+    ):
+        module = ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+    robot_module.__path__ = []
+    monkeypatch.setitem(sys.modules, robot_name, robot_module)
+    monkeypatch.setitem(sys.modules, f"{robot_name}.cosmos_utils", cosmos_utils)
+
+    model = object()
+    gates = []
+
+    def model_for_request(current, *, mode, **kwargs):
+        del current, kwargs
+        gates.append(("layout", mode))
+        return model
+
+    monkeypatch.setattr(worker, "_model_for_request", model_for_request)
+    monkeypatch.setattr(
+        worker,
+        "_validate_explicit_prior_runtime",
+        lambda received: gates.append(("runtime", received)),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_validate_official_libero_geometry",
+        lambda cfg, received: gates.append(("geometry", received)),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_build_libero_data_batch",
+        lambda cfg, received, stats, obs, task, utils: (
+            {"video": torch.zeros(1, 3, 33, 224, 224)},
+            _latent_indices(),
+        ),
+    )
+    calls = []
+
+    def run_continuation(
+        received_model,
+        data_batch,
+        latent_indices,
+        state,
+        time_value,
+        *,
+        teacher_steps,
+    ):
+        del data_batch, latent_indices
+        calls.append(
+            (
+                received_model,
+                state.detach().cpu().clone(),
+                time_value.detach().cpu().clone(),
+                teacher_steps,
+            )
+        )
+        per_sample_t = time_value[:, 0]
+        return {
+            "endpoint_video": state + 1,
+            "video_frame_mask": torch.ones(1, 9, dtype=torch.bool),
+            "effective_teacher_steps": 8,
+            "normalized_t": per_sample_t,
+            "edm_sigma": per_sample_t / (1.0 - per_sample_t),
+        }
+
+    monkeypatch.setattr(
+        worker, "_run_joint_continuation_endpoint", run_continuation
+    )
+    response_stream = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request) + "\n"))
+    monkeypatch.setattr(sys, "stdout", response_stream)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+
+    worker.main()
+
+    payload = json.loads(response_stream.getvalue())
+    assert payload["ok"] is True
+    assert gates == [
+        ("layout", "joint_continuation_endpoint"),
+        ("runtime", model),
+        ("geometry", model),
+    ]
+    assert len(calls) == 2
+    assert [call[3] for call in calls] == [8, 8]
+    torch.testing.assert_close(calls[0][1], torch.from_numpy(canonical[0:1]))
+    torch.testing.assert_close(
+        calls[1][2], torch.from_numpy(normalized_t[1:2])
+    )
+    with np.load(response_path) as response:
+        np.testing.assert_array_equal(
+            response["endpoint_video"], canonical + 1
+        )
+        assert response["video_frame_mask"].dtype == np.bool_
+        assert int(response["effective_teacher_steps"]) == 8
+        assert str(response["joint_state_sha256"]) == worker._array_sha256(
+            canonical
+        )
+        assert str(response["normalized_t_sha256"]) == worker._array_sha256(
+            normalized_t
+        )
+        np.testing.assert_allclose(
+            response["edm_sigma"], np.asarray([5.0, 15.0]), rtol=1e-6
+        )
 
 
 def test_same_prior_npz_loader_rejects_dtype_before_fingerprinting():

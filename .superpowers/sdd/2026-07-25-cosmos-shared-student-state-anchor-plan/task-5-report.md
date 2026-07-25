@@ -177,3 +177,49 @@ were unrelated host dependency imports: missing `libcudnn_adv.so.9` through
 Transformer Engine or missing `libero`. No failing test entered a changed
 worker, adapter, diagnostic, or rollout path. `git diff --check` and Python
 compilation of every modified production module both exited zero.
+
+## Review-fix round 2 addendum
+
+Round 2 preserves the deployment-aligned independent video/action clocks and
+makes continuation availability explicit:
+
+- The raw worker now dispatches `joint_continuation_endpoint` through `main()`.
+  It applies the same audited clean-repository gate as same-prior inference,
+  validates the official runtime and LIBERO geometry, requires exact float32
+  NPZ state/time arrays, fingerprints the exact arrays, builds each official
+  observation batch, and invokes continuation once per sample. The existing
+  low-level continuation path converts `sigma=r/(1-r)` and
+  `x_sigma=z_r/(1-r)` and reports the observed eight denoiser evaluations.
+  The common `finally` block closes the loaded NPZ on success or failure.
+- Before invoking continuation, the probe verifies that each selected video
+  clock and each selected action clock is constant across its own frames, then
+  compares the per-sample normalized clocks. With the deployment shifts
+  `5.0/0.05`, they differ, so continuation is not called.
+- Mixed-clock runs emit no numeric `G_anchor`, `G_anchor_mse`, ratio, or
+  anchor-derived branch sample. Their packed counts are zero, while
+  `mechanism/g_anchor_available=0` and
+  `mechanism/g_anchor_unavailable_mixed_clock=1` are real per-sample
+  diagnostics. Zero-count anchor means are omitted from JSONL, TensorBoard,
+  and W&B mappings instead of being presented as measured zeros.
+- Equal-clock runs retain the diagnostic-only continuation path, compute
+  `G_anchor`, and fail closed on an empty/mismatched mask or an observed
+  Teacher step count other than eight.
+- `G_comp`, same-state field matching, same-prior endpoint/training behavior,
+  action-context metrics, video-to-action metrics, and the Task 3 shared-state
+  rollout remain available and unchanged in the normal mixed-clock case.
+
+Round 2 TDD evidence:
+
+```text
+RED: worker main returned unsupported mode and continuation skipped the
+     audited layout gate.
+RED: the 5.0/0.05 probe invoked continuation and emitted numeric G_anchor.
+RED: zero global anchor count reconstructed a numeric G_anchor=0 mean.
+GREEN: 70 passed (worker runtime + Task 5 mechanism/aggregation suites).
+GREEN: 13 passed, 63 deselected (Task 2 worker/adapter endpoint contracts).
+GREEN: 44 passed (Task 3 regression).
+GREEN: 125 passed (the prior scoped regression command, expanded by round 2).
+```
+
+No training, torchrun, checkpoint mutation, or evaluation launch was
+performed.

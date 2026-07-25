@@ -976,7 +976,7 @@ class _AlignedMechanismTeacher:
 class _AlignedMechanismHarness(FlowMapStepMixin):
     device = torch.device("cpu")
 
-    def __init__(self, teacher):
+    def __init__(self, teacher, *, action_snr_shift=0.05):
         self.teacher = teacher
         self.student = object()
         self.empty_emb = torch.zeros(1, 1, 1)
@@ -992,7 +992,7 @@ class _AlignedMechanismHarness(FlowMapStepMixin):
             used_action_channel_ids=list(range(7)),
             inverse_used_action_channel_ids=list(range(7)),
             snr_shift=5.0,
-            action_snr_shift=0.05,
+            action_snr_shift=action_snr_shift,
             opd_danceopd_rollout_steps=(2, 4),
             cfg_min=1.0,
             cfg_max=1.0,
@@ -1120,6 +1120,7 @@ def _run_aligned_mechanism_case(
     legacy_value=0.0,
     mask_mode="valid",
     steps=8,
+    equal_clocks=False,
 ):
     import distillation_flowmap.flowmap_step as flowmap_step_module
 
@@ -1139,7 +1140,7 @@ def _run_aligned_mechanism_case(
 
     def capture_samples(**kwargs):
         captured_metrics.update(kwargs)
-        return {"mechanism/g_anchor": torch.zeros(2)}
+        return compute_mechanism_metric_samples(**kwargs)
 
     monkeypatch.setattr(
         flowmap_step_module, "compute_mechanism_metric_samples", capture_samples
@@ -1147,7 +1148,9 @@ def _run_aligned_mechanism_case(
     teacher = _AlignedMechanismTeacher(
         legacy_value=legacy_value, mask_mode=mask_mode, steps=steps
     )
-    harness = _AlignedMechanismHarness(teacher)
+    harness = _AlignedMechanismHarness(
+        teacher, action_snr_shift=5.0 if equal_clocks else 0.05
+    )
     batch = {
         "latents": torch.zeros(2, 16, 9, 28, 28),
         "actions": torch.zeros(2, 7, 16, 4, 1),
@@ -1158,7 +1161,7 @@ def _run_aligned_mechanism_case(
     return harness, teacher, captured_metrics, stats
 
 
-def test_live_probe_uses_shared_k4_state_and_exact_direct_composed_edges(
+def test_mixed_clock_probe_skips_continuation_but_keeps_composition_metrics(
     monkeypatch,
 ):
     harness, teacher, metrics, stats = _run_aligned_mechanism_case(monkeypatch)
@@ -1174,7 +1177,7 @@ def test_live_probe_uses_shared_k4_state_and_exact_direct_composed_edges(
     ) * 1000
     torch.testing.assert_close(field.video_t, expected_r)
     assert field.video.data_ptr() == direct.video.data_ptr()
-    assert teacher.continuation_call.state.data_ptr() == field.video.data_ptr()
+    assert teacher.continuation_call is None
     torch.testing.assert_close(direct.video_t, expected_r)
     assert torch.count_nonzero(direct.video_r) == 0
     torch.testing.assert_close(first_edge.video_t, expected_r)
@@ -1183,28 +1186,58 @@ def test_live_probe_uses_shared_k4_state_and_exact_direct_composed_edges(
     assert torch.count_nonzero(second_edge.video_r) == 0
     assert torch.all(first_edge.action_r < first_edge.action_t)
     assert torch.all(second_edge.action_t > second_edge.action_r)
-    torch.testing.assert_close(
-        metrics["teacher_continuation_video"],
-        torch.full_like(metrics["teacher_continuation_video"], 7.0),
-    )
+    assert metrics["teacher_continuation_video"] is None
     torch.testing.assert_close(
         metrics["same_prior_teacher_endpoint_video"],
         torch.full_like(metrics["same_prior_teacher_endpoint_video"], 9.0),
     )
     assert metrics["shared_state_verified"] is True
     assert metrics["same_prior_verified"] is True
-    assert metrics["continuation_verified"] is True
-    assert metrics["effective_teacher_steps"] == 8
+    assert metrics["continuation_verified"] is False
+    assert metrics["effective_teacher_steps"] is None
+    assert stats["mechanism/g_anchor_count"].item() == 0
+    assert stats["mechanism/g_anchor_mse_count"].item() == 0
+    assert stats["mechanism/g_anchor_available_sum"].item() == 0
+    assert stats["mechanism/g_anchor_available_count"].item() == 2
+    assert (
+        stats["mechanism/g_anchor_unavailable_mixed_clock_sum"].item()
+        == 2
+    )
+    assert stats["mechanism/g_comp_count"].item() == 2
     assert stats["mechanism/student_steps_sum"].item() == 8
     assert len(rollout) == 4
 
 
+def test_equal_clock_probe_dispatches_continuation_and_computes_anchor(
+    monkeypatch,
+):
+    harness, teacher, metrics, stats = _run_aligned_mechanism_case(
+        monkeypatch, equal_clocks=True
+    )
+
+    field = harness.calls[4]
+    assert teacher.continuation_call.state.data_ptr() == field.video.data_ptr()
+    torch.testing.assert_close(
+        teacher.continuation_call.normalized_t,
+        field.video_t / 1000.0,
+    )
+    assert metrics["continuation_verified"] is True
+    assert metrics["effective_teacher_steps"] == 8
+    assert stats["mechanism/g_anchor_count"].item() == 2
+    assert stats["mechanism/g_anchor_mse_count"].item() == 2
+    assert stats["mechanism/g_anchor_available_sum"].item() == 2
+    assert (
+        stats["mechanism/g_anchor_unavailable_mixed_clock_sum"].item()
+        == 0
+    )
+
+
 def test_legacy_target_changes_cannot_change_g_inputs(monkeypatch):
     _, _, first, _ = _run_aligned_mechanism_case(
-        monkeypatch, legacy_value=-100.0
+        monkeypatch, legacy_value=-100.0, equal_clocks=True
     )
     _, _, second, _ = _run_aligned_mechanism_case(
-        monkeypatch, legacy_value=100.0
+        monkeypatch, legacy_value=100.0, equal_clocks=True
     )
     for key in (
         "teacher_continuation_video",
@@ -1228,7 +1261,10 @@ def test_live_probe_fails_closed_on_mask_or_step_provenance(
 ):
     with pytest.raises(RuntimeError, match=match):
         _run_aligned_mechanism_case(
-            monkeypatch, mask_mode=mask_mode, steps=steps
+            monkeypatch,
+            mask_mode=mask_mode,
+            steps=steps,
+            equal_clocks=True,
         )
 
 

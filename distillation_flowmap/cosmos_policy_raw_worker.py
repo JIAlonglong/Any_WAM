@@ -216,7 +216,7 @@ def _model_for_request(
     cfg,
     get_model,
 ):
-    if mode == "same_prior_endpoint":
+    if mode in ("same_prior_endpoint", "joint_continuation_endpoint"):
         _validate_same_prior_layout_source(repo, cosmos_utils)
     if model is None:
         model, _ = get_model(cfg)
@@ -518,6 +518,94 @@ def _load_same_prior_arrays(data):
         _array_sha256(video_prior),
         _array_sha256(action_prior),
     )
+
+
+def _load_joint_continuation_arrays(data):
+    state_raw = np.asarray(data["canonical_joint_state"])
+    time_raw = np.asarray(data["normalized_t"])
+    if state_raw.dtype != np.float32:
+        raise ValueError(
+            "joint continuation canonical_joint_state NPZ dtype must be "
+            f"float32, got {state_raw.dtype}"
+        )
+    if time_raw.dtype != np.float32:
+        raise ValueError(
+            "joint continuation normalized_t NPZ dtype must be "
+            f"float32, got {time_raw.dtype}"
+        )
+    state = np.ascontiguousarray(state_raw)
+    normalized_t = np.ascontiguousarray(time_raw)
+    if not np.isfinite(state).all():
+        raise ValueError(
+            "joint continuation canonical_joint_state must contain only "
+            "finite values"
+        )
+    if not np.isfinite(normalized_t).all():
+        raise ValueError(
+            "joint continuation normalized_t must contain only finite values"
+        )
+    return (
+        state,
+        normalized_t,
+        _array_sha256(state),
+        _array_sha256(normalized_t),
+    )
+
+
+def _joint_continuation_response_fields(
+    result, *, joint_state_sha256, normalized_t_sha256
+):
+    endpoint = result["endpoint_video"]
+    frame_mask = result["video_frame_mask"]
+    effective_steps = result["effective_teacher_steps"]
+    normalized_t = result["normalized_t"]
+    edm_sigma = result["edm_sigma"]
+    _require_exact_teacher_steps(
+        effective_steps,
+        error_cls=RuntimeError,
+        source="observed effective",
+    )
+    if not isinstance(endpoint, torch.Tensor) or endpoint.dtype != torch.float32:
+        raise RuntimeError(
+            "joint continuation backend endpoint dtype must be float32"
+        )
+    if not isinstance(frame_mask, torch.Tensor) or frame_mask.dtype != torch.bool:
+        raise RuntimeError(
+            "joint continuation backend video frame mask must be boolean"
+        )
+    if frame_mask.shape != (endpoint.shape[0], endpoint.shape[2]):
+        raise RuntimeError(
+            "joint continuation backend video frame mask shape is invalid"
+        )
+    if not bool(frame_mask.any(dim=1).all()):
+        raise RuntimeError(
+            "joint continuation backend video frame mask must be nonempty"
+        )
+    if (
+        not isinstance(normalized_t, torch.Tensor)
+        or normalized_t.dtype != torch.float32
+        or normalized_t.shape != (endpoint.shape[0],)
+        or not bool(torch.isfinite(normalized_t).all())
+    ):
+        raise RuntimeError(
+            "joint continuation backend normalized time is invalid"
+        )
+    if (
+        not isinstance(edm_sigma, torch.Tensor)
+        or edm_sigma.dtype != torch.float32
+        or edm_sigma.shape != (endpoint.shape[0],)
+        or not bool(torch.isfinite(edm_sigma).all())
+    ):
+        raise RuntimeError("joint continuation backend EDM sigma is invalid")
+    return {
+        "endpoint_video": endpoint.detach().cpu().numpy(),
+        "video_frame_mask": frame_mask.detach().cpu().numpy(),
+        "effective_teacher_steps": np.asarray(effective_steps, dtype=np.int64),
+        "joint_state_sha256": np.asarray(joint_state_sha256),
+        "normalized_t_sha256": np.asarray(normalized_t_sha256),
+        "normalized_t": normalized_t.detach().cpu().numpy(),
+        "edm_sigma": edm_sigma.detach().cpu().numpy(),
+    }
 
 
 def _same_prior_response_fields(
@@ -886,6 +974,120 @@ def main():
                 cfg=cfg,
                 get_model=get_model,
             )
+            if mode == "joint_continuation_endpoint":
+                teacher_steps = request.get("teacher_steps")
+                _require_exact_teacher_steps(teacher_steps)
+                (
+                    canonical_state_np,
+                    normalized_t_np,
+                    joint_state_sha256,
+                    normalized_t_sha256,
+                ) = _load_joint_continuation_arrays(data)
+                if tuple(canonical_state_np.shape[1:]) != (16, 9, 28, 28):
+                    raise ValueError(
+                        "joint continuation canonical_joint_state NPZ shape "
+                        "must be [B,16,9,28,28], got "
+                        f"{canonical_state_np.shape}"
+                    )
+                batch_size = canonical_state_np.shape[0]
+                if normalized_t_np.ndim not in (1, 2):
+                    raise ValueError(
+                        "joint continuation normalized_t NPZ shape must be "
+                        "[B] or [B,F]"
+                    )
+                if normalized_t_np.shape[0] != batch_size:
+                    raise ValueError(
+                        "joint continuation state/time batch sizes differ"
+                    )
+                _validate_explicit_prior_runtime(model)
+                _validate_official_libero_geometry(cfg, model)
+                if len(tasks) != batch_size:
+                    raise ValueError(
+                        "joint continuation task count does not match state batch"
+                    )
+                if (
+                    primary.shape[0] != len(tasks)
+                    or wrist.shape[0] != len(tasks)
+                    or proprio.shape[0] != len(tasks)
+                ):
+                    raise ValueError(
+                        "joint continuation observation batch does not match "
+                        "task count"
+                    )
+                endpoint_tensors = []
+                mask_tensors = []
+                returned_times = []
+                edm_sigmas = []
+                observed_steps = []
+                with torch.no_grad():
+                    for idx, task in enumerate(tasks):
+                        obs = {
+                            "primary_image": primary[idx],
+                            "wrist_image": wrist[idx],
+                            "proprio": proprio[idx],
+                        }
+                        data_batch, latent_indices = _build_libero_data_batch(
+                            cfg,
+                            model,
+                            dataset_stats,
+                            obs,
+                            task,
+                            cosmos_utils,
+                        )
+                        device = data_batch["video"].device
+                        continuation_result = _run_joint_continuation_endpoint(
+                            model,
+                            data_batch,
+                            latent_indices,
+                            torch.from_numpy(
+                                canonical_state_np[idx : idx + 1]
+                            ).to(device),
+                            torch.from_numpy(
+                                normalized_t_np[idx : idx + 1]
+                            ).to(device),
+                            teacher_steps=teacher_steps,
+                        )
+                        endpoint_tensors.append(
+                            continuation_result["endpoint_video"].detach().cpu()
+                        )
+                        mask_tensors.append(
+                            continuation_result["video_frame_mask"].detach().cpu()
+                        )
+                        returned_times.append(
+                            continuation_result["normalized_t"].detach().cpu()
+                        )
+                        edm_sigmas.append(
+                            continuation_result["edm_sigma"].detach().cpu()
+                        )
+                        observed_steps.append(
+                            continuation_result["effective_teacher_steps"]
+                        )
+                if not observed_steps or any(
+                    value != 8 for value in observed_steps
+                ):
+                    raise RuntimeError(
+                        "joint continuation batch did not observe exactly eight "
+                        "teacher steps per sample"
+                    )
+                fields = _joint_continuation_response_fields(
+                    {
+                        "endpoint_video": torch.cat(endpoint_tensors, dim=0),
+                        "video_frame_mask": torch.cat(mask_tensors, dim=0),
+                        "effective_teacher_steps": observed_steps[0],
+                        "normalized_t": torch.cat(returned_times, dim=0),
+                        "edm_sigma": torch.cat(edm_sigmas, dim=0),
+                    },
+                    joint_state_sha256=joint_state_sha256,
+                    normalized_t_sha256=normalized_t_sha256,
+                )
+                response_path = request["actions_path"]
+                np.savez_compressed(response_path, **fields)
+                print(
+                    json.dumps({"ok": True, "actions_path": response_path}),
+                    file=response_out,
+                    flush=True,
+                )
+                continue
             if mode == "same_prior_endpoint":
                 teacher_steps = request.get("teacher_steps")
                 _require_exact_teacher_steps(teacher_steps)

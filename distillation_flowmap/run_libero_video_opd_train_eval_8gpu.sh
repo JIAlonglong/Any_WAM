@@ -48,6 +48,8 @@ DEFAULT_OUTPUT="${SHARED_ROOT}/distillation_flowmap/output_libero_lingbotva_stag
 [[ -z "$RUN_TAG" ]] || DEFAULT_OUTPUT="${DEFAULT_OUTPUT}_${RUN_TAG}"
 OUTPUT_DIR="${OUTPUT_DIR:-$DEFAULT_OUTPUT}"
 EVAL_OUTPUT_ROOT="${EVAL_OUTPUT_ROOT:-${SHARED_ROOT}/evaluation/results/libero_lingbotva_video_only_opd_${RUN_TAG:-formal}}"
+NAIVE_CKPT="${NAIVE_CKPT:-}"
+EVAL_CONTRACT="${EVAL_OUTPUT_ROOT}/evaluation_contract.json"
 
 TRAIN_SCRIPT="${SCRIPT_DIR}/run_libero_video_only_opd_stage2_8gpu.sh"
 EVAL_SCRIPT="${PROJECT_ROOT}/evaluation/libero/run_lingbotva_4suite_124_eval_8gpu.sh"
@@ -94,11 +96,29 @@ fi
 
 if [[ "$PHASE" == eval || "$PHASE" == all ]]; then
     print_eval teacher "$TEACHER_TRANSFORMER"
-    print_eval stage1 "$STAGE1_TRANSFORMER"
+    print_eval stage1_only "$STAGE1_TRANSFORMER"
     print_eval stage2 "$STAGE2_TRANSFORMER"
+    if [[ -n "$NAIVE_CKPT" ]]; then
+        print_eval naive_composition "$NAIVE_CKPT"
+    else
+        echo "EVAL_CONTRACT naive_composition=missing reason=no_explicit_no_distillation_checkpoint"
+    fi
     if [[ "$DRY_RUN" == 0 ]]; then
         run_eval teacher "$TEACHER_TRANSFORMER"
-        run_eval stage1 "$STAGE1_TRANSFORMER"
+        run_eval stage1_only "$STAGE1_TRANSFORMER"
         run_eval stage2 "$STAGE2_TRANSFORMER"
+        if [[ -n "$NAIVE_CKPT" ]]; then
+            run_eval naive_composition "$NAIVE_CKPT"
+        fi
+        contract_cmd=(
+            "$PYTHON" "${PROJECT_ROOT}/evaluation/libero/write_lingbotva_eval_contract.py"
+            --output "$EVAL_CONTRACT"
+            --teacher "$TEACHER_TRANSFORMER"
+            --stage1-only "$STAGE1_TRANSFORMER"
+            --stage2 "$STAGE2_TRANSFORMER"
+            --episodes-per-task "$EPISODES"
+        )
+        [[ -z "$NAIVE_CKPT" ]] || contract_cmd+=(--naive "$NAIVE_CKPT")
+        "${contract_cmd[@]}"
     fi
 fi

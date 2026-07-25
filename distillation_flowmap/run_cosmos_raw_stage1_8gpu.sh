@@ -214,6 +214,9 @@ COSMOS_WORKER_ENV_ROOT="${COSMOS_WORKER_ENV_ROOT:-/kpfs-intern/jialongliu/envs/c
 COSMOS_POLICY_PYTHON="${COSMOS_POLICY_PYTHON:-${COSMOS_WORKER_ENV_ROOT}/bin/python}"
 COSMOS_PREDICT2_REPO="${COSMOS_PREDICT2_REPO:-/kpfs-intern/jialongliu/projects/cosmos-predict2.5}"
 COSMOS_PREDICT25_LOCAL_MODEL_DIR="${COSMOS_PREDICT25_LOCAL_MODEL_DIR:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/local_hf/Cosmos-Predict2-2B-Video2World}"
+COSMOS_WORKER_SITE_PACKAGES="${COSMOS_WORKER_SITE_PACKAGES:-${COSMOS_WORKER_ENV_ROOT}/lib/python3.10/site-packages}"
+COSMOS_POLICY_EXTRA_PYTHONPATH="$COSMOS_PREDICT2_REPO/packages/cosmos-cuda:$COSMOS_PREDICT2_REPO/packages/cosmos-oss"
+COSMOS_WORKER_CUDA_LIBRARY_PATH="${COSMOS_WORKER_CUDA_LIBRARY_PATH:-${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cublas/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_cupti/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_nvrtc/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cuda_runtime/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cudnn/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cufft/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cufile/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/curand/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusolver/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/cusparse/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/nccl/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/nvjitlink/lib:${COSMOS_WORKER_SITE_PACKAGES}/nvidia/nvtx/lib}"
 TRAIN_SEED="${TRAIN_SEED:-42}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES="${COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES:-$CUDA_VISIBLE_DEVICES}"
@@ -241,6 +244,21 @@ require_dir COSMOS_POLICY_PATH "$COSMOS_POLICY_PATH"
     "COSMOS_POLICY_PYTHON is not executable: $COSMOS_POLICY_PYTHON"
 require_dir COSMOS_PREDICT2_REPO "$COSMOS_PREDICT2_REPO"
 require_dir COSMOS_PREDICT25_LOCAL_MODEL_DIR "$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
+require_dir "Cosmos CUDA package" "$COSMOS_PREDICT2_REPO/packages/cosmos-cuda"
+require_dir "Cosmos OSS package" "$COSMOS_PREDICT2_REPO/packages/cosmos-oss"
+require_dir COSMOS_WORKER_SITE_PACKAGES "$COSMOS_WORKER_SITE_PACKAGES"
+IFS=':' read -r -a worker_cuda_library_dirs <<< "$COSMOS_WORKER_CUDA_LIBRARY_PATH"
+(( ${#worker_cuda_library_dirs[@]} > 0 )) || die \
+    "COSMOS_WORKER_CUDA_LIBRARY_PATH must declare at least one directory"
+for worker_cuda_library_dir in "${worker_cuda_library_dirs[@]}"; do
+    require_dir "COSMOS_WORKER_CUDA_LIBRARY_PATH entry" \
+        "$worker_cuda_library_dir"
+done
+cosmos_git_status="$(
+    GIT_OPTIONAL_LOCKS=0 git -C "$COSMOS_PREDICT2_REPO" status \
+        --porcelain=v1 --untracked-files=all
+)" || die "COSMOS_PREDICT2_REPO must be a readable Git repository"
+[[ -z "$cosmos_git_status" ]] || die "COSMOS_PREDICT2_REPO must be clean"
 
 output_safety_code='import os, sys
 from pathlib import Path
@@ -359,6 +377,9 @@ launch_env=(
     "COSMOS_POLICY_PYTHON=$COSMOS_POLICY_PYTHON"
     "COSMOS_PREDICT2_REPO=$COSMOS_PREDICT2_REPO"
     "COSMOS_PREDICT25_LOCAL_MODEL_DIR=$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
+    "COSMOS_POLICY_EXTRA_PYTHONPATH=$COSMOS_POLICY_EXTRA_PYTHONPATH"
+    "COSMOS_WORKER_SITE_PACKAGES=$COSMOS_WORKER_SITE_PACKAGES"
+    "COSMOS_WORKER_CUDA_LIBRARY_PATH=$COSMOS_WORKER_CUDA_LIBRARY_PATH"
     "COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES=$COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES"
     "COSMOS_POLICY_NUM_DENOISING_STEPS_ACTION=${COSMOS_POLICY_NUM_DENOISING_STEPS_ACTION:-5}"
     "GRADIENT_CHECKPOINTING=1"
@@ -386,6 +407,14 @@ if [[ -n "$RESUME_FROM_PATH" ]]; then
     command+=(--resume-from-path "$RESUME_FROM_PATH")
 fi
 command+=(--gradient-accumulation-steps 4)
+
+if ! PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$COSMOS_PREDICT2_REPO:$COSMOS_POLICY_EXTRA_PYTHONPATH" \
+    LD_LIBRARY_PATH="$COSMOS_WORKER_CUDA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    "$COSMOS_POLICY_PYTHON" -c \
+    'import cosmos_cuda, cosmos_predict2; from cosmos_predict2._src.predict2.cosmos_policy.experiments.robot.cosmos_utils import get_action'; then
+    die "worker import preflight failed"
+fi
 
 preflight_code='import os
 from importlib import import_module

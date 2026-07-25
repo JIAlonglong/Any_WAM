@@ -11,6 +11,21 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "distillation_flowmap" / "run_cosmos_raw_stage1_8gpu.sh"
 PYTHON = Path("/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python")
 DEVICES = "0,1,2,3,4,5,6,7"
+CUDA_LIBRARY_RELATIVES = (
+    "nvidia/cublas/lib",
+    "nvidia/cuda_cupti/lib",
+    "nvidia/cuda_nvrtc/lib",
+    "nvidia/cuda_runtime/lib",
+    "nvidia/cudnn/lib",
+    "nvidia/cufft/lib",
+    "nvidia/cufile/lib",
+    "nvidia/curand/lib",
+    "nvidia/cusolver/lib",
+    "nvidia/cusparse/lib",
+    "nvidia/nccl/lib",
+    "nvidia/nvjitlink/lib",
+    "nvidia/nvtx/lib",
+)
 RAW_CONTRACT = {
     "contract_version": 2,
     "training_contract_stage": "raw_stage1",
@@ -43,13 +58,45 @@ def _layout(tmp_path: Path) -> dict[str, str]:
     policy.mkdir()
     worker_repo = tmp_path / "cosmos-predict2.5"
     worker_repo.mkdir()
+    for relative in ("packages/cosmos-cuda", "packages/cosmos-oss"):
+        package = worker_repo / relative
+        package.mkdir(parents=True)
+        (package / ".fixture").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(worker_repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(worker_repo), "config", "user.email", "fixture@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(worker_repo), "config", "user.name", "Fixture"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(worker_repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(worker_repo), "commit", "-qm", "fixture"],
+        check=True,
+    )
     local_model = tmp_path / "cosmos-local-model"
     local_model.mkdir()
+    worker_env = tmp_path / "cosmos-worker-env"
+    worker_site_packages = worker_env / "lib/python3.10/site-packages"
+    for relative in CUDA_LIBRARY_RELATIVES:
+        (worker_site_packages / relative).mkdir(parents=True)
     worker_python = tmp_path / "cosmos-python"
-    _write_executable(worker_python, "exit 0\n")
+    _write_executable(
+        worker_python,
+        'printf "worker-import-preflight\\n" >> "$CALLS_LOG"\n'
+        'printf "%s\\n" "$*" > "$WORKER_PREFLIGHT_LOG"\n'
+        'printf "PYTHONPATH=%s\\n" "${PYTHONPATH:-}" >> "$WORKER_PREFLIGHT_LOG"\n'
+        'printf "LD_LIBRARY_PATH=%s\\n" "${LD_LIBRARY_PATH:-}" >> "$WORKER_PREFLIGHT_LOG"\n'
+        'printf "PYTHONDONTWRITEBYTECODE=%s\\n" "${PYTHONDONTWRITEBYTECODE:-}" >> "$WORKER_PREFLIGHT_LOG"\n'
+        '[[ "$*" == *"import cosmos_cuda, cosmos_predict2; from cosmos_predict2._src.predict2.cosmos_policy.experiments.robot.cosmos_utils import get_action"* ]] || exit 91\n'
+        'exit "${FAKE_WORKER_IMPORT_EXIT:-0}"\n',
+    )
     preflight = tmp_path / "fake-preflight"
     _write_executable(
         preflight,
+        'printf "config-preflight\\n" >> "$CALLS_LOG"\n'
         'printf "%s\\n" "$*" >> "$PREFLIGHT_LOG"\n'
         'if [[ "${CLAIM_OUTPUT_DURING_PREFLIGHT:-0}" == 1 ]]; then\n'
         '    mkdir -p "$OUTPUT_DIR"\n'
@@ -59,6 +106,7 @@ def _layout(tmp_path: Path) -> dict[str, str]:
     torchrun = tmp_path / "fake-torchrun"
     _write_executable(
         torchrun,
+        'printf "torchrun\\n" >> "$CALLS_LOG"\n'
         'printf "%s\\n" "$*" > "$TORCHRUN_LOG"\n'
         "env | LC_ALL=C sort >> \"$TORCHRUN_LOG\"\n",
     )
@@ -68,6 +116,8 @@ def _layout(tmp_path: Path) -> dict[str, str]:
         "policy": str(policy),
         "worker_repo": str(worker_repo),
         "local_model": str(local_model),
+        "worker_env": str(worker_env),
+        "worker_site_packages": str(worker_site_packages),
         "worker_python": str(worker_python),
         "preflight": str(preflight),
         "torchrun": str(torchrun),
@@ -86,11 +136,14 @@ def _env(tmp_path: Path) -> dict[str, str]:
             "COSMOS_POLICY_PYTHON": paths["worker_python"],
             "COSMOS_PREDICT2_REPO": paths["worker_repo"],
             "COSMOS_PREDICT25_LOCAL_MODEL_DIR": paths["local_model"],
+            "COSMOS_WORKER_ENV_ROOT": paths["worker_env"],
             "PYTHON_BIN": str(PYTHON),
             "PREFLIGHT_BIN": paths["preflight"],
             "PREFLIGHT_LOG": str(tmp_path / "preflight.log"),
+            "WORKER_PREFLIGHT_LOG": str(tmp_path / "worker-preflight.log"),
             "TORCHRUN_BIN": paths["torchrun"],
             "TORCHRUN_LOG": str(tmp_path / "torchrun.log"),
+            "CALLS_LOG": str(tmp_path / "calls.log"),
             "CUDA_VISIBLE_DEVICES": DEVICES,
         }
     )
@@ -106,6 +159,16 @@ def _run(mode: str, *args: str, env: dict[str, str]) -> subprocess.CompletedProc
         capture_output=True,
         check=False,
     )
+
+
+def _assignments(stdout: str) -> dict[str, str]:
+    return {
+        key: value
+        for line in stdout.splitlines()
+        if "=" in line
+        for key, value in [line.split("=", 1)]
+        if key.isupper()
+    }
 
 
 def _import_stage1_config(
@@ -221,6 +284,16 @@ def test_dry_run_prints_corrected_raw_contract_without_mutation(tmp_path):
     result = _run("dry-run", env=env)
 
     assert result.returncode == 0, result.stdout + result.stderr
+    values = _assignments(result.stdout)
+    repo = Path(env["COSMOS_PREDICT2_REPO"])
+    worker_site_packages = (
+        Path(env["COSMOS_WORKER_ENV_ROOT"]) / "lib/python3.10/site-packages"
+    )
+    assert values["COSMOS_POLICY_EXTRA_PYTHONPATH"] == (
+        f"{repo}/packages/cosmos-cuda:{repo}/packages/cosmos-oss"
+    )
+    assert values["COSMOS_WORKER_SITE_PACKAGES"] == str(worker_site_packages)
+    assert "nvidia/cudnn/lib" in values["COSMOS_WORKER_CUDA_LIBRARY_PATH"]
     assert "CONFIG_FILE=distillation_flowmap.config_libero_cosmos_policy_stage1" in result.stdout
     assert "MAX_TRAIN_STEPS=5000" in result.stdout
     assert "SAVE_INTERVAL=1000" in result.stdout
@@ -233,6 +306,70 @@ def test_dry_run_prints_corrected_raw_contract_without_mutation(tmp_path):
     assert "raw_stage1_5000" not in result.stdout
     assert not Path(env["STAGE1_OUTPUT"]).exists()
     assert Path(env["PREFLIGHT_LOG"]).read_text(encoding="utf-8")
+    worker_log = Path(env["WORKER_PREFLIGHT_LOG"]).read_text(encoding="utf-8")
+    assert (
+        f"PYTHONPATH={repo}:{repo}/packages/cosmos-cuda:"
+        f"{repo}/packages/cosmos-oss"
+    ) in worker_log
+    assert f"LD_LIBRARY_PATH={values['COSMOS_WORKER_CUDA_LIBRARY_PATH']}" in worker_log
+    assert "PYTHONDONTWRITEBYTECODE=1" in worker_log
+    assert not Path(env["TORCHRUN_LOG"]).exists()
+
+
+@pytest.mark.parametrize("package", ("cosmos-cuda", "cosmos-oss"))
+def test_rejects_missing_cosmos_worker_package_roots(tmp_path, package):
+    env = _env(tmp_path)
+    package_root = Path(env["COSMOS_PREDICT2_REPO"]) / "packages" / package
+    (package_root / ".fixture").unlink()
+    package_root.rmdir()
+
+    result = _run("dry-run", env=env)
+
+    assert result.returncode != 0
+    assert package in result.stderr
+    assert not Path(env["WORKER_PREFLIGHT_LOG"]).exists()
+
+
+def test_rejects_dirty_cosmos_worker_repository(tmp_path):
+    env = _env(tmp_path)
+    (Path(env["COSMOS_PREDICT2_REPO"]) / "untracked.py").write_text(
+        "DIRTY = True\n",
+        encoding="utf-8",
+    )
+
+    result = _run("dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "COSMOS_PREDICT2_REPO must be clean" in result.stderr
+    assert not Path(env["WORKER_PREFLIGHT_LOG"]).exists()
+
+
+def test_rejects_missing_declared_worker_cuda_library_directory(tmp_path):
+    env = _env(tmp_path)
+    missing = (
+        Path(env["COSMOS_WORKER_ENV_ROOT"])
+        / "lib/python3.10/site-packages/nvidia/cudnn/lib"
+    )
+    missing.rmdir()
+
+    result = _run("dry-run", env=env)
+
+    assert result.returncode != 0
+    assert str(missing) in result.stderr
+    assert not Path(env["WORKER_PREFLIGHT_LOG"]).exists()
+
+
+def test_full_cosmos_utils_worker_import_failure_is_fail_closed(tmp_path):
+    env = _env(tmp_path)
+    env["FAKE_WORKER_IMPORT_EXIT"] = "9"
+
+    result = _run("dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "worker import preflight failed" in result.stderr
+    worker_call = Path(env["WORKER_PREFLIGHT_LOG"]).read_text(encoding="utf-8")
+    assert "cosmos_utils import get_action" in worker_call
+    assert not Path(env["STAGE1_OUTPUT"]).exists()
     assert not Path(env["TORCHRUN_LOG"]).exists()
 
 
@@ -650,6 +787,8 @@ def test_run_creates_output_only_after_preflight_and_executes_fake_torchrun(tmp_
     result = _run("run", "--steps", "20", "--save-interval", "10", env=env)
 
     assert result.returncode == 0, result.stdout + result.stderr
+    calls = Path(env["CALLS_LOG"]).read_text(encoding="utf-8").splitlines()
+    assert calls.index("worker-import-preflight") < calls.index("torchrun")
     output = Path(env["STAGE1_OUTPUT"])
     assert output.is_dir()
     log = Path(env["TORCHRUN_LOG"]).read_text(encoding="utf-8")
@@ -660,6 +799,9 @@ def test_run_creates_output_only_after_preflight_and_executes_fake_torchrun(tmp_
     assert "RESUME_ONLINE_FROM_TARGET=0" in log
     assert "RESET_RESUME_STEP=0" in log
     assert "RESUME_OPTIMIZER_STATE=0" in log
+    assert "COSMOS_POLICY_EXTRA_PYTHONPATH=" in log
+    assert "COSMOS_WORKER_SITE_PACKAGES=" in log
+    assert "COSMOS_WORKER_CUDA_LIBRARY_PATH=" in log
     assert "--resume-from-path" not in log
 
 

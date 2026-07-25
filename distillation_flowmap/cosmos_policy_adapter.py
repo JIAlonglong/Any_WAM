@@ -1127,6 +1127,156 @@ class CosmosPolicyActionTeacher:
             "action_prior_sha256": str(result["action_prior_sha256"]),
         }
 
+    def predict_raw_joint_continuation_endpoint(
+        self,
+        raw_batch,
+        *,
+        canonical_joint_state,
+        normalized_t,
+        teacher_steps=8,
+    ):
+        """Continue an action-injected normalized joint state to clean x0."""
+        _require_exact_teacher_steps(teacher_steps)
+        primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
+        canonical_np = np.ascontiguousarray(_as_numpy(canonical_joint_state))
+        normalized_t_np = np.ascontiguousarray(_as_numpy(normalized_t))
+        if canonical_np.dtype != np.float32:
+            raise ValueError(
+                "canonical_joint_state must use float32 without conversion"
+            )
+        if normalized_t_np.dtype != np.float32:
+            raise ValueError("normalized_t must use float32 without conversion")
+        if (
+            canonical_np.ndim != 5
+            or tuple(canonical_np.shape[1:]) != (16, 9, 28, 28)
+        ):
+            raise ValueError(
+                "canonical_joint_state must have Cosmos shape [B,16,9,28,28]"
+            )
+        batch_size = canonical_np.shape[0]
+        if batch_size != len(tasks):
+            raise ValueError(
+                "canonical_joint_state batch size must match observations"
+            )
+        if normalized_t_np.ndim == 1:
+            if normalized_t_np.shape != (batch_size,):
+                raise ValueError("normalized_t must have shape [B] or [B,F]")
+            per_sample_t = normalized_t_np
+        elif normalized_t_np.ndim == 2:
+            if normalized_t_np.shape[0] != batch_size:
+                raise ValueError(
+                    "normalized_t batch size must match canonical state"
+                )
+            if not np.array_equal(
+                normalized_t_np,
+                np.broadcast_to(normalized_t_np[:, :1], normalized_t_np.shape),
+            ):
+                raise ValueError(
+                    "normalized_t must be constant across frames per sample"
+                )
+            per_sample_t = normalized_t_np[:, 0]
+        else:
+            raise ValueError("normalized_t must have shape [B] or [B,F]")
+        if not np.isfinite(canonical_np).all():
+            raise ValueError(
+                "canonical_joint_state must contain only finite values"
+            )
+        if not np.isfinite(per_sample_t).all():
+            raise ValueError("normalized_t must contain only finite values")
+        if not (
+            (per_sample_t >= 4.0 / 5.0)
+            & (per_sample_t <= 80.0 / 81.0)
+        ).all():
+            raise ValueError(
+                "normalized_t must remain in the calibrated Cosmos band"
+            )
+
+        arrays = {
+            "primary_image": primary,
+            "wrist_image": wrist,
+            "proprio": proprio,
+            "canonical_joint_state": canonical_np,
+            "normalized_t": normalized_t_np,
+        }
+        result = self._request_raw_worker_npz(
+            {
+                "mode": "joint_continuation_endpoint",
+                "tasks": tasks,
+                "teacher_steps": teacher_steps,
+            },
+            arrays,
+        )
+        required = (
+            "endpoint_video",
+            "video_frame_mask",
+            "effective_teacher_steps",
+            "joint_state_sha256",
+            "normalized_t_sha256",
+            "normalized_t",
+            "edm_sigma",
+        )
+        missing = [key for key in required if key not in result]
+        if missing:
+            raise RuntimeError(
+                "joint continuation worker response missing required fields: "
+                f"{missing}"
+            )
+        effective_steps = result["effective_teacher_steps"]
+        _require_exact_teacher_steps(
+            effective_steps,
+            error_cls=RuntimeError,
+            source="response effective",
+        )
+        if str(result["joint_state_sha256"]) != _array_sha256(canonical_np):
+            raise RuntimeError(
+                "joint continuation worker state fingerprint mismatch"
+            )
+        if str(result["normalized_t_sha256"]) != _array_sha256(normalized_t_np):
+            raise RuntimeError(
+                "joint continuation worker time fingerprint mismatch"
+            )
+        endpoint = np.asarray(result["endpoint_video"])
+        frame_mask = np.asarray(result["video_frame_mask"])
+        returned_t = np.asarray(result["normalized_t"], dtype=np.float32)
+        edm_sigma = np.asarray(result["edm_sigma"], dtype=np.float32)
+        if endpoint.shape != canonical_np.shape or not np.isfinite(endpoint).all():
+            raise RuntimeError(
+                "joint continuation worker returned an invalid endpoint"
+            )
+        if frame_mask.dtype != np.bool_ or frame_mask.shape != (
+            batch_size,
+            canonical_np.shape[2],
+        ):
+            raise RuntimeError(
+                "joint continuation worker returned an invalid video mask"
+            )
+        if not frame_mask.any(axis=1).all():
+            raise RuntimeError(
+                "joint continuation worker video mask must be nonempty"
+            )
+        if returned_t.shape != (batch_size,) or not np.array_equal(
+            returned_t, per_sample_t
+        ):
+            raise RuntimeError(
+                "joint continuation worker normalized time mismatch"
+            )
+        expected_sigma = per_sample_t / (1.0 - per_sample_t)
+        if (
+            edm_sigma.shape != (batch_size,)
+            or not np.isfinite(edm_sigma).all()
+            or not np.allclose(edm_sigma, expected_sigma, rtol=1e-6, atol=1e-6)
+        ):
+            raise RuntimeError("joint continuation worker EDM sigma mismatch")
+        return {
+            "endpoint_video": torch.from_numpy(endpoint.astype(np.float32)),
+            "video_frame_mask": torch.from_numpy(frame_mask.copy()),
+            "effective_teacher_steps": effective_steps,
+            "joint_state_sha256": str(result["joint_state_sha256"]),
+            "normalized_t_sha256": str(result["normalized_t_sha256"]),
+            "normalized_t": torch.from_numpy(returned_t.copy()),
+            "edm_sigma": torch.from_numpy(edm_sigma.copy()),
+        }
+
     def predict_raw_action_result(self, raw_batch, include_future=False):
         if self._raw_action_provider is not None:
             return self._coerce_raw_action_result(self._raw_action_provider(raw_batch))

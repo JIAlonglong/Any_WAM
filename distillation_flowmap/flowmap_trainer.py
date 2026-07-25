@@ -48,7 +48,7 @@ from distillation_flowmap.cosmos_progressive_opd import (
     should_stop_training_at_step,
 )
 from distillation_flowmap.cosmos_deployment_rollout import (
-    deployment_joint_step_for_update,
+    mechanism_diagnostic_joint_step_for_update,
 )
 from distillation_flowmap.cosmos_training_contract import contract_metadata
 from distillation_flowmap.cosmos_teacher_roles import resolve_teacher_roles
@@ -3638,7 +3638,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             0,
             rank,
         )
-        student_steps = deployment_joint_step_for_update(diagnostic_index)
+        student_steps = mechanism_diagnostic_joint_step_for_update(
+            diagnostic_index
+        )
         local_preflight_error = None
         diagnostic_batch = None
         try:

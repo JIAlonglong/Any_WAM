@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -272,11 +273,24 @@ def _validate_explicit_prior_runtime(model):
 
 
 def _generate_from_explicit_prior(
-    model, data_batch, joint_prior, *, teacher_steps
+    model,
+    data_batch,
+    joint_prior,
+    *,
+    teacher_steps,
+    sigma_max=80.0,
 ):
     """Run the audited EDM endpoint and return its observed denoiser count."""
     _require_exact_teacher_steps(teacher_steps)
     _validate_explicit_prior_runtime(model)
+    if (
+        isinstance(sigma_max, bool)
+        or not isinstance(sigma_max, (int, float))
+        or not math.isfinite(float(sigma_max))
+        or not 4.0 <= float(sigma_max) <= 80.0
+    ):
+        raise ValueError("explicit-prior sigma_max must be a scalar in [4,80]")
+    sigma_max = float(sigma_max)
     generate = model.generate_samples_from_batch
     signature = inspect.signature(generate)
     if "x_sigma_max" not in signature.parameters:
@@ -312,9 +326,9 @@ def _generate_from_explicit_prior(
         endpoint = generate(
             data_batch,
             x_sigma_max=joint_prior,
-            num_steps=8,
+            num_steps=teacher_steps,
             solver_option="2ab",
-            sigma_max=80,
+            sigma_max=sigma_max,
             guidance=0,
             use_variance_scale=False,
         )
@@ -325,10 +339,113 @@ def _generate_from_explicit_prior(
             model.get_x0_fn_from_batch = previous_instance_value
     if observed_nfe != 8:
         raise RuntimeError(
-            "Cosmos same-prior sampler did not execute exactly 8 denoiser "
+            "Cosmos explicit-prior sampler did not execute exactly 8 denoiser "
             f"evaluations; observed {observed_nfe}"
         )
     return endpoint, observed_nfe
+
+
+def _slice_batch_value(value, index, batch_size):
+    if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
+        return value[index : index + 1]
+    if isinstance(value, np.ndarray) and value.ndim > 0 and value.shape[0] == batch_size:
+        return value[index : index + 1]
+    if isinstance(value, dict):
+        return {
+            key: _slice_batch_value(item, index, batch_size)
+            for key, item in value.items()
+        }
+    if isinstance(value, list) and len(value) == batch_size:
+        return value[index : index + 1]
+    if isinstance(value, tuple) and len(value) == batch_size:
+        return value[index : index + 1]
+    return value
+
+
+def _run_joint_continuation_endpoint(
+    model,
+    data_batch,
+    latent_indices,
+    canonical_joint_state,
+    normalized_t,
+    *,
+    teacher_steps,
+):
+    """Continue canonical normalized joint states with exact per-sample EDM clocks."""
+    _require_exact_teacher_steps(teacher_steps)
+    canonical = torch.as_tensor(canonical_joint_state)
+    times = torch.as_tensor(normalized_t, device=canonical.device)
+    if canonical.dtype != torch.float32:
+        raise ValueError("canonical_joint_state must use float32 without conversion")
+    if canonical.ndim != 5 or tuple(canonical.shape[1:]) != (16, 9, 28, 28):
+        raise ValueError(
+            "canonical_joint_state must have Cosmos shape [B,16,9,28,28]"
+        )
+    if times.dtype != torch.float32:
+        raise ValueError("normalized_t must use float32 without conversion")
+    batch_size = canonical.shape[0]
+    if times.ndim == 1:
+        if times.shape != (batch_size,):
+            raise ValueError("normalized_t must have shape [B] or [B,F]")
+        per_sample_t = times
+    elif times.ndim == 2:
+        if times.shape[0] != batch_size:
+            raise ValueError("normalized_t batch size must match canonical state")
+        if not torch.equal(times, times[:, :1].expand_as(times)):
+            raise ValueError("normalized_t must be constant across frames per sample")
+        per_sample_t = times[:, 0]
+    else:
+        raise ValueError("normalized_t must have shape [B] or [B,F]")
+    if not bool(torch.isfinite(canonical).all()):
+        raise ValueError("canonical_joint_state must contain only finite values")
+    if not bool(torch.isfinite(per_sample_t).all()):
+        raise ValueError("normalized_t must contain only finite values")
+    if not bool(
+        ((per_sample_t >= 4.0 / 5.0) & (per_sample_t <= 80.0 / 81.0)).all()
+    ):
+        raise ValueError("normalized_t must remain in the calibrated Cosmos band")
+
+    mask = _video_frame_mask(canonical, latent_indices)
+    if not bool(mask.any(dim=1).all()):
+        raise RuntimeError("joint continuation requires a nonempty video mask")
+
+    endpoints = []
+    observed_steps = []
+    edm_sigmas = per_sample_t / (1.0 - per_sample_t)
+    for index in range(batch_size):
+        sigma = float(edm_sigmas[index].item())
+        edm_state = canonical[index : index + 1] / (
+            1.0 - per_sample_t[index]
+        )
+        endpoint, effective_steps = _generate_from_explicit_prior(
+            model,
+            _slice_batch_value(data_batch, index, batch_size),
+            edm_state,
+            teacher_steps=teacher_steps,
+            sigma_max=sigma,
+        )
+        if (
+            not isinstance(endpoint, torch.Tensor)
+            or endpoint.shape != canonical[index : index + 1].shape
+            or endpoint.dtype != torch.float32
+            or not bool(torch.isfinite(endpoint).all())
+        ):
+            raise RuntimeError(
+                "Cosmos joint continuation returned an invalid clean endpoint"
+            )
+        endpoints.append(endpoint)
+        observed_steps.append(effective_steps)
+    if not observed_steps or any(value != 8 for value in observed_steps):
+        raise RuntimeError(
+            "Cosmos joint continuation did not observe eight steps per sample"
+        )
+    return {
+        "endpoint_video": torch.cat(endpoints, dim=0),
+        "video_frame_mask": mask,
+        "effective_teacher_steps": observed_steps[0],
+        "normalized_t": per_sample_t,
+        "edm_sigma": edm_sigmas,
+    }
 
 
 def _validate_official_libero_geometry(cfg, model):
@@ -515,10 +632,11 @@ def _run_same_prior_endpoint(
     if not torch.equal(joint_prior[mask[:, None, :, None, None].expand_as(joint_prior)],
                        video_prior[mask[:, None, :, None, None].expand_as(video_prior)]):
         raise RuntimeError("action packing changed a valid video frame")
+    edm_joint_prior = joint_prior * 80.0
     endpoint, effective_steps = _generate_from_explicit_prior(
         model,
         data_batch,
-        joint_prior,
+        edm_joint_prior,
         teacher_steps=teacher_steps,
     )
     if not isinstance(endpoint, torch.Tensor):

@@ -18,6 +18,8 @@ for _path in (
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+from distillation_flowmap.cosmos_policy_adapter import unpack_flowmap_action_query
+from distillation_flowmap.danceopd_query import build_shifted_terminal_path
 from distillation_flowmap.flowmap_step import FlowMapStepMixin
 from distillation_flowmap.mechanism_diagnostics import (
     capture_diagnostic_snapshot_if_due,
@@ -137,7 +139,7 @@ def test_shared_cosmos_joint_builder_replaces_video_and_holds_action_state():
     assert joint["action_dict"]["actions_mask"] is context["action_mask"]
 
 
-def test_mechanism_preflight_rejects_teacher_without_same_prior_endpoint():
+def test_mechanism_preflight_rejects_teacher_without_joint_continuation():
     harness = _BuilderHarness()
 
     class LegacyTeacher:
@@ -151,14 +153,22 @@ def test_mechanism_preflight_rejects_teacher_without_same_prior_endpoint():
         def predict_raw_joint_latent_velocity(*args, **kwargs):
             raise AssertionError("preflight must not run inference")
 
+        @staticmethod
+        def predict_raw_same_prior_endpoint(*args, **kwargs):
+            raise AssertionError("preflight must not run inference")
+
     harness.teacher = LegacyTeacher()
     batch = {
         "latents": torch.zeros(1, 1, 1),
         "actions": torch.zeros(1, 1, 1),
     }
-    with pytest.raises(RuntimeError, match="same-prior"):
+    with pytest.raises(RuntimeError, match="continuation"):
         harness._validate_cosmos_mechanism_preflight(
             batch, teacher_steps=8, student_steps=2
+        )
+    with pytest.raises(ValueError, match="2 or 4"):
+        harness._validate_cosmos_mechanism_preflight(
+            batch, teacher_steps=8, student_steps=1
         )
 
 
@@ -731,185 +741,495 @@ def test_teacher_direct_and_composed_routes_share_start_and_endpoint_time():
     assert not torch.allclose(mismatched_endpoint, composed)
 
 
-def test_live_probe_feeds_same_prior_endpoint_and_verified_provenance(monkeypatch):
+def test_shared_query_builder_uses_k4_shifted_paths_and_distinct_legal_states(
+    monkeypatch,
+):
     import distillation_flowmap.flowmap_step as flowmap_step_module
 
-    endpoint_video = torch.full((1, 1, 2, 1, 1), 9.0)
-    captured_metrics = {}
-
-    class Teacher:
-        raw_inference_enabled = True
+    class Harness(FlowMapStepMixin):
+        device = torch.device("cpu")
 
         def __init__(self):
-            self.same_prior_calls = 0
-            self.video_prior = None
-            self.action_prior = None
-
-        def predict_raw_latent_target(self, *args, **kwargs):
-            return {
-                "cosmos_latent_x0": torch.zeros(1, 1, 2, 1, 1),
-                "actions": torch.zeros(1, 1, 1),
-            }
-
-        def predict_raw_joint_latent_velocity(self, *args, **kwargs):
-            raise AssertionError("the harness replaces the field probe")
-
-        def predict_raw_same_prior_endpoint(
-            self, batch, *, video_prior, action_prior, teacher_steps
-        ):
-            del batch
-            self.same_prior_calls += 1
-            self.video_prior = video_prior
-            self.action_prior = action_prior
-            return {
-                "endpoint_video": endpoint_video,
-                "video_frame_mask": torch.ones(1, 2, dtype=torch.bool),
-                "effective_teacher_steps": teacher_steps,
-                "video_prior_sha256": "verified-by-adapter",
-                "action_prior_sha256": "verified-by-adapter",
-            }
-
-    class Harness(_BuilderHarness):
-        def __init__(self):
-            super().__init__()
-            self.teacher = Teacher()
-            self.student_rollout_video_prior = None
-            self.student_rollout_action_prior = None
-            self.teacher_field_query = None
+            self.student = object()
+            self.empty_emb = torch.zeros(1, 1, 1)
             self.config = SimpleNamespace(
                 num_train_timesteps=1000,
-                attn_mode="flex",
-                action_downsample_factor=1,
-                cosmos_latent_epsilon=1e-3,
-                norm_stat={"q01": 0.0, "q99": 1.0},
-                inverse_used_action_channel_ids=None,
-                used_action_channel_ids=tuple(range(7)),
-                action_packing_schema="unused",
-                mechanism_cosmos_t_min=4.0 / 5.0,
-                mechanism_cosmos_t_max=80.0 / 81.0,
-                mechanism_diagnostic_r=500,
-                mechanism_diagnostic_s=250,
+                cosmos_latent_channels=1,
+                cosmos_latent_frames=3,
+                cosmos_latent_height=1,
+                cosmos_latent_width=1,
+                action_downsample_factor=4,
+                action_packing_schema="downsample_survivor_v2",
+                used_action_channel_ids=list(range(7)),
+                snr_shift=5.0,
+                action_snr_shift=0.05,
+                opd_danceopd_rollout_steps=(2, 4),
+                cfg_min=1.0,
+                cfg_max=1.0,
             )
+            self.calls = []
 
-        def _validate_cosmos_mechanism_preflight(self, *args, **kwargs):
+        @staticmethod
+        def _mechanism_joint_input(video, action, video_t, action_t, context):
+            return {
+                "latent_dict": {
+                    "noisy_latents": video,
+                    "timesteps": video_t,
+                },
+                "action_dict": {
+                    "noisy_latents": action,
+                    "timesteps": action_t,
+                },
+            }
+
+        @staticmethod
+        def _init_joint_mask(_joint_input):
             return None
 
-        def _prepare_cosmos_mechanism_context(self, batch):
-            return {
-                "batch": batch,
-                "input_dict": {
-                    "latent_dict": {},
-                    "action_dict": {
-                        "latent": batch["actions"],
-                        "cond_timesteps": torch.zeros(1, 1),
-                        "text_emb": torch.zeros(1, 1, 1),
-                        "grid_id": None,
-                        "actions_mask": torch.ones(1, 1, 1, 1, 1),
-                    },
-                    "chunk_size": 1,
-                    "window_size": 1,
-                },
-                "batch_size": 1,
-                "ref_shape": (1, 1, 2, 1, 1),
-                "action_clean": batch["actions"],
-                "action_frames": 1,
-                "action_mask": torch.ones(1, 1, 1, 1, 1),
-                "action_latent": batch["actions"],
-                "action_cond_t": torch.zeros(1, 1),
-                "action_text": torch.zeros(1, 1, 1),
-                "action_grid": None,
-                "empty_emb": torch.zeros(1, 1, 1),
-                "chunk_size": 1,
-                "window_size": 1,
-                "student_model": self.student,
-                "cfg_scale": 1.0,
-                "video_base": {},
-            }
-
-        def _student_euler_integrate(self, **kwargs):
-            self.student_rollout_video_prior = kwargs["noisy_latents"]
-            self.student_rollout_action_prior = kwargs["base_input_dict"][
-                "action_dict"
-            ]["noisy_latents"]
+        def _student_joint_forward(
+            self,
+            model,
+            joint_input,
+            empty_emb,
+            video_r,
+            action_r,
+            **kwargs,
+        ):
+            del model, empty_emb, kwargs
+            self.calls.append(
+                SimpleNamespace(
+                    video=joint_input["latent_dict"]["noisy_latents"],
+                    action=joint_input["action_dict"]["noisy_latents"],
+                    video_t=joint_input["latent_dict"]["timesteps"],
+                    action_t=joint_input["action_dict"]["timesteps"],
+                    video_r=video_r,
+                    action_r=action_r,
+                )
+            )
             return (
-                torch.full((1, 1, 2, 1, 1), 2.0),
-                None,
-                None,
-                torch.zeros(1, 7, 1, 1, 1),
+                torch.ones_like(joint_input["latent_dict"]["noisy_latents"]),
+                torch.ones_like(joint_input["action_dict"]["noisy_latents"]),
             )
 
-        def _cosmos_teacher_field_probe(self, **kwargs):
-            self.teacher_field_query = kwargs["query_latent"]
-            return {
-                "student_query_video": kwargs["query_latent"],
-                "teacher_field_video": torch.zeros(1, 1, 2, 1, 1),
-                "video_frame_mask": torch.ones(1, 2, dtype=torch.bool),
-                "student_direct_video": torch.full((1, 1, 2, 1, 1), 4.0),
-                "student_field_video": torch.zeros(1, 1, 2, 1, 1),
-            }
+        @staticmethod
+        def _extract_action_v(action, _frames):
+            return action
 
-        def _cosmos_student_joint_map(self, *args, **kwargs):
-            value = 5.0 if len(self.captured) == 0 else 6.0
-            self.captured.append(value)
+        @staticmethod
+        def _joint_euler_update(
+            video, action, video_v, action_v, video_t, video_r, action_t, action_r
+        ):
+            def view(time):
+                return time[:, None, :, None, None] / 1000.0
+
             return (
-                torch.full((1, 1, 2, 1, 1), value),
-                torch.zeros(1, 1, 1, 1, 1),
-                torch.zeros(1, 1, 2, 1, 1),
-                torch.zeros(1, 1, 1, 1, 1),
+                video + video_v * (view(video_r) - view(video_t)),
+                action + action_v * (view(action_r) - view(action_t)),
             )
 
-        def _cosmos_teacher_video_continuation(self, **kwargs):
-            return torch.full((1, 1, 2, 1, 1), 7.0)
+    batch = {
+        "latents": torch.zeros(2, 1, 3, 1, 1),
+        "actions": torch.zeros(2, 7, 16, 4, 1),
+    }
+    input_dict = {
+        "latent_dict": {
+            "latent": batch["latents"],
+            "cond_timesteps": torch.zeros(2, 3),
+            "text_emb": torch.zeros(2, 1, 1),
+            "grid_id": None,
+        },
+        "action_dict": {
+            "latent": batch["actions"],
+            "cond_timesteps": torch.zeros(2, 16),
+            "text_emb": torch.zeros(2, 1, 1),
+            "grid_id": None,
+            "actions_mask": torch.ones_like(batch["actions"][:, :1]),
+        },
+        "chunk_size": 1,
+        "window_size": 1,
+    }
+    monkeypatch.setattr(
+        flowmap_step_module,
+        "sample_nonterminal_semantic_query_indices",
+        lambda sigmas, batch_size: torch.tensor([1, 2]),
+    )
+    harness = Harness()
+    shared = harness._build_cosmos_shifted_shared_query(
+        batch, input_dict, student_steps=4
+    )
 
-        def _cosmos_action_context_predictions(self, *args, **kwargs):
-            zero = torch.zeros(1, 1, 1, 1, 1)
-            return {"gt": zero, "student": zero, "teacher_video": zero}
+    video_sigmas = build_shifted_terminal_path(
+        steps=4, shift=5.0, device=torch.device("cpu"), dtype=torch.float32
+    )
+    action_sigmas = build_shifted_terminal_path(
+        steps=4, shift=0.05, device=torch.device("cpu"), dtype=torch.float32
+    )
+    torch.testing.assert_close(
+        shared["query_video_t"],
+        torch.stack((video_sigmas[1].expand(3), video_sigmas[2].expand(3)))
+        * 1000,
+    )
+    torch.testing.assert_close(
+        shared["query_action_t"],
+        torch.stack((action_sigmas[1].expand(4), action_sigmas[2].expand(4)))
+        * 1000,
+    )
+    unpacked = unpack_flowmap_action_query(
+        harness.calls[0].action,
+        used_action_channel_ids=list(range(7)),
+        packing_schema="downsample_survivor_v2",
+        downsample_factor=4,
+    )
+    torch.testing.assert_close(unpacked, shared["native_action_prior"])
+    assert shared["student_steps"] == 4
+    assert shared["query_indices"].tolist() == [1, 2]
 
-    def capture_samples(**kwargs):
-        captured_metrics.update(kwargs)
-        return {"mechanism/g_anchor": torch.zeros(1)}
 
+class _AlignedMechanismTeacher:
+    raw_inference_enabled = True
+
+    def __init__(self, *, legacy_value=0.0, mask_mode="valid", steps=8):
+        self.legacy_value = legacy_value
+        self.mask_mode = mask_mode
+        self.steps = steps
+        self.field_call = None
+        self.same_prior_call = None
+        self.continuation_call = None
+
+    def _mask(self, reference, *, endpoint=False):
+        mask = torch.zeros(
+            reference.shape[0], reference.shape[2], dtype=torch.bool
+        )
+        if self.mask_mode != "empty":
+            mask[:, 6:8] = True
+        if self.mask_mode == "mismatch" and endpoint:
+            mask[0, 6] = False
+        return mask
+
+    def predict_raw_joint_latent_velocity(
+        self, batch, query_latent, query_action, t
+    ):
+        del batch
+        self.field_call = SimpleNamespace(
+            video=query_latent, action=query_action, t=t
+        )
+        return {
+            "cosmos_joint_query": query_latent,
+            "cosmos_latent_velocity": torch.zeros_like(query_latent),
+            "cosmos_video_frame_mask": self._mask(query_latent),
+        }
+
+    def predict_raw_same_prior_endpoint(
+        self, batch, *, video_prior, action_prior, teacher_steps
+    ):
+        del batch
+        self.same_prior_call = SimpleNamespace(
+            video_prior=video_prior,
+            action_prior=action_prior,
+            teacher_steps=teacher_steps,
+        )
+        return {
+            "endpoint_video": torch.full_like(video_prior, 9.0),
+            "video_frame_mask": self._mask(video_prior, endpoint=True),
+            "effective_teacher_steps": self.steps,
+            "video_prior_sha256": "verified",
+            "action_prior_sha256": "verified",
+        }
+
+    def predict_raw_joint_continuation_endpoint(
+        self,
+        batch,
+        *,
+        canonical_joint_state,
+        normalized_t,
+        teacher_steps,
+    ):
+        del batch
+        self.continuation_call = SimpleNamespace(
+            state=canonical_joint_state,
+            normalized_t=normalized_t,
+            teacher_steps=teacher_steps,
+        )
+        batch_size = canonical_joint_state.shape[0]
+        return {
+            "endpoint_video": torch.full_like(canonical_joint_state, 7.0),
+            "video_frame_mask": self._mask(
+                canonical_joint_state, endpoint=True
+            ),
+            "effective_teacher_steps": self.steps,
+            "joint_state_sha256": "verified",
+            "normalized_t_sha256": "verified",
+            "normalized_t": normalized_t[:, 0],
+            "edm_sigma": normalized_t[:, 0] / (1.0 - normalized_t[:, 0]),
+        }
+
+    def predict_raw_latent_target(self, batch, **kwargs):
+        del batch, kwargs
+        return {
+            "cosmos_latent_x0": torch.full(
+                (2, 16, 9, 28, 28), self.legacy_value
+            ),
+            "actions": torch.full((2, 16, 7), self.legacy_value),
+        }
+
+
+class _AlignedMechanismHarness(FlowMapStepMixin):
+    device = torch.device("cpu")
+
+    def __init__(self, teacher):
+        self.teacher = teacher
+        self.student = object()
+        self.empty_emb = torch.zeros(1, 1, 1)
+        self.calls = []
+        self.config = SimpleNamespace(
+            num_train_timesteps=1000,
+            cosmos_latent_channels=16,
+            cosmos_latent_frames=9,
+            cosmos_latent_height=28,
+            cosmos_latent_width=28,
+            action_downsample_factor=4,
+            action_packing_schema="downsample_survivor_v2",
+            used_action_channel_ids=list(range(7)),
+            inverse_used_action_channel_ids=list(range(7)),
+            snr_shift=5.0,
+            action_snr_shift=0.05,
+            opd_danceopd_rollout_steps=(2, 4),
+            cfg_min=1.0,
+            cfg_max=1.0,
+            cosmos_latent_epsilon=1e-3,
+            norm_stat={"q01": 0.0, "q99": 1.0},
+            mechanism_diagnostic_r=500.0,
+            mechanism_diagnostic_s=250.0,
+            mechanism_cosmos_t_min=4.0 / 5.0,
+            mechanism_cosmos_t_max=80.0 / 81.0,
+        )
+
+    @staticmethod
+    def _prepare_base_dict(batch):
+        batch_size = batch["latents"].shape[0]
+        return {
+            "latent_dict": {
+                "latent": batch["latents"],
+                "cond_timesteps": torch.zeros(batch_size, 9),
+                "text_emb": torch.zeros(batch_size, 1, 1),
+                "grid_id": None,
+            },
+            "action_dict": {
+                "latent": batch["actions"],
+                "cond_timesteps": torch.zeros(batch_size, 16),
+                "text_emb": torch.zeros(batch_size, 1, 1),
+                "grid_id": None,
+                "actions_mask": torch.ones_like(batch["actions"][:, :1]),
+            },
+            "chunk_size": 1,
+            "window_size": 1,
+        }
+
+    def _prepare_cosmos_mechanism_context(self, batch):
+        input_dict = self._prepare_base_dict(batch)
+        action = batch["actions"][:, :, ::4]
+        return {
+            "batch": batch,
+            "input_dict": input_dict,
+            "batch_size": batch["latents"].shape[0],
+            "ref_shape": tuple(batch["latents"].shape),
+            "action_clean": action,
+            "action_frames": action.shape[2],
+            "action_mask": input_dict["action_dict"]["actions_mask"][:, :, ::4],
+            "student_model": self.student,
+            "video_base": input_dict["latent_dict"],
+            "action_latent": action,
+            "action_cond_t": input_dict["action_dict"]["cond_timesteps"][:, ::4],
+            "action_text": input_dict["action_dict"]["text_emb"],
+            "action_grid": None,
+            "empty_emb": self.empty_emb.expand(batch["latents"].shape[0], -1, -1),
+            "chunk_size": 1,
+            "window_size": 1,
+            "cfg_scale": 1.0,
+        }
+
+    @staticmethod
+    def _mechanism_joint_input(video, action, video_t, action_t, context):
+        return {
+            "latent_dict": {
+                "noisy_latents": video,
+                "timesteps": video_t,
+            },
+            "action_dict": {
+                "noisy_latents": action,
+                "timesteps": action_t,
+            },
+        }
+
+    @staticmethod
+    def _init_joint_mask(_joint_input):
+        return None
+
+    def _student_joint_forward(
+        self,
+        model,
+        joint_input,
+        empty_emb,
+        video_r,
+        action_r,
+        *,
+        require_action,
+        **kwargs,
+    ):
+        del model, empty_emb, kwargs
+        call = SimpleNamespace(
+            video=joint_input["latent_dict"]["noisy_latents"],
+            action=joint_input["action_dict"]["noisy_latents"],
+            video_t=joint_input["latent_dict"]["timesteps"],
+            action_t=joint_input["action_dict"]["timesteps"],
+            video_r=video_r,
+            action_r=action_r,
+            require_action=require_action,
+        )
+        self.calls.append(call)
+        video_velocity = torch.ones_like(call.video)
+        if not require_action:
+            return video_velocity
+        return video_velocity, torch.ones_like(call.action)
+
+    @staticmethod
+    def _extract_action_v(action, _frames):
+        return action
+
+    @staticmethod
+    def _joint_euler_update(
+        video, action, video_v, action_v, video_t, video_r, action_t, action_r
+    ):
+        def view(time):
+            return time[:, None, :, None, None] / 1000.0
+
+        return (
+            video + video_v * (view(video_r) - view(video_t)),
+            action + action_v * (view(action_r) - view(action_t)),
+        )
+
+    def _cosmos_action_context_predictions(self, *args, **kwargs):
+        del args, kwargs
+        zero = torch.zeros(2, 7, 4, 4, 1)
+        return {"gt": zero, "student": zero, "teacher_video": zero}
+
+
+def _run_aligned_mechanism_case(
+    monkeypatch,
+    *,
+    legacy_value=0.0,
+    mask_mode="valid",
+    steps=8,
+):
+    import distillation_flowmap.flowmap_step as flowmap_step_module
+
+    captured_metrics = {}
+    monkeypatch.setattr(
+        flowmap_step_module,
+        "sample_nonterminal_semantic_query_indices",
+        lambda sigmas, batch_size: torch.tensor([1, 2]),
+    )
     monkeypatch.setattr(
         flowmap_step_module,
         "cosmos_actions_to_flowmap_x0",
-        lambda *args, **kwargs: torch.zeros(1, 7, 1, 1, 1),
+        lambda actions, **kwargs: torch.zeros(
+            kwargs["target_shape"], dtype=kwargs["dtype"]
+        ),
     )
-    packed_action_inputs = []
 
-    def fake_pack_actions(aligned_prior, *args, **kwargs):
-        packed_action_inputs.append(aligned_prior)
-        return torch.zeros(1, 7, 1, 1, 1)
+    def capture_samples(**kwargs):
+        captured_metrics.update(kwargs)
+        return {"mechanism/g_anchor": torch.zeros(2)}
 
-    monkeypatch.setattr(
-        flowmap_step_module, "pack_actions_for_downsample", fake_pack_actions
-    )
     monkeypatch.setattr(
         flowmap_step_module, "compute_mechanism_metric_samples", capture_samples
     )
-    harness = Harness()
+    teacher = _AlignedMechanismTeacher(
+        legacy_value=legacy_value, mask_mode=mask_mode, steps=steps
+    )
+    harness = _AlignedMechanismHarness(teacher)
     batch = {
-        "latents": torch.zeros(1, 1, 2, 1, 1),
-        "actions": torch.zeros(1, 7, 1, 1, 1),
+        "latents": torch.zeros(2, 16, 9, 28, 28),
+        "actions": torch.zeros(2, 7, 16, 4, 1),
     }
-    harness._run_cosmos_mechanism_probe(
-        batch, seed=7, teacher_steps=8, student_steps=2
+    stats = harness._run_cosmos_mechanism_probe(
+        batch, seed=17, teacher_steps=8, student_steps=4
     )
+    return harness, teacher, captured_metrics, stats
 
-    assert harness.teacher.same_prior_calls == 1
-    assert harness.teacher.video_prior is harness.student_rollout_video_prior
-    assert harness.teacher_field_query.data_ptr() != batch["latents"].data_ptr()
-    assert harness.teacher_field_query.requires_grad is False
-    assert harness.student_rollout_action_prior.requires_grad is False
+
+def test_live_probe_uses_shared_k4_state_and_exact_direct_composed_edges(
+    monkeypatch,
+):
+    harness, teacher, metrics, stats = _run_aligned_mechanism_case(monkeypatch)
+
+    rollout = harness.calls[:4]
+    field = harness.calls[4]
+    direct, first_edge, second_edge = harness.calls[5:8]
+    video_sigmas = build_shifted_terminal_path(
+        steps=4, shift=5.0, device=torch.device("cpu"), dtype=torch.float32
+    )
+    expected_r = torch.stack(
+        (video_sigmas[1].expand(9), video_sigmas[2].expand(9))
+    ) * 1000
+    torch.testing.assert_close(field.video_t, expected_r)
+    assert field.video.data_ptr() == direct.video.data_ptr()
+    assert teacher.continuation_call.state.data_ptr() == field.video.data_ptr()
+    torch.testing.assert_close(direct.video_t, expected_r)
+    assert torch.count_nonzero(direct.video_r) == 0
+    torch.testing.assert_close(first_edge.video_t, expected_r)
+    assert torch.all(first_edge.video_r == 250)
+    assert torch.all(second_edge.video_t == 250)
+    assert torch.count_nonzero(second_edge.video_r) == 0
+    assert torch.all(first_edge.action_r < first_edge.action_t)
+    assert torch.all(second_edge.action_t > second_edge.action_r)
     torch.testing.assert_close(
-        packed_action_inputs[0][..., tuple(range(7))],
-        harness.teacher.action_prior,
+        metrics["teacher_continuation_video"],
+        torch.full_like(metrics["teacher_continuation_video"], 7.0),
     )
     torch.testing.assert_close(
-        captured_metrics["same_prior_teacher_endpoint_video"], endpoint_video
+        metrics["same_prior_teacher_endpoint_video"],
+        torch.full_like(metrics["same_prior_teacher_endpoint_video"], 9.0),
     )
-    assert captured_metrics["shared_state_verified"] is True
-    assert captured_metrics["same_prior_verified"] is True
-    assert captured_metrics["effective_teacher_steps"] == 8
+    assert metrics["shared_state_verified"] is True
+    assert metrics["same_prior_verified"] is True
+    assert metrics["continuation_verified"] is True
+    assert metrics["effective_teacher_steps"] == 8
+    assert stats["mechanism/student_steps_sum"].item() == 8
+    assert len(rollout) == 4
+
+
+def test_legacy_target_changes_cannot_change_g_inputs(monkeypatch):
+    _, _, first, _ = _run_aligned_mechanism_case(
+        monkeypatch, legacy_value=-100.0
+    )
+    _, _, second, _ = _run_aligned_mechanism_case(
+        monkeypatch, legacy_value=100.0
+    )
+    for key in (
+        "teacher_continuation_video",
+        "same_prior_teacher_endpoint_video",
+        "direct_route_video",
+        "composed_route_video",
+    ):
+        torch.testing.assert_close(first[key], second[key])
+
+
+@pytest.mark.parametrize(
+    "mask_mode,steps,match",
+    [
+        ("empty", 8, "nonempty mask"),
+        ("mismatch", 8, "mask"),
+        ("valid", 7, "eight-step"),
+    ],
+)
+def test_live_probe_fails_closed_on_mask_or_step_provenance(
+    monkeypatch, mask_mode, steps, match
+):
+    with pytest.raises(RuntimeError, match=match):
+        _run_aligned_mechanism_case(
+            monkeypatch, mask_mode=mask_mode, steps=steps
+        )
 
 
 def test_probe_interface_is_observation_only_and_capability_gates_teacher_joint():

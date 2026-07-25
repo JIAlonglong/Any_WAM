@@ -576,6 +576,9 @@ def test_aligned_cosmos_video_opd_reuses_one_generated_canonical_joint_state():
                 ),
             )
 
+    Harness._build_cosmos_shifted_shared_query = _flowmap_method(
+        "_build_cosmos_shifted_shared_query"
+    )
     Harness._cosmos_aligned_video_opd_step = _flowmap_method(
         "_cosmos_aligned_video_opd_step"
     )
@@ -928,6 +931,10 @@ def _aligned_recording_case(
     class Harness(_AlignedRecorderHarness):
         pass
 
+    Harness._build_cosmos_shifted_shared_query = _flowmap_method(
+        "_build_cosmos_shifted_shared_query",
+        **overrides,
+    )
     Harness._cosmos_aligned_video_opd_step = _flowmap_method(
         "_cosmos_aligned_video_opd_step",
         **overrides,

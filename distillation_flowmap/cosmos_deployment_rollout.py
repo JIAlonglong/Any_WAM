@@ -4,12 +4,21 @@ import torch
 
 
 DEPLOYMENT_STUDENT_STEPS = (1, 2, 4)
+MECHANISM_DIAGNOSTIC_STUDENT_STEPS = (2, 4)
 
 
 def deployment_joint_step_for_update(update_index: int) -> int:
     if update_index < 0:
         raise ValueError("update_index must be non-negative")
     return DEPLOYMENT_STUDENT_STEPS[update_index % len(DEPLOYMENT_STUDENT_STEPS)]
+
+
+def mechanism_diagnostic_joint_step_for_update(diagnostic_index: int) -> int:
+    if diagnostic_index < 0:
+        raise ValueError("diagnostic_index must be non-negative")
+    return MECHANISM_DIAGNOSTIC_STUDENT_STEPS[
+        diagnostic_index % len(MECHANISM_DIAGNOSTIC_STUDENT_STEPS)
+    ]
 
 
 def should_run_deployment_joint_rollout(step: int, interval: int = 4) -> bool:

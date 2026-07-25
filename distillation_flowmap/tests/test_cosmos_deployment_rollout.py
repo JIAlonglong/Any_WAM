@@ -4,6 +4,7 @@ import torch
 from distillation_flowmap.cosmos_deployment_rollout import (
     deployment_endpoint_losses,
     deployment_joint_step_for_update,
+    mechanism_diagnostic_joint_step_for_update,
     should_run_deployment_joint_rollout,
     should_run_raw_auxiliary,
 )
@@ -13,6 +14,15 @@ def test_deployment_k_cycle_is_balanced_and_deterministic():
     assert [deployment_joint_step_for_update(i) for i in range(9)] == [
         1, 2, 4, 1, 2, 4, 1, 2, 4
     ]
+
+
+def test_mechanism_diagnostic_cycle_excludes_non_compositional_k1():
+    assert [
+        mechanism_diagnostic_joint_step_for_update(i) for i in range(8)
+    ] == [2, 4, 2, 4, 2, 4, 2, 4]
+
+    with pytest.raises(ValueError, match="non-negative"):
+        mechanism_diagnostic_joint_step_for_update(-1)
 
 
 def test_deployment_steps_match_the_compositional_training_budgets():

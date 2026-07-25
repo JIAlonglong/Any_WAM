@@ -122,6 +122,7 @@ def compute_mechanism_metric_samples(
     teacher_joint_available: bool = True,
     shared_state_verified: bool = False,
     same_prior_verified: bool = False,
+    continuation_verified: bool = False,
     effective_teacher_steps: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Return per-sample metrics; callers retain raw non-finite values for validity."""
@@ -192,6 +193,9 @@ def compute_mechanism_metric_samples(
         ),
         "mechanism/same_prior_verified": torch.full_like(
             anchor, float(bool(same_prior_verified))
+        ),
+        "mechanism/continuation_verified": torch.full_like(
+            anchor, float(bool(continuation_verified))
         ),
         "mechanism/effective_teacher_steps_verified": torch.full_like(
             anchor,

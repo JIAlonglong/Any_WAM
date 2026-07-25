@@ -404,6 +404,74 @@ def test_same_prior_endpoint_request_round_trips_exact_priors_and_eight_steps(
     assert result["video_frame_mask"].dtype == torch.bool
 
 
+def test_joint_continuation_request_round_trips_state_time_and_provenance(tmp_path):
+    teacher = _make_same_prior_teacher(tmp_path)
+    canonical = torch.randn(1, 16, 9, 28, 28, dtype=torch.float32)
+    normalized_t = torch.full((1, 9), 5.0 / 6.0, dtype=torch.float32)
+    captured = {}
+
+    def fake_worker(payload, arrays):
+        captured.update(payload)
+        np.testing.assert_array_equal(
+            arrays["canonical_joint_state"], canonical.numpy()
+        )
+        np.testing.assert_array_equal(arrays["normalized_t"], normalized_t.numpy())
+        return {
+            "endpoint_video": np.zeros_like(arrays["canonical_joint_state"]),
+            "video_frame_mask": np.ones((1, 9), dtype=bool),
+            "effective_teacher_steps": 8,
+            "joint_state_sha256": _sha256_array(
+                arrays["canonical_joint_state"]
+            ),
+            "normalized_t_sha256": _sha256_array(arrays["normalized_t"]),
+            "normalized_t": arrays["normalized_t"][:, 0],
+            "edm_sigma": np.asarray([5.0], dtype=np.float32),
+        }
+
+    teacher._request_raw_worker_npz = fake_worker
+    result = teacher.predict_raw_joint_continuation_endpoint(
+        {"raw_task": ["task"]},
+        canonical_joint_state=canonical,
+        normalized_t=normalized_t,
+        teacher_steps=8,
+    )
+
+    assert captured["mode"] == "joint_continuation_endpoint"
+    assert captured["teacher_steps"] == 8
+    assert result["effective_teacher_steps"] == 8
+    torch.testing.assert_close(result["normalized_t"], torch.tensor([5.0 / 6.0]))
+    torch.testing.assert_close(result["edm_sigma"], torch.tensor([5.0]))
+
+
+def test_joint_continuation_adapter_rejects_empty_mask_and_bad_fingerprint(
+    tmp_path,
+):
+    teacher = _make_same_prior_teacher(tmp_path)
+    canonical = torch.zeros(1, 16, 9, 28, 28)
+    normalized_t = torch.full((1,), 5.0 / 6.0)
+
+    def fake_worker(payload, arrays):
+        del payload
+        return {
+            "endpoint_video": np.zeros_like(arrays["canonical_joint_state"]),
+            "video_frame_mask": np.zeros((1, 9), dtype=bool),
+            "effective_teacher_steps": 8,
+            "joint_state_sha256": "wrong",
+            "normalized_t_sha256": _sha256_array(arrays["normalized_t"]),
+            "normalized_t": arrays["normalized_t"],
+            "edm_sigma": np.asarray([5.0], dtype=np.float32),
+        }
+
+    teacher._request_raw_worker_npz = fake_worker
+    with pytest.raises(RuntimeError, match="fingerprint|nonempty"):
+        teacher.predict_raw_joint_continuation_endpoint(
+            {"raw_task": ["task"]},
+            canonical_joint_state=canonical,
+            normalized_t=normalized_t,
+            teacher_steps=8,
+        )
+
+
 def test_same_prior_endpoint_rejects_non_eight_steps_before_worker_start(tmp_path):
     teacher = _make_same_prior_teacher(tmp_path)
     teacher._ensure_raw_worker = lambda: pytest.fail("worker must not start")

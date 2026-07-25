@@ -37,6 +37,13 @@ def _runtime_model(*, nfe=8, endpoint_dtype=torch.float32, sigma_min=4, sigma_ma
             use_variance_scale=use_variance_scale,
             seed=seed,
         )
+        captured.setdefault("calls", []).append(
+            {
+                "data_batch": data_batch,
+                "x_sigma_max": x_sigma_max,
+                "sigma_max": sigma_max,
+            }
+        )
         x0_fn = self.get_x0_fn_from_batch(data_batch, guidance)
         sigma = torch.ones(x_sigma_max.shape[0])
         for _ in range(self.requested_nfe):
@@ -487,15 +494,15 @@ def test_same_prior_worker_requires_exact_joint_geometry_and_preserves_video():
         teacher_steps=8,
     )
 
-    joint = captured["joint_prior"]
+    edm_joint = captured["joint_prior"]
     packed = action_prior.flatten().repeat(112)[: 16 * 28 * 28].reshape(16, 28, 28)
-    assert torch.equal(joint[0, :, 4], packed)
-    assert torch.equal(joint[0, :, 6], video_prior[0, :, 6])
-    assert torch.equal(joint[0, :, 7], video_prior[0, :, 7])
+    assert torch.equal(edm_joint[0, :, 4], packed * 80.0)
+    assert torch.equal(edm_joint[0, :, 6], video_prior[0, :, 6] * 80.0)
+    assert torch.equal(edm_joint[0, :, 7], video_prior[0, :, 7] * 80.0)
     assert result["video_frame_mask"].tolist() == [
         [False, False, False, False, False, False, True, True, False]
     ]
-    assert torch.equal(result["endpoint_video"], joint + 10)
+    assert torch.equal(result["endpoint_video"], edm_joint + 10)
     assert result["effective_teacher_steps"] == 8
 
     with pytest.raises(ValueError, match=r"\[B,16,9,28,28\]"):
@@ -507,6 +514,96 @@ def test_same_prior_worker_requires_exact_joint_geometry_and_preserves_video():
             action_prior,
             teacher_steps=8,
         )
+
+
+def test_joint_continuation_converts_each_normalized_state_to_its_own_edm_sigma():
+    from distillation_flowmap.cosmos_policy_raw_worker import (
+        _run_joint_continuation_endpoint,
+    )
+
+    model, captured = _runtime_model()
+    canonical = torch.stack(
+        (
+            torch.full((16, 9, 28, 28), 2.0),
+            torch.full((16, 9, 28, 28), 3.0),
+        )
+    )
+    normalized_t = torch.tensor(
+        [[5.0 / 6.0] * 9, [15.0 / 16.0] * 9],
+        dtype=torch.float32,
+    )
+    data_batch = {
+        "video": torch.zeros(2, 3, 33, 224, 224, dtype=torch.uint8),
+        "action_latent_idx": torch.tensor([4, 4]),
+    }
+
+    result = _run_joint_continuation_endpoint(
+        model,
+        data_batch,
+        _latent_indices(),
+        canonical,
+        normalized_t,
+        teacher_steps=8,
+    )
+
+    assert len(captured["calls"]) == 2
+    assert captured["calls"][0]["sigma_max"] == pytest.approx(5.0)
+    assert captured["calls"][1]["sigma_max"] == pytest.approx(15.0)
+    assert isinstance(captured["calls"][0]["sigma_max"], float)
+    torch.testing.assert_close(
+        captured["calls"][0]["x_sigma_max"],
+        canonical[0:1] * 6.0,
+    )
+    torch.testing.assert_close(
+        captured["calls"][1]["x_sigma_max"],
+        canonical[1:2] * 16.0,
+    )
+    assert result["effective_teacher_steps"] == 8
+    torch.testing.assert_close(
+        result["edm_sigma"], torch.tensor([5.0, 15.0])
+    )
+
+
+def test_joint_continuation_rejects_per_frame_time_disagreement_before_sampler():
+    from distillation_flowmap.cosmos_policy_raw_worker import (
+        _run_joint_continuation_endpoint,
+    )
+
+    model, captured = _runtime_model()
+    normalized_t = torch.full((1, 9), 5.0 / 6.0, dtype=torch.float32)
+    normalized_t[0, 3] = 15.0 / 16.0
+
+    with pytest.raises(ValueError, match="constant across frames"):
+        _run_joint_continuation_endpoint(
+            model,
+            _data_batch(),
+            _latent_indices(),
+            torch.zeros(1, 16, 9, 28, 28),
+            normalized_t,
+            teacher_steps=8,
+        )
+
+    assert captured.get("calls", []) == []
+
+
+def test_joint_continuation_rejects_empty_video_mask_before_sampler():
+    from distillation_flowmap.cosmos_policy_raw_worker import (
+        _run_joint_continuation_endpoint,
+    )
+
+    model, captured = _runtime_model()
+    empty_indices = {key: -1 for key in _latent_indices()}
+    with pytest.raises(RuntimeError, match="nonempty"):
+        _run_joint_continuation_endpoint(
+            model,
+            _data_batch(),
+            empty_indices,
+            torch.zeros(1, 16, 9, 28, 28),
+            torch.full((1,), 5.0 / 6.0),
+            teacher_steps=8,
+        )
+
+    assert captured.get("calls", []) == []
 
 
 def test_same_prior_npz_loader_rejects_dtype_before_fingerprinting():

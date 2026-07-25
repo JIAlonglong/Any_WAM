@@ -731,7 +731,11 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "ok": True,
-                    "note": "Local preflight passed; it did not start a Cosmos worker or prove Cosmos CUDA-extra compatibility.",
+                    "note": (
+                        "Local preflight validated the configured Cosmos worker "
+                        "CUDA runtime and host prerequisites; it did not start a "
+                        "Cosmos worker or load rollout model weights."
+                    ),
                 }
             )
         )

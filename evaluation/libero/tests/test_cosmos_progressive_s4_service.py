@@ -1295,7 +1295,7 @@ def test_live_main_seeds_before_building_service(monkeypatch):
     assert events == [("seed", 41), ("build", None)]
 
 
-def test_preflight_neither_seeds_nor_builds_live_service(monkeypatch):
+def test_preflight_neither_seeds_nor_builds_live_service(monkeypatch, capsys):
     import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
 
     events = []
@@ -1327,6 +1327,13 @@ def test_preflight_neither_seeds_nor_builds_live_service(monkeypatch):
 
     assert result == 0
     assert events == [("preflight", None)]
+    note = capsys.readouterr().out
+    assert "validated the configured Cosmos worker CUDA runtime" in note
+    assert "did not start a Cosmos worker" in note
+    assert (
+        "did not start a Cosmos worker or prove Cosmos CUDA-extra compatibility"
+        not in note
+    )
 
 
 def test_stdio_builds_service_without_seeding(monkeypatch):

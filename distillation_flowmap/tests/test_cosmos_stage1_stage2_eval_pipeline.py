@@ -309,10 +309,29 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
         _plain_file(teacher / name)
     local_model = tmp_path / "local-model"
     local_model.mkdir()
+    worker_root = tmp_path / "cosmos-worker-env"
+    (worker_root / "bin").mkdir(parents=True)
     worker_python = _write_executable(
-        tmp_path / "cosmos-worker-python",
+        worker_root / "bin" / "python",
         "exit 0\n",
     )
+    worker_site_packages = worker_root / "lib/python3.10/site-packages"
+    for package in (
+        "cublas",
+        "cuda_cupti",
+        "cuda_nvrtc",
+        "cuda_runtime",
+        "cudnn",
+        "cufft",
+        "cufile",
+        "curand",
+        "cusolver",
+        "cusparse",
+        "nccl",
+        "nvjitlink",
+        "nvtx",
+    ):
+        (worker_site_packages / "nvidia" / package / "lib").mkdir(parents=True)
     cosmos_cuda = tmp_path / "cosmos-worker-pythonpath" / "cosmos-cuda"
     cosmos_oss = tmp_path / "cosmos-worker-pythonpath" / "cosmos-oss"
     cosmos_cuda.mkdir(parents=True)
@@ -367,6 +386,7 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
             "COSMOS_PREDICT25_LOCAL_MODEL_DIR": str(local_model),
             "COSMOS_POLICY_PYTHON": str(worker_python),
             "COSMOS_POLICY_EXTRA_PYTHONPATH": f"{cosmos_cuda}:{cosmos_oss}",
+            "COSMOS_WORKER_ENV_ROOT": str(worker_root),
             "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
             "CALLS_LOG": str(calls),
             "COSMOS_RAW_STAGE1_LAUNCHER": str(stage1),
@@ -464,6 +484,36 @@ def test_pipeline_read_only_modes_write_nothing(tmp_path, mode):
         f"COSMOS_POLICY_EXTRA_PYTHONPATH="
         f"{env['COSMOS_POLICY_EXTRA_PYTHONPATH']}"
     ) in evaluation
+    worker_cuda_root = (
+        Path(env["COSMOS_WORKER_ENV_ROOT"])
+        / "lib/python3.10/site-packages/nvidia"
+    )
+    expected_cuda = ":".join(
+        str(worker_cuda_root / package / "lib")
+        for package in (
+            "cublas",
+            "cuda_cupti",
+            "cuda_nvrtc",
+            "cuda_runtime",
+            "cudnn",
+            "cufft",
+            "cufile",
+            "curand",
+            "cusolver",
+            "cusparse",
+            "nccl",
+            "nvjitlink",
+            "nvtx",
+        )
+    )
+    assert f"COSMOS_WORKER_CUDA_LIBRARY_PATH={expected_cuda}" in evaluation
+    assert f"LD_LIBRARY_PATH={expected_cuda}" in evaluation
+    for label in ("STAGE1_COMMAND=", "STAGE2_COMMAND=", "EVAL_COMMAND="):
+        command = next(
+            line for line in result.stdout.splitlines() if line.startswith(label)
+        )
+        assert f"COSMOS_WORKER_CUDA_LIBRARY_PATH={expected_cuda}" in command
+        assert f"LD_LIBRARY_PATH={expected_cuda}" in command
 
 
 @pytest.mark.parametrize(
@@ -487,7 +537,7 @@ def test_pipeline_requires_explicit_cosmos_worker_environment(
     assert not Path(env["CALLS_LOG"]).exists()
 
 
-@pytest.mark.parametrize("invalid_kind", ("python", "pythonpath"))
+@pytest.mark.parametrize("invalid_kind", ("python", "pythonpath", "cuda_library"))
 def test_pipeline_rejects_invalid_cosmos_worker_environment_without_writes(
     tmp_path, invalid_kind
 ):
@@ -497,9 +547,12 @@ def test_pipeline_rejects_invalid_cosmos_worker_environment_without_writes(
         invalid.write_text("#!/bin/sh\n", encoding="utf-8")
         env["COSMOS_POLICY_PYTHON"] = str(invalid)
         expected = "COSMOS_POLICY_PYTHON"
-    else:
+    elif invalid_kind == "pythonpath":
         env["COSMOS_POLICY_EXTRA_PYTHONPATH"] += f":{tmp_path / 'missing'}"
         expected = "COSMOS_POLICY_EXTRA_PYTHONPATH"
+    else:
+        env["COSMOS_WORKER_CUDA_LIBRARY_PATH"] = str(tmp_path / "missing")
+        expected = "COSMOS_WORKER_CUDA_LIBRARY_PATH"
     before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
 
     result = _pipeline(env, output_root, "--dry-run")
@@ -507,6 +560,28 @@ def test_pipeline_rejects_invalid_cosmos_worker_environment_without_writes(
     after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
     assert result.returncode != 0
     assert expected in result.stderr
+    assert before == after
+    assert not output_root.exists()
+    assert not Path(env["CALLS_LOG"]).exists()
+
+
+def test_pipeline_default_cuda_library_path_fails_closed_when_component_missing(
+    tmp_path,
+):
+    env, output_root = _pipeline_env(tmp_path)
+    missing = (
+        Path(env["COSMOS_WORKER_ENV_ROOT"])
+        / "lib/python3.10/site-packages/nvidia/cudnn/lib"
+    )
+    missing.rmdir()
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    result = _pipeline(env, output_root, "--dry-run")
+
+    after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    assert result.returncode != 0
+    assert "COSMOS_WORKER_CUDA_LIBRARY_PATH" in result.stderr
+    assert "cudnn" in result.stderr
     assert before == after
     assert not output_root.exists()
     assert not Path(env["CALLS_LOG"]).exists()

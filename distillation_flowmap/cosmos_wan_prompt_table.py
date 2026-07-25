@@ -27,6 +27,7 @@ _CONFIG_FILES = (
 )
 _ARTIFACT_DIRS = ("text_encoder", "transformer")
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
+_TOKENIZER_VOCAB_FILES = ("spiece.model", "tokenizer.json")
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -39,11 +40,35 @@ def canonical_manifest_digest(tasks: Sequence[str]) -> str:
     return hashlib.sha256(_canonical_json(list(tasks))).hexdigest()
 
 
-def load_canonical_tasks(path: str | Path = DEFAULT_MANIFEST) -> tuple[str, ...]:
+def _load_manifest(path: str | Path) -> dict[str, Any]:
     source = Path(path)
     payload = json.loads(source.read_text(encoding="utf-8"))
     if payload.get("format") != "flash_wam.libero_40_task_manifest.v1":
         raise ValueError(f"unsupported LIBERO task manifest format: {source}")
+    source_metadata = payload.get("source")
+    source_digest = (
+        source_metadata.get("artifact_sha256")
+        if isinstance(source_metadata, Mapping)
+        else None
+    )
+    if (
+        not isinstance(source_digest, str)
+        or len(source_digest) != 64
+        or any(character not in "0123456789abcdef" for character in source_digest)
+    ):
+        raise ValueError(f"LIBERO task manifest source artifact digest is invalid: {source}")
+    return payload
+
+
+def canonical_task_source_digest(
+    path: str | Path = DEFAULT_MANIFEST,
+) -> str:
+    return _load_manifest(path)["source"]["artifact_sha256"]
+
+
+def load_canonical_tasks(path: str | Path = DEFAULT_MANIFEST) -> tuple[str, ...]:
+    source = Path(path)
+    payload = _load_manifest(source)
     tasks = payload.get("tasks")
     if (
         not isinstance(tasks, list)
@@ -65,19 +90,25 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def inspect_wan_base(path: str | Path) -> dict[str, Any]:
-    """Return a stable, cheap identity for the explicit Wan base model.
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON config: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"config must be a JSON object: {path}")
+    return payload
 
-    Config contents are hashed.  Large weight files are represented by their
-    relative names and sizes, which catches incomplete/mismatched layouts
-    without hashing many gigabytes during every preflight.
-    """
+
+def inspect_wan_base(path: str | Path) -> dict[str, Any]:
+    """Validate and content-hash the explicit deployed Wan base model."""
 
     root = Path(path).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Wan base model directory does not exist: {root}")
 
-    configs = {}
+    configs: dict[str, str] = {}
+    config_payloads: dict[str, dict[str, Any]] = {}
     for relative in _CONFIG_FILES:
         source = root / relative
         if not source.is_file() or source.is_symlink():
@@ -85,8 +116,52 @@ def inspect_wan_base(path: str | Path) -> dict[str, Any]:
                 f"Wan base model is missing plain file {relative}: {source}"
             )
         configs[relative] = _sha256_file(source)
+        config_payloads[relative] = _read_json_object(source)
 
-    weights = {}
+    transformer_config = config_payloads["transformer/config.json"]
+    if transformer_config.get("_class_name") != "WanTransformer3DModel":
+        raise ValueError(
+            "Wan transformer config _class_name must be WanTransformer3DModel"
+        )
+    text_config = config_payloads["text_encoder/config.json"]
+    architectures = text_config.get("architectures")
+    if (
+        not isinstance(architectures, list)
+        or "UMT5EncoderModel" not in architectures
+        or text_config.get("model_type") != "umt5"
+    ):
+        raise ValueError(
+            "Wan text encoder must use UMT5EncoderModel with model_type='umt5'"
+        )
+    if text_config.get("d_model") != PROMPT_SHAPE[2]:
+        raise ValueError(
+            f"Wan text encoder d_model must be {PROMPT_SHAPE[2]}, "
+            f"got {text_config.get('d_model')!r}"
+        )
+    tokenizer_config = config_payloads["tokenizer/tokenizer_config.json"]
+    if tokenizer_config.get("tokenizer_class") not in {
+        "T5Tokenizer",
+        "T5TokenizerFast",
+    }:
+        raise ValueError("Wan tokenizer_class must be T5Tokenizer or T5TokenizerFast")
+
+    tokenizer_root = root / "tokenizer"
+    if not any((tokenizer_root / name).is_file() for name in _TOKENIZER_VOCAB_FILES):
+        raise FileNotFoundError(
+            f"Wan tokenizer vocabulary is missing under {tokenizer_root}; "
+            f"expected one of {_TOKENIZER_VOCAB_FILES}"
+        )
+
+    artifacts: dict[str, dict[str, Any]] = {}
+    tokenizer_files = sorted(source for source in tokenizer_root.iterdir() if source.is_file())
+    for source in tokenizer_files:
+        if source.is_symlink():
+            raise ValueError(f"Wan tokenizer artifact must not be a symlink: {source}")
+        artifacts[str(source.relative_to(root))] = {
+            "size_bytes": source.stat().st_size,
+            "sha256": _sha256_file(source),
+        }
+
     for relative_dir in _ARTIFACT_DIRS:
         directory = root / relative_dir
         files = sorted(
@@ -99,9 +174,14 @@ def inspect_wan_base(path: str | Path) -> dict[str, Any]:
                 f"Wan base model has no weights under {relative_dir}: {directory}"
             )
         for source in files:
-            weights[str(source.relative_to(root))] = source.stat().st_size
+            if source.is_symlink():
+                raise ValueError(f"Wan model weight must not be a symlink: {source}")
+            artifacts[str(source.relative_to(root))] = {
+                "size_bytes": source.stat().st_size,
+                "sha256": _sha256_file(source),
+            }
 
-    identity_payload = {"configs": configs, "weight_sizes": weights}
+    identity_payload = {"configs": configs, "artifacts": artifacts}
     return {
         "resolved_path": str(root),
         "identity_sha256": hashlib.sha256(
@@ -166,6 +246,7 @@ def prompt_table_payload(
     *,
     tasks: Sequence[str],
     wan_base: Mapping[str, Any],
+    task_source_artifact_sha256: str,
 ) -> dict[str, Any]:
     return {
         "format": FORMAT,
@@ -173,11 +254,12 @@ def prompt_table_payload(
         "metadata": {
             "task_count": len(tasks),
             "task_manifest_sha256": canonical_manifest_digest(tasks),
+            "task_source_artifact_sha256": task_source_artifact_sha256,
             "prompt_shape": list(PROMPT_SHAPE),
             "wan_base_identity": wan_base["identity_sha256"],
             "wan_base_resolved_path": wan_base["resolved_path"],
             "wan_base_configs": wan_base["configs"],
-            "wan_base_weight_sizes": wan_base["weight_sizes"],
+            "wan_base_artifacts": wan_base["artifacts"],
         },
     }
 
@@ -222,6 +304,7 @@ def validate_prompt_table(
     *,
     tasks: Sequence[str],
     expected_wan_base_identity: str | None = None,
+    expected_task_source_artifact_sha256: str | None = None,
 ) -> dict[str, Any]:
     source = Path(path)
     if not source.is_file() or source.is_symlink():
@@ -245,6 +328,22 @@ def validate_prompt_table(
     expected_digest = canonical_manifest_digest(tasks)
     if metadata.get("task_manifest_sha256") != expected_digest:
         raise ValueError("prompt table task manifest identity does not match")
+    if metadata.get("task_count") != len(tasks):
+        raise ValueError(
+            f"prompt table task_count must equal {len(tasks)}, "
+            f"got {metadata.get('task_count')!r}"
+        )
+    if metadata.get("prompt_shape") != list(PROMPT_SHAPE):
+        raise ValueError(
+            f"prompt table prompt_shape must equal {list(PROMPT_SHAPE)}, "
+            f"got {metadata.get('prompt_shape')!r}"
+        )
+    if (
+        expected_task_source_artifact_sha256 is not None
+        and metadata.get("task_source_artifact_sha256")
+        != expected_task_source_artifact_sha256
+    ):
+        raise ValueError("prompt table task source artifact identity does not match")
     if (
         expected_wan_base_identity is not None
         and metadata.get("wan_base_identity") != expected_wan_base_identity

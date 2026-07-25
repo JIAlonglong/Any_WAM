@@ -10,6 +10,7 @@ from distillation_flowmap.cosmos_wan_prompt_table import (
     PROMPT_SHAPE,
     build_prompt_embeddings,
     canonical_manifest_digest,
+    canonical_task_source_digest,
     inspect_wan_base,
     load_canonical_tasks,
     save_prompt_table_atomic,
@@ -70,8 +71,18 @@ class _FakeEncoder:
 def _wan_base(tmp_path: Path) -> Path:
     root = tmp_path / "wan-base"
     for relative, payload in (
-        ("tokenizer/tokenizer_config.json", {"model_max_length": 512}),
-        ("text_encoder/config.json", {"d_model": 4096}),
+        (
+            "tokenizer/tokenizer_config.json",
+            {"model_max_length": 512, "tokenizer_class": "T5Tokenizer"},
+        ),
+        (
+            "text_encoder/config.json",
+            {
+                "architectures": ["UMT5EncoderModel"],
+                "model_type": "umt5",
+                "d_model": 4096,
+            },
+        ),
         ("transformer/config.json", {"_class_name": "WanTransformer3DModel"}),
         ("model_index.json", {"_class_name": "WanPipeline"}),
     ):
@@ -80,6 +91,8 @@ def _wan_base(tmp_path: Path) -> Path:
         path.write_text(json.dumps(payload), encoding="utf-8")
     (root / "text_encoder/model.safetensors").write_bytes(b"encoder")
     (root / "transformer/diffusion_pytorch_model.safetensors").write_bytes(b"student")
+    (root / "tokenizer/spiece.model").write_bytes(b"sentencepiece")
+    (root / "tokenizer/special_tokens_map.json").write_text("{}", encoding="utf-8")
     return root
 
 
@@ -90,7 +103,10 @@ def _payload(tasks, base_identity):
             task: torch.zeros(PROMPT_SHAPE, dtype=torch.float16) for task in tasks
         },
         "metadata": {
+            "task_count": len(tasks),
             "task_manifest_sha256": canonical_manifest_digest(tasks),
+            "prompt_shape": list(PROMPT_SHAPE),
+            "task_source_artifact_sha256": canonical_task_source_digest(),
             "wan_base_identity": base_identity,
         },
     }
@@ -130,12 +146,56 @@ def test_wan_base_identity_rejects_missing_components_and_changes_with_artifacts
     assert len(first["identity_sha256"]) == 64
     assert first["resolved_path"] == str(root.resolve())
 
-    (root / "text_encoder/model.safetensors").write_bytes(b"changed-size")
+    (root / "text_encoder/model.safetensors").write_bytes(b"changed")
     second = inspect_wan_base(root)
     assert second["identity_sha256"] != first["identity_sha256"]
 
     (root / "tokenizer/tokenizer_config.json").unlink()
     with pytest.raises(FileNotFoundError, match="tokenizer/tokenizer_config.json"):
+        inspect_wan_base(root)
+
+
+@pytest.mark.parametrize(
+    ("relative", "replacement", "message"),
+    (
+        (
+            "transformer/config.json",
+            {"_class_name": "NotWan"},
+            "WanTransformer3DModel",
+        ),
+        (
+            "text_encoder/config.json",
+            {
+                "architectures": ["NotT5"],
+                "model_type": "umt5",
+                "d_model": 4096,
+            },
+            "UMT5EncoderModel",
+        ),
+        (
+            "text_encoder/config.json",
+            {
+                "architectures": ["UMT5EncoderModel"],
+                "model_type": "umt5",
+                "d_model": 1024,
+            },
+            "d_model.*4096",
+        ),
+    ),
+)
+def test_wan_base_rejects_semantically_wrong_model_contracts(
+    tmp_path, relative, replacement, message
+):
+    root = _wan_base(tmp_path)
+    (root / relative).write_text(json.dumps(replacement), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        inspect_wan_base(root)
+
+
+def test_wan_base_requires_tokenizer_model_assets(tmp_path):
+    root = _wan_base(tmp_path)
+    (root / "tokenizer/spiece.model").unlink()
+    with pytest.raises(FileNotFoundError, match="tokenizer.*vocabulary"):
         inspect_wan_base(root)
 
 
@@ -180,6 +240,31 @@ def test_validator_rejects_wrong_manifest_or_wan_base_identity(tmp_path):
     torch.save(payload, path)
     with pytest.raises(ValueError, match="Wan base identity"):
         validate_prompt_table(path, tasks=tasks, expected_wan_base_identity="base-b")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("task_count", 39, "task_count"),
+        ("prompt_shape", [1, 512, 1024], "prompt_shape"),
+        ("task_source_artifact_sha256", "0" * 64, "source artifact"),
+    ),
+)
+def test_validator_rejects_inconsistent_contract_metadata(
+    tmp_path, field, value, message
+):
+    tasks = ("task alpha",)
+    path = tmp_path / "table.pt"
+    payload = _payload(tasks, "base-a")
+    payload["metadata"][field] = value
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match=message):
+        validate_prompt_table(
+            path,
+            tasks=tasks,
+            expected_wan_base_identity="base-a",
+            expected_task_source_artifact_sha256=canonical_task_source_digest(),
+        )
 
 
 def test_cli_dry_run_prints_plan_and_writes_nothing(tmp_path):

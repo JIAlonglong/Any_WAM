@@ -11,6 +11,7 @@ import torch
 from distillation_flowmap.cosmos_wan_prompt_table import (
     PROMPT_SHAPE,
     build_prompt_embeddings,
+    canonical_task_source_digest,
     inspect_wan_base,
     load_canonical_tasks,
     prompt_table_payload,
@@ -40,7 +41,13 @@ def _emit(key: str, value: object) -> None:
 
 def main() -> None:
     args = _parse_args()
-    tasks = load_canonical_tasks(args.manifest) if args.manifest else load_canonical_tasks()
+    manifest = args.manifest if args.manifest else None
+    tasks = load_canonical_tasks(manifest) if manifest else load_canonical_tasks()
+    task_source_digest = (
+        canonical_task_source_digest(manifest)
+        if manifest
+        else canonical_task_source_digest()
+    )
     wan_base = inspect_wan_base(args.wan_base_model)
     output = Path(args.output).expanduser()
 
@@ -56,6 +63,7 @@ def main() -> None:
             output,
             tasks=tasks,
             expected_wan_base_identity=wan_base["identity_sha256"],
+            expected_task_source_artifact_sha256=task_source_digest,
         )
         _emit("VALID", 1)
         return
@@ -95,12 +103,18 @@ def main() -> None:
         prompt_cleaner=prompt_clean,
         batch_size=args.batch_size,
     )
-    payload = prompt_table_payload(embeddings, tasks=tasks, wan_base=wan_base)
+    payload = prompt_table_payload(
+        embeddings,
+        tasks=tasks,
+        wan_base=wan_base,
+        task_source_artifact_sha256=task_source_digest,
+    )
     save_prompt_table_atomic(output, payload)
     validate_prompt_table(
         output,
         tasks=tasks,
         expected_wan_base_identity=wan_base["identity_sha256"],
+        expected_task_source_artifact_sha256=task_source_digest,
     )
     _emit("VALID", 1)
 

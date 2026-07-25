@@ -6,15 +6,72 @@ import distillation_flowmap.danceopd_query as danceopd_query
 from wan_va.utils.scheduler import FlowMatchScheduler
 
 from distillation_flowmap.danceopd_query import (
+    aligned_anchor_mse,
+    build_shifted_terminal_path,
     denoised_endpoint_mse,
     direct_velocity_mse,
+    legal_cosmos_query_indices,
     sample_low_noise_query_indices,
+    sample_nonterminal_semantic_query_indices,
     sample_semantic_query_indices,
     select_per_sample_trajectory_state,
 )
 
 
 class DanceOPDQueryTest(unittest.TestCase):
+    def test_cosmos_shifted_paths_match_inference_for_k2_and_k4(self):
+        for steps in (2, 4):
+            got = build_shifted_terminal_path(
+                steps=steps, shift=5.0, device=torch.device("cpu"), dtype=torch.float64
+            )
+            raw = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float64)
+            expected = 5.0 * raw / (1.0 + 4.0 * raw)
+            torch.testing.assert_close(got, expected)
+
+    def test_cosmos_query_indices_exclude_prior_endpoint_and_teacher_invalid_band(self):
+        sigmas = build_shifted_terminal_path(
+            steps=4, shift=5.0, device=torch.device("cpu"), dtype=torch.float32
+        )
+        legal = legal_cosmos_query_indices(sigmas)
+        self.assertEqual(legal.tolist(), [1, 2])
+        sampled = sample_nonterminal_semantic_query_indices(sigmas, batch_size=128)
+        self.assertLessEqual(set(sampled.tolist()), {1, 2})
+
+    def test_cosmos_k2_path_has_one_legal_nonterminal_query(self):
+        sigmas = build_shifted_terminal_path(
+            steps=2, shift=5.0, device=torch.device("cpu"), dtype=torch.float32
+        )
+        self.assertEqual(legal_cosmos_query_indices(sigmas).tolist(), [1])
+
+    def test_aligned_anchor_mse_broadcasts_per_sample_sigma(self):
+        query_video = torch.tensor([[[[[4.0]]]], [[[[9.0]]]]])
+        query_sigma = torch.tensor([0.5, 0.25])
+        student_velocity = torch.tensor([[[[[2.0]]]], [[[[4.0]]]]])
+        teacher_endpoint = torch.tensor([[[[[2.0]]]], [[[[7.0]]]]])
+
+        loss = aligned_anchor_mse(
+            query_video, query_sigma, student_velocity, teacher_endpoint
+        )
+
+        self.assertTrue(torch.allclose(loss, torch.tensor(1.0)))
+
+    def test_aligned_anchor_mse_uses_optional_video_mask_only(self):
+        query_video = torch.tensor([[[[[4.0]], [[4.0]]]]])
+        query_sigma = torch.tensor([0.5])
+        student_velocity = torch.tensor([[[[[2.0]], [[2.0]]]]])
+        teacher_endpoint = torch.tensor([[[[[3.0]], [[99.0]]]]])
+        valid_video_mask = torch.tensor([[True, False]])
+
+        loss = aligned_anchor_mse(
+            query_video,
+            query_sigma,
+            student_velocity,
+            teacher_endpoint,
+            valid_video_mask,
+        )
+
+        self.assertTrue(torch.allclose(loss, torch.tensor(0.0)))
+
     def test_endpoint_sigma_sampler_uses_exact_clean_region_formula(self):
         original_sample = torch.distributions.Beta.sample
         try:

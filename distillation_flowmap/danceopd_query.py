@@ -8,6 +8,71 @@ import torch
 import torch.nn.functional as F
 
 
+def build_shifted_terminal_path(
+    *,
+    steps: int,
+    shift: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build the terminal-to-clean shifted FlowMatch inference path."""
+    if steps < 1 or not math.isfinite(shift) or shift <= 0:
+        raise ValueError("steps must be positive and shift must be finite and > 0")
+    raw = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=dtype)
+    return shift * raw / (1.0 + (shift - 1.0) * raw)
+
+
+def legal_cosmos_query_indices(
+    sigmas: torch.Tensor,
+    *,
+    sigma_min: float = 4 / 5,
+    sigma_max: float = 80 / 81,
+) -> torch.Tensor:
+    """Return nonterminal path states accepted by the Cosmos teacher band."""
+    indices = torch.arange(sigmas.numel(), device=sigmas.device)
+    mask = (indices > 0) & (indices < sigmas.numel() - 1)
+    mask &= (sigmas >= sigma_min) & (sigmas <= sigma_max)
+    legal = indices[mask]
+    if legal.numel() == 0:
+        raise ValueError("no nonterminal query lies inside the Cosmos teacher band")
+    return legal
+
+
+def sample_nonterminal_semantic_query_indices(
+    sigmas: torch.Tensor, batch_size: int
+) -> torch.Tensor:
+    """Sample legal Cosmos queries with a semantic-side Beta(5, 2) bias."""
+    legal = legal_cosmos_query_indices(sigmas)
+    beta = torch.distributions.Beta(
+        torch.tensor(5.0, device=sigmas.device),
+        torch.tensor(2.0, device=sigmas.device),
+    )
+    draws = beta.sample((batch_size,))
+    slots = torch.clamp((draws * legal.numel()).long(), max=legal.numel() - 1)
+    return legal[slots]
+
+
+def aligned_anchor_mse(
+    query_video: torch.Tensor,
+    query_sigma: torch.Tensor,
+    student_velocity: torch.Tensor,
+    teacher_endpoint: torch.Tensor,
+    valid_video_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Match the student query's denoised endpoint to its aligned teacher target."""
+    sigma = query_sigma.to(device=query_video.device, dtype=query_video.dtype)
+    while sigma.ndim < query_video.ndim:
+        sigma = sigma.unsqueeze(-1)
+    student_endpoint = query_video - sigma * student_velocity
+    if valid_video_mask is not None:
+        mask = valid_video_mask.to(device=query_video.device, dtype=query_video.dtype)
+        if mask.ndim == 2 and query_video.ndim == 5:
+            mask = mask[:, None, :, None, None]
+        student_endpoint = student_endpoint * mask
+        teacher_endpoint = teacher_endpoint * mask
+    return F.mse_loss(student_endpoint, teacher_endpoint, reduction="mean")
+
+
 def sample_endpoint_sigmas(
     *,
     batch_size: int,

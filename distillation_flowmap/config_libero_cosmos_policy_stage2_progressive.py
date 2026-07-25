@@ -447,11 +447,21 @@ if _cosmos_libero_variant_payload is not None:
         endpoint_weight=cfg.opd_danceopd_endpoint_weight,
         velocity_weight=cfg.opd_danceopd_velocity_weight,
     )
-elif cfg.opd_danceopd_rollout_step_choices != (2, 4):
-    raise ValueError(
-        "OPD_DANCEOPD_ROLLOUT_STEPS must resolve exactly to 2,4 when no "
-        "canonical variant identity is provided"
-    )
+else:
+    if cfg.opd_danceopd_rollout_step_choices != (2, 4):
+        raise ValueError(
+            "OPD_DANCEOPD_ROLLOUT_STEPS must resolve exactly to 2,4 when no "
+            "canonical variant identity is provided"
+        )
+    for _weight_name, _weight_value in (
+        ("OPD_DANCEOPD_ENDPOINT_WEIGHT", cfg.opd_danceopd_endpoint_weight),
+        ("OPD_DANCEOPD_VELOCITY_WEIGHT", cfg.opd_danceopd_velocity_weight),
+    ):
+        if _weight_value <= 0:
+            raise ValueError(
+                f"{_weight_name} must be positive when no canonical variant "
+                "identity is provided"
+            )
 
 if cfg.opd_danceopd_velocity_weight > 0:
     _validate_aligned_query_grids(

@@ -95,6 +95,8 @@ TEACHER_CKPT="${TEACHER_CKPT:-/kpfs-intern/jialongliu/projects/lingbot-va/checkp
 WAN22_PRETRAINED_PATH="${WAN22_PRETRAINED_PATH:-/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero}"
 export WAN22_PRETRAINED_PATH
 SAVE_ROOT="${SAVE_ROOT:-${PROJECT_ROOT}/evaluation/outputs/libero_env_${STEP}_${VARIANT}}"
+MODEL_NAME="${MODEL_NAME:-${VARIANT}}"
+LATENCY_JSONL="${LATENCY_JSONL:-${SAVE_ROOT}/sampler_latency.jsonl}"
 VIDEO_DIR="${SAVE_ROOT}/videos"
 ACTION_DIR="${SAVE_ROOT}/actions"
 RESULT_DIR="${SAVE_ROOT}/results"
@@ -128,6 +130,8 @@ log_header() {
     echo "  Teacher:        ${TEACHER_CKPT}"
     echo "  Base model:     ${WAN22_PRETRAINED_PATH}"
     echo "  Save root:      ${SAVE_ROOT}"
+    echo "  Model name:     ${MODEL_NAME}"
+    echo "  Latency JSONL:  ${LATENCY_JSONL}"
     echo "============================================"
 }
 
@@ -170,6 +174,8 @@ start_server() {
         --checkpoint-path "$ckpt_path" \
         --num-steps "$num_steps" \
         --action-num-steps "$action_num_steps" \
+        --model-name "$MODEL_NAME" \
+        --latency-jsonl "$LATENCY_JSONL" \
         --save-root "$save_root" &
 
     SERVER_PID=$!

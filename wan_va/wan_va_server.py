@@ -65,6 +65,10 @@ from inference import create_inference_kwargs, flowmap_inference, flowmap_update
 from distillation_flowmap.runtime_metadata import (
     resolve_action_downsample_factor,
 )
+from evaluation.libero.sampler_latency import (
+    append_sampler_latency_record,
+    build_sampler_latency_record,
+)
 from einops import rearrange
 from tqdm import tqdm
 
@@ -85,6 +89,10 @@ class VA_Server:
         self.enable_offload = getattr(job_config, "enable_offload", False)
         self.num_steps = getattr(job_config, "num_steps", 2)
         self.action_num_steps = getattr(job_config, "action_num_steps", None)
+        self.eval_model_name = getattr(job_config, "eval_model_name", "unknown")
+        self.latency_jsonl = getattr(job_config, "latency_jsonl", None)
+        self.eval_metadata = {}
+        self.sampler_call_index = 0
 
         # ------------------------------------------------------------------
         # 1. Load pretrained components (VAE, text encoder, tokenizer)
@@ -825,6 +833,8 @@ class VA_Server:
 
         if reset:
             logger.info("******************* Reset server ******************")
+            self.eval_metadata = dict(obs.get("eval_metadata") or {})
+            self.sampler_call_index = 0
             self._reset(prompt=prompt)
             return dict()
         elif compute_kv_cache:
@@ -833,7 +843,22 @@ class VA_Server:
             return dict()
         else:
             logger.info("################# Infer One Chunk #################")
+            started_at = time.perf_counter()
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            if self.latency_jsonl:
+                record = build_sampler_latency_record(
+                    model=self.eval_model_name,
+                    suite=self.eval_metadata["suite"],
+                    task_idx=self.eval_metadata["task_idx"],
+                    episode_idx=self.eval_metadata["episode_idx"],
+                    video_steps=self.num_steps,
+                    action_steps=self.action_num_steps or self.num_steps,
+                    call_index=self.sampler_call_index,
+                    elapsed_ms=elapsed_ms,
+                )
+                append_sampler_latency_record(self.latency_jsonl, record)
+            self.sampler_call_index += 1
             return dict(action=action)
 
 
@@ -923,6 +948,10 @@ def run(args):
         config.prompt = args.prompt
     if args.num_chunks_to_infer is not None:
         config.num_chunks_to_infer = args.num_chunks_to_infer
+    if args.model_name is not None:
+        config.eval_model_name = args.model_name
+    if args.latency_jsonl is not None:
+        config.latency_jsonl = args.latency_jsonl
 
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -1011,6 +1040,18 @@ def main():
         type=int,
         default=None,
         help="Number of chunks to generate in i2va mode.",
+    )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default=None,
+        help="Stable evaluated-model name written to latency provenance.",
+    )
+    parser.add_argument(
+        "--latency-jsonl",
+        type=str,
+        default=None,
+        help="Append one auditable record per completed joint sampler call.",
     )
     args = parser.parse_args()
     run(args)

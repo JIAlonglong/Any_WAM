@@ -68,3 +68,34 @@ def test_unknown_suite_is_rejected(tmp_path):
 
     assert result.returncode != 0
     assert "Unsupported LIBERO_BENCHMARK" in result.stderr
+
+
+def test_eval_contract_wires_model_and_sampler_latency_output(tmp_path):
+    env = _env(tmp_path, "libero_10")
+    env["MODEL_NAME"] = "stage2"
+    env["LATENCY_JSONL"] = str(tmp_path / "latency" / "sampler_latency.jsonl")
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "step_1", "target_student"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Model name:     stage2" in result.stdout
+    assert f"Latency JSONL:  {env['LATENCY_JSONL']}" in result.stdout
+
+
+def test_client_and_server_preserve_episode_latency_provenance():
+    client_source = (ROOT / "evaluation" / "libero" / "client.py").read_text()
+    server_source = (ROOT / "wan_va" / "wan_va_server.py").read_text()
+
+    assert '"eval_metadata": {' in client_source
+    assert '"suite": libero_benchmark' in client_source
+    assert '"task_idx": int(task_idx)' in client_source
+    assert '"episode_idx": int(episode_idx)' in client_source
+    assert "started_at = time.perf_counter()" in server_source
+    assert "append_sampler_latency_record" in server_source

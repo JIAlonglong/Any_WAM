@@ -100,7 +100,17 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
     cur_env = construct_single_env(env_args)
     first_obs = init_single_env(cur_env, init_states[episode_idx % init_states.shape[0]])
 
-    ret = model.infer(dict(reset=True, prompt=prompt))
+    ret = model.infer(
+        {
+            "reset": True,
+            "prompt": prompt,
+            "eval_metadata": {
+                "suite": libero_benchmark,
+                "task_idx": int(task_idx),
+                "episode_idx": int(episode_idx),
+            },
+        }
+    )
 
     full_obs_list = []
     done = False

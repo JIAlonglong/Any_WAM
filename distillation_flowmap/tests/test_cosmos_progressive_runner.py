@@ -914,6 +914,9 @@ def _aligned_recording_case(
     events=None,
     canonical_mismatch=False,
     endpoint_mask_mismatch=False,
+    rollout_steps=(2, 4),
+    endpoint_weight=1.0,
+    velocity_weight=1.0,
 ):
     teacher = _AlignedRecorderTeacher(
         events=events,
@@ -940,11 +943,116 @@ def _aligned_recording_case(
         **overrides,
     )
     harness = Harness(batch_size, teacher, events)
+    harness.config.opd_danceopd_rollout_steps = rollout_steps
+    harness.config.opd_danceopd_endpoint_weight = endpoint_weight
+    harness.config.opd_danceopd_velocity_weight = velocity_weight
     batch = {
         "latents": torch.full((batch_size, 1, 3, 1, 1), 91.0),
         "actions": torch.full((batch_size, 7, 16, 4, 1), 73.0),
     }
     return harness, batch, gate
+
+
+@pytest.mark.parametrize(
+    ("arm", "rollout_steps", "endpoint_weight", "velocity_weight"),
+    [
+        ("s1", (1,), 1.0, 0.0),
+        ("s2", (2,), 1.0, 1.0),
+        ("s4", (4,), 1.0, 1.0),
+        ("universal", (2, 4), 1.0, 1.0),
+        ("universal-video-action", (2, 4), 1.0, 1.0),
+        ("stage1_only", (2, 4), 0.0, 0.0),
+        ("anchor_only", (2, 4), 1.0, 0.0),
+        ("field_only", (2, 4), 0.0, 1.0),
+        ("apm", (2, 4), 1.0, 1.0),
+    ],
+)
+def test_aligned_runtime_executes_every_canonical_arm_without_cross_arm_defaults(
+    arm, rollout_steps, endpoint_weight, velocity_weight
+):
+    harness, batch, _ = _aligned_recording_case(
+        rollout_steps=rollout_steps,
+        endpoint_weight=endpoint_weight,
+        velocity_weight=velocity_weight,
+    )
+
+    result = harness._cosmos_aligned_video_opd_step(batch, 0)
+    call_kinds = [call.kind for call in harness.student.calls]
+
+    assert result["skip_step"] is False
+    assert result["opd_endpoint_contrib"].item() == pytest.approx(
+        result["opd_endpoint_loss"].item() * endpoint_weight
+    )
+    assert result["opd_same_state_velocity_contrib"].item() == pytest.approx(
+        result["opd_same_state_velocity_loss"].item() * velocity_weight
+    )
+    if arm == "stage1_only":
+        assert call_kinds == []
+        assert harness._action_teacher_model.endpoint_call is None
+        assert not hasattr(harness._action_teacher_model, "field_call")
+        assert result["loss"].item() == 0.0
+    elif arm == "s1":
+        assert call_kinds == ["anchor"]
+        assert harness._action_teacher_model.endpoint_call is not None
+        assert not hasattr(harness._action_teacher_model, "field_call")
+    else:
+        assert ("anchor" in call_kinds) is bool(endpoint_weight)
+        assert ("field" in call_kinds) is bool(velocity_weight)
+        assert (
+            harness._action_teacher_model.endpoint_call is not None
+        ) is bool(endpoint_weight)
+        assert hasattr(
+            harness._action_teacher_model, "field_call"
+        ) is bool(velocity_weight)
+
+
+@pytest.mark.parametrize("rollout_steps", [(3,), (1, 2), (4, 2), ()])
+def test_aligned_runtime_rejects_noncanonical_rollout_choice_sets(rollout_steps):
+    harness, batch, _ = _aligned_recording_case(
+        rollout_steps=rollout_steps,
+    )
+
+    with pytest.raises(ValueError, match="canonical"):
+        harness._cosmos_aligned_video_opd_step(batch, 0)
+
+
+def test_aligned_runtime_rejects_field_loss_for_one_step_budget():
+    harness, batch, _ = _aligned_recording_case(
+        rollout_steps=(1,),
+        endpoint_weight=1.0,
+        velocity_weight=1.0,
+    )
+
+    with pytest.raises(ValueError, match="K=1.*field"):
+        harness._cosmos_aligned_video_opd_step(batch, 0)
+
+    assert harness.student.calls == []
+    assert not hasattr(harness._action_teacher_model, "field_call")
+    assert harness._action_teacher_model.endpoint_call is None
+
+
+def test_aligned_runtime_applies_configured_weights_to_exact_contributions():
+    harness, batch, _ = _aligned_recording_case(
+        rollout_steps=(2,),
+        endpoint_weight=0.25,
+        velocity_weight=3.0,
+    )
+
+    result = harness._cosmos_aligned_video_opd_step(batch, 0)
+
+    torch.testing.assert_close(
+        result["opd_endpoint_contrib"],
+        result["opd_endpoint_loss"] * 0.25,
+    )
+    torch.testing.assert_close(
+        result["opd_same_state_velocity_contrib"],
+        result["opd_same_state_velocity_loss"] * 3.0,
+    )
+    torch.testing.assert_close(
+        result["loss"],
+        result["opd_endpoint_contrib"]
+        + result["opd_same_state_velocity_contrib"],
+    )
 
 
 def _install_scripted_origin_reducer(monkeypatch, *, remote_origin, events):

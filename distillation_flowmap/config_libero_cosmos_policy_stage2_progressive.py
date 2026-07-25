@@ -621,7 +621,10 @@ if _cosmos_libero_variant_payload is not None:
             )
     cfg.cosmos_libero_variant_identity = dict(_variant_expected)
 
-cfg.aligned_video_opd_enabled = True
+cfg.aligned_video_opd_enabled = bool(
+    cfg.opd_danceopd_endpoint_weight > 0
+    or cfg.opd_danceopd_velocity_weight > 0
+)
 cfg.deployment_joint_rollout_enabled = True
 cfg.deployment_joint_rollout_interval = 4
 cfg.deployment_joint_steps = (1, 2, 4)

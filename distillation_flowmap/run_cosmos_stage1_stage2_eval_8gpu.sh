@@ -210,7 +210,8 @@ STAGE1_LAUNCHER="${COSMOS_RAW_STAGE1_LAUNCHER:-$SCRIPT_DIR/run_cosmos_raw_stage1
 STAGE2_LAUNCHER="${COSMOS_STAGE2_LAUNCHER:-$SCRIPT_DIR/run_cosmos_libero_train_8gpu.sh}"
 EVAL_LAUNCHER="${COSMOS_JOINT124_EVAL_LAUNCHER:-$PROJECT_ROOT/evaluation/libero/run_cosmos_progressive_joint_124_eval_8gpu.sh}"
 LOCK_PREPARER="${COSMOS_LOCK_PREPARER:-$SCRIPT_DIR/prepare_cosmos_libero_provenance_locks.py}"
-for executable in "$STAGE1_LAUNCHER" "$STAGE2_LAUNCHER" "$EVAL_LAUNCHER" "$LOCK_PREPARER"; do
+PROMPT_TABLE_BUILDER="${COSMOS_WAN_PROMPT_TABLE_BUILDER:-$SCRIPT_DIR/build_cosmos_wan_prompt_table.py}"
+for executable in "$STAGE1_LAUNCHER" "$STAGE2_LAUNCHER" "$EVAL_LAUNCHER" "$LOCK_PREPARER" "$PROMPT_TABLE_BUILDER"; do
     [[ -x "$executable" ]] || die "required executable is missing: $executable"
 done
 
@@ -221,9 +222,10 @@ COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-/kpfs-intern/jialongliu/models/cosmos_
 COSMOS_PREDICT25_LOCAL_MODEL_DIR="${COSMOS_PREDICT25_LOCAL_MODEL_DIR:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/local_hf/Cosmos-Predict2-2B-Video2World}"
 require_dir DATASET_PATH "$DATASET_PATH"
 [[ -f "$EMPTY_EMB_PATH" ]] || die "EMPTY_EMB_PATH is missing: $EMPTY_EMB_PATH"
-require_env S4_PROMPT_TABLE
-[[ -f "$S4_PROMPT_TABLE" && ! -L "$S4_PROMPT_TABLE" ]] || \
-    die "S4_PROMPT_TABLE must be a plain all-40 prompt table: $S4_PROMPT_TABLE"
+if [[ -n "$S4_PROMPT_TABLE" ]]; then
+    [[ -f "$S4_PROMPT_TABLE" && ! -L "$S4_PROMPT_TABLE" ]] || \
+        die "S4_PROMPT_TABLE must be a plain all-40 prompt table: $S4_PROMPT_TABLE"
+fi
 require_dir COSMOS_POLICY_PATH "$COSMOS_POLICY_PATH"
 require_dir COSMOS_PREDICT25_LOCAL_MODEL_DIR "$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
 if ! (
@@ -257,6 +259,12 @@ STAGE2_OUTPUT="$RUN_ROOT/universal-video-action"
 STAGE2_CHECKPOINT="$STAGE2_OUTPUT/checkpoints/step_$STAGE2_STEPS"
 EVAL_TRANSFORMER="$STAGE2_CHECKPOINT/target_student/transformer"
 MATRIX_ROOT="$RUN_ROOT/eval/student_teacher"
+PROMPT_TABLE_WAS_EXPLICIT=0
+if [[ -n "$S4_PROMPT_TABLE" ]]; then
+    PROMPT_TABLE_WAS_EXPLICIT=1
+else
+    S4_PROMPT_TABLE="$RUN_ROOT/libero_wan_prompt_embeddings_all40.pt"
+fi
 
 stage1_command=(
     "$STAGE1_LAUNCHER" run
@@ -291,6 +299,21 @@ lock_command+=(
     --local-model-root "$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
     --stage1-target-root "$STAGE1_TARGET"
 )
+if [[ "$PROMPT_TABLE_BUILDER" == *.py ]]; then
+    prompt_table_command=("$PYTHON_BIN" "$PROMPT_TABLE_BUILDER")
+else
+    prompt_table_command=("$PROMPT_TABLE_BUILDER")
+fi
+prompt_table_command+=(
+    --wan-base-model "$WAN_STUDENT_BASE_MODEL_PATH"
+    --output "$S4_PROMPT_TABLE"
+)
+PROMPT_TABLE_MODE=build
+if (( PROMPT_TABLE_WAS_EXPLICIT )) || [[ -f "$S4_PROMPT_TABLE" ]]; then
+    PROMPT_TABLE_MODE=validate
+    prompt_table_command+=(--validate-only)
+fi
+prompt_table_plan=("${prompt_table_command[@]}" --dry-run)
 eval_command=("$EVAL_LAUNCHER" run)
 stage1_environment=(
     env
@@ -440,18 +463,27 @@ printf 'OPD_DANCEOPD_ENDPOINT_WEIGHT=1.0\n'
 printf 'OPD_DANCEOPD_VELOCITY_WEIGHT=1.0\n'
 printf 'ACTION_DOWNSAMPLE_FACTOR=4\n'
 printf 'VIDEO_ACTION_BRIDGE=0\n'
+printf 'PROMPT_TABLE_MODE=%s\n' "$PROMPT_TABLE_MODE"
+printf 'S4_PROMPT_TABLE=%s\n' "$S4_PROMPT_TABLE"
 
 if [[ -n "$READ_ONLY_MODE" ]]; then
     printf 'PIPELINE_MODE=%s\n' "$READ_ONLY_MODE"
     print_command STAGE1_COMMAND "${stage1_plan[@]}"
     print_command LOCK_COMMAND "${lock_plan[@]}"
     print_command STAGE2_COMMAND "${stage2_plan[@]}"
+    if [[ "$PHASE" == all || "$PHASE" == eval ]]; then
+        print_command PROMPT_TABLE_COMMAND "${prompt_table_plan[@]}"
+        run_child "${prompt_table_plan[@]}"
+    fi
     print_command EVAL_COMMAND "${eval_plan[@]}"
     exit 0
 fi
 print_command STAGE1_COMMAND "${stage1_execution[@]}"
 print_command LOCK_COMMAND "${lock_command[@]}"
 print_command STAGE2_COMMAND "${stage2_execution[@]}"
+if [[ "$PHASE" == all || "$PHASE" == eval ]]; then
+    print_command PROMPT_TABLE_COMMAND "${prompt_table_command[@]}"
+fi
 print_command EVAL_COMMAND "${eval_execution[@]}"
 
 if [[ "$PHASE" == all ]]; then
@@ -478,6 +510,11 @@ else
     require_transformer Stage2-target "$EVAL_TRANSFORMER"
     [[ ! -e "$MATRIX_ROOT" && ! -L "$MATRIX_ROOT" ]] || die \
         "evaluation matrix already exists: $MATRIX_ROOT"
+fi
+
+if (( PROMPT_TABLE_WAS_EXPLICIT )) && \
+        [[ "$PHASE" == all || "$PHASE" == eval ]]; then
+    run_child "${prompt_table_command[@]}"
 fi
 
 export PIPELINE_RUN_ROOT="$RUN_ROOT"
@@ -514,6 +551,10 @@ if [[ "$PHASE" == all || "$PHASE" == stage2 ]]; then
     require_transformer Stage2-target "$EVAL_TRANSFORMER"
 fi
 [[ "$PHASE" != stage2 ]] || exit 0
+
+if (( ! PROMPT_TABLE_WAS_EXPLICIT )); then
+    run_child "${prompt_table_command[@]}"
+fi
 
 export MATRIX_ROOT
 export S4_CKPT_ROOT="$EVAL_TRANSFORMER"

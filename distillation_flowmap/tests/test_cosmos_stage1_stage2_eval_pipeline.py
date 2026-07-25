@@ -257,7 +257,7 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
     )
     eval_script = _write_executable(
         tmp_path / "eval.sh",
-        'printf "eval:%s\\n" "$*" >> "$CALLS_LOG"\n',
+        'printf "eval:%s:prompt=%s\\n" "$*" "$S4_PROMPT_TABLE" >> "$CALLS_LOG"\n',
     )
     lock_script = _write_executable(
         tmp_path / "locks.sh",
@@ -268,6 +268,26 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
         'mkdir -p "$output"; for name in dataset teacher local_model video_vae; do\n'
         '  printf "{}\\n" > "$output/$name.lock.json"\n'
         "done\n",
+    )
+    prompt_builder = _write_executable(
+        tmp_path / "prompt-builder.sh",
+        'output=""; validate=0; read_only=0\n'
+        'while (( $# )); do\n'
+        '  case "$1" in\n'
+        '    --output) output="$2"; shift 2;;\n'
+        '    --validate-only) validate=1; shift;;\n'
+        '    --dry-run) read_only=1; shift;;\n'
+        '    *) shift;;\n'
+        '  esac\n'
+        'done\n'
+        'if (( read_only )); then exit 0; fi\n'
+        'printf "prompt:%s:%s\\n" "$validate" "$output" >> "$CALLS_LOG"\n'
+        'if (( validate )); then\n'
+        '  [[ -f "$output" ]] || { printf "missing prompt table\\n" >&2; exit 3; }\n'
+        'else\n'
+        '  [[ ! -e "$output" ]] || { printf "refusing overwrite\\n" >&2; exit 4; }\n'
+        '  mkdir -p "$(dirname "$output")"; printf table > "$output"\n'
+        'fi\n',
     )
     init = tmp_path / "lingbotva-init"
     _plain_file(
@@ -343,6 +363,7 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
             "COSMOS_STAGE2_LAUNCHER": str(stage2),
             "COSMOS_JOINT124_EVAL_LAUNCHER": str(eval_script),
             "COSMOS_LOCK_PREPARER": str(lock_script),
+            "COSMOS_WAN_PROMPT_TABLE_BUILDER": str(prompt_builder),
         }
     )
     return env, output_root
@@ -379,19 +400,21 @@ def test_pipeline_formal_calls_stage1_locks_stage2_eval_in_order(tmp_path):
     assert result.returncode == 0, result.stderr
     lines = Path(env["CALLS_LOG"]).read_text(encoding="utf-8").splitlines()
     assert [line.split(":", 1)[0] for line in lines] == [
+        "prompt",
         "stage1",
         "locks",
         "stage2",
         "eval",
     ]
-    assert "run --steps 5000 --save-interval 1000 --master-port 29671" in lines[0]
-    assert "universal-video-action --steps 10000 --save-interval 1000" in lines[2]
-    assert "--master-port 29672" in lines[2]
+    assert lines[0].startswith("prompt:1:")
+    assert "run --steps 5000 --save-interval 1000 --master-port 29671" in lines[1]
+    assert "universal-video-action --steps 10000 --save-interval 1000" in lines[3]
+    assert "--master-port 29672" in lines[3]
     assert "stage2_target" in result.stdout
     assert "official_teacher" in result.stdout
     assert "40 tasks" in result.stdout
     assert "2000 episodes per role/K" in result.stdout
-    eval_call = lines[3]
+    eval_call = lines[4]
     assert "run" in eval_call
 
 
@@ -438,14 +461,100 @@ def test_pipeline_rejects_cosmos_repo_not_at_audited_commit(tmp_path):
     assert "audited commit" in result.stderr
 
 
-def test_pipeline_requires_explicit_all_40_prompt_table(tmp_path):
+def test_pipeline_builds_missing_all_40_prompt_table_after_stage2_before_eval(tmp_path):
     env, output_root = _pipeline_env(tmp_path)
     env.pop("S4_PROMPT_TABLE")
 
+    result = _pipeline(env, output_root)
+
+    assert result.returncode == 0, result.stderr
+    lines = Path(env["CALLS_LOG"]).read_text(encoding="utf-8").splitlines()
+    assert [line.split(":", 1)[0] for line in lines] == [
+        "stage1",
+        "locks",
+        "stage2",
+        "prompt",
+        "eval",
+    ]
+    assert lines[3].startswith("prompt:0:")
+    generated = output_root / "serial" / "libero_wan_prompt_embeddings_all40.pt"
+    assert generated.is_file()
+    assert f"prompt={generated}" in lines[4]
+
+
+def test_pipeline_missing_prompt_table_dry_run_prints_build_without_writes(tmp_path):
+    env, output_root = _pipeline_env(tmp_path)
+    env.pop("S4_PROMPT_TABLE")
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
     result = _pipeline(env, output_root, "--dry-run")
 
-    assert result.returncode != 0
-    assert "S4_PROMPT_TABLE must be set explicitly" in result.stderr
+    after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    assert result.returncode == 0, result.stderr
+    assert before == after
+    assert "PROMPT_TABLE_MODE=build" in result.stdout
+    assert "PROMPT_TABLE_COMMAND=" in result.stdout
+    assert "--dry-run" in result.stdout
+    assert not Path(env["CALLS_LOG"]).exists()
+
+
+def test_eval_only_reuses_generated_table_by_validation(tmp_path):
+    env, output_root = _pipeline_env(tmp_path)
+    env.pop("S4_PROMPT_TABLE")
+    run_root = output_root / "serial"
+    generated = _plain_file(run_root / "libero_wan_prompt_embeddings_all40.pt")
+    transformer = (
+        run_root
+        / "universal-video-action/checkpoints/step_10000/target_student/transformer"
+    )
+    _plain_file(transformer / "config.json", b"{}")
+    _plain_file(transformer / "diffusion_pytorch_model.safetensors")
+    config = {
+        "contract_version": 2,
+        "training_contract_stage": "raw_stage1",
+        "action_packing_schema": "downsample_survivor_v2",
+        "action_downsample_factor": 4,
+        "action_chunk_shape": [4, 4],
+        "checkpoint_step": 5000,
+        "student_backend": "wan_flowmap",
+        "teacher_backend": "cosmos_policy",
+        "student_base_model_path": env["WAN_STUDENT_BASE_MODEL_PATH"],
+        "teacher_model_path": env["COSMOS_POLICY_PATH"],
+    }
+    for variant in ("online_student", "target_student"):
+        stage1_transformer = (
+            run_root / f"stage1/checkpoints/step_5000/{variant}/transformer"
+        )
+        _plain_file(
+            stage1_transformer / "config.json",
+            json.dumps(config, sort_keys=True).encode(),
+        )
+        _plain_file(stage1_transformer / "diffusion_pytorch_model.safetensors")
+    for name in ("teacher.lock.json",):
+        _plain_file(run_root / "provenance-locks" / name, b"{}")
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(WRAPPER),
+            "--phase",
+            "eval",
+            "--output-root",
+            str(output_root),
+            "--run-tag",
+            "serial",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = Path(env["CALLS_LOG"]).read_text(encoding="utf-8").splitlines()
+    assert lines[0] == f"prompt:1:{generated}"
+    assert lines[1].startswith("eval:")
 
 
 def test_pipeline_requires_explicit_student_init_and_clean_cosmos_repo(tmp_path):

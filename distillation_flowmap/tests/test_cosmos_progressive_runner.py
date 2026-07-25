@@ -7,10 +7,21 @@ from types import ModuleType
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from distillation_flowmap.cosmos_deployment_rollout import deployment_endpoint_losses
+from distillation_flowmap.cosmos_policy_adapter import unpack_flowmap_action_query
 from distillation_flowmap.cosmos_progressive_opd import broadcast_joint_action_timesteps
+from distillation_flowmap.cosmos_training_contract import pack_actions_for_downsample
+from distillation_flowmap.danceopd_query import (
+    aligned_anchor_mse,
+    build_shifted_terminal_path,
+    masked_video_velocity_mse,
+    sample_nonterminal_semantic_query_indices,
+    select_per_sample_trajectory_state,
+)
+from distillation_flowmap.distributed_safety import all_ranks_finite
 from distillation_flowmap.opd_rollout_grad import (
     SUPPORTED_ROLLOUT_GRAD_MODES,
     rollout_step_requires_grad,
@@ -119,6 +130,14 @@ def _flowmap_method(name, **overrides):
         "rollout_step_requires_grad": rollout_step_requires_grad,
         "contextlib": contextlib,
         "_synchronized_nonfinite_decision": _synchronized_nonfinite_decision,
+        "aligned_anchor_mse": aligned_anchor_mse,
+        "all_ranks_finite": all_ranks_finite,
+        "build_shifted_terminal_path": build_shifted_terminal_path,
+        "dist": dist,
+        "masked_video_velocity_mse": masked_video_velocity_mse,
+        "pack_actions_for_downsample": pack_actions_for_downsample,
+        "sample_nonterminal_semantic_query_indices": sample_nonterminal_semantic_query_indices,
+        "select_per_sample_trajectory_state": select_per_sample_trajectory_state,
     }
     namespace.update(overrides)
     exec(compile(module, "<deployment-method>", "exec"), namespace)
@@ -377,3 +396,247 @@ def test_real_student_euler_final_states_backpropagate_to_student(monkeypatch):
     (video_final.sum() + action_final.sum()).backward()
     assert harness.student.scale.grad is not None
     assert harness.student.scale.grad.abs().item() > 0
+
+
+def test_aligned_cosmos_video_opd_reuses_one_generated_canonical_joint_state():
+    class Student(nn.Module):
+        def __init__(self, perturb=0.0):
+            super().__init__()
+            self.rollout_scale = nn.Parameter(torch.tensor(1.0))
+            self.field_scale = nn.Parameter(torch.tensor(0.5))
+            self.anchor_scale = nn.Parameter(torch.tensor(-0.5))
+            self.perturb = perturb
+            self.calls = []
+
+    class Teacher:
+        raw_inference_enabled = True
+
+        def __init__(self):
+            self.endpoint_call = None
+
+        def predict_raw_joint_latent_velocity(
+            self, batch, query_latent, query_action, t
+        ):
+            del batch, query_action, t
+            return {
+                "cosmos_joint_query": query_latent,
+                "cosmos_latent_velocity": torch.full_like(query_latent, 2.0),
+                "cosmos_video_frame_mask": torch.ones(
+                    query_latent.shape[0], query_latent.shape[2], dtype=torch.bool
+                ),
+            }
+
+        def predict_raw_same_prior_endpoint(
+            self, batch, *, video_prior, action_prior, teacher_steps
+        ):
+            del batch
+            self.endpoint_call = SimpleNamespace(
+                video_prior=video_prior,
+                action_prior=action_prior,
+                teacher_steps=teacher_steps,
+            )
+            return {
+                "endpoint_video": torch.full_like(video_prior, -2.0),
+                "video_frame_mask": torch.ones(
+                    video_prior.shape[0], video_prior.shape[2], dtype=torch.bool
+                ),
+                "effective_teacher_steps": 8,
+                "video_prior_sha256": "verified",
+                "action_prior_sha256": "verified",
+            }
+
+    class Harness:
+        def __init__(self, perturb=0.0):
+            self.device = torch.device("cpu")
+            self.student = Student(perturb)
+            self._action_teacher_model = Teacher()
+            self.empty_emb = torch.zeros(1, 1, 1)
+            self.config = SimpleNamespace(
+                rank=0,
+                num_train_timesteps=1000,
+                cosmos_latent_channels=1,
+                cosmos_latent_frames=3,
+                cosmos_latent_height=1,
+                cosmos_latent_width=1,
+                action_downsample_factor=4,
+                action_packing_schema="downsample_survivor_v2",
+                used_action_channel_ids=list(range(7)),
+                snr_shift=5.0,
+                action_snr_shift=0.05,
+                opd_danceopd_rollout_steps=(2, 4),
+                cfg_min=1.0,
+                cfg_max=1.0,
+            )
+
+        @staticmethod
+        def convert_input_format(batch):
+            return batch
+
+        @staticmethod
+        def _prepare_base_dict(batch):
+            return {
+                "latent_dict": {
+                    "latent": batch["latents"],
+                    "cond_timesteps": torch.zeros(1, 3),
+                    "text_emb": torch.zeros(1, 1, 1),
+                    "grid_id": None,
+                },
+                "action_dict": {
+                    "latent": batch["actions"],
+                    "cond_timesteps": torch.zeros(1, 16),
+                    "text_emb": torch.zeros(1, 1, 1),
+                    "grid_id": None,
+                    "actions_mask": torch.ones_like(batch["actions"][:, :1]),
+                },
+                "chunk_size": 1,
+                "window_size": 1,
+            }
+
+        @staticmethod
+        def _mechanism_joint_input(video, action, video_t, action_t, context):
+            return {
+                "latent_dict": {
+                    **context["video_base"],
+                    "noisy_latents": video,
+                    "timesteps": video_t,
+                },
+                "action_dict": {
+                    "noisy_latents": action,
+                    "latent": context["action_latent"],
+                    "timesteps": action_t,
+                    "cond_timesteps": context["action_cond_t"],
+                    "text_emb": context["action_text"],
+                },
+                "chunk_size": 1,
+                "window_size": 1,
+            }
+
+        @staticmethod
+        def _init_joint_mask(_joint_input):
+            return None
+
+        @staticmethod
+        def _extract_action_v(action, _frames):
+            return action
+
+        @staticmethod
+        def _timestep_to_sigma_5d(t):
+            return t[:, None, :, None, None] / 1000.0
+
+        def _student_joint_forward(
+            self,
+            model,
+            joint_input,
+            _empty,
+            video_r,
+            action_r,
+            *,
+            require_action,
+            **_kwargs,
+        ):
+            del action_r
+            video = joint_input["latent_dict"]["noisy_latents"]
+            action = joint_input["action_dict"]["noisy_latents"]
+            assert joint_input["latent_dict"]["latent"].data_ptr() == video.data_ptr()
+            assert joint_input["action_dict"]["latent"].data_ptr() == action.data_ptr()
+            kind = (
+                "rollout"
+                if require_action
+                else ("anchor" if bool((video_r == 0).all()) else "field")
+            )
+            model.calls.append(SimpleNamespace(kind=kind, video=video, action=action))
+            if require_action:
+                video_v = torch.ones_like(video) * (
+                    model.rollout_scale + model.perturb
+                )
+                return video_v, torch.ones_like(action) * model.rollout_scale
+            scale = model.anchor_scale if kind == "anchor" else model.field_scale
+            return torch.ones_like(video) * scale
+
+        def _joint_euler_update(
+            self, video, action, video_v, action_v, vt, vr, at, ar
+        ):
+            return (
+                video
+                + video_v
+                * (
+                    self._timestep_to_sigma_5d(vr)
+                    - self._timestep_to_sigma_5d(vt)
+                ),
+                action
+                + action_v
+                * (
+                    self._timestep_to_sigma_5d(ar)
+                    - self._timestep_to_sigma_5d(at)
+                ),
+            )
+
+    Harness._cosmos_aligned_video_opd_step = _flowmap_method(
+        "_cosmos_aligned_video_opd_step"
+    )
+    batch = {
+        "gt_video": torch.full((1, 1, 3, 1, 1), 91.0),
+        "gt_action": torch.full((1, 7, 16, 4, 1), 73.0),
+    }
+    batch["latents"] = batch["gt_video"]
+    batch["actions"] = batch["gt_action"]
+
+    def run(perturb):
+        torch.manual_seed(17)
+        harness = Harness(perturb)
+        result = harness._cosmos_aligned_video_opd_step(batch.copy(), 0)
+        return harness, result
+
+    harness, result = run(0.0)
+    rollout_calls = [
+        call for call in harness.student.calls if call.kind == "rollout"
+    ]
+    field_call = next(call for call in harness.student.calls if call.kind == "field")
+    anchor_call = next(
+        call for call in harness.student.calls if call.kind == "anchor"
+    )
+
+    assert len(rollout_calls) in (2, 4)
+    assert torch.equal(field_call.video, anchor_call.video)
+    assert torch.equal(field_call.action, anchor_call.action)
+    assert field_call.video.data_ptr() == anchor_call.video.data_ptr()
+    assert field_call.action.data_ptr() == anchor_call.action.data_ptr()
+    assert not field_call.video.requires_grad
+    assert not field_call.action.requires_grad
+    assert not torch.equal(field_call.video, batch["gt_video"])
+    assert not torch.equal(field_call.action, batch["gt_action"][:, :, ::4])
+    for previous, current in zip(rollout_calls, rollout_calls[1:]):
+        assert not torch.equal(previous.video, current.video)
+
+    endpoint_call = harness._action_teacher_model.endpoint_call
+    assert endpoint_call.teacher_steps == 8
+    assert endpoint_call.video_prior.data_ptr() == rollout_calls[0].video.data_ptr()
+    unpacked_prior = unpack_flowmap_action_query(
+        rollout_calls[0].action,
+        used_action_channel_ids=list(range(7)),
+        packing_schema="downsample_survivor_v2",
+        downsample_factor=4,
+    )
+    assert torch.equal(unpacked_prior, endpoint_call.action_prior)
+
+    perturbed, _ = run(0.75)
+    perturbed_field = next(
+        call for call in perturbed.student.calls if call.kind == "field"
+    )
+    perturbed_anchor = next(
+        call for call in perturbed.student.calls if call.kind == "anchor"
+    )
+    assert not torch.equal(field_call.video, perturbed_field.video)
+    assert not torch.equal(anchor_call.video, perturbed_anchor.video)
+
+    assert harness.student.rollout_scale.grad is None
+    assert harness.student.field_scale.grad is not None
+    assert harness.student.field_scale.grad.abs().item() > 0
+    assert harness.student.anchor_scale.grad is not None
+    assert harness.student.anchor_scale.grad.abs().item() > 0
+    assert result["skip_step"] is False
+    assert result["opd_teacher_steps"].item() == 8
+    assert result["opd_same_prior_verified"].item() == 1
+    assert result["opd_canonical_state_verified"].item() == 1
+    assert "opd_action_endpoint_loss" not in result
+    assert "opd_action_field_loss" not in result

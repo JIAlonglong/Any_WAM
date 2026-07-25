@@ -287,8 +287,9 @@ if [[ "$RESUME_STAGE" == stage1 ]]; then
 elif [[ "$RESUME_STAGE" == stage2 ]]; then
     stage2_command+=(--resume-step "$RESUME_STEP")
 fi
+HELPER_PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va${PYTHONPATH:+:$PYTHONPATH}"
 if [[ "$LOCK_PREPARER" == *.py ]]; then
-    lock_command=("$PYTHON_BIN" "$LOCK_PREPARER")
+    lock_command=(env "PYTHONPATH=$HELPER_PYTHONPATH" "$PYTHON_BIN" "$LOCK_PREPARER")
 else
     lock_command=("$LOCK_PREPARER")
 fi
@@ -300,7 +301,10 @@ lock_command+=(
     --stage1-target-root "$STAGE1_TARGET"
 )
 if [[ "$PROMPT_TABLE_BUILDER" == *.py ]]; then
-    prompt_table_command=("$PYTHON_BIN" "$PROMPT_TABLE_BUILDER")
+    prompt_table_command=(
+        env "PYTHONPATH=$HELPER_PYTHONPATH"
+        "$PYTHON_BIN" "$PROMPT_TABLE_BUILDER"
+    )
 else
     prompt_table_command=("$PROMPT_TABLE_BUILDER")
 fi

@@ -498,6 +498,23 @@ def test_pipeline_missing_prompt_table_dry_run_prints_build_without_writes(tmp_p
     assert not Path(env["CALLS_LOG"]).exists()
 
 
+def test_pipeline_python_prompt_builder_receives_project_pythonpath(tmp_path):
+    env, output_root = _pipeline_env(tmp_path)
+    builder = tmp_path / "python-prompt-builder.py"
+    builder.write_text(
+        "import distillation_flowmap.cosmos_wan_prompt_table\n",
+        encoding="utf-8",
+    )
+    builder.chmod(builder.stat().st_mode | stat.S_IXUSR)
+    env["COSMOS_WAN_PROMPT_TABLE_BUILDER"] = str(builder)
+    env.pop("PYTHONPATH", None)
+
+    result = _pipeline(env, output_root, "--dry-run")
+
+    assert result.returncode == 0, result.stderr
+    assert "PROMPT_TABLE_COMMAND=" in result.stdout
+
+
 def test_eval_only_reuses_generated_table_by_validation(tmp_path):
     env, output_root = _pipeline_env(tmp_path)
     env.pop("S4_PROMPT_TABLE")

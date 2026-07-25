@@ -365,6 +365,14 @@ for variant, raw_path in zip(("online_student", "target_student"), sys.argv[1:3]
     path = Path(raw_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
     validate_contract_metadata(payload, required_stage="raw_stage1")
+    if payload.get("student_backend") != "wan_flowmap":
+        raise ValueError(
+            f"{variant} student_backend must be exactly 'wan_flowmap'"
+        )
+    if payload.get("teacher_backend") != "cosmos_policy":
+        raise ValueError(
+            f"{variant} teacher_backend must be exactly 'cosmos_policy'"
+        )
     actual_step = payload.get("checkpoint_step")
     if type(actual_step) is not int or actual_step != expected_step:
         raise ValueError(

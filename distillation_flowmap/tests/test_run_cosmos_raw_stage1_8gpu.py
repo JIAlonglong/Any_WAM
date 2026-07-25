@@ -32,6 +32,8 @@ RAW_CONTRACT = {
     "action_packing_schema": "downsample_survivor_v2",
     "action_downsample_factor": 4,
     "action_chunk_shape": [4, 4],
+    "student_backend": "wan_flowmap",
+    "teacher_backend": "cosmos_policy",
 }
 
 
@@ -740,6 +742,8 @@ def test_resume_rejects_symlinked_path_components_and_files(tmp_path, component)
         ("online_student", "contract_version", 1, "contract_version"),
         ("target_student", "training_contract_stage", "progressive_stage2", "training_contract_stage"),
         ("target_student", "checkpoint_step", 2999, "checkpoint_step"),
+        ("online_student", "student_backend", "cosmos_policy", "student_backend"),
+        ("target_student", "teacher_backend", "wanva", "teacher_backend"),
     ],
 )
 def test_resume_rejects_wrong_metadata_on_both_variants(

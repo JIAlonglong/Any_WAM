@@ -1227,6 +1227,44 @@ def test_libero_cosmos_policy_configs_are_action_only(monkeypatch):
         assert cfg.return_raw_observation is False
 
 
+def test_legacy_action_stage2_requires_explicit_hybrid_paths(monkeypatch):
+    module_name = "distillation_flowmap.config_libero_cosmos_policy_stage2"
+    for name in (
+        "COSMOS_POLICY_PATH",
+        "WAN_STUDENT_BASE_MODEL_PATH",
+        "STUDENT_BASE_MODEL_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    sys.modules.pop(module_name, None)
+
+    with pytest.raises(KeyError, match="COSMOS_POLICY_PATH"):
+        importlib.import_module(module_name)
+
+    monkeypatch.setenv("COSMOS_POLICY_PATH", "/explicit/cosmos-teacher")
+    sys.modules.pop(module_name, None)
+    with pytest.raises(ValueError, match="WAN_STUDENT_BASE_MODEL_PATH"):
+        importlib.import_module(module_name)
+
+
+def test_legacy_action_stage2_accepts_old_student_alias_and_rejects_conflict(
+    monkeypatch,
+):
+    module_name = "distillation_flowmap.config_libero_cosmos_policy_stage2"
+    monkeypatch.setenv("COSMOS_POLICY_PATH", "/explicit/cosmos-teacher")
+    monkeypatch.delenv("WAN_STUDENT_BASE_MODEL_PATH", raising=False)
+    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/explicit/legacy-wan")
+    sys.modules.pop(module_name, None)
+
+    cfg = importlib.import_module(module_name).cfg
+    assert cfg.student_backend == "wan_flowmap"
+    assert cfg.student_base_model_path == "/explicit/legacy-wan"
+
+    monkeypatch.setenv("WAN_STUDENT_BASE_MODEL_PATH", "/explicit/new-wan")
+    sys.modules.pop(module_name, None)
+    with pytest.raises(ValueError, match="disagree"):
+        importlib.import_module(module_name)
+
+
 def test_cosmos_dual_teacher_stage1_config_imports(monkeypatch):
     monkeypatch.setenv("COSMOS_POLICY_PATH", "/tmp/cosmos-policy")
     monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")

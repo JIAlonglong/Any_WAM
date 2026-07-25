@@ -66,8 +66,29 @@ def test_cosmos_latent_stage2_defaults_are_memory_safe(monkeypatch):
     assert module.cfg.opd_transition_group_weight <= 1e-2
 
 
+def _hybrid_roots(tmp_path):
+    wan_base = tmp_path / "wan-base"
+    (wan_base / "transformer").mkdir(parents=True)
+    (wan_base / "transformer" / "config.json").write_text(
+        json.dumps({"_class_name": "WanTransformer3DModel"})
+    )
+    cosmos_teacher = tmp_path / "cosmos-teacher"
+    cosmos_teacher.mkdir()
+    (cosmos_teacher / "config.json").write_text(
+        json.dumps({"model_type": "cosmos-policy"})
+    )
+    for name in (
+        "Cosmos-Policy-LIBERO-Predict2-2B.pt",
+        "libero_dataset_statistics.json",
+        "libero_t5_embeddings.pkl",
+    ):
+        (cosmos_teacher / name).write_bytes(b"fixture")
+    return wan_base, cosmos_teacher
+
+
 def _set_valid_progressive_lineage(monkeypatch, tmp_path):
     stage1 = tmp_path / "stage1"
+    wan_base, cosmos_teacher = _hybrid_roots(tmp_path)
     payload = {
         "contract_version": 2,
         "training_contract_stage": "raw_stage1",
@@ -77,6 +98,8 @@ def _set_valid_progressive_lineage(monkeypatch, tmp_path):
         "checkpoint_step": 5000,
         "teacher_backend": "cosmos_policy",
         "student_backend": "wan_flowmap",
+        "student_base_model_path": str(wan_base.resolve()),
+        "teacher_model_path": str(cosmos_teacher.resolve()),
     }
     for variant in ("online_student", "target_student"):
         transformer = stage1 / variant / "transformer"
@@ -96,7 +119,8 @@ def _set_valid_progressive_lineage(monkeypatch, tmp_path):
     )
     for name, value in {
         "STUDENT_BASE_MODEL_PATH": str(stage1 / "target_student"),
-        "WAN_STUDENT_BASE_MODEL_PATH": str(stage1 / "target_student"),
+        "WAN_STUDENT_BASE_MODEL_PATH": str(wan_base),
+        "COSMOS_POLICY_PATH": str(cosmos_teacher),
         "RESUME_FROM_PATH": str(stage1),
         "PARENT_STAGE1_PATH": parent.canonical_path,
         "PARENT_STAGE1_CONTRACT_IDENTITY": parent.contract_identity,
@@ -178,6 +202,7 @@ def test_real_checkpoint_writer_persists_stage1_backend_and_stage2_lineage(
     tmp_path, monkeypatch
 ):
     _patch_checkpoint_io(monkeypatch)
+    wan_base, cosmos_teacher = _hybrid_roots(tmp_path)
     stage1_save = tmp_path / "raw-stage1" / "checkpoints"
     stage1_config = SimpleNamespace(
         rank=0,
@@ -188,8 +213,8 @@ def test_real_checkpoint_writer_persists_stage1_backend_and_stage2_lineage(
         action_chunk_shape=[4, 4],
         teacher_backend="cosmos_policy",
         student_backend="wan_flowmap",
-        student_base_model_path="/explicit/cosmos-base",
-        teacher_model_path="/explicit/cosmos-teacher",
+        student_base_model_path=str(wan_base),
+        teacher_model_path=str(cosmos_teacher),
     )
     stage1_trainer = _checkpoint_trainer(
         stage1_save, step=5000, config=stage1_config
@@ -209,8 +234,8 @@ def test_real_checkpoint_writer_persists_stage1_backend_and_stage2_lineage(
     )
     assert stage1_payload["teacher_backend"] == "cosmos_policy"
     assert stage1_payload["student_backend"] == "wan_flowmap"
-    assert stage1_payload["student_base_model_path"] == "/explicit/cosmos-base"
-    assert stage1_payload["teacher_model_path"] == "/explicit/cosmos-teacher"
+    assert stage1_payload["student_base_model_path"] == str(wan_base)
+    assert stage1_payload["teacher_model_path"] == str(cosmos_teacher)
 
     arm_root = tmp_path / "progressive-stage2"
     lineage_json = json.dumps(
@@ -255,7 +280,7 @@ def test_real_checkpoint_writer_persists_stage1_backend_and_stage2_lineage(
         student_backend="wan_flowmap",
         teacher_backend="cosmos_policy",
         student_base_model_path=str(stage1_checkpoint / "target_student"),
-        teacher_model_path="/explicit/cosmos-teacher",
+        teacher_model_path=str(cosmos_teacher),
         parent_stage1_path=parent.canonical_path,
         parent_stage1_contract_identity=parent.contract_identity,
         stage2_lineage_json=lineage_json,

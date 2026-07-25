@@ -33,6 +33,7 @@ PROGRESSIVE_ALLOWED_DIFFERENCES = {
     "rollout_step_pairs",
     "danceopd_rollout_steps",
     "video_velocity_weight",
+    "action_opd_enabled",
     "opd_rollout_grad_mode",
     "opd_action_rollout_grad_mode",
     "opd_rollout_grad_steps",
@@ -160,7 +161,9 @@ def test_progressive_arms_differ_only_in_declared_budget_fields(tmp_path):
     for name, subset in expected.items():
         assert {key: records[name][key] for key in subset} == subset
         assert records[name]["action_endpoint_weight"] == 1.0
-        assert records[name]["action_opd_enabled"] is False
+        assert records[name]["action_opd_enabled"] is (
+            name == "universal-video-action"
+        )
         assert records[name]["use_opd_aux"] is True
 
     _assert_only_declared_progressive_differences(records.values())

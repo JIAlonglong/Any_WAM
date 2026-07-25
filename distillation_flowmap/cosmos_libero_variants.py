@@ -302,7 +302,7 @@ def resolve_variant(
         "video_endpoint_weight": spec["video_endpoint_weight"],
         "video_velocity_weight": spec["video_velocity_weight"],
         "action_endpoint_weight": spec["action_endpoint_weight"],
-        "action_opd_enabled": False,
+        "action_opd_enabled": name == "universal-video-action",
         "use_opd_aux": use_opd_aux,
         "opd_aux_standalone_step": use_opd_aux,
         "learning_rate": 2e-7,

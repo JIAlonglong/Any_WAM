@@ -125,6 +125,7 @@ def test_builder_uses_wan_contract_and_zero_pads_tokens_after_attention_mask():
 
 def test_wan_base_identity_rejects_missing_components_and_changes_with_artifacts(tmp_path):
     root = _wan_base(tmp_path)
+    (root / "model_index.json").unlink()
     first = inspect_wan_base(root)
     assert len(first["identity_sha256"]) == 64
     assert first["resolved_path"] == str(root.resolve())

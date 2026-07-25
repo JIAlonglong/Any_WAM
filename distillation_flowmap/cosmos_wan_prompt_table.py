@@ -21,7 +21,6 @@ FORMAT = "flash_wam.libero_wan_prompt_table.v1"
 PROMPT_SHAPE = (1, 512, 4096)
 DEFAULT_MANIFEST = Path(__file__).with_name("libero_40_task_manifest.json")
 _CONFIG_FILES = (
-    "model_index.json",
     "tokenizer/tokenizer_config.json",
     "text_encoder/config.json",
     "transformer/config.json",

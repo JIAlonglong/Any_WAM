@@ -78,7 +78,12 @@ except ImportError:
     HAS_PEFT = False
 
 from distillation.data import DataMixin
-from distillation.ema import update_ema
+from distillation.ema import (
+    SelectiveFp32EMA,
+    load_selective_ema_rank_state,
+    save_selective_ema_rank_state,
+    update_ema,
+)
 from flowmap_step import FlowMapStepMixin
 from model_flowmap import setup_flowmap_model, patch_model_forward
 
@@ -1072,6 +1077,33 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             self.target_student.requires_grad_(False)  # 冻结，仅用于推理
             self.target_student.eval()
 
+        self._action_ema = None
+        self._last_action_ema_stats = {}
+        if (
+            self.target_student is not None
+            and bool(getattr(config, "action_ema_fp32", False))
+        ):
+            target_named_parameters = list(
+                self.target_student.named_parameters()
+            )
+            source_named_parameters = list(self.student.named_parameters())
+            selected_names = {
+                name
+                for name, _ in target_named_parameters
+                if classify_parameter_branch(name) == "action"
+            }
+            self._action_ema = SelectiveFp32EMA(
+                target_named_parameters,
+                source_named_parameters,
+                selected_names,
+            )
+            self._restore_action_ema_state()
+            if config.rank == 0:
+                logger.info(
+                    "FP32 action EMA enabled for %d tensors",
+                    len(self._action_ema.selected_names),
+                )
+
         # ==============================================================
         # 优化器和学习率调度器
         # ==============================================================
@@ -1257,6 +1289,56 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     if config.rank == 0:
                         logger.info(f"Loaded discriminator optimizer from {disc_opt_ckpt}")
 
+    def _ema_rank_world_size(self):
+        if dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+        return int(getattr(self.config, "rank", 0)), int(
+            getattr(self.config, "world_size", 1)
+        )
+
+    def _restore_action_ema_state(self):
+        if self._action_ema is None:
+            return False
+        reset_resume_step = bool(
+            getattr(self.config, "reset_resume_step", False)
+        )
+        if self._resume_ckpt_dir is None or self.step <= 0 or reset_resume_step:
+            return False
+        rank, world_size = self._ema_rank_world_size()
+        state_dir = Path(self._resume_ckpt_dir) / "action_ema_fp32"
+        load_selective_ema_rank_state(
+            self._action_ema,
+            state_dir,
+            rank=rank,
+            world_size=world_size,
+            expected_step=self.step,
+        )
+        if self.config.rank == 0:
+            logger.info("Restored FP32 action EMA from %s", state_dir)
+        return True
+
+    def _save_action_ema_state(self, step_dir):
+        if self._action_ema is None:
+            return
+        rank, world_size = self._ema_rank_world_size()
+        state_dir = Path(step_dir) / "action_ema_fp32"
+        save_selective_ema_rank_state(
+            self._action_ema,
+            state_dir,
+            rank=rank,
+            world_size=world_size,
+            step=self.step,
+        )
+        if rank == 0:
+            manifest = {
+                "version": SelectiveFp32EMA.STATE_VERSION,
+                "world_size": world_size,
+                "checkpoint_step": self.step,
+                "selected_names": list(self._action_ema.selected_names),
+            }
+            with open(state_dir / "manifest.json", "w") as f:
+                json.dump(manifest, f, indent=2)
+
     # ==================================================================
     # 保存检查点（与原始 FlashWAMDistiller 完全相同）
     # ==================================================================
@@ -1327,6 +1409,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     torch.save(self.optimizer.state_dict(), step_dir / "optimizer.pt")
                     torch.save(self.lr_scheduler.state_dict(), step_dir / "lr_scheduler.pt")
                     logger.info(f"  Saved optimizer/scheduler -> {step_dir}")
+
+            if which == "target_student":
+                self._save_action_ema_state(
+                    self.save_dir / f"step_{self.step}"
+                )
 
             # 保存判别器权重（仅在 use_dmd=True 且保存 online_student 时）
             if self.use_dmd and which == "online_student" and self.discriminator is not None:
@@ -3123,11 +3210,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         ema_decay = 0.0 if self.step < ema_warmup_steps else config.ema_decay
                         self._last_ema_decay = float(ema_decay)
                         if self.target_student is not None:
-                            update_ema(
-                                self.target_student.parameters(),
-                                self.student.parameters(),
-                                rate=ema_decay,
-                            )
+                            if self._action_ema is not None:
+                                self._last_action_ema_stats = (
+                                    self._action_ema.update(ema_decay)
+                                )
+                            else:
+                                update_ema(
+                                    self.target_student.parameters(),
+                                    self.student.parameters(),
+                                    rate=ema_decay,
+                                )
 
                 # 计算平均损失（跨所有进程）
                 lr = self.lr_scheduler.get_last_lr()[0]
@@ -3376,10 +3468,21 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         "train/lr": lr,
                         "train/ema_decay": getattr(self, '_last_ema_decay', config.ema_decay),
                     }
+                    for key, value in self._last_action_ema_stats.items():
+                        log_dict[f"ema_action/{key}"] = value
                     if grad_branch_norms:
                         log_dict["grad_norm/video_branch"] = grad_branch_norms["video"]
                         log_dict["grad_norm/action_branch"] = grad_branch_norms["action"]
                         log_dict["grad_norm/shared_branch"] = grad_branch_norms["shared"]
+                        grad_ratio_eps = 1e-12
+                        log_dict["grad_norm/action_to_shared"] = (
+                            grad_branch_norms["action"]
+                            / max(grad_branch_norms["shared"], grad_ratio_eps)
+                        )
+                        log_dict["grad_norm/action_to_video"] = (
+                            grad_branch_norms["action"]
+                            / max(grad_branch_norms["video"], grad_ratio_eps)
+                        )
                     if self.distill_video:
                         if use_onpolicy_now:
                             postfix["vt"] = f"{avg_video_loss:.4f}"

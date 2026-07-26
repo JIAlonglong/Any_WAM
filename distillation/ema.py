@@ -20,6 +20,7 @@ EMA 的作用：
 import torch
 import torch.distributed as dist
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 
 
 _is_distributed = None  # 缓存分布式状态
@@ -197,6 +198,70 @@ class SelectiveFp32EMA:
             target_by_name[name].copy_(
                 master.to(dtype=target_by_name[name].dtype)
             )
+
+
+def selective_ema_rank_state_path(checkpoint_dir, rank: int) -> Path:
+    return Path(checkpoint_dir) / f"rank_{int(rank):05d}.pt"
+
+
+def save_selective_ema_rank_state(
+    ema: SelectiveFp32EMA,
+    checkpoint_dir,
+    *,
+    rank: int,
+    world_size: int,
+    step: int,
+) -> Path:
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    path = selective_ema_rank_state_path(checkpoint_dir, rank)
+    torch.save(
+        {
+            "rank": int(rank),
+            "world_size": int(world_size),
+            "step": int(step),
+            "ema": ema.state_dict(),
+        },
+        path,
+    )
+    return path
+
+
+def load_selective_ema_rank_state(
+    ema: SelectiveFp32EMA,
+    checkpoint_dir,
+    *,
+    rank: int,
+    world_size: int,
+    expected_step: int,
+) -> dict[str, int]:
+    path = selective_ema_rank_state_path(checkpoint_dir, rank)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing selective EMA rank state: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    saved_rank = int(payload.get("rank", -1))
+    saved_world_size = int(payload.get("world_size", -1))
+    saved_step = int(payload.get("step", -1))
+    if saved_rank != int(rank):
+        raise ValueError(
+            f"Selective EMA rank mismatch: saved={saved_rank} expected={rank}"
+        )
+    if saved_world_size != int(world_size):
+        raise ValueError(
+            "Selective EMA world size mismatch: "
+            f"saved={saved_world_size} expected={world_size}"
+        )
+    if saved_step != int(expected_step):
+        raise ValueError(
+            f"Selective EMA step mismatch: saved={saved_step} "
+            f"expected={expected_step}"
+        )
+    ema.load_state_dict(payload["ema"])
+    return {
+        "rank": saved_rank,
+        "world_size": saved_world_size,
+        "step": saved_step,
+    }
 
 
 @torch.no_grad()

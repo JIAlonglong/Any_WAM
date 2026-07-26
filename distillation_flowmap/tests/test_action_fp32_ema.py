@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import pytest
 import torch
 
-from distillation.ema import SelectiveFp32EMA
+from distillation.ema import (
+    SelectiveFp32EMA,
+    load_selective_ema_rank_state,
+    save_selective_ema_rank_state,
+)
 
 
 def _named_parameter(name, value, *, dtype=torch.bfloat16):
@@ -130,3 +135,126 @@ def test_selective_fp32_ema_rejects_nonfinite_state():
 
     with pytest.raises(ValueError, match="non-finite"):
         ema.load_state_dict(state)
+
+
+def test_selective_fp32_ema_rank_checkpoint_round_trip(tmp_path):
+    name = "action_proj_out.weight"
+    target_a = _named_parameter(name, [0.03125])
+    source_a = _named_parameter(name, [0.03173828125])
+    ema_a = SelectiveFp32EMA(target_a, source_a, {name})
+    ema_a.update(0.99)
+    save_selective_ema_rank_state(
+        ema_a,
+        tmp_path,
+        rank=0,
+        world_size=1,
+        step=50,
+    )
+
+    target_b = _named_parameter(name, [0.03125])
+    source_b = _named_parameter(name, [0.03173828125])
+    ema_b = SelectiveFp32EMA(target_b, source_b, {name})
+    metadata = load_selective_ema_rank_state(
+        ema_b,
+        tmp_path,
+        rank=0,
+        world_size=1,
+        expected_step=50,
+    )
+
+    assert metadata == {"rank": 0, "world_size": 1, "step": 50}
+    assert ema_a.state_dict()["masters"][name].equal(
+        ema_b.state_dict()["masters"][name]
+    )
+
+
+def test_selective_fp32_ema_rank_checkpoint_requires_file(tmp_path):
+    name = "action_proj_out.weight"
+    ema = SelectiveFp32EMA(
+        _named_parameter(name, [0.0]),
+        _named_parameter(name, [1.0]),
+        {name},
+    )
+
+    with pytest.raises(FileNotFoundError, match="rank_00000"):
+        load_selective_ema_rank_state(
+            ema,
+            tmp_path,
+            rank=0,
+            world_size=1,
+            expected_step=50,
+        )
+
+
+@pytest.mark.parametrize(
+    ("load_rank", "load_world_size", "load_step", "message"),
+    [
+        (1, 2, 50, "rank"),
+        (0, 2, 50, "world size"),
+        (0, 1, 51, "step"),
+    ],
+)
+def test_selective_fp32_ema_rank_checkpoint_validates_metadata(
+    tmp_path,
+    load_rank,
+    load_world_size,
+    load_step,
+    message,
+):
+    name = "action_proj_out.weight"
+    ema = SelectiveFp32EMA(
+        _named_parameter(name, [0.0]),
+        _named_parameter(name, [1.0]),
+        {name},
+    )
+    save_selective_ema_rank_state(
+        ema,
+        tmp_path,
+        rank=0,
+        world_size=1,
+        step=50,
+    )
+    source = tmp_path / "rank_00000.pt"
+    destination = tmp_path / f"rank_{load_rank:05d}.pt"
+    if destination != source:
+        destination.write_bytes(source.read_bytes())
+
+    with pytest.raises(ValueError, match=message):
+        load_selective_ema_rank_state(
+            ema,
+            tmp_path,
+            rank=load_rank,
+            world_size=load_world_size,
+            expected_step=load_step,
+        )
+
+
+def test_flowmap_trainer_wires_fp32_ema_only_for_action_branch():
+    source = (
+        Path(__file__).resolve().parents[1] / "flowmap_trainer.py"
+    ).read_text()
+
+    assert "SelectiveFp32EMA" in source
+    assert 'classify_parameter_branch(name) == "action"' in source
+    assert "self._action_ema.update(ema_decay)" in source
+    assert "update_ema(" in source
+
+
+def test_flowmap_trainer_saves_and_strictly_restores_action_ema_state():
+    source = (
+        Path(__file__).resolve().parents[1] / "flowmap_trainer.py"
+    ).read_text()
+
+    assert "save_selective_ema_rank_state(" in source
+    assert "load_selective_ema_rank_state(" in source
+    assert '"action_ema_fp32"' in source
+    assert "reset_resume_step" in source
+
+
+def test_flowmap_trainer_logs_action_gradient_ratios():
+    source = (
+        Path(__file__).resolve().parents[1] / "flowmap_trainer.py"
+    ).read_text()
+
+    assert '"grad_norm/action_to_shared"' in source
+    assert '"grad_norm/action_to_video"' in source

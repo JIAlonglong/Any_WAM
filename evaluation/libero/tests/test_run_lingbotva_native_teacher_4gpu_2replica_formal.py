@@ -46,6 +46,14 @@ def test_fast_four_gpu_wrapper_expands_to_two_independent_replicas(tmp_path):
     for steps in ("1", "2", "4"):
         lanes = [worker for worker in workers if worker["steps"] == steps]
         assert len(lanes) == 8
-        assert {worker["replica"] for worker in lanes} == {"0", "1"}
-        assert {worker["gpu"] for worker in lanes} == {"0", "1", "2", "3"}
+        assert {(worker["gpu"], worker["replica"]) for worker in lanes} == {
+            ("0", "0"),
+            ("0", "1"),
+            ("1", "0"),
+            ("1", "1"),
+            ("2", "0"),
+            ("2", "1"),
+            ("3", "0"),
+            ("3", "1"),
+        }
     assert not output_root.exists()

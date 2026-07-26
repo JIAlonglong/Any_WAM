@@ -169,8 +169,16 @@ def test_check_only_expands_four_gpus_to_two_independent_replicas(tmp_path):
     for steps in ("1", "2", "4"):
         lanes = [worker for worker in workers if worker["steps"] == steps]
         assert len(lanes) == 8
-        assert {lane["gpu"] for lane in lanes} == {"0", "1", "2", "3"}
-        assert {lane["replica"] for lane in lanes} == {"0", "1"}
+        assert {(lane["gpu"], lane["replica"]) for lane in lanes} == {
+            ("0", "0"),
+            ("0", "1"),
+            ("1", "0"),
+            ("1", "1"),
+            ("2", "0"),
+            ("2", "1"),
+            ("3", "0"),
+            ("3", "1"),
+        }
         assert len({lane["master_port"] for lane in lanes}) == 8
         assert len({lane["ws_port"] for lane in lanes}) == 8
         assert len({lane["save_root"] for lane in lanes}) == 8

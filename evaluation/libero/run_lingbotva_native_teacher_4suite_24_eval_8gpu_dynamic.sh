@@ -530,7 +530,7 @@ run_budget() {
     local steps="$1"
     local budget_root="${MODEL_RESULT_ROOT}/steps_${steps}"
     local claims_root="${budget_root}/claims"
-    local lane gpu_index gpu replica worker_root
+    local lane gpu_index gpu replica worker worker_root
 
     mkdir -p "${budget_root}/workers" "$claims_root"
     ACTIVE_WORKER_PIDS=()

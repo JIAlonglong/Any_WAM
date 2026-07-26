@@ -7,7 +7,12 @@ dependencies, so they remain runnable in a lightweight test environment.
 from __future__ import annotations
 
 import ast
+import os
+import subprocess
+import textwrap
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -73,8 +78,6 @@ def _calls_named(nodes: list[ast.stmt], name: str) -> list[ast.Call]:
 
 def test_client_no_save_video_keeps_cache_key_frames_without_writing_mp4():
     tree = _parse(CLIENT)
-    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-    assert any(_is_boolean_optional_argument(call, "--save-video") for call in calls)
 
     run_one = _function(tree, "run_one")
     assert "save_video_enabled" in [arg.arg for arg in run_one.args.args]
@@ -107,6 +110,55 @@ def test_client_no_save_video_keeps_cache_key_frames_without_writing_mp4():
         if isinstance(call, ast.Call)
     )
     assert any(_calls_named(block.body, "save_video") for block in guarded_blocks)
+
+
+def test_libero_python38_client_accepts_no_save_video_without_boolean_optional_action():
+    """Python 3.8 is the real LIBERO client runtime on the A800 evaluator."""
+    client_python = os.environ.get("CLIENT_PYTHON")
+    if not client_python or not Path(client_python).is_file():
+        pytest.skip("CLIENT_PYTHON is required to exercise the LIBERO runtime")
+
+    code = textwrap.dedent(
+        f"""\
+        from pathlib import Path
+
+        source_path = Path({str(CLIENT)!r})
+        namespace = {{
+            "__file__": str(source_path),
+            "__name__": "_client_cli_contract",
+        }}
+        exec(compile(source_path.read_text(), str(source_path), "exec"), namespace)
+        argparse_module = namespace["argparse"]
+        if hasattr(argparse_module, "BooleanOptionalAction"):
+            delattr(argparse_module, "BooleanOptionalAction")
+
+        original_parse_args = argparse_module.ArgumentParser.parse_args
+
+        def parse_args(self, args=None, namespace=None):
+            return original_parse_args(self, ["--no-save-video"], namespace)
+
+        argparse_module.ArgumentParser.parse_args = parse_args
+        observed = {{}}
+        namespace["run"] = lambda **kwargs: observed.update(kwargs)
+        namespace["main"]()
+        assert observed["save_video_enabled"] is False, observed
+        """
+    )
+    result = subprocess.run(
+        [client_python, "-c", code],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "MUJOCO_GL": "osmesa",
+            "PYOPENGL_PLATFORM": "osmesa",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_native_server_no_save_debug_tensors_guards_only_debug_writes():

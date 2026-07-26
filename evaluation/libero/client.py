@@ -268,9 +268,15 @@ def main():
     parser.add_argument(
         "--save-video",
         dest="save_video_enabled",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",
         default=True,
         help="Save per-episode MP4 files.",
+    )
+    parser.add_argument(
+        "--no-save-video",
+        dest="save_video_enabled",
+        action="store_false",
+        help="Do not save per-episode MP4 files.",
     )
     args = parser.parse_args()
     run(**vars(args))

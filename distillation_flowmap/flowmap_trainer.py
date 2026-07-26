@@ -80,6 +80,7 @@ except ImportError:
 from distillation.data import DataMixin
 from distillation.ema import (
     SelectiveFp32EMA,
+    invalidate_fsdp1_unsharded_parameter_cache,
     load_selective_ema_rank_state,
     save_selective_ema_rank_state,
     update_ema,
@@ -3220,6 +3221,15 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                                     self.student.parameters(),
                                     rate=ema_decay,
                                 )
+                            if self.use_fsdp1:
+                                invalidated_handles = (
+                                    invalidate_fsdp1_unsharded_parameter_cache(
+                                        self.target_student
+                                    )
+                                )
+                                self._last_action_ema_stats[
+                                    "fsdp_cache_invalidated_handles"
+                                ] = float(invalidated_handles)
 
                 # 计算平均损失（跨所有进程）
                 lr = self.lr_scheduler.get_last_lr()[0]

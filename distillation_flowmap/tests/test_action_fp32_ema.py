@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -258,3 +261,38 @@ def test_flowmap_trainer_logs_action_gradient_ratios():
 
     assert '"grad_norm/action_to_shared"' in source
     assert '"grad_norm/action_to_video"' in source
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_FSDP_CUDA_TESTS") != "1",
+    reason="requires the explicit CUDA FSDP integration-test opt-in",
+)
+def test_fsdp_action_ema_update_persists_to_forward_and_full_state():
+    worker = (
+        Path(__file__).resolve().parent
+        / "fsdp_action_ema_writeback_worker.py"
+    )
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = env.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
+    repo_root = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (repo_root, env.get("PYTHONPATH")) if part
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=2",
+            str(worker),
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "FSDP_ACTION_EMA_WRITEBACK_OK" in result.stdout

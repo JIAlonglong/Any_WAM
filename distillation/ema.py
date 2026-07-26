@@ -200,6 +200,35 @@ class SelectiveFp32EMA:
             )
 
 
+@torch.no_grad()
+def invalidate_fsdp1_unsharded_parameter_cache(model) -> int:
+    """Discard stale FSDP1 full-parameter buffers after an external EMA update.
+
+    FSDP1 may retain the unsharded buffer used by a frozen/no-grad forward
+    even after switching the exposed original parameters back to local shard
+    views. EMA mutates those local shards directly. Unless the retained full
+    buffers are freed, the next target forward and a full-state checkpoint can
+    reuse the pre-EMA values.
+    """
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    except ImportError:
+        return 0
+
+    if not isinstance(model, FSDP):
+        return 0
+
+    invalidated = 0
+    for fsdp_module in FSDP.fsdp_modules(model):
+        handle = getattr(fsdp_module, "_handle", None)
+        if handle is None or not handle.uses_sharded_strategy:
+            continue
+        handle.reshard(free_unsharded_flat_param=True)
+        handle.post_reshard()
+        invalidated += 1
+    return invalidated
+
+
 def selective_ema_rank_state_path(checkpoint_dir, rank: int) -> Path:
     return Path(checkpoint_dir) / f"rank_{int(rank):05d}.pt"
 

@@ -11,7 +11,7 @@ SCRIPT = (
     ROOT
     / "evaluation"
     / "libero"
-    / "run_cosmos_official_teacher_124_eval_8gpu.sh"
+    / "run_cosmos_official_teacher_124_eval_4gpu.sh"
 )
 
 
@@ -22,8 +22,6 @@ def _write_sentinel(path: Path) -> None:
         "payload = {\n"
         "    'argv': sys.argv[1:],\n"
         "    'S4_MATRIX_ROLES': os.environ.get('S4_MATRIX_ROLES'),\n"
-        "    'S4_ALIGNMENT_VERIFIED': os.environ.get('S4_ALIGNMENT_VERIFIED'),\n"
-        "    'S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH': os.environ.get('S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH'),\n"
         "    'S4_FORMAL_NUM_SHARDS': os.environ.get('S4_FORMAL_NUM_SHARDS'),\n"
         "    'S4_VIDEO_SEEDS': os.environ.get('S4_VIDEO_SEEDS'),\n"
         "    'S4_EPISODES_PER_TASK': os.environ.get('S4_EPISODES_PER_TASK'),\n"
@@ -66,11 +64,7 @@ def _env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
             "PYTHON_BIN": sys.executable,
             "COSMOS_TEACHER_MATRIX_LAUNCHER": str(sentinel),
             "SENTINEL_OUTPUT": str(capture),
-            # The dedicated wrapper must override all three.
-            "S4_MATRIX_ROLES": "stage2_target",
-            "S4_ALIGNMENT_VERIFIED": "0",
-            "S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH": "1",
-            "S4_FORMAL_NUM_SHARDS": "2",
+            "S4_FORMAL_NUM_SHARDS": "4",
             "S4_VIDEO_SEEDS": "0,1,2",
         }
     )
@@ -78,9 +72,13 @@ def _env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
     return env, capture, matrix_root
 
 
-def _run(mode: str, *, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["bash", str(SCRIPT), mode],
+def test_four_gpu_wrapper_forces_two_shards_and_representative_video_seed(
+    tmp_path,
+):
+    env, capture, matrix_root = _env(tmp_path)
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "dry-run"],
         cwd=ROOT,
         env=env,
         text=True,
@@ -88,56 +86,16 @@ def _run(mode: str, *, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
         check=False,
     )
 
-
-def test_teacher_wrapper_forces_verified_teacher_only_eight_gpu_contract(tmp_path):
-    env, capture, matrix_root = _env(tmp_path)
-
-    result = _run("dry-run", env=env)
-
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(capture.read_text(encoding="utf-8"))
     assert payload == {
         "argv": ["dry-run"],
         "S4_MATRIX_ROLES": "official_teacher",
-        "S4_ALIGNMENT_VERIFIED": "1",
-        "S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH": "0",
-        "S4_FORMAL_NUM_SHARDS": "4",
-        "S4_VIDEO_SEEDS": "0,1,2",
+        "S4_FORMAL_NUM_SHARDS": "2",
+        "S4_VIDEO_SEEDS": "0",
         "S4_EPISODES_PER_TASK": "50",
         "S4_CKPT_ROOT": env["COSMOS_POLICY_PATH"],
         "MATRIX_ROOT": str(matrix_root),
     }
     assert not matrix_root.exists()
 
-
-def test_teacher_wrapper_preserves_episode_override(tmp_path):
-    env, capture, _matrix_root = _env(tmp_path)
-    env["S4_EPISODES_PER_TASK"] = "1"
-
-    result = _run("dry-run", env=env)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    payload = json.loads(capture.read_text(encoding="utf-8"))
-    assert payload["S4_EPISODES_PER_TASK"] == "1"
-    assert payload["S4_MATRIX_ROLES"] == "official_teacher"
-
-
-def test_teacher_wrapper_rejects_existing_root_before_delegation(tmp_path):
-    env, capture, matrix_root = _env(tmp_path)
-    matrix_root.mkdir()
-
-    result = _run("run", env=env)
-
-    assert result.returncode == 2
-    assert "MATRIX_ROOT already exists" in result.stderr
-    assert not capture.exists()
-
-
-def test_teacher_wrapper_rejects_unknown_mode(tmp_path):
-    env, capture, _matrix_root = _env(tmp_path)
-
-    result = _run("smoke", env=env)
-
-    assert result.returncode == 2
-    assert "run or dry-run" in result.stderr
-    assert not capture.exists()

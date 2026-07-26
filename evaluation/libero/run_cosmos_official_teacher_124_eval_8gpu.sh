@@ -53,7 +53,12 @@ source "${SCRIPT_DIR}/cosmos_progressive_s4_env.sh"
 export S4_MATRIX_ROLES=official_teacher
 export S4_ALIGNMENT_VERIFIED=1
 export S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH=0
-export S4_FORMAL_NUM_SHARDS=4
+COSMOS_TEACHER_FORMAL_NUM_SHARDS="${COSMOS_TEACHER_FORMAL_NUM_SHARDS:-4}"
+case "${COSMOS_TEACHER_FORMAL_NUM_SHARDS}" in
+    2|4) ;;
+    *) die "COSMOS_TEACHER_FORMAL_NUM_SHARDS must be 2 or 4" ;;
+esac
+export S4_FORMAL_NUM_SHARDS="${COSMOS_TEACHER_FORMAL_NUM_SHARDS}"
 export S4_EPISODES_PER_TASK="${S4_EPISODES_PER_TASK:-50}"
 
 # The delegated matrix parser requires S4_CKPT_ROOT syntactically. In the

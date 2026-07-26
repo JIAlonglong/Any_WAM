@@ -106,6 +106,24 @@ def test_matrix_dry_run_plans_four_suites_for_three_matched_budgets(tmp_path):
     assert not root.exists()
 
 
+def test_matrix_dry_run_honors_two_shard_four_gpu_layout(tmp_path):
+    env = _base_env(tmp_path)
+    env["S4_FORMAL_NUM_SHARDS"] = "2"
+    root = Path(env["MATRIX_ROOT"])
+
+    result = _run("dry-run", env=env)
+    _assert_success(result)
+
+    assert result.stdout.count("S4_FORMAL_NUM_SHARDS=2") == 12
+    assert result.stdout.count("PREFLIGHT_SHARD=0") == 12
+    assert result.stdout.count("PREFLIGHT_SHARD=1") == 12
+    assert "PREFLIGHT_SHARD=2" not in result.stdout
+    assert "PREFLIGHT_SHARD=3" not in result.stdout
+    assert "CUDA_VISIBLE_DEVICES=4" not in result.stdout
+    assert "CUDA_VISIBLE_DEVICES=6" not in result.stdout
+    assert not root.exists()
+
+
 def test_matrix_rejects_existing_root_before_starting_a_child(tmp_path):
     env = _base_env(tmp_path)
     root = Path(env["MATRIX_ROOT"])

@@ -90,7 +90,12 @@ else
     export S4_EVAL_IS_FORMAL=0
     ALIGNMENT_BLOCKED=1
 fi
-export S4_FORMAL_NUM_SHARDS=4
+S4_FORMAL_NUM_SHARDS="${S4_FORMAL_NUM_SHARDS:-4}"
+case "${S4_FORMAL_NUM_SHARDS}" in
+    2|4) ;;
+    *) die "S4_FORMAL_NUM_SHARDS must be 2 or 4" ;;
+esac
+export S4_FORMAL_NUM_SHARDS
 export S4_VIDEO_SEEDS="${S4_VIDEO_SEEDS:-0,1}"
 
 if [[ "${MODE}" == "dry-run" ]]; then

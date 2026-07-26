@@ -129,6 +129,38 @@ def test_formal_four_shards_use_all_eight_gpus_and_joint_k2(tmp_path):
         assert ("--save-video" in tokens) is (seed in {0, 1})
 
 
+def test_official_teacher_four_shards_can_colocate_on_four_gpus(tmp_path):
+    env = _launcher_env(tmp_path)
+    env.update(
+        S4_MODEL_ROLE="official_teacher",
+        COSMOS_POLICY_PATH=str(tmp_path / "teacher"),
+        COSMOS_POLICY_TEACHER_LOCK=str(tmp_path / "teacher.lock.json"),
+        S4_FORMAL_NUM_SHARDS="4",
+        S4_FORMAL_GPU_LAYOUT="colocated",
+    )
+    Path(env["COSMOS_POLICY_PATH"]).mkdir()
+    Path(env["COSMOS_POLICY_TEACHER_LOCK"]).write_text("{}")
+    result = run_launcher("formal", env=env)
+    _assert_success(result)
+
+    assert _shard_records(result.stdout) == [
+        (0, 0, 0, "0,3"),
+        (1, 1, 1, "3,6"),
+        (2, 2, 2, "6,8"),
+        (3, 3, 3, "8,10"),
+    ]
+
+
+def test_colocated_layout_rejects_student_role(tmp_path):
+    env = _launcher_env(tmp_path)
+    env["S4_FORMAL_NUM_SHARDS"] = "4"
+    env["S4_FORMAL_GPU_LAYOUT"] = "colocated"
+    result = run_launcher("formal", env=env)
+
+    assert result.returncode == 2
+    assert "official_teacher" in result.stderr
+
+
 def test_formal_joint_k1_reaches_every_preflight_and_rollout(tmp_path):
     env = _launcher_env(tmp_path)
     env["S4_STUDENT_STEPS"] = "1"
@@ -156,6 +188,7 @@ def test_formal_joint_k1_reaches_every_preflight_and_rollout(tmp_path):
     [
         ("S4_STUDENT_STEPS", "3", "S4_STUDENT_STEPS must be 1, 2, or 4"),
         ("S4_FORMAL_NUM_SHARDS", "3", "S4_FORMAL_NUM_SHARDS must be 2 or 4"),
+        ("S4_FORMAL_GPU_LAYOUT", "invalid", "S4_FORMAL_GPU_LAYOUT must be paired or colocated"),
         ("S4_VIDEO_SEEDS", "0,nope", "S4_VIDEO_SEEDS"),
         ("S4_VIDEO_SEEDS", "0,", "S4_VIDEO_SEEDS"),
         ("S4_VIDEO_SEEDS", "01", "S4_VIDEO_SEEDS"),

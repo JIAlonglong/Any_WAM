@@ -287,8 +287,13 @@ run_live_evaluation() {
         task_ends=(5 10)
     else
         shard_ids=(0 1 2 3)
-        student_gpus=(0 2 4 6)
-        worker_gpus=(1 3 5 7)
+        if [[ "${S4_FORMAL_GPU_LAYOUT}" == "colocated" ]]; then
+            student_gpus=(0 1 2 3)
+            worker_gpus=(0 1 2 3)
+        else
+            student_gpus=(0 2 4 6)
+            worker_gpus=(1 3 5 7)
+        fi
         task_starts=(0 3 6 8)
         task_ends=(3 6 8 10)
     fi
@@ -420,6 +425,19 @@ case "${S4_FORMAL_NUM_SHARDS}" in
     2|4) ;;
     *) die "S4_FORMAL_NUM_SHARDS must be 2 or 4" ;;
 esac
+S4_FORMAL_GPU_LAYOUT="${S4_FORMAL_GPU_LAYOUT:-paired}"
+case "${S4_FORMAL_GPU_LAYOUT}" in
+    paired|colocated) ;;
+    *) die "S4_FORMAL_GPU_LAYOUT must be paired or colocated" ;;
+esac
+if [[ "${S4_FORMAL_GPU_LAYOUT}" == "colocated" && \
+      "${S4_MODEL_ROLE}" != "official_teacher" ]]; then
+    die "S4_FORMAL_GPU_LAYOUT=colocated is only valid for official_teacher"
+fi
+if [[ "${S4_FORMAL_GPU_LAYOUT}" == "colocated" && \
+      "${S4_FORMAL_NUM_SHARDS}" != "4" ]]; then
+    die "S4_FORMAL_GPU_LAYOUT=colocated requires S4_FORMAL_NUM_SHARDS=4"
+fi
 S4_VIDEO_SEEDS="${S4_VIDEO_SEEDS:-}"
 declare -A S4_VIDEO_SEED_SET=()
 if [[ -n "${S4_VIDEO_SEEDS}" ]]; then
@@ -497,6 +515,7 @@ emit_kv "S4_STUDENT_STEPS" "${S4_STUDENT_STEPS}"
 emit_kv "S4_LIBERO_BENCHMARK" "${S4_LIBERO_BENCHMARK}"
 emit_kv "S4_EPISODES_PER_TASK" "${S4_EPISODES_PER_TASK}"
 emit_kv "S4_FORMAL_NUM_SHARDS" "${S4_FORMAL_NUM_SHARDS}"
+emit_kv "S4_FORMAL_GPU_LAYOUT" "${S4_FORMAL_GPU_LAYOUT}"
 emit_kv "S4_VIDEO_SEEDS" "${S4_VIDEO_SEEDS}"
 emit_kv "EVALUATION_CLASSIFICATION" "${S4_EVAL_CLASSIFICATION}"
 emit_kv "EVALUATION_IS_FORMAL" "${S4_EVAL_IS_FORMAL}"

@@ -1,7 +1,7 @@
 #!/bin/bash
-# Dynamically balance all 40 standard LIBERO tasks across eight native-teacher
-# servers. Each server stays alive for one matched video/action budget and
-# claims one task at a time, so slow suites cannot strand otherwise idle GPUs.
+# Dynamically balance all 40 standard LIBERO tasks across one to eight
+# native-teacher servers. Each server stays alive for one matched video/action
+# budget and claims one task at a time, so slow suites cannot strand idle GPUs.
 
 set -euo pipefail
 
@@ -35,7 +35,7 @@ TERMINATING=0
 
 usage() {
     echo "Usage: $0 --checkpoint TRANSFORMER --output-root DIR [options]"
-    echo "Options: --episodes N --gpu-ids 0,...,7 --master-port-base N --ws-port-base N --budgets 1,2,4"
+    echo "Options: --episodes N --gpu-ids 0,...,N (1-8 GPUs) --master-port-base N --ws-port-base N --budgets 1,2,4"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -75,26 +75,13 @@ require_positive_integer "WORKER_STOP_TIMEOUT_SECONDS" "$WORKER_STOP_TIMEOUT_SEC
 
 MASTER_PORT_BASE=$((10#$MASTER_PORT_BASE))
 WS_PORT_BASE=$((10#$WS_PORT_BASE))
-if (( MASTER_PORT_BASE + 7 > 65535 )); then
-    echo "--master-port-base range must end at or below 65535" >&2
-    exit 2
-fi
-if (( WS_PORT_BASE + 7 > 65535 )); then
-    echo "--ws-port-base range must end at or below 65535" >&2
-    exit 2
-fi
-if (( MASTER_PORT_BASE <= WS_PORT_BASE + 7 && WS_PORT_BASE <= MASTER_PORT_BASE + 7 )); then
-    echo "Master and WebSocket port ranges must not overlap: [${MASTER_PORT_BASE}, $((MASTER_PORT_BASE + 7))] and [${WS_PORT_BASE}, $((WS_PORT_BASE + 7))]" >&2
-    exit 2
-fi
-
 if [ -z "$GPU_IDS" ]; then
-    echo "GPU_IDS must contain exactly 8 unique non-negative integers; got: $GPU_IDS" >&2
+    echo "GPU_IDS must contain between 1 and 8 unique non-negative integers; got: $GPU_IDS" >&2
     exit 2
 fi
 case "$GPU_IDS" in
     ,*|*,|*,,*)
-        echo "GPU_IDS must contain exactly 8 unique non-negative integers; got: $GPU_IDS" >&2
+        echo "GPU_IDS must contain between 1 and 8 unique non-negative integers; got: $GPU_IDS" >&2
         exit 2
         ;;
 esac
@@ -103,7 +90,7 @@ SEEN_GPUS=()
 for gpu in "${GPUS[@]}"; do
     case "$gpu" in
         ''|*[!0-9]*)
-            echo "GPU_IDS must contain exactly 8 unique non-negative integers; got: $GPU_IDS" >&2
+            echo "GPU_IDS must contain between 1 and 8 unique non-negative integers; got: $GPU_IDS" >&2
             exit 2
             ;;
     esac
@@ -115,13 +102,27 @@ for gpu in "${GPUS[@]}"; do
         fi
     done
     if [ "$duplicate_gpu" -ne 0 ]; then
-        echo "GPU_IDS must contain exactly 8 unique non-negative integers; got: $GPU_IDS" >&2
+        echo "GPU_IDS must contain between 1 and 8 unique non-negative integers; got: $GPU_IDS" >&2
         exit 2
     fi
     SEEN_GPUS+=("$gpu")
 done
-if [ "${#GPUS[@]}" -ne 8 ]; then
-    echo "GPU_IDS must contain exactly 8 unique non-negative integers; got: $GPU_IDS" >&2
+WORKER_COUNT="${#GPUS[@]}"
+if [ "$WORKER_COUNT" -lt 1 ] || [ "$WORKER_COUNT" -gt 8 ]; then
+    echo "GPU_IDS must contain between 1 and 8 unique non-negative integers; got: $GPU_IDS" >&2
+    exit 2
+fi
+LAST_WORKER_OFFSET=$((WORKER_COUNT - 1))
+if (( MASTER_PORT_BASE + LAST_WORKER_OFFSET > 65535 )); then
+    echo "--master-port-base range must end at or below 65535" >&2
+    exit 2
+fi
+if (( WS_PORT_BASE + LAST_WORKER_OFFSET > 65535 )); then
+    echo "--ws-port-base range must end at or below 65535" >&2
+    exit 2
+fi
+if (( MASTER_PORT_BASE <= WS_PORT_BASE + LAST_WORKER_OFFSET && WS_PORT_BASE <= MASTER_PORT_BASE + LAST_WORKER_OFFSET )); then
+    echo "Master and WebSocket port ranges must not overlap: [${MASTER_PORT_BASE}, $((MASTER_PORT_BASE + LAST_WORKER_OFFSET))] and [${WS_PORT_BASE}, $((WS_PORT_BASE + LAST_WORKER_OFFSET))]" >&2
     exit 2
 fi
 
@@ -218,7 +219,7 @@ PY
 
 preflight_ports() {
     local worker master_port ws_port
-    for worker in 0 1 2 3 4 5 6 7; do
+    for ((worker = 0; worker < WORKER_COUNT; worker++)); do
         master_port=$((MASTER_PORT_BASE + worker))
         ws_port=$((WS_PORT_BASE + worker))
         if ! port_is_available "$master_port"; then
@@ -524,7 +525,7 @@ run_budget() {
 
     mkdir -p "${budget_root}/workers" "$claims_root"
     ACTIVE_WORKER_PIDS=()
-    for worker in 0 1 2 3 4 5 6 7; do
+    for ((worker = 0; worker < WORKER_COUNT; worker++)); do
         gpu="${GPUS[$worker]}"
         worker_root="${budget_root}/workers/worker_${worker}"
         mkdir -p "$worker_root"
@@ -576,11 +577,11 @@ fi
 if [ "${CHECK_ONLY:-0}" = "1" ]; then
     prepare_result_root
     for steps in "${BUDGETS[@]}"; do
-        for worker in 0 1 2 3 4 5 6 7; do
+        for ((worker = 0; worker < WORKER_COUNT; worker++)); do
             print_worker_plan "$steps" "$worker" "${GPUS[$worker]}"
         done
     done
-    echo "CHECK_ONLY=1: verified $((${#BUDGETS[@]} * 8)) dynamic workers (40 tasks x budgets ${BUDGETS_CSV})."
+    echo "CHECK_ONLY=1: verified $((${#BUDGETS[@]} * WORKER_COUNT)) dynamic workers (40 tasks x budgets ${BUDGETS_CSV})."
     exit 0
 fi
 

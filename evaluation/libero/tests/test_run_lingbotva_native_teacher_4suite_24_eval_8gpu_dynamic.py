@@ -120,13 +120,40 @@ def test_check_only_defaults_to_a_full_three_budget_dynamic_rerun_without_artifa
         assert len({worker["latency_jsonl"] for worker in budget_workers}) == 8
 
 
-def test_check_only_rejects_invalid_eight_gpu_lists(tmp_path):
-    """Accepting an undersized GPU list would violate one-server-per-GPU ownership."""
-    for gpu_ids in ("0,1,2,3,4,5,6", "0,1,2,3,4,5,6,7,"):
+def test_check_only_accepts_a_four_gpu_dynamic_plan(tmp_path):
+    """A four-GPU allocation must retain dynamic claims and all formal artifacts."""
+    result = _run_check_only(tmp_path, gpu_ids="0,1,2,3")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    workers = [
+        _worker_fields(line)
+        for line in result.stdout.splitlines()
+        if line.startswith("WORKER ")
+    ]
+    assert len(workers) == 12
+    assert "CHECK_ONLY=1: verified 12 dynamic workers" in result.stdout
+    for steps in ("1", "2", "4"):
+        budget_workers = [worker for worker in workers if worker["steps"] == steps]
+        assert len(budget_workers) == 4
+        assert {worker["gpu"] for worker in budget_workers} == {"0", "1", "2", "3"}
+        assert {worker["task_queue"] for worker in budget_workers} == {"40"}
+        assert {worker["claim_mode"] for worker in budget_workers} == {"mkdir"}
+        assert {worker["client_flag"] for worker in budget_workers} == {
+            "--no-save-video"
+        }
+        assert {worker["server_flag"] for worker in budget_workers} == {
+            "--no-save-debug-tensors"
+        }
+        assert len({worker["master_port"] for worker in budget_workers}) == 4
+        assert len({worker["ws_port"] for worker in budget_workers}) == 4
+
+
+def test_check_only_rejects_invalid_gpu_lists_outside_one_to_eight_workers(tmp_path):
+    for gpu_ids in ("", "0,1,2,3,4,5,6,7,8", "0,1,2,3,4,5,6,7,"):
         result = _run_check_only(tmp_path, gpu_ids=gpu_ids)
 
         assert result.returncode != 0
-        assert "exactly 8 unique" in result.stderr
+        assert "between 1 and 8 unique" in result.stderr
         assert "non-negative integers" in result.stderr
 
 

@@ -328,6 +328,11 @@ RESUME_FROM_PATH=""
 RESUME_ONLINE_FROM_TARGET=0
 RESET_RESUME_STEP=0
 RESUME_OPTIMIZER_STATE=0
+STAGE1_RESUME_OPTIMIZER_STATE="${STAGE1_RESUME_OPTIMIZER_STATE:-1}"
+case "$STAGE1_RESUME_OPTIMIZER_STATE" in
+    0|1) ;;
+    *) die "STAGE1_RESUME_OPTIMIZER_STATE must be 0 or 1" ;;
+esac
 if [[ -n "$RESUME_STEP" ]]; then
     require_plain_dir "resume OUTPUT_DIR" "$OUTPUT_DIR"
     require_plain_dir "resume checkpoints" "$OUTPUT_DIR/checkpoints"
@@ -384,7 +389,7 @@ print(f"validated corrected raw Stage-1 checkpoint step {expected_step}")'
     fi
     RESUME_ONLINE_FROM_TARGET=0
     RESET_RESUME_STEP=0
-    RESUME_OPTIMIZER_STATE=1
+    RESUME_OPTIMIZER_STATE="$STAGE1_RESUME_OPTIMIZER_STATE"
 else
     [[ ! -e "$OUTPUT_DIR" && ! -L "$OUTPUT_DIR" ]] || die \
         "Refusing fresh run with existing OUTPUT_DIR: $OUTPUT_DIR"
@@ -470,7 +475,7 @@ expected = {
     "resume_from_path": resume_path,
     "resume_online_from_target": False,
     "reset_resume_step": False,
-    "resume_optimizer_state": resume_path is not None,
+    "resume_optimizer_state": bool(int(os.environ["RESUME_OPTIMIZER_STATE"])),
     "seed": int(os.environ["TRAIN_SEED"]),
     "max_train_steps": int(os.environ["MAX_TRAIN_STEPS"]),
     "save_interval": int(os.environ["SAVE_INTERVAL"]),

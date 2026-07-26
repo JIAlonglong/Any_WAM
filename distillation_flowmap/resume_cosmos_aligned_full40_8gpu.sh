@@ -85,6 +85,10 @@ export COSMOS_POLICY_EXTRA_PYTHONPATH
 export DATASET_PATH
 export EMPTY_EMB_PATH
 export CUDA_VISIBLE_DEVICES
+# step_1000 was written by the former FSDP2 path, so its DTensor Adam moments
+# cannot be loaded into the corrected FSDP1 training path. Resume model weights
+# and the global step, then rebuild optimizer moments locally.
+export STAGE1_RESUME_OPTIMIZER_STATE=0
 
 common=(
     --output-root "$OUTPUT_ROOT"

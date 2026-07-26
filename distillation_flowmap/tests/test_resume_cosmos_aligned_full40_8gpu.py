@@ -35,14 +35,17 @@ def _fixture(tmp_path: Path, *, checkpoint: bool = True):
         (transformer / "diffusion_pytorch_model.safetensors").write_bytes(b"x")
 
     calls_log = tmp_path / "calls.log"
+    env_log = tmp_path / "env.log"
     launcher = _write_executable(
         tmp_path / "record-launcher.sh",
-        'printf "%s\\n" "$*" >> "$CALLS_LOG"\n',
+        'printf "%s\\n" "$*" >> "$CALLS_LOG"\n'
+        'printf "%s\\n" "${STAGE1_RESUME_OPTIMIZER_STATE:-unset}" >> "$ENV_LOG"\n',
     )
     env = os.environ.copy()
     env.update(
         {
             "CALLS_LOG": str(calls_log),
+            "ENV_LOG": str(env_log),
             "COSMOS_PIPELINE_LAUNCHER": str(launcher),
             "OUTPUT_ROOT": str(output_root),
             "RUN_TAG": run_tag,
@@ -115,6 +118,22 @@ def test_resume_wrapper_dry_run_propagates_to_all_phases(tmp_path):
     ]
     assert len(calls) == 3
     assert all("--dry-run" in call for call in calls)
+
+
+def test_resume_wrapper_disables_incompatible_stage1_optimizer_restore(tmp_path):
+    env, _ = _fixture(tmp_path)
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER), "--dry-run"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "env.log").read_text().splitlines() == ["0", "0", "0"]
 
 
 def test_resume_wrapper_rejects_missing_checkpoint_before_launch(tmp_path):

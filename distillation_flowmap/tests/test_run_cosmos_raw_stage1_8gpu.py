@@ -668,6 +668,25 @@ def test_resume_requires_exact_step_and_complete_v2_raw_checkpoint(tmp_path):
     assert not Path(env["TORCHRUN_LOG"]).exists()
 
 
+def test_resume_can_skip_optimizer_state_when_sharding_backend_changed(tmp_path):
+    env = _env(tmp_path)
+    checkpoint = _checkpoint(Path(env["STAGE1_OUTPUT"]), 3000, env=env)
+    env["STAGE1_RESUME_OPTIMIZER_STATE"] = "0"
+
+    result = _run(
+        "dry-run",
+        "--steps",
+        "5000",
+        "--resume-step",
+        "3000",
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"RESUME_FROM_PATH={checkpoint}" in result.stdout
+    assert "RESUME_OPTIMIZER_STATE=0" in result.stdout
+
+
 def test_real_config_preflight_accepts_fresh_and_resume_modes(tmp_path):
     env = _env(tmp_path)
     env["PREFLIGHT_BIN"] = str(PYTHON)

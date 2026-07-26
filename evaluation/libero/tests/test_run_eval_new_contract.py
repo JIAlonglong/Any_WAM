@@ -89,6 +89,66 @@ def test_eval_contract_wires_model_and_sampler_latency_output(tmp_path):
     assert f"Latency JSONL:  {env['LATENCY_JSONL']}" in result.stdout
 
 
+def test_flowmap_backend_remains_default(tmp_path):
+    env = _env(tmp_path, "libero_10")
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "step_1", "target_student"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "Server backend: flowmap" in result.stdout
+
+
+def test_native_teacher_backend_routes_to_dedicated_server(tmp_path):
+    env = _env(tmp_path, "libero_10")
+    (
+        Path(env["OUTPUT_ROOT"])
+        / "checkpoints"
+        / "external"
+        / "teacher_native"
+        / "transformer"
+    ).mkdir(parents=True)
+    env.update(
+        {
+            "SERVER_BACKEND": "native_teacher",
+            "MODEL_NAME": "teacher_native",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "external", "teacher_native"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Server backend: native_teacher" in result.stdout
+    assert "wan_va/wan_va_native_teacher_server.py" in result.stdout
+
+
+def test_unknown_server_backend_is_rejected(tmp_path):
+    env = _env(tmp_path, "libero_10")
+    env["SERVER_BACKEND"] = "unknown"
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "step_1", "target_student"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Unsupported SERVER_BACKEND" in result.stderr
+
+
 def test_client_and_server_preserve_episode_latency_provenance():
     client_source = (ROOT / "evaluation" / "libero" / "client.py").read_text()
     server_source = (ROOT / "wan_va" / "wan_va_server.py").read_text()

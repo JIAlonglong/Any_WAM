@@ -96,6 +96,23 @@ WAN22_PRETRAINED_PATH="${WAN22_PRETRAINED_PATH:-/kpfs-intern/jialongliu/projects
 export WAN22_PRETRAINED_PATH
 SAVE_ROOT="${SAVE_ROOT:-${PROJECT_ROOT}/evaluation/outputs/libero_env_${STEP}_${VARIANT}}"
 MODEL_NAME="${MODEL_NAME:-${VARIANT}}"
+SERVER_BACKEND="${SERVER_BACKEND:-flowmap}"
+case "$SERVER_BACKEND" in
+    flowmap)
+        SERVER_ENTRYPOINT="wan_va/wan_va_server.py"
+        ;;
+    native_teacher)
+        SERVER_ENTRYPOINT="wan_va/wan_va_native_teacher_server.py"
+        [ "$MODEL_NAME" = "teacher_native" ] || {
+            echo "native_teacher requires MODEL_NAME=teacher_native" >&2
+            exit 2
+        }
+        ;;
+    *)
+        echo "Unsupported SERVER_BACKEND: $SERVER_BACKEND" >&2
+        exit 2
+        ;;
+esac
 LATENCY_JSONL="${LATENCY_JSONL:-${SAVE_ROOT}/sampler_latency.jsonl}"
 VIDEO_DIR="${SAVE_ROOT}/videos"
 ACTION_DIR="${SAVE_ROOT}/actions"
@@ -131,6 +148,8 @@ log_header() {
     echo "  Base model:     ${WAN22_PRETRAINED_PATH}"
     echo "  Save root:      ${SAVE_ROOT}"
     echo "  Model name:     ${MODEL_NAME}"
+    echo "  Server backend: ${SERVER_BACKEND}"
+    echo "  Server entry:   ${SERVER_ENTRYPOINT}"
     echo "  Latency JSONL:  ${LATENCY_JSONL}"
     echo "============================================"
 }
@@ -168,7 +187,7 @@ start_server() {
     $SERVER_PYTHON -m torch.distributed.run \
         --nproc_per_node 1 \
         --master_port "$MASTER_PORT" \
-        wan_va/wan_va_server.py \
+        "$SERVER_ENTRYPOINT" \
         --config-name libero \
         --port "$PORT" \
         --checkpoint-path "$ckpt_path" \

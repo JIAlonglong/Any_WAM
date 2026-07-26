@@ -21,6 +21,7 @@ import subprocess
 import sys
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 import numpy as np
@@ -364,6 +365,23 @@ def _configure_live_config(args: argparse.Namespace, dependencies: Mapping[str, 
     return config
 
 
+def _configure_official_teacher_config(
+    args: argparse.Namespace, dependencies: Mapping[str, Any]
+) -> Any:
+    """Build the raw-teacher runtime config without importing student lineage."""
+    teacher_root = dependencies["resolve_cosmos_policy_assets"](
+        args.teacher_model_path
+    )["root"]
+    return SimpleNamespace(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        return_raw_observation=True,
+        cosmos_policy_use_raw_inference=True,
+        teacher_model_path=teacher_root,
+    )
+
+
 def _load_empty_embedding(path: str | Path, *, torch_module: Any, device: Any) -> Any:
     embedding = torch_module.load(path, map_location="cpu", weights_only=False)
     if not torch_module.is_tensor(embedding) or tuple(embedding.shape) != PROMPT_EMBEDDING_SHAPE:
@@ -586,7 +604,7 @@ def build_live_service(args: argparse.Namespace) -> tuple[CosmosProgressiveS4Ser
         device = torch.device(args.device)
         torch.cuda.set_device(device)
         args.teacher_model_path = resolved_teacher.root_path
-        config = _configure_live_config(
+        config = _configure_official_teacher_config(
             args,
             {"resolve_cosmos_policy_assets": resolve_cosmos_policy_assets},
         )

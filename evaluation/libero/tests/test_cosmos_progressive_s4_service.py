@@ -1,5 +1,6 @@
 import json
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
@@ -1183,6 +1184,42 @@ def test_live_runtime_preflight_rejects_non_cu128_cosmos_python(tmp_path, monkey
             device="cuda:0",
             checkpoint_transformer=checkpoint,
         )
+
+
+def test_official_teacher_config_does_not_import_student_training_config(
+    tmp_path, monkeypatch
+):
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    teacher = tmp_path / "official-teacher"
+    teacher.mkdir()
+    args = SimpleNamespace(teacher_model_path=str(teacher))
+    for name in (
+        "STUDENT_BASE_MODEL_PATH",
+        "RESUME_FROM_PATH",
+        "PARENT_STAGE1_PATH",
+        "PARENT_STAGE1_CONTRACT_IDENTITY",
+        "STAGE2_LINEAGE_JSON",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        rollout.importlib,
+        "import_module",
+        lambda _name: (_ for _ in ()).throw(
+            AssertionError("official teacher must not import student training config")
+        ),
+    )
+
+    config = rollout._configure_official_teacher_config(
+        args,
+        {"resolve_cosmos_policy_assets": lambda path: {"root": str(Path(path).resolve())}},
+    )
+
+    assert config.teacher_model_path == str(teacher.resolve())
+    assert config.cosmos_policy_use_raw_inference is True
+    assert config.return_raw_observation is True
+    assert config.rank == config.local_rank == 0
+    assert config.world_size == 1
 
 
 def test_live_cli_requires_seed_before_constructing_service(monkeypatch):

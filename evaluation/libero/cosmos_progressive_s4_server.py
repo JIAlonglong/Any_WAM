@@ -30,6 +30,54 @@ PROMPT_EMBEDDING_SHAPE = (1, 512, 4096)
 SUPPORTED_STUDENT_STEPS = (1, 2, 4)
 
 
+def student_action_grid_contract(
+    *,
+    action_tensor_shape: tuple[int, ...] | list[int],
+    action_downsample_factor: int,
+) -> dict[str, Any]:
+    """Describe how the compact FlowMap action state maps to 16 LIBERO actions."""
+    shape = tuple(int(value) for value in action_tensor_shape)
+    factor = int(action_downsample_factor)
+    if len(shape) != 5 or shape[0] != 1 or shape[-1] != 1:
+        raise ValueError(f"student action tensor must be [1,C,F,N,1], got {shape}")
+    if factor <= 0:
+        raise ValueError("action_downsample_factor must be positive")
+    frames, actions_per_frame = shape[2], shape[3]
+    horizon = frames * actions_per_frame
+    if horizon != S4_ACTION_STEPS:
+        raise ValueError(
+            f"compact student action grid must decode {S4_ACTION_STEPS} actions, got {horizon}"
+        )
+    return {
+        "schema": "cosmos_action_grid_v1",
+        "layout": "flowmap_compact_temporal_grid",
+        "action_downsample_factor": factor,
+        "action_tensor_shape": list(shape),
+        "updated_action_latent_indices": list(range(frames)),
+        "updated_action_indices": list(range(horizon)),
+        "action_horizon": horizon,
+    }
+
+
+def summarize_action_temporal_frames(action_tensor: Any) -> list[dict[str, float | int]]:
+    """Return portable mean/std/absmax diagnostics for each compact temporal frame."""
+    action = _as_numpy(action_tensor).astype(np.float32, copy=False)
+    if action.ndim != 5 or action.shape[0] != 1 or action.shape[-1] != 1:
+        raise ValueError(f"action tensor must be [1,C,F,N,1], got {action.shape}")
+    summaries = []
+    for frame in range(int(action.shape[2])):
+        values = action[:, :, frame, :, :].reshape(-1)
+        summaries.append(
+            {
+                "frame": frame,
+                "mean": float(values.mean()),
+                "std": float(values.std()),
+                "absmax": float(np.abs(values).max()),
+            }
+        )
+    return summaries
+
+
 def normalize_student_steps(value: int) -> int:
     value = int(value)
     if value not in SUPPORTED_STUDENT_STEPS:
@@ -347,6 +395,7 @@ class SharedNpzCosmosAnchorWorker:
 @dataclass
 class S4Decision:
     action: np.ndarray
+    student_action_latent: Any
     raw_anchor: Any
     raw_actions: Any
     prompt_embedding: Any
@@ -370,6 +419,7 @@ class CosmosProgressiveS4Engine:
         action_steps: int | None = None,
         student_steps: int | None = None,
         checkpoint_contract_identity: str | None = None,
+        action_downsample_factor: int = 4,
     ) -> None:
         self.anchor_worker = SharedNpzCosmosAnchorWorker(cosmos_teacher)
         self.prompt_table = prompt_table
@@ -391,8 +441,11 @@ class CosmosProgressiveS4Engine:
         self.action_steps = request.action_steps
         self.student_steps = request.student_steps
         self.checkpoint_contract_identity = checkpoint_contract_identity
+        self.action_downsample_factor = int(action_downsample_factor)
         if self.anchor_epsilon <= 0:
             raise ValueError("anchor_epsilon must be positive")
+        if self.action_downsample_factor <= 0:
+            raise ValueError("action_downsample_factor must be positive")
 
     @staticmethod
     def _default_anchor_noise() -> np.ndarray:
@@ -455,6 +508,7 @@ class CosmosProgressiveS4Engine:
         action = decode_student_action(student_action, self.action_template)
         return S4Decision(
             action=action,
+            student_action_latent=student_action,
             raw_anchor=video_x0,
             raw_actions=raw_actions,
             prompt_embedding=text_emb,
@@ -471,7 +525,14 @@ class RawAnchorLedger:
         if self.root is not None:
             self.root.mkdir(parents=True, exist_ok=True)
 
-    def record(self, *, raw_anchor: Any, raw_actions: Any, prompt: str) -> str | None:
+    def record(
+        self,
+        *,
+        raw_anchor: Any,
+        raw_actions: Any,
+        student_action_latent: Any,
+        prompt: str,
+    ) -> str | None:
         anchor = np.ascontiguousarray(_as_numpy(raw_anchor).astype(np.float32, copy=False))
         if tuple(anchor.shape) != COSMOS_VIDEO_SHAPE:
             raise ValueError(f"Cannot record non-S4 anchor with shape {anchor.shape}")
@@ -485,6 +546,9 @@ class RawAnchorLedger:
             path,
             cosmos_latent_x0=self.last_anchor,
             actions=np.ascontiguousarray(_as_numpy(raw_actions).astype(np.float32, copy=False)),
+            student_action_latent=np.ascontiguousarray(
+                _as_numpy(student_action_latent).astype(np.float32, copy=False)
+            ),
             prompt=np.asarray(prompt),
         )
         return filename
@@ -506,6 +570,13 @@ class CosmosProgressiveS4Service:
         self.checkpoint_contract_identity = checkpoint_contract_identity or engine.checkpoint_contract_identity
         self.anchor_ledger = RawAnchorLedger(anchor_record_dir)
 
+    def _action_grid_contract(self) -> dict[str, Any]:
+        channels = int(_as_numpy(self.engine.action_template.q01).reshape(-1).size)
+        return student_action_grid_contract(
+            action_tensor_shape=(1, channels, 4, 4, 1),
+            action_downsample_factor=self.engine.action_downsample_factor,
+        )
+
     def infer(self, request: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(request, Mapping):
             raise TypeError("service request must be a mapping")
@@ -519,6 +590,7 @@ class CosmosProgressiveS4Service:
                 "video_steps": self.engine.video_steps,
                 "action_steps": self.engine.action_steps,
                 "student_steps": self.engine.student_steps,
+                "action_grid_contract": self._action_grid_contract(),
             }
         prompt = _require_prompt(request.get("prompt", request.get("task")))
         libero_obs = request.get("obs", request.get("libero_obs"))
@@ -531,6 +603,7 @@ class CosmosProgressiveS4Service:
         anchor_record = self.anchor_ledger.record(
             raw_anchor=decision.raw_anchor,
             raw_actions=decision.raw_actions,
+            student_action_latent=decision.student_action_latent,
             prompt=prompt,
         )
         # ``decode_student_action`` is the final type/shape gate, but keep this
@@ -538,6 +611,10 @@ class CosmosProgressiveS4Service:
         action = np.ascontiguousarray(decision.action, dtype=np.float32)
         if action.shape != (S4_ACTION_STEPS, S4_ACTION_DIM):
             raise AssertionError(f"service produced invalid S4 action shape {action.shape}")
+        action_grid = student_action_grid_contract(
+            action_tensor_shape=tuple(_as_numpy(decision.student_action_latent).shape),
+            action_downsample_factor=self.engine.action_downsample_factor,
+        )
         return {
             "ok": True,
             "action": action,
@@ -551,6 +628,10 @@ class CosmosProgressiveS4Service:
             "video_steps": self.engine.video_steps,
             "action_steps": self.engine.action_steps,
             "student_steps": self.engine.student_steps,
+            "action_grid_contract": action_grid,
+            "action_frame_stats": summarize_action_temporal_frames(
+                decision.student_action_latent
+            ),
         }
 
 

@@ -20,6 +20,40 @@ from distillation_flowmap.cosmos_official_source_contract import (
 )
 
 
+def official_teacher_action_grid_contract(
+    *, action_shape: tuple[int, ...] | list[int]
+) -> dict[str, Any]:
+    """Declare the native teacher horizon; it has no FlowMap compact-grid metadata."""
+    shape = tuple(int(value) for value in action_shape)
+    if shape != (1, 16, 7):
+        raise ValueError(f"official teacher action shape must be [1,16,7], got {shape}")
+    indices = list(range(16))
+    return {
+        "schema": "cosmos_action_grid_v1",
+        "layout": "official_teacher_native_horizon",
+        "action_downsample_factor": 1,
+        "action_tensor_shape": list(shape),
+        "updated_action_latent_indices": indices,
+        "updated_action_indices": indices,
+        "action_horizon": 16,
+    }
+
+
+def _summarize_native_action_frames(actions: np.ndarray) -> list[dict[str, float | int]]:
+    values = np.asarray(actions, dtype=np.float32)
+    if values.shape != (1, 16, 7):
+        raise ValueError(f"official teacher action shape must be [1,16,7], got {values.shape}")
+    return [
+        {
+            "frame": frame,
+            "mean": float(values[0, frame].mean()),
+            "std": float(values[0, frame].std()),
+            "absmax": float(np.abs(values[0, frame]).max()),
+        }
+        for frame in range(16)
+    ]
+
+
 @dataclass(frozen=True)
 class ResolvedCosmosOfficialTeacher:
     """Verified monolithic official policy root, never a student transformer."""
@@ -299,6 +333,9 @@ class OfficialTeacherEvaluationService:
             "action_steps": self.action_steps,
             "s4_checkpoint": self.checkpoint_identifier,
             "checkpoint_contract_identity": self.checkpoint_contract_identity,
+            "action_grid_contract": official_teacher_action_grid_contract(
+                action_shape=(1, 16, 7)
+            ),
         }
 
     def infer(self, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -332,6 +369,10 @@ class OfficialTeacherEvaluationService:
             "action": np.ascontiguousarray(actions[0]),
             "actions": np.ascontiguousarray(actions[0]),
             **self._metadata(),
+            "action_grid_contract": official_teacher_action_grid_contract(
+                action_shape=actions.shape
+            ),
+            "action_frame_stats": _summarize_native_action_frames(actions),
             "requested_video_steps": result["requested_video_steps"],
             "requested_action_steps": result["requested_action_steps"],
             "effective_video_steps": result["effective_video_steps"],

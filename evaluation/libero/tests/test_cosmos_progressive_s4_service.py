@@ -5,6 +5,7 @@ from types import ModuleType, SimpleNamespace
 import numpy as np
 import pytest
 
+import evaluation.libero.cosmos_progressive_s4_server as s4_server
 from evaluation.libero.cosmos_progressive_s4_client import CosmosProgressiveS4Client
 from evaluation.libero.cosmos_progressive_s4_server import (
     ActionDecodingTemplate,
@@ -78,6 +79,63 @@ def test_live_s4_action_decoder_returns_only_16_valid_seven_dof_actions():
     np.testing.assert_allclose(decoded, 0.0)
 
 
+def test_student_action_grid_contract_covers_every_decoded_action():
+    contract = s4_server.student_action_grid_contract(
+        action_tensor_shape=(1, 30, 4, 4, 1),
+        action_downsample_factor=4,
+    )
+
+    assert contract == {
+        "schema": "cosmos_action_grid_v1",
+        "layout": "flowmap_compact_temporal_grid",
+        "action_downsample_factor": 4,
+        "action_tensor_shape": [1, 30, 4, 4, 1],
+        "updated_action_latent_indices": [0, 1, 2, 3],
+        "updated_action_indices": list(range(16)),
+        "action_horizon": 16,
+    }
+
+
+def test_action_temporal_frame_stats_expose_gaussian_like_unupdated_frames():
+    latent = np.zeros((1, 2, 4, 3, 1), dtype=np.float32)
+    latent[:, :, 1] = np.asarray(
+        [[[[1.0], [-1.0], [1.0]], [[-1.0], [1.0], [-1.0]]]],
+        dtype=np.float32,
+    )
+
+    stats = s4_server.summarize_action_temporal_frames(latent)
+
+    assert [item["frame"] for item in stats] == [0, 1, 2, 3]
+    assert stats[0] == {"frame": 0, "mean": 0.0, "std": 0.0, "absmax": 0.0}
+    assert stats[1]["mean"] == 0.0
+    assert stats[1]["std"] == pytest.approx(1.0)
+    assert stats[1]["absmax"] == 1.0
+
+
+def test_startup_rejects_teacher_that_inherits_student_compact_grid():
+    from evaluation.libero.rollout_cosmos_progressive_s4 import (
+        build_service_startup_diagnostics,
+    )
+
+    class WrongTeacherGrid:
+        def infer(self, _request):
+            return {
+                "model_role": "official_teacher",
+                "s4_checkpoint": "/teacher",
+                "video_steps": 1,
+                "action_steps": 1,
+                "action_grid_contract": s4_server.student_action_grid_contract(
+                    action_tensor_shape=(1, 30, 4, 4, 1),
+                    action_downsample_factor=4,
+                ),
+            }
+
+    with pytest.raises(RuntimeError, match="official teacher.*native"):
+        build_service_startup_diagnostics(
+            WrongTeacherGrid(), skip_first_action=False
+        )
+
+
 def test_prompt_table_rejects_a_missing_libero_task_embedding():
     with pytest.raises(KeyError, match="missing prompt embedding"):
         PromptEmbeddingTable({}).get("unseen task")
@@ -138,6 +196,7 @@ def test_every_infer_request_queries_a_fresh_cosmos_raw_anchor(tmp_path):
         anchor_record_dir=tmp_path / "anchors",
     )
 
+    reset = service.infer({"reset": True})
     first = service.infer({"obs": OBS, "prompt": "open the drawer"})
     second = service.infer({"obs": OBS, "prompt": "open the drawer"})
 
@@ -154,6 +213,29 @@ def test_every_infer_request_queries_a_fresh_cosmos_raw_anchor(tmp_path):
     assert first["s4_checkpoint"] == "s4-checkpoint"
     assert first["student_steps"] == 2
     assert first["decision_duration_s"] >= 0.0
+    assert first["action_grid_contract"]["action_downsample_factor"] == 4
+    assert first["action_grid_contract"]["updated_action_latent_indices"] == [0, 1, 2, 3]
+    assert first["action_grid_contract"]["updated_action_indices"] == list(range(16))
+    assert reset["action_grid_contract"] == first["action_grid_contract"]
+    assert len(first["action_frame_stats"]) == 4
+    with np.load(tmp_path / "anchors" / first["raw_anchor_record"]) as payload:
+        assert payload["student_action_latent"].shape == (1, 7, 4, 4, 1)
+
+    from evaluation.libero.rollout_cosmos_progressive_s4 import (
+        build_service_startup_diagnostics,
+    )
+
+    startup = build_service_startup_diagnostics(
+        service, skip_first_action=True
+    )
+    assert startup["model_name"] == "stage2_target"
+    assert startup["checkpoint"] == "s4-checkpoint"
+    assert startup["video_num_steps"] == startup["action_num_steps"] == 2
+    assert startup["action_downsample_factor"] == 4
+    assert startup["updated_action_indices"] == list(range(16))
+    assert startup["effective_updated_action_indices_first_chunk"] == list(range(1, 16))
+    assert startup["executed_action_indices_first_chunk"] == list(range(1, 16))
+    assert startup["updated_equals_executed_first_chunk"] is True
 
 
 class _FailingService:
@@ -334,6 +416,86 @@ def test_client_records_rollout_seed_on_success(tmp_path):
     assert persisted["student_steps"] == 2
 
 
+def test_client_rejects_action_grid_that_does_not_cover_executed_positions(tmp_path):
+    class BrokenGridService:
+        def infer(self, request):
+            if request.get("reset"):
+                return {"ok": True, "student_steps": 2}
+            return {
+                "action": np.zeros((16, 7), dtype=np.float32),
+                "student_steps": 2,
+                "model_role": "stage2_target",
+                "action_grid_contract": {
+                    "schema": "cosmos_action_grid_v1",
+                    "layout": "flowmap_compact_temporal_grid",
+                    "action_downsample_factor": 4,
+                    "action_tensor_shape": [1, 30, 4, 4, 1],
+                    "updated_action_latent_indices": [0],
+                    "updated_action_indices": [0, 1, 2, 3],
+                    "action_horizon": 16,
+                },
+            }
+
+    client = CosmosProgressiveS4Client(
+        BrokenGridService(),
+        output_dir=tmp_path,
+        student_steps=2,
+        warmup_steps=0,
+        skip_first_action=True,
+    )
+    record = client.run_with_env(
+        env=_DoneEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=8,
+        episode_idx=0,
+        prompt="open the drawer",
+        max_env_steps=1,
+        init_env_fn=lambda *_args, **_kwargs: OBS,
+        rollout_seed=42,
+    )
+
+    assert record["server_failure"] is True
+    assert "updated action indices" in record["error"]
+
+
+def test_client_matches_first_chunk_execution_to_updated_output_positions(tmp_path):
+    class CompleteGridService:
+        def infer(self, request):
+            if request.get("reset"):
+                return {"ok": True, "student_steps": 2}
+            return {
+                "action": np.zeros((16, 7), dtype=np.float32),
+                "student_steps": 2,
+                "model_role": "stage2_target",
+                "action_grid_contract": s4_server.student_action_grid_contract(
+                    action_tensor_shape=(1, 30, 4, 4, 1),
+                    action_downsample_factor=4,
+                ),
+            }
+
+    client = CosmosProgressiveS4Client(
+        CompleteGridService(),
+        output_dir=tmp_path,
+        student_steps=2,
+        warmup_steps=0,
+        skip_first_action=True,
+    )
+    record = client.run_with_env(
+        env=_DoneEnv(),
+        initial_state=np.zeros(1, dtype=np.float32),
+        task_idx=9,
+        episode_idx=0,
+        prompt="open the drawer",
+        max_env_steps=1,
+        init_env_fn=lambda *_args, **_kwargs: OBS,
+        rollout_seed=42,
+    )
+
+    assert record["action_grid_verified"] is True
+    assert record["updated_action_indices"] == list(range(1, 16))
+    assert record["executed_action_indices"] == list(range(1, 16))
+
+
 def test_real_service_metadata_is_persisted_in_client_episode_record(tmp_path):
     """Dropping service provenance must make the formal merger reject real rollouts."""
     teacher = _RecordingTeacher()
@@ -393,6 +555,9 @@ def test_real_service_metadata_is_persisted_in_client_episode_record(tmp_path):
     }
     assert {key: record[key] for key in expected} == expected
     assert {key: persisted[key] for key in expected} == expected
+    assert record["action_grid_verified"] is True
+    assert record["action_grid_contract"]["updated_action_indices"] == list(range(16))
+    assert len(record["action_frame_stats"]) == 4
 
 
 def test_non_video_episode_does_not_extract_or_save_frames(tmp_path):
@@ -1050,6 +1215,9 @@ def test_live_rollout_constructs_client_with_requested_student_steps(monkeypatch
         lambda _args: (object(), SimpleNamespace(close=lambda: None)),
     )
     monkeypatch.setattr(rollout, "CosmosProgressiveS4Client", RecordingClient)
+    monkeypatch.setattr(
+        rollout, "build_service_startup_diagnostics", lambda *_args, **_kwargs: {}
+    )
 
     result = rollout.main(
         [
@@ -1099,6 +1267,9 @@ def test_live_rollout_forwards_cli_video_choice_to_every_task_call(
         lambda _args: (object(), SimpleNamespace(close=lambda: None)),
     )
     monkeypatch.setattr(rollout, "CosmosProgressiveS4Client", RecordingClient)
+    monkeypatch.setattr(
+        rollout, "build_service_startup_diagnostics", lambda *_args, **_kwargs: {}
+    )
 
     result = rollout.main(
         [
@@ -1144,6 +1315,9 @@ def test_live_rollout_applies_episode_index_offset(monkeypatch):
         lambda _args: (object(), SimpleNamespace(close=lambda: None)),
     )
     monkeypatch.setattr(rollout, "CosmosProgressiveS4Client", RecordingClient)
+    monkeypatch.setattr(
+        rollout, "build_service_startup_diagnostics", lambda *_args, **_kwargs: {}
+    )
 
     result = rollout.main(
         [
@@ -1229,6 +1403,9 @@ def test_live_main_reseeds_each_episode_after_k_dependent_prior_consumption(monk
             lambda _args: (object(), SimpleNamespace(close=lambda: None)),
         )
         monkeypatch.setattr(rollout, "CosmosProgressiveS4Client", RecordingClient)
+        monkeypatch.setattr(
+            rollout, "build_service_startup_diagnostics", lambda *_args, **_kwargs: {}
+        )
         rollout.main(
             [
                 "--checkpoint-transformer",
@@ -1276,6 +1453,9 @@ def test_live_main_seeds_before_building_service(monkeypatch):
         ),
     )
     monkeypatch.setattr(rollout, "CosmosProgressiveS4Client", RecordingClient)
+    monkeypatch.setattr(
+        rollout, "build_service_startup_diagnostics", lambda *_args, **_kwargs: {}
+    )
 
     result = rollout.main(
         [
@@ -1358,6 +1538,9 @@ def test_stdio_builds_service_without_seeding(monkeypatch):
         rollout,
         "serve_json_lines",
         lambda received, **_kwargs: events.append(("serve", received)),
+    )
+    monkeypatch.setattr(
+        rollout, "build_service_startup_diagnostics", lambda *_args, **_kwargs: {}
     )
 
     result = rollout.main(

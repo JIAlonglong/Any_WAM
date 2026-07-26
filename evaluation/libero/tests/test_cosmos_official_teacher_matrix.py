@@ -65,6 +65,7 @@ def test_official_service_returns_raw_action_and_effective_k_without_student_met
     response = service.infer({"obs": "obs", "prompt": "pick"})
 
     assert reset["model_role"] == response["model_role"] == "official_teacher"
+    assert reset["action_grid_contract"] == response["action_grid_contract"]
     assert "student_steps" not in reset
     assert "student_steps" not in response
     assert response["action"].shape == (16, 7)
@@ -72,6 +73,22 @@ def test_official_service_returns_raw_action_and_effective_k_without_student_met
     assert response["action_steps"] == response["effective_action_steps"] == 2
     assert response["matched_budget_verified"] is True
     assert response["future_prediction_keys"] == ["primary"]
+    assert response["action_grid_contract"] == {
+        "schema": "cosmos_action_grid_v1",
+        "layout": "official_teacher_native_horizon",
+        "action_downsample_factor": 1,
+        "action_tensor_shape": [1, 16, 7],
+        "updated_action_latent_indices": list(range(16)),
+        "updated_action_indices": list(range(16)),
+        "action_horizon": 16,
+    }
+    assert len(response["action_frame_stats"]) == 16
+    assert response["action_frame_stats"][0] == {
+        "frame": 0,
+        "mean": 0.0,
+        "std": 0.0,
+        "absmax": 0.0,
+    }
 
 
 def test_official_client_requires_role_and_effective_k_and_omits_student_steps(tmp_path):

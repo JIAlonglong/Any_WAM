@@ -241,6 +241,66 @@ class CosmosProgressiveS4Client:
         ):
             raise ValueError("S4 service checkpoint_contract_identity mismatch")
 
+    def _validate_action_grid_execution(
+        self, response: Mapping[str, Any], *, start_idx: int
+    ) -> dict[str, Any]:
+        """Fail closed when the policy did not update every action the client will execute."""
+        if "model_role" not in response:
+            return {}
+        contract = response.get("action_grid_contract")
+        if not isinstance(contract, Mapping):
+            raise ValueError("S4 service response lacks action_grid_contract")
+        if contract.get("schema") != "cosmos_action_grid_v1":
+            raise ValueError("S4 service action_grid_contract schema mismatch")
+        horizon = int(contract.get("action_horizon", -1))
+        if horizon != S4_ACTION_STEPS:
+            raise ValueError(
+                f"S4 action horizon mismatch: service={horizon}, client={S4_ACTION_STEPS}"
+            )
+        shape = [int(value) for value in contract.get("action_tensor_shape", ())]
+        factor = int(contract.get("action_downsample_factor", -1))
+        latent_indices = [
+            int(value) for value in contract.get("updated_action_latent_indices", ())
+        ]
+        if self.model_role == "official_teacher":
+            if (
+                contract.get("layout") != "official_teacher_native_horizon"
+                or factor != 1
+                or shape != [1, S4_ACTION_STEPS, S4_ACTION_DIM]
+                or latent_indices != list(range(S4_ACTION_STEPS))
+            ):
+                raise ValueError("official teacher action grid is not the native continuous horizon")
+        else:
+            expected_latent = list(range(shape[2])) if len(shape) == 5 else []
+            if (
+                contract.get("layout") != "flowmap_compact_temporal_grid"
+                or factor != 4
+                or len(shape) != 5
+                or shape[0] != 1
+                or shape[-1] != 1
+                or shape[2] * shape[3] != S4_ACTION_STEPS
+                or latent_indices != expected_latent
+            ):
+                raise ValueError(
+                    "student updated action indices do not cover the complete compact grid"
+                )
+        updated = [int(value) for value in contract.get("updated_action_indices", ())]
+        executed = list(range(int(start_idx), S4_ACTION_STEPS))
+        effective_updated = [index for index in updated if index >= int(start_idx)]
+        if effective_updated != executed:
+            raise ValueError(
+                "updated action indices do not match executed action indices: "
+                f"updated={effective_updated}, executed={executed}"
+            )
+        return {
+            "action_grid_verified": True,
+            "action_layout": str(contract["layout"]),
+            "action_downsample_factor": factor,
+            "action_tensor_shape": shape,
+            "updated_action_indices": effective_updated,
+            "executed_action_indices": executed,
+        }
+
     def _server_failure_record(
         self,
         *,
@@ -310,6 +370,7 @@ class CosmosProgressiveS4Client:
         chunks = 0
         done = False
         service_metadata: dict[str, Any] = {}
+        action_grid_metadata: dict[str, Any] = {}
         env_steps = 0
         try:
             obs = init_env_fn(
@@ -342,6 +403,10 @@ class CosmosProgressiveS4Client:
                     self._validate_service_student_steps(response)
                     self._validate_service_checkpoint(response)
                     actions = self._validate_service_action(response)
+                    start_idx = 1 if self.skip_first_action and chunks == 0 else 0
+                    action_grid_metadata = self._validate_action_grid_execution(
+                        response, start_idx=start_idx
+                    )
                 except Exception as exc:
                     return self._server_failure_record(
                         task_idx=task_idx,
@@ -367,6 +432,8 @@ class CosmosProgressiveS4Client:
                         "cosmos_repo_commit",
                         "cosmos_source_sha256",
                         "future_prediction_keys",
+                        "action_grid_contract",
+                        "action_frame_stats",
                     )
                     if key in response
                     and not (
@@ -374,7 +441,6 @@ class CosmosProgressiveS4Client:
                         and self.expected_s4_checkpoint is not None
                     )
                 }
-                start_idx = 1 if self.skip_first_action and chunks == 0 else 0
                 for action in actions[start_idx:]:
                     obs, _, done, _ = env.step(action.astype(np.float32, copy=False))
                     env_steps += 1
@@ -400,6 +466,7 @@ class CosmosProgressiveS4Client:
                 "num_chunks": int(chunks),
                 "video_path": str(video_path) if video_path is not None and frames else None,
                 **service_metadata,
+                **action_grid_metadata,
             }
             self._write_record(record)
             return record

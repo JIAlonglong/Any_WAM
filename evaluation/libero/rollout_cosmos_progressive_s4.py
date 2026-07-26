@@ -672,6 +672,7 @@ def build_live_service(args: argparse.Namespace) -> tuple[CosmosProgressiveS4Ser
         video_steps=request.video_steps,
         action_steps=request.action_steps,
         checkpoint_contract_identity=resolved_checkpoint.checkpoint_contract_identity,
+        action_downsample_factor=int(config.action_downsample_factor),
     )
     service = CosmosProgressiveS4Service(
         engine=engine,
@@ -680,6 +681,68 @@ def build_live_service(args: argparse.Namespace) -> tuple[CosmosProgressiveS4Ser
         anchor_record_dir=args.anchor_record_dir,
     )
     return service, teacher
+
+
+def build_service_startup_diagnostics(
+    service: Any, *, skip_first_action: bool
+) -> dict[str, Any]:
+    """Resolve and prove the role-specific action layout before any rollout."""
+    metadata = service.infer({"reset": True})
+    contract = metadata.get("action_grid_contract")
+    if not isinstance(contract, Mapping):
+        raise RuntimeError("Cosmos evaluation service lacks action_grid_contract at startup")
+    role = str(metadata.get("model_role"))
+    shape = [int(value) for value in contract.get("action_tensor_shape", ())]
+    factor = int(contract.get("action_downsample_factor", -1))
+    layout = contract.get("layout")
+    if role == "official_teacher":
+        if (
+            layout != "official_teacher_native_horizon"
+            or factor != 1
+            or shape != [1, S4_ACTION_STEPS, S4_ACTION_DIM]
+        ):
+            raise RuntimeError(
+                "official teacher must use its native continuous action horizon"
+            )
+    elif (
+        layout != "flowmap_compact_temporal_grid"
+        or factor != 4
+        or len(shape) != 5
+        or shape[0] != 1
+        or shape[-1] != 1
+        or shape[2] * shape[3] != S4_ACTION_STEPS
+    ):
+        raise RuntimeError("student must use the validated compact 4x4 action grid")
+    updated = [int(value) for value in contract.get("updated_action_indices", ())]
+    start_idx = 1 if bool(skip_first_action) else 0
+    executed = list(range(start_idx, S4_ACTION_STEPS))
+    effective_updated = [index for index in updated if index >= start_idx]
+    if effective_updated != executed:
+        raise RuntimeError(
+            "Cosmos startup action-grid mismatch: "
+            f"updated={effective_updated}, executed={executed}"
+        )
+    return {
+        "model_name": role,
+        "checkpoint": metadata["s4_checkpoint"],
+        "video_num_steps": int(metadata["video_steps"]),
+        "action_num_steps": int(metadata["action_steps"]),
+        "action_downsample_factor": factor,
+        "action_tensor_shape": shape,
+        "action_horizon": int(contract["action_horizon"]),
+        "updated_action_latent_indices": list(
+            contract["updated_action_latent_indices"]
+        ),
+        "updated_action_indices": updated,
+        "effective_updated_action_indices_first_chunk": effective_updated,
+        "executed_action_indices_first_chunk": executed,
+        "updated_equals_executed_first_chunk": effective_updated == executed,
+        "teacher_budget_semantics": (
+            "native_multistep_teacher_forced_to_matched_coarse_solver_budget"
+            if metadata["model_role"] == "official_teacher"
+            else "distilled_student_native_few_step_budget"
+        ),
+    }
 
 
 def serve_json_lines(service: CosmosProgressiveS4Service, *, input_stream: Any, output_stream: Any) -> None:
@@ -755,6 +818,14 @@ def main(argv: list[str] | None = None) -> int:
     request = resolve_cli_inference_request(args)
     service, teacher = build_live_service(args)
     try:
+        startup_diagnostics = build_service_startup_diagnostics(
+            service, skip_first_action=args.skip_first_action
+        )
+        print(
+            json.dumps({"cosmos_action_grid_startup": startup_diagnostics}, sort_keys=True),
+            file=sys.stderr,
+            flush=True,
+        )
         if args.serve_stdio:
             serve_json_lines(service, input_stream=sys.stdin, output_stream=sys.stdout)
             return 0

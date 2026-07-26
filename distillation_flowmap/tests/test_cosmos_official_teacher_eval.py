@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import distillation_flowmap.cosmos_official_teacher_eval as teacher_eval
 from distillation_flowmap.cosmos_official_teacher_eval import (
     OfficialTeacherMatchedBudgetAdapter,
     resolve_cosmos_official_teacher_root,
@@ -33,6 +34,22 @@ def test_official_teacher_accepts_explicit_matched_budgets(budget):
     assert request.video_steps == budget
     assert request.action_steps == budget
     assert request.student_steps is None
+
+
+def test_official_teacher_missing_flowmap_metadata_uses_native_continuous_grid():
+    contract = teacher_eval.official_teacher_action_grid_contract(
+        action_shape=(1, 16, 7),
+    )
+
+    assert contract == {
+        "schema": "cosmos_action_grid_v1",
+        "layout": "official_teacher_native_horizon",
+        "action_downsample_factor": 1,
+        "action_tensor_shape": [1, 16, 7],
+        "updated_action_latent_indices": list(range(16)),
+        "updated_action_indices": list(range(16)),
+        "action_horizon": 16,
+    }
 
 
 def _write_official_teacher_root(root: Path) -> Path:

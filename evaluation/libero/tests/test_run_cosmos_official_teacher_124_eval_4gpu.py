@@ -23,6 +23,7 @@ def _write_sentinel(path: Path) -> None:
         "    'argv': sys.argv[1:],\n"
         "    'S4_MATRIX_ROLES': os.environ.get('S4_MATRIX_ROLES'),\n"
         "    'S4_FORMAL_NUM_SHARDS': os.environ.get('S4_FORMAL_NUM_SHARDS'),\n"
+        "    'S4_FORMAL_GPU_LAYOUT': os.environ.get('S4_FORMAL_GPU_LAYOUT'),\n"
         "    'S4_VIDEO_SEEDS': os.environ.get('S4_VIDEO_SEEDS'),\n"
         "    'S4_EPISODES_PER_TASK': os.environ.get('S4_EPISODES_PER_TASK'),\n"
         "    'S4_CKPT_ROOT': os.environ.get('S4_CKPT_ROOT'),\n"
@@ -72,7 +73,7 @@ def _env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
     return env, capture, matrix_root
 
 
-def test_four_gpu_wrapper_forces_two_shards_and_representative_video_seed(
+def test_four_gpu_wrapper_uses_four_colocated_shards_and_representative_video_seed(
     tmp_path,
 ):
     env, capture, matrix_root = _env(tmp_path)
@@ -91,11 +92,11 @@ def test_four_gpu_wrapper_forces_two_shards_and_representative_video_seed(
     assert payload == {
         "argv": ["dry-run"],
         "S4_MATRIX_ROLES": "official_teacher",
-        "S4_FORMAL_NUM_SHARDS": "2",
+        "S4_FORMAL_NUM_SHARDS": "4",
+        "S4_FORMAL_GPU_LAYOUT": "colocated",
         "S4_VIDEO_SEEDS": "0",
         "S4_EPISODES_PER_TASK": "50",
         "S4_CKPT_ROOT": env["COSMOS_POLICY_PATH"],
         "MATRIX_ROOT": str(matrix_root),
     }
     assert not matrix_root.exists()
-

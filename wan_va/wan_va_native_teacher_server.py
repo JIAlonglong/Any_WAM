@@ -703,6 +703,7 @@ class VA_Server:
 
 def run(args):
     config = VA_CONFIGS[args.config_name]
+    config.infer_mode = "server"
     port = config.port if args.port is None else args.port
 
     native_contract = resolve_native_teacher_contract(

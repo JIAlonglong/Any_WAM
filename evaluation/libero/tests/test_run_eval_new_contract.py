@@ -104,6 +104,24 @@ def test_flowmap_backend_remains_default(tmp_path):
     assert "Server backend: flowmap" in result.stdout
 
 
+def test_flowmap_backend_keeps_default_sampling_budgets(tmp_path):
+    env = _env(tmp_path, "libero_10")
+    env.pop("NUM_STEPS")
+    env.pop("ACTION_NUM_STEPS")
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "step_1", "target_student"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Video steps:    20" in result.stdout
+    assert "Action steps:   50" in result.stdout
+
+
 def test_native_teacher_backend_routes_to_dedicated_server(tmp_path):
     env = _env(tmp_path, "libero_10")
     (
@@ -131,6 +149,79 @@ def test_native_teacher_backend_routes_to_dedicated_server(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Server backend: native_teacher" in result.stdout
     assert "wan_va/wan_va_native_teacher_server.py" in result.stdout
+
+
+def test_native_teacher_defaults_action_steps_to_video_steps(tmp_path):
+    env = _env(tmp_path, "libero_10")
+    env.pop("ACTION_NUM_STEPS")
+    env.update(
+        {
+            "SERVER_BACKEND": "native_teacher",
+            "MODEL_NAME": "teacher_native",
+            "NUM_STEPS": "4",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "step_1", "target_student"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Video steps:    4" in result.stdout
+    assert "Action steps:   4" in result.stdout
+
+
+def test_native_teacher_start_server_invokes_dedicated_entrypoint(tmp_path):
+    env = _env(tmp_path, "libero_10")
+    base_model = tmp_path / "base_model"
+    for component in ("transformer", "vae", "tokenizer", "text_encoder"):
+        (base_model / component).mkdir(parents=True)
+
+    server_stub = tmp_path / "server_stub.sh"
+    server_stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$SERVER_CAPTURE"\n')
+    server_stub.chmod(0o755)
+    client_stub = tmp_path / "client_stub.sh"
+    client_stub.write_text("#!/bin/sh\nexit 0\n")
+    client_stub.chmod(0o755)
+    server_capture = tmp_path / "server_args.txt"
+
+    env.pop("ACTION_NUM_STEPS")
+    env.update(
+        {
+            "CHECK_ONLY": "0",
+            "EVAL_MODE": "success",
+            "SERVER_BACKEND": "native_teacher",
+            "MODEL_NAME": "teacher_native",
+            "NUM_STEPS": "4",
+            "WAN22_PRETRAINED_PATH": str(base_model),
+            "SERVER_PYTHON": str(server_stub),
+            "CLIENT_PYTHON": str(client_stub),
+            "SERVER_CAPTURE": str(server_capture),
+            "SERVER_WAIT_SECONDS": "0",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "step_1", "target_student"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    server_args = server_capture.read_text()
+    assert "wan_va/wan_va_native_teacher_server.py" in server_args
+    assert "--config-name\nlibero" in server_args
+    assert "--port\n29057" in server_args
+    assert "--checkpoint-path" in server_args
+    assert "--num-steps\n4" in server_args
+    assert "--action-num-steps\n4" in server_args
+    assert "--model-name\nteacher_native" in server_args
 
 
 def test_unknown_server_backend_is_rejected(tmp_path):

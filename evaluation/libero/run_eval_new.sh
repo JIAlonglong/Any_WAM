@@ -42,7 +42,7 @@ STEP="${1:-}"
 VARIANT="${2:-online_student}"
 EVAL_MODE="${EVAL_MODE:-visualize}"
 NUM_STEPS="${NUM_STEPS:-20}"
-ACTION_NUM_STEPS="${ACTION_NUM_STEPS:-50}"
+ACTION_NUM_STEPS="${ACTION_NUM_STEPS:-}"
 TEST_NUM="${TEST_NUM:-3}"
 PORT="${PORT:-29057}"
 TASK_START="${TASK_START:-0}"
@@ -100,6 +100,7 @@ SERVER_BACKEND="${SERVER_BACKEND:-flowmap}"
 case "$SERVER_BACKEND" in
     flowmap)
         SERVER_ENTRYPOINT="wan_va/wan_va_server.py"
+        ACTION_NUM_STEPS="${ACTION_NUM_STEPS:-50}"
         ;;
     native_teacher)
         SERVER_ENTRYPOINT="wan_va/wan_va_native_teacher_server.py"
@@ -107,6 +108,7 @@ case "$SERVER_BACKEND" in
             echo "native_teacher requires MODEL_NAME=teacher_native" >&2
             exit 2
         }
+        ACTION_NUM_STEPS="${ACTION_NUM_STEPS:-${NUM_STEPS}}"
         ;;
     *)
         echo "Unsupported SERVER_BACKEND: $SERVER_BACKEND" >&2

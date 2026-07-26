@@ -1147,15 +1147,19 @@ def _cuda_available_torch(*, device_count=1):
     )
 
 
-def test_live_runtime_preflight_rejects_incompatible_host_driver(tmp_path, monkeypatch):
+def test_live_runtime_preflight_warns_for_older_host_driver(tmp_path, monkeypatch):
     import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
 
     checkpoint = tmp_path / "s4-checkpoint"
     checkpoint.mkdir()
+    cosmos_python = tmp_path / "cosmos-python"
+    cosmos_python.write_text("#!/bin/sh\n", encoding="utf-8")
     monkeypatch.setitem(sys.modules, "torch", _cuda_available_torch())
     monkeypatch.setattr(rollout, "_nvidia_driver_version", lambda: "550.90.07")
+    monkeypatch.setattr(rollout, "_cosmos_python_cuda_version", lambda _path: "12.8")
+    monkeypatch.setenv("COSMOS_POLICY_PYTHON", str(cosmos_python))
 
-    with pytest.raises(RuntimeError, match="NVIDIA driver.*570.124.06"):
+    with pytest.warns(RuntimeWarning, match="NVIDIA driver.*570.124.06"):
         rollout.require_live_s4_prerequisites(
             device="cuda:0",
             checkpoint_transformer=checkpoint,

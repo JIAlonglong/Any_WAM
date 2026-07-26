@@ -19,6 +19,7 @@ import random
 import re
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -177,9 +178,12 @@ def require_live_s4_prerequisites(*, device: str, checkpoint_transformer: str | 
             "requires NVIDIA driver >=570.124.06; do not start the raw worker on this host."
         )
     if _version_tuple(driver) < _MIN_COSMOS_DRIVER:
-        raise CosmosRuntimePrerequisiteError(
-            f"NVIDIA driver {driver} is incompatible with official Cosmos cu128; "
-            "requires >=570.124.06. Do not start the raw worker on this host."
+        warnings.warn(
+            f"NVIDIA driver {driver} is older than the official Cosmos cu128 "
+            "reference requirement >=570.124.06; continuing because the runtime "
+            "may provide CUDA forward-compatibility support.",
+            RuntimeWarning,
+            stacklevel=2,
         )
 
     cosmos_python = resolve_cosmos_policy_python()

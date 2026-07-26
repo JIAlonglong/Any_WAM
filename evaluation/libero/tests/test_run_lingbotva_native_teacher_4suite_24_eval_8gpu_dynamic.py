@@ -4,6 +4,8 @@ import textwrap
 import time
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = (
@@ -18,7 +20,9 @@ def _worker_fields(line):
     return dict(field.split("=", 1) for field in line.split()[1:])
 
 
-def _run_check_only(tmp_path, gpu_ids="0,1,2,3,4,5,6,7", budgets=None):
+def _run_check_only(
+    tmp_path, gpu_ids="0,1,2,3,4,5,6,7", budgets=None, replicas_per_gpu=None
+):
     checkpoint = tmp_path / "base" / "transformer"
     checkpoint.mkdir(parents=True, exist_ok=True)
     return _run_launcher(
@@ -28,6 +32,7 @@ def _run_check_only(tmp_path, gpu_ids="0,1,2,3,4,5,6,7", budgets=None):
         check_only=True,
         gpu_ids=gpu_ids,
         budgets=budgets,
+        replicas_per_gpu=replicas_per_gpu,
     )
 
 
@@ -38,6 +43,7 @@ def _run_launcher(
     output_root,
     check_only,
     gpu_ids="0,1,2,3,4,5,6,7",
+    replicas_per_gpu=None,
     budgets=None,
     master_port="32680",
     ws_port="32780",
@@ -65,6 +71,8 @@ def _run_launcher(
     ]
     if budgets is not None:
         args.extend(["--budgets", budgets])
+    if replicas_per_gpu is not None:
+        args.extend(["--replicas-per-gpu", replicas_per_gpu])
     return subprocess.run(
         args,
         cwd=ROOT,
@@ -146,6 +154,34 @@ def test_check_only_accepts_a_four_gpu_dynamic_plan(tmp_path):
         }
         assert len({worker["master_port"] for worker in budget_workers}) == 4
         assert len({worker["ws_port"] for worker in budget_workers}) == 4
+
+
+def test_check_only_expands_four_gpus_to_two_independent_replicas(tmp_path):
+    result = _run_check_only(tmp_path, gpu_ids="0,1,2,3", replicas_per_gpu="2")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    workers = [
+        _worker_fields(line)
+        for line in result.stdout.splitlines()
+        if line.startswith("WORKER ")
+    ]
+    assert len(workers) == 24
+    for steps in ("1", "2", "4"):
+        lanes = [worker for worker in workers if worker["steps"] == steps]
+        assert len(lanes) == 8
+        assert {lane["gpu"] for lane in lanes} == {"0", "1", "2", "3"}
+        assert {lane["replica"] for lane in lanes} == {"0", "1"}
+        assert len({lane["master_port"] for lane in lanes}) == 8
+        assert len({lane["ws_port"] for lane in lanes}) == 8
+        assert len({lane["save_root"] for lane in lanes}) == 8
+
+
+@pytest.mark.parametrize("replicas_per_gpu", ("0", "3", "two"))
+def test_check_only_rejects_invalid_replica_counts(tmp_path, replicas_per_gpu):
+    result = _run_check_only(tmp_path, replicas_per_gpu=replicas_per_gpu)
+
+    assert result.returncode != 0
+    assert "--replicas-per-gpu must be 1 or 2" in result.stderr
 
 
 def test_check_only_rejects_invalid_gpu_lists_outside_one_to_eight_workers(tmp_path):
@@ -274,6 +310,8 @@ def test_first_worker_failure_terminates_sibling_server_groups_promptly(tmp_path
         checkpoint=checkpoint,
         output_root=output_root,
         check_only=False,
+        gpu_ids="0",
+        replicas_per_gpu="2",
         master_port=str(master_port),
         ws_port=str(ws_port),
         extra_env={
@@ -382,6 +420,8 @@ def test_one_budget_claims_every_task_once_and_reaches_the_merger(tmp_path):
         output_root=output_root,
         check_only=False,
         budgets="1",
+        gpu_ids="0,1",
+        replicas_per_gpu="2",
         master_port=str(master_port),
         ws_port=str(ws_port),
         extra_env={
@@ -402,8 +442,10 @@ def test_one_budget_claims_every_task_once_and_reaches_the_merger(tmp_path):
         for suite in ("libero_spatial", "libero_goal", "libero_object", "libero_10")
         for task_idx in range(10)
     }
-    assert set(call_file.read_text().splitlines()) == expected_calls
-    assert len(call_file.read_text().splitlines()) == 40
+    calls = call_file.read_text().splitlines()
+    assert set(calls) == expected_calls
+    assert len(calls) == 40
+    assert len(set(calls)) == 40
     assert (output_root / "teacher_native" / "steps_1" / "summary.json").exists()
     for pid in {int(line) for line in pid_file.read_text().splitlines()}:
         try:

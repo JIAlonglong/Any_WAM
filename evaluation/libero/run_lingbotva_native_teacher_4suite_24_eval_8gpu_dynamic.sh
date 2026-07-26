@@ -17,6 +17,7 @@ SERVER_PYTHON="${SERVER_PYTHON:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam
 CLIENT_PYTHON="${CLIENT_PYTHON:-/kpfs-intern/jialongliu/miniforge3/envs/libero/bin/python}"
 READY_PYTHON="${READY_PYTHON:-python3}"
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
+REPLICAS_PER_GPU=1
 MASTER_PORT_BASE=32680
 WS_PORT_BASE=32780
 EPISODES=50
@@ -35,7 +36,7 @@ TERMINATING=0
 
 usage() {
     echo "Usage: $0 --checkpoint TRANSFORMER --output-root DIR [options]"
-    echo "Options: --episodes N --gpu-ids 0,...,N (1-8 GPUs) --master-port-base N --ws-port-base N --budgets 1,2,4"
+    echo "Options: --episodes N --gpu-ids 0,...,N (1-8 GPUs) --replicas-per-gpu 1|2 --master-port-base N --ws-port-base N --budgets 1,2,4"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -44,6 +45,7 @@ while [ "$#" -gt 0 ]; do
         --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
         --episodes) EPISODES="$2"; shift 2 ;;
         --gpu-ids) GPU_IDS="$2"; shift 2 ;;
+        --replicas-per-gpu) REPLICAS_PER_GPU="$2"; shift 2 ;;
         --master-port-base) MASTER_PORT_BASE="$2"; shift 2 ;;
         --ws-port-base) WS_PORT_BASE="$2"; shift 2 ;;
         --budgets) BUDGETS_CSV="$2"; shift 2 ;;
@@ -107,22 +109,27 @@ for gpu in "${GPUS[@]}"; do
     fi
     SEEN_GPUS+=("$gpu")
 done
-WORKER_COUNT="${#GPUS[@]}"
-if [ "$WORKER_COUNT" -lt 1 ] || [ "$WORKER_COUNT" -gt 8 ]; then
+GPU_COUNT="${#GPUS[@]}"
+if [ "$GPU_COUNT" -lt 1 ] || [ "$GPU_COUNT" -gt 8 ]; then
     echo "GPU_IDS must contain between 1 and 8 unique non-negative integers; got: $GPU_IDS" >&2
     exit 2
 fi
-LAST_WORKER_OFFSET=$((WORKER_COUNT - 1))
-if (( MASTER_PORT_BASE + LAST_WORKER_OFFSET > 65535 )); then
+case "$REPLICAS_PER_GPU" in
+    1|2) ;;
+    *) echo "--replicas-per-gpu must be 1 or 2" >&2; exit 2 ;;
+esac
+LANE_COUNT=$((GPU_COUNT * REPLICAS_PER_GPU))
+LAST_LANE_OFFSET=$((LANE_COUNT - 1))
+if (( MASTER_PORT_BASE + LAST_LANE_OFFSET > 65535 )); then
     echo "--master-port-base range must end at or below 65535" >&2
     exit 2
 fi
-if (( WS_PORT_BASE + LAST_WORKER_OFFSET > 65535 )); then
+if (( WS_PORT_BASE + LAST_LANE_OFFSET > 65535 )); then
     echo "--ws-port-base range must end at or below 65535" >&2
     exit 2
 fi
-if (( MASTER_PORT_BASE <= WS_PORT_BASE + LAST_WORKER_OFFSET && WS_PORT_BASE <= MASTER_PORT_BASE + LAST_WORKER_OFFSET )); then
-    echo "Master and WebSocket port ranges must not overlap: [${MASTER_PORT_BASE}, $((MASTER_PORT_BASE + LAST_WORKER_OFFSET))] and [${WS_PORT_BASE}, $((WS_PORT_BASE + LAST_WORKER_OFFSET))]" >&2
+if (( MASTER_PORT_BASE <= WS_PORT_BASE + LAST_LANE_OFFSET && WS_PORT_BASE <= MASTER_PORT_BASE + LAST_LANE_OFFSET )); then
+    echo "Master and WebSocket port ranges must not overlap: [${MASTER_PORT_BASE}, $((MASTER_PORT_BASE + LAST_LANE_OFFSET))] and [${WS_PORT_BASE}, $((WS_PORT_BASE + LAST_LANE_OFFSET))]" >&2
     exit 2
 fi
 
@@ -218,10 +225,10 @@ PY
 }
 
 preflight_ports() {
-    local worker master_port ws_port
-    for ((worker = 0; worker < WORKER_COUNT; worker++)); do
-        master_port=$((MASTER_PORT_BASE + worker))
-        ws_port=$((WS_PORT_BASE + worker))
+    local lane master_port ws_port
+    for ((lane = 0; lane < LANE_COUNT; lane++)); do
+        master_port=$((MASTER_PORT_BASE + lane))
+        ws_port=$((WS_PORT_BASE + lane))
         if ! port_is_available "$master_port"; then
             echo "Master port is already occupied: ${master_port}" >&2
             return 1
@@ -265,12 +272,13 @@ print_worker_plan() {
     local steps="$1"
     local worker="$2"
     local gpu="$3"
+    local replica="$4"
     local budget_root="${MODEL_RESULT_ROOT}/steps_${steps}"
     local worker_root="${budget_root}/workers/worker_${worker}"
     local master_port=$((MASTER_PORT_BASE + worker))
     local ws_port=$((WS_PORT_BASE + worker))
 
-    echo "WORKER model=${MODEL_NAME} backend=native_teacher steps=${steps} worker=${worker} gpu=${gpu} episodes=${EPISODES} task_queue=${#TASK_SPECS[@]} master_port=${master_port} ws_port=${ws_port} save_root=${worker_root}/server results_root=${worker_root}/results latency_jsonl=${worker_root}/sampler_latency.jsonl claim_mode=mkdir client_flag=--no-save-video server_flag=--no-save-debug-tensors"
+    echo "WORKER model=${MODEL_NAME} backend=native_teacher steps=${steps} worker=${worker} replica=${replica} gpu=${gpu} episodes=${EPISODES} task_queue=${#TASK_SPECS[@]} master_port=${master_port} ws_port=${ws_port} save_root=${worker_root}/server results_root=${worker_root}/results latency_jsonl=${worker_root}/sampler_latency.jsonl claim_mode=mkdir client_flag=--no-save-video server_flag=--no-save-debug-tensors"
 }
 
 server_group_is_alive() {
@@ -338,8 +346,9 @@ run_worker() {
     local steps="$1"
     local worker="$2"
     local gpu="$3"
-    local budget_root="$4"
-    local claims_root="$5"
+    local replica="$4"
+    local budget_root="$5"
+    local claims_root="$6"
     local worker_root="${budget_root}/workers/worker_${worker}"
     local server_root="${worker_root}/server"
     local results_root="${worker_root}/results"
@@ -353,7 +362,7 @@ run_worker() {
     trap 'stop_server; exit 130' INT TERM HUP
     trap stop_server EXIT
     mkdir -p "$server_root" "$results_root"
-    echo "SERVER worker=${worker} steps=${steps} gpu=${gpu} master_port=${master_port} ws_port=${ws_port}"
+    echo "SERVER worker=${worker} replica=${replica} steps=${steps} gpu=${gpu} master_port=${master_port} ws_port=${ws_port}"
     CUDA_VISIBLE_DEVICES="$gpu" setsid "$SERVER_PYTHON" -m torch.distributed.run \
         --nproc_per_node 1 \
         --master_port "$master_port" \
@@ -385,7 +394,7 @@ run_worker() {
         task_idx="${task_spec##*:}"
         claim_dir="${claims_root}/${suite}_${task_idx}"
         if mkdir "$claim_dir" 2>/dev/null; then
-            echo "CLAIM worker=${worker} steps=${steps} suite=${suite} task=${task_idx}"
+            echo "CLAIM worker=${worker} replica=${replica} steps=${steps} suite=${suite} task=${task_idx}"
         elif [ -d "$claim_dir" ]; then
             continue
         else
@@ -521,12 +530,15 @@ run_budget() {
     local steps="$1"
     local budget_root="${MODEL_RESULT_ROOT}/steps_${steps}"
     local claims_root="${budget_root}/claims"
-    local worker gpu worker_root
+    local lane gpu_index gpu replica worker_root
 
     mkdir -p "${budget_root}/workers" "$claims_root"
     ACTIVE_WORKER_PIDS=()
-    for ((worker = 0; worker < WORKER_COUNT; worker++)); do
-        gpu="${GPUS[$worker]}"
+    for ((lane = 0; lane < LANE_COUNT; lane++)); do
+        worker="$lane"
+        gpu_index=$((lane % GPU_COUNT))
+        gpu="${GPUS[$gpu_index]}"
+        replica=$((lane / GPU_COUNT))
         worker_root="${budget_root}/workers/worker_${worker}"
         mkdir -p "$worker_root"
         setsid env \
@@ -534,6 +546,7 @@ run_budget() {
             DYNAMIC_STEPS="$steps" \
             DYNAMIC_WORKER="$worker" \
             DYNAMIC_GPU="$gpu" \
+            DYNAMIC_REPLICA="$replica" \
             DYNAMIC_BUDGET_ROOT="$budget_root" \
             DYNAMIC_CLAIMS_ROOT="$claims_root" \
             SERVER_PYTHON="$SERVER_PYTHON" \
@@ -546,6 +559,7 @@ run_budget() {
             --output-root "$OUTPUT_ROOT" \
             --episodes "$EPISODES" \
             --gpu-ids "$GPU_IDS" \
+            --replicas-per-gpu "$REPLICAS_PER_GPU" \
             --master-port-base "$MASTER_PORT_BASE" \
             --ws-port-base "$WS_PORT_BASE" \
             --budgets "$steps" >"${worker_root}/worker.log" 2>&1 &
@@ -564,24 +578,27 @@ run_budget() {
 }
 
 if [ "${DYNAMIC_WORKER_MODE:-0}" = "1" ]; then
-    for required in DYNAMIC_STEPS DYNAMIC_WORKER DYNAMIC_GPU DYNAMIC_BUDGET_ROOT DYNAMIC_CLAIMS_ROOT; do
+    for required in DYNAMIC_STEPS DYNAMIC_WORKER DYNAMIC_GPU DYNAMIC_REPLICA DYNAMIC_BUDGET_ROOT DYNAMIC_CLAIMS_ROOT; do
         if [ -z "${!required:-}" ]; then
             echo "Missing dynamic worker setting: ${required}" >&2
             exit 2
         fi
     done
-    run_worker "$DYNAMIC_STEPS" "$DYNAMIC_WORKER" "$DYNAMIC_GPU" "$DYNAMIC_BUDGET_ROOT" "$DYNAMIC_CLAIMS_ROOT"
+    run_worker "$DYNAMIC_STEPS" "$DYNAMIC_WORKER" "$DYNAMIC_GPU" "$DYNAMIC_REPLICA" "$DYNAMIC_BUDGET_ROOT" "$DYNAMIC_CLAIMS_ROOT"
     exit 0
 fi
 
 if [ "${CHECK_ONLY:-0}" = "1" ]; then
     prepare_result_root
     for steps in "${BUDGETS[@]}"; do
-        for ((worker = 0; worker < WORKER_COUNT; worker++)); do
-            print_worker_plan "$steps" "$worker" "${GPUS[$worker]}"
+        for ((worker = 0; worker < LANE_COUNT; worker++)); do
+            gpu_index=$((worker % GPU_COUNT))
+            gpu="${GPUS[$gpu_index]}"
+            replica=$((worker / GPU_COUNT))
+            print_worker_plan "$steps" "$worker" "$gpu" "$replica"
         done
     done
-    echo "CHECK_ONLY=1: verified $((${#BUDGETS[@]} * WORKER_COUNT)) dynamic workers (40 tasks x budgets ${BUDGETS_CSV})."
+    echo "CHECK_ONLY=1: verified $((${#BUDGETS[@]} * LANE_COUNT)) dynamic workers (40 tasks x budgets ${BUDGETS_CSV})."
     exit 0
 fi
 

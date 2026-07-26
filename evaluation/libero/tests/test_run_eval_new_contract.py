@@ -218,10 +218,18 @@ def test_native_teacher_start_server_invokes_dedicated_entrypoint(tmp_path):
     assert "wan_va/wan_va_native_teacher_server.py" in server_args
     assert "--config-name\nlibero" in server_args
     assert "--port\n29057" in server_args
-    assert "--checkpoint-path" in server_args
+    expected_checkpoint = (
+        Path(env["OUTPUT_ROOT"])
+        / "checkpoints"
+        / "step_1"
+        / "target_student"
+        / "transformer"
+    )
+    assert f"--checkpoint-path\n{expected_checkpoint}" in server_args
     assert "--num-steps\n4" in server_args
     assert "--action-num-steps\n4" in server_args
     assert "--model-name\nteacher_native" in server_args
+    assert f"--save-root\n{Path(env['SAVE_ROOT']) / 'actions'}" in server_args
 
 
 def test_unknown_server_backend_is_rejected(tmp_path):

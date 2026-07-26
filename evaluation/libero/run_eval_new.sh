@@ -17,7 +17,7 @@
 #   LIBERO_BENCHMARK: libero_10 | libero_spatial | libero_object | libero_goal
 #   EVAL_MODE:        visualize | compare | success | all，默认 visualize
 #   NUM_STEPS:        视频推理步数，默认 20
-#   ACTION_NUM_STEPS: action 推理步数，默认 50
+#   ACTION_NUM_STEPS: action 推理步数；FlowMap 默认 50，native_teacher 未设置时默认 NUM_STEPS
 #   TEST_NUM:         每任务 episode 数，默认 3，正式成功率建议 50
 #   TASK_START/END:   任务范围 [start, end)，默认 visualize/compare 跑 0..3，success 跑 0..10
 #   PORT:             WebSocket 端口，默认 29057

@@ -16,8 +16,9 @@ one server safely: a newer connection closes the older one.
 
 The dynamic launcher gains a replica count, initially used as `2` per physical
 GPU. For each `(gpu, replica, budget)`, it starts an independent teacher server
-and one independent LIBERO client lane with unique master/WebSocket ports and
-worker directories. Every lane uses the existing atomic claim directory for
+and one independent LIBERO client lane.  Master/WebSocket ports and worker
+directories are unique among the simultaneously active lanes of a budget.
+Every lane uses the existing atomic claim directory for
 the same 40-task budget queue, so each task is still evaluated exactly once.
 
 Each replica owns its own model process and mutable cache. There is no

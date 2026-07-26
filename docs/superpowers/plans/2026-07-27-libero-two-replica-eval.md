@@ -14,7 +14,7 @@
 - Preserve 40 tasks, 50 episodes, matched video/action budgets `1,2,4`, no MP4, no debug tensors, and the existing merger schema.
 - A single native-teacher server remains single-client; never share a server or its KV cache between replicas.
 - Default `--replicas-per-gpu` is exactly `1`; supported values are `1` and `2`.
-- Each lane has a unique worker ID, replica ID, master port, WebSocket port, server root, results root, and latency JSONL path.
+- Each simultaneously active lane has a unique worker ID, replica ID, master port, WebSocket port, server root, results root, and latency JSONL path.  The three budgets run serially and may reuse the same non-overlapping lane port range.
 - All two-replica formal runs use a fresh output root and a new port range.
 
 ---
@@ -247,7 +247,7 @@ Expected: all tests pass with no regression to one-replica operation.
 
 - [ ] **Step 2: Run remote check-only preflight**
 
-On RobotWin A800, run the fast wrapper with `CHECK_ONLY=1` and a nonexistent temporary output root. Confirm 24 planned lanes, eight lanes per budget, 24 unique port pairs, and no output directory creation.
+On RobotWin A800, run the fast wrapper with `CHECK_ONLY=1` and a nonexistent temporary output root. Confirm 24 planned lanes, eight lanes per budget, eight unique master/WebSocket pairs within each serial budget, and no output directory creation.
 
 - [ ] **Step 3: Stop the old one-replica run only after user confirmation and capacity availability**
 

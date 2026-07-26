@@ -1222,6 +1222,28 @@ def test_official_teacher_config_does_not_import_student_training_config(
     assert config.world_size == 1
 
 
+def test_official_teacher_checkpoint_identifier_never_reads_student_checkpoint():
+    import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
+
+    args = SimpleNamespace(
+        checkpoint_transformer=None,
+        cosmos_policy_path="/models/official-teacher",
+        teacher_model_path="/models/official-teacher",
+    )
+    request = SimpleNamespace(model_role="official_teacher")
+
+    assert rollout._resolve_service_checkpoint_identifier(
+        SimpleNamespace(checkpoint_identifier="/verified/official-teacher"),
+        args=args,
+        request=request,
+    ) == "/verified/official-teacher"
+    assert rollout._resolve_service_checkpoint_identifier(
+        SimpleNamespace(),
+        args=args,
+        request=request,
+    ) == "/models/official-teacher"
+
+
 def test_live_cli_requires_seed_before_constructing_service(monkeypatch):
     import evaluation.libero.rollout_cosmos_progressive_s4 as rollout
 

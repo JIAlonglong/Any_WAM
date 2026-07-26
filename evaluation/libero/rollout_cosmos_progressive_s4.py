@@ -382,6 +382,23 @@ def _configure_official_teacher_config(
     )
 
 
+def _resolve_service_checkpoint_identifier(
+    service: Any, *, args: argparse.Namespace, request: Any
+) -> str:
+    identifier = getattr(service, "checkpoint_identifier", None)
+    if identifier:
+        return str(identifier)
+    if request.model_role == "official_teacher":
+        checkpoint = args.cosmos_policy_path or args.teacher_model_path
+    else:
+        checkpoint = args.checkpoint_transformer
+    if not checkpoint:
+        raise ValueError(
+            f"{request.model_role} did not provide a checkpoint identifier"
+        )
+    return str(Path(checkpoint).resolve())
+
+
 def _load_empty_embedding(path: str | Path, *, torch_module: Any, device: Any) -> Any:
     embedding = torch_module.load(path, map_location="cpu", weights_only=False)
     if not torch_module.is_tensor(embedding) or tuple(embedding.shape) != PROMPT_EMBEDDING_SHAPE:
@@ -859,10 +876,10 @@ def main(argv: list[str] | None = None) -> int:
             video_steps=request.video_steps,
             action_steps=request.action_steps,
             libero_benchmark=args.libero_benchmark,
-            expected_s4_checkpoint=getattr(
+            expected_s4_checkpoint=_resolve_service_checkpoint_identifier(
                 service,
-                "checkpoint_identifier",
-                str(Path(args.checkpoint_transformer).resolve()),
+                args=args,
+                request=request,
             ),
             expected_checkpoint_contract_identity=getattr(
                 service, "checkpoint_contract_identity", None

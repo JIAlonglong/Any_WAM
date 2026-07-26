@@ -12,7 +12,7 @@ CLIENT_PYTHON="${CLIENT_PYTHON:-/kpfs-intern/jialongliu/miniforge3/envs/libero/b
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 MASTER_PORT_BASE=29680
 WS_PORT_BASE=29780
-EPISODES=10
+EPISODES=50
 MODEL_NAME="teacher_native"
 CHECKPOINT=""
 OUTPUT_ROOT=""
@@ -44,6 +44,14 @@ if [ -z "$CHECKPOINT" ] || [ -z "$OUTPUT_ROOT" ]; then
     exit 2
 fi
 case "$EPISODES" in ''|*[!0-9]*|0) echo "--episodes must be a positive integer" >&2; exit 2 ;; esac
+case "$MASTER_PORT_BASE" in ''|*[!0-9]*|0) echo "--master-port-base must be a positive integer" >&2; exit 2 ;; esac
+case "$WS_PORT_BASE" in ''|*[!0-9]*|0) echo "--ws-port-base must be a positive integer" >&2; exit 2 ;; esac
+MASTER_PORT_BASE=$((10#$MASTER_PORT_BASE))
+WS_PORT_BASE=$((10#$WS_PORT_BASE))
+if (( MASTER_PORT_BASE <= WS_PORT_BASE + 7 && WS_PORT_BASE <= MASTER_PORT_BASE + 7 )); then
+    echo "Master and WebSocket port ranges must not overlap: [${MASTER_PORT_BASE}, $((MASTER_PORT_BASE + 7))] and [${WS_PORT_BASE}, $((WS_PORT_BASE + 7))]" >&2
+    exit 2
+fi
 
 IFS=',' read -r -a GPUS <<< "$GPU_IDS"
 declare -A SEEN_GPUS=()
@@ -79,7 +87,7 @@ run_budget() {
         save_root="${budget_root}/workers/${suite}_${start}_${end}"
         master_port=$((MASTER_PORT_BASE + worker))
         ws_port=$((WS_PORT_BASE + worker))
-        echo "WORKER model=${MODEL_NAME} backend=native_teacher steps=${steps} suite=${suite} tasks=${start}:${end} gpu=${gpu} video_steps=${steps} action_steps=${steps} master_port=${master_port} ws_port=${ws_port}"
+        echo "WORKER model=${MODEL_NAME} backend=native_teacher steps=${steps} episodes=${EPISODES} suite=${suite} tasks=${start}:${end} gpu=${gpu} video_steps=${steps} action_steps=${steps} master_port=${master_port} ws_port=${ws_port}"
         if [ "${CHECK_ONLY:-0}" = "1" ]; then
             continue
         fi

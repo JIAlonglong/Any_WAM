@@ -56,6 +56,7 @@ class VA_Server:
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
         self.native_contract = job_config.native_contract
         self.latency_jsonl = job_config.latency_jsonl
+        self.save_debug_tensors = getattr(job_config, 'save_debug_tensors', True)
         self.eval_metadata = {}
         self.sampler_call_index = 0
 
@@ -572,17 +573,25 @@ class VA_Server:
 
         actions[:, ~self.action_mask] *= 0
 
-        save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
-        save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
+        if self.save_debug_tensors:
+            save_async(
+                latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt')
+            )
+            save_async(
+                actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt')
+            )
 
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
         return actions, latents
 
     def _compute_kv_cache(self, obs):
-        ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
-        save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+        if self.save_debug_tensors:
+            save_async(
+                obs['obs'],
+                os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'),
+            )
         latent_model_input = self._encode_obs(obs)
         if self.frame_st_id == 0:
             latent_model_input = torch.cat(
@@ -737,6 +746,7 @@ def run(args):
     config.native_contract = native_contract
     config.latency_jsonl = args.latency_jsonl
     config.save_root = args.save_root
+    config.save_debug_tensors = args.save_debug_tensors
 
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
@@ -805,6 +815,12 @@ def main():
         "--save-root",
         required=True,
         help="Root directory for saving native inference outputs.",
+    )
+    parser.add_argument(
+        "--save-debug-tensors",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save latent, action, and observation debug tensors.",
     )
     args = parser.parse_args()
     run(args)

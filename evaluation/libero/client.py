@@ -84,7 +84,14 @@ def env_one_step(env_in, action):
     return _extract_obs(obs), done
 
 
-def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
+def run_one(
+    model,
+    libero_benchmark,
+    task_idx,
+    out_dir,
+    episode_idx,
+    save_video_enabled=True,
+):
     benchmark_dict = benchmark.get_benchmark_dict()
     benchmark_instance = benchmark_dict[libero_benchmark]()
     num_tasks = benchmark_instance.get_num_tasks()
@@ -130,7 +137,8 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
                 if done:
                     break
                 if (j+1) % action_per_frame == 0:
-                    full_obs_list.append(observes)
+                    if save_video_enabled:
+                        full_obs_list.append(observes)
                     key_frame_list.append(observes)
 
             if done:
@@ -143,21 +151,36 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
         else:
             model.infer(dict(obs=key_frame_list, compute_kv_cache=True, imagine=False, state=action))
 
-    out_file = Path(out_dir) / libero_benchmark / f"{task_idx}_{prompt.replace(' ', '_')}" / f"{episode_idx}_{done}.mp4"
-    out_file.parent.mkdir(exist_ok=True, parents=True)
-
-    save_video(
-        real_obs_list=full_obs_list,
-        save_path=out_file,
-        fps=60,
-        video_names=["observation.images.agentview_rgb", "observation.images.eye_in_hand_rgb"]
-    )
+    if save_video_enabled:
+        out_file = (
+            Path(out_dir)
+            / libero_benchmark
+            / f"{task_idx}_{prompt.replace(' ', '_')}"
+            / f"{episode_idx}_{done}.mp4"
+        )
+        out_file.parent.mkdir(exist_ok=True, parents=True)
+        save_video(
+            real_obs_list=full_obs_list,
+            save_path=out_file,
+            fps=60,
+            video_names=[
+                "observation.images.agentview_rgb",
+                "observation.images.eye_in_hand_rgb",
+            ],
+        )
 
     cur_env.close()
     return done
 
 
-def run(libero_benchmark, port, out_dir, test_num, task_range=None):
+def run(
+    libero_benchmark,
+    port,
+    out_dir,
+    test_num,
+    task_range=None,
+    save_video_enabled=True,
+):
     '''
         task_range: [start, end) for splitting tasks
     '''
@@ -187,7 +210,14 @@ def run(libero_benchmark, port, out_dir, test_num, task_range=None):
             succ_num = 0.
 
         for episode_idx in tqdm(episode_list, total=len(episode_list)):
-            res_i = run_one(model, libero_benchmark, task_idx, out_dir, episode_idx)
+            res_i = run_one(
+                model,
+                libero_benchmark,
+                task_idx,
+                out_dir,
+                episode_idx,
+                save_video_enabled=save_video_enabled,
+            )
             succ_num += res_i
             succ_rate = succ_num / (episode_idx + 1)
             print(f"Success rate: {succ_rate}, success num: {succ_num}, total num: {episode_idx + 1}")
@@ -234,6 +264,13 @@ def main():
         type=str,
         default="outputs/libero",
         help="Output directory for results",
+    )
+    parser.add_argument(
+        "--save-video",
+        dest="save_video_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save per-episode MP4 files.",
     )
     args = parser.parse_args()
     run(**vars(args))

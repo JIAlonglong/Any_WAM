@@ -19,9 +19,184 @@ EMA 的作用：
 
 import torch
 import torch.distributed as dist
+from collections.abc import Iterable, Mapping
 
 
 _is_distributed = None  # 缓存分布式状态
+
+
+def _validated_named_parameter_pairs(
+    target_named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
+    source_named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
+) -> list[tuple[str, torch.nn.Parameter, torch.nn.Parameter]]:
+    target_named_parameters = list(target_named_parameters)
+    source_named_parameters = list(source_named_parameters)
+    target_names = [name for name, _ in target_named_parameters]
+    source_names = [name for name, _ in source_named_parameters]
+    if target_names != source_names:
+        raise ValueError(
+            "EMA target/source parameter names must match in the same order"
+        )
+
+    pairs = []
+    for (name, target), (_, source) in zip(
+        target_named_parameters, source_named_parameters
+    ):
+        if target.shape != source.shape:
+            raise ValueError(
+                f"EMA parameter shape mismatch for {name}: "
+                f"target={tuple(target.shape)} source={tuple(source.shape)}"
+            )
+        if not target.is_floating_point() or not source.is_floating_point():
+            raise ValueError(f"EMA parameter {name} must be floating point")
+        pairs.append((name, target, source))
+    return pairs
+
+
+class SelectiveFp32EMA:
+    """Persistent FP32 EMA for selected parameters with legacy fallback."""
+
+    STATE_VERSION = 1
+
+    def __init__(
+        self,
+        target_named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
+        source_named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
+        selected_names: Iterable[str],
+    ):
+        self._pairs = _validated_named_parameter_pairs(
+            target_named_parameters, source_named_parameters
+        )
+        available_names = {name for name, _, _ in self._pairs}
+        requested_names = set(selected_names)
+        unknown_names = requested_names - available_names
+        if unknown_names:
+            preview = ", ".join(sorted(unknown_names)[:8])
+            raise ValueError(f"EMA selected names are not model parameters: {preview}")
+
+        self._selected_names = tuple(
+            name for name, _, _ in self._pairs if name in requested_names
+        )
+        if not self._selected_names:
+            raise ValueError(
+                "SelectiveFp32EMA requires at least one selected parameter"
+            )
+        self._selected_name_set = set(self._selected_names)
+        self._masters = {
+            name: target.detach().float().clone()
+            for name, target, _ in self._pairs
+            if name in self._selected_name_set
+        }
+
+    @property
+    def selected_names(self) -> tuple[str, ...]:
+        return self._selected_names
+
+    @torch.no_grad()
+    def update(self, rate: float) -> dict[str, float]:
+        rate = float(rate)
+        if not 0.0 <= rate <= 1.0:
+            raise ValueError("EMA rate must lie in [0, 1]")
+
+        nonselected_targets = []
+        nonselected_sources = []
+        moved_count = 0
+        master_delta_max = 0.0
+        target_source_max = 0.0
+        lerp_weight = 1.0 - rate
+
+        for name, target, source in self._pairs:
+            if name not in self._selected_name_set:
+                nonselected_targets.append(target)
+                nonselected_sources.append(source)
+                continue
+
+            master = self._masters[name]
+            if master.numel() == 0:
+                continue
+            source_fp32 = source.detach().float()
+            gap_max = float((source_fp32 - master).abs().max().item())
+            if not torch.isfinite(torch.tensor(gap_max)):
+                raise RuntimeError(
+                    f"Non-finite FP32 action EMA update for parameter {name}"
+                )
+            delta_max = gap_max * lerp_weight
+            master.lerp_(source_fp32, lerp_weight)
+            target.copy_(master.to(dtype=target.dtype))
+            moved_count += int(delta_max > 0.0)
+            master_delta_max = max(master_delta_max, delta_max)
+            target_source_max = max(
+                target_source_max,
+                float((target.detach() - source.detach()).abs().max().item()),
+            )
+
+        if nonselected_targets:
+            update_ema(
+                nonselected_targets,
+                nonselected_sources,
+                rate=rate,
+            )
+
+        return {
+            "selected_count": float(len(self._selected_names)),
+            "selected_moved_count": float(moved_count),
+            "master_delta_max": master_delta_max,
+            "target_source_max": target_source_max,
+        }
+
+    def state_dict(self) -> dict:
+        return {
+            "version": self.STATE_VERSION,
+            "selected_names": self._selected_names,
+            "masters": {
+                name: master.detach().cpu().clone()
+                for name, master in self._masters.items()
+            },
+        }
+
+    @torch.no_grad()
+    def load_state_dict(self, state: Mapping) -> None:
+        version = int(state.get("version", -1))
+        if version != self.STATE_VERSION:
+            raise ValueError(
+                f"Unsupported selective EMA state version {version}; "
+                f"expected {self.STATE_VERSION}"
+            )
+        selected_names = tuple(state.get("selected_names", ()))
+        if selected_names != self._selected_names:
+            raise ValueError(
+                "Selective EMA state selected names do not match the model"
+            )
+        masters = state.get("masters")
+        if not isinstance(masters, Mapping):
+            raise ValueError("Selective EMA state masters must be a mapping")
+        if set(masters) != self._selected_name_set:
+            raise ValueError("Selective EMA state master names do not match the model")
+
+        target_by_name = {
+            name: target
+            for name, target, _ in self._pairs
+            if name in self._selected_name_set
+        }
+        for name in self._selected_names:
+            saved = masters[name]
+            master = self._masters[name]
+            if not isinstance(saved, torch.Tensor):
+                raise ValueError(f"Selective EMA state for {name} must be a tensor")
+            if saved.shape != master.shape:
+                raise ValueError(
+                    f"Selective EMA state shape mismatch for {name}: "
+                    f"saved={tuple(saved.shape)} expected={tuple(master.shape)}"
+                )
+            saved_fp32 = saved.to(device=master.device, dtype=torch.float32)
+            if not bool(torch.isfinite(saved_fp32).all().item()):
+                raise ValueError(
+                    f"Selective EMA state contains non-finite values for {name}"
+                )
+            master.copy_(saved_fp32)
+            target_by_name[name].copy_(
+                master.to(dtype=target_by_name[name].dtype)
+            )
 
 
 @torch.no_grad()

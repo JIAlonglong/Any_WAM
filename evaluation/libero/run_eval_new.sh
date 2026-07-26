@@ -99,6 +99,10 @@ MODEL_NAME="${MODEL_NAME:-${VARIANT}}"
 SERVER_BACKEND="${SERVER_BACKEND:-flowmap}"
 case "$SERVER_BACKEND" in
     flowmap)
+        if [ "$MODEL_NAME" = "teacher_native" ]; then
+            echo "flowmap backend does not accept MODEL_NAME=teacher_native" >&2
+            exit 2
+        fi
         SERVER_ENTRYPOINT="wan_va/wan_va_server.py"
         ACTION_NUM_STEPS="${ACTION_NUM_STEPS:-50}"
         ;;

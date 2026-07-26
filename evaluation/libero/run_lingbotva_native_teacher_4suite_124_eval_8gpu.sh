@@ -10,8 +10,8 @@ MERGE_SCRIPT="${PROJECT_ROOT}/evaluation/libero/merge_lingbotva_4suite_results.p
 SERVER_PYTHON="${SERVER_PYTHON:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python}"
 CLIENT_PYTHON="${CLIENT_PYTHON:-/kpfs-intern/jialongliu/miniforge3/envs/libero/bin/python}"
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
-MASTER_PORT_BASE=29680
-WS_PORT_BASE=29780
+MASTER_PORT_BASE=30680
+WS_PORT_BASE=30780
 EPISODES=50
 MODEL_NAME="teacher_native"
 CHECKPOINT=""
@@ -80,13 +80,39 @@ if [ ! -d "$CHECKPOINT" ]; then
     exit 1
 fi
 
+MODEL_RESULT_ROOT="${OUTPUT_ROOT}/${MODEL_NAME}"
+if [ ! -e "$MODEL_RESULT_ROOT" ]; then
+    RESULT_ROOT_STATE="absent"
+    RESULT_ROOT_LAUNCH_ALLOWED="yes"
+elif [ ! -d "$MODEL_RESULT_ROOT" ]; then
+    RESULT_ROOT_STATE="not_directory"
+    RESULT_ROOT_LAUNCH_ALLOWED="no"
+elif [ -n "$(find "$MODEL_RESULT_ROOT" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    RESULT_ROOT_STATE="nonempty"
+    RESULT_ROOT_LAUNCH_ALLOWED="no"
+else
+    RESULT_ROOT_STATE="empty"
+    RESULT_ROOT_LAUNCH_ALLOWED="yes"
+fi
+echo "RESULT_ROOT path=${MODEL_RESULT_ROOT} state=${RESULT_ROOT_STATE} launch_allowed=${RESULT_ROOT_LAUNCH_ALLOWED}"
+if [ "$RESULT_ROOT_LAUNCH_ALLOWED" = "no" ] && [ "${CHECK_ONLY:-0}" != "1" ]; then
+    if [ "$RESULT_ROOT_STATE" = "nonempty" ]; then
+        echo "Refusing to reuse nonempty native result root: ${MODEL_RESULT_ROOT}" >&2
+    else
+        echo "Native result root is not a directory: ${MODEL_RESULT_ROOT}" >&2
+    fi
+    exit 2
+fi
+
 run_budget() {
     local steps="$1"
     local budget_root="${OUTPUT_ROOT}/${MODEL_NAME}/steps_${steps}"
     local -a pids=()
     local worker suite start end gpu save_root master_port ws_port
 
-    mkdir -p "${budget_root}/workers"
+    if [ "${CHECK_ONLY:-0}" != "1" ]; then
+        mkdir -p "${budget_root}/workers"
+    fi
     for worker in 0 1 2 3 4 5 6 7; do
         suite="${SUITES[$worker]}"
         start="${STARTS[$worker]}"

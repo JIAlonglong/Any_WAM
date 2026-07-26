@@ -104,6 +104,30 @@ def test_flowmap_backend_remains_default(tmp_path):
     assert "Server backend: flowmap" in result.stdout
 
 
+def test_flowmap_backend_rejects_reserved_native_teacher_identity(tmp_path):
+    env = _env(tmp_path, "libero_10")
+    env.update(
+        {
+            "SERVER_BACKEND": "flowmap",
+            "MODEL_NAME": "teacher_native",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "step_1", "target_student"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert (
+        "flowmap backend does not accept MODEL_NAME=teacher_native"
+        in result.stderr
+    )
+
+
 def test_flowmap_backend_keeps_default_sampling_budgets(tmp_path):
     env = _env(tmp_path, "libero_10")
     env.pop("NUM_STEPS")

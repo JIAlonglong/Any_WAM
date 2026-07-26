@@ -119,3 +119,19 @@ def test_launcher_rejects_overlapping_port_ranges(
 
     assert result.returncode != 0
     assert "must not overlap" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("port_flag", "port_base"),
+    [
+        ("--master-port-base", "000"),
+        ("--ws-port-base", "not-a-number"),
+    ],
+)
+def test_launcher_rejects_non_positive_or_non_numeric_port_bases(
+    tmp_path, port_flag, port_base
+):
+    result = run_check_only(tmp_path, port_flag, port_base)
+
+    assert result.returncode != 0
+    assert "must be a positive integer" in result.stderr

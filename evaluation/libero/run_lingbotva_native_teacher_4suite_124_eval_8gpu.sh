@@ -48,6 +48,14 @@ case "$MASTER_PORT_BASE" in ''|*[!0-9]*|0) echo "--master-port-base must be a po
 case "$WS_PORT_BASE" in ''|*[!0-9]*|0) echo "--ws-port-base must be a positive integer" >&2; exit 2 ;; esac
 MASTER_PORT_BASE=$((10#$MASTER_PORT_BASE))
 WS_PORT_BASE=$((10#$WS_PORT_BASE))
+if [ "$MASTER_PORT_BASE" -eq 0 ]; then
+    echo "--master-port-base must be a positive integer" >&2
+    exit 2
+fi
+if [ "$WS_PORT_BASE" -eq 0 ]; then
+    echo "--ws-port-base must be a positive integer" >&2
+    exit 2
+fi
 if (( MASTER_PORT_BASE <= WS_PORT_BASE + 7 && WS_PORT_BASE <= MASTER_PORT_BASE + 7 )); then
     echo "Master and WebSocket port ranges must not overlap: [${MASTER_PORT_BASE}, $((MASTER_PORT_BASE + 7))] and [${WS_PORT_BASE}, $((WS_PORT_BASE + 7))]" >&2
     exit 2

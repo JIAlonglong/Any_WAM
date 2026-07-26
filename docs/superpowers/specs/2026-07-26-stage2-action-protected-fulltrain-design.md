@@ -15,67 +15,57 @@ must not override closed-loop action performance when selecting checkpoints.
 - Run one full eight-GPU Stage-2 job, with early monitoring rather than a
   separate short-training branch.
 
-## Action-Protection Changes
+## Scope
 
-### 1. Add the missing DanceOPD action endpoint
+This change isolates one hypothesis: the existing action supervision failed
+because BF16 EMA silently froze the action side of `target_student`.
 
-The current DanceOPD route jointly rolls the multi-step teacher's video and
-action states to the endpoint, but discards the teacher action endpoint and
-anchors only video.
+- Keep the existing action consistency, GT regression, and local action
+  flow-matching losses unchanged.
+- Do not add a DanceOPD action endpoint.
+- Do not enable action OPD or joint action OPD rollout.
+- Do not change the weights of the existing action losses.
+- Keep the existing video DanceOPD path unchanged.
 
-Retain `teacher_current_action` as a detached multi-step endpoint. At the same
-student-reached joint query state used by the video anchor:
+The run may enable the already implemented video-to-action bridge, but bridge
+configuration is not part of the EMA fix and must be reported independently.
 
-1. request both student video and action velocity;
-2. reconstruct the student's one-step action endpoint from the query action
-   state and query action sigma;
-3. compute masked action endpoint MSE against the multi-step teacher action
-   endpoint;
-4. add it to the DanceOPD auxiliary with an explicit configurable weight.
+## EMA Repair
 
-Use the existing `opd_danceopd_action_endpoint_weight` configuration name.
-Report the loss and weighted contribution through the existing action
-transition/endpoint metric channels so a silently inactive action objective is
-visible immediately.
+Maintain a persistent FP32 EMA master state for the action-specific target
+parameters while retaining BF16 target parameters for model forward and
+checkpoint compatibility.
 
-### 2. Enable the video-to-action deployment bridge
+For every selected target/source parameter pair:
 
-Enable the existing bridge so the action branch learns under detached
-student-generated video and action history. Keep direct normalized-action x0
-supervision and its validity mask. The bridge remains separate from the
-multi-step-teacher endpoint target.
+1. initialize the FP32 master from the target parameter;
+2. update `master = decay * master + (1 - decay) * source.float()`;
+3. copy `master` back to the BF16 target parameter;
+4. retain the FP32 master across optimizer steps.
 
-### 3. Keep the regular action anchors
+Continue using the existing BF16 EMA path for non-action parameters in this
+urgent change. Shared parameters already moved in the failed run; the observed
+silent freeze was isolated to all 18 action-specific tensors.
 
-Retain:
+The FP32 action EMA state must:
 
-- main action consistency loss;
-- GT action regression;
-- local action flow-matching regularization;
-- action downsample factor 1.
-
-No action clipping or gripper thresholding is added during training or
-evaluation; those would hide model failure rather than restore policy quality.
-
-## EMA and Checkpoint Policy
-
-The previous BF16 EMA silently froze all 18 action-specific tensors while the
-shared transformer changed. For this urgent run:
-
-- set EMA decay to zero for the whole run;
-- target student becomes an exact BF16 copy of the updated online student;
-- save and retain both online and target checkpoints;
-- assert at checkpoint time that target and online action tensors match;
-- report action-branch and shared-branch parameter movement from the Stage-1
-  initialization.
-
-FP32 EMA is deferred to a later non-urgent change because it adds material
-memory and distributed-checkpoint risk. It is not required for this run.
+- be sharded/local in the same way as the FSDP parameters;
+- validate target/source parameter name, shape, and dtype compatibility;
+- be saved with each checkpoint;
+- be restored when resuming a repaired checkpoint;
+- fail explicitly if a repaired checkpoint is missing or incompatible rather
+  than silently restarting the EMA history;
+- expose the maximum online/EMA action difference and the number of action
+  target tensors that moved from initialization.
 
 ## Configuration and Launch Isolation
 
 Create a new action-protected config and launcher instead of changing the
 meaning of the existing `video_only_opd` experiment.
+
+Before the full run, execute a 50–100 optimizer-step eight-GPU gradient probe
+from Stage-1 step 2000 with the exact full-run loss configuration. The probe is
+not a model-selection experiment and does not enable any new action loss.
 
 Initial full-run settings:
 
@@ -83,14 +73,12 @@ Initial full-run settings:
 - reset optimizer and global step;
 - 8 GPUs;
 - maximum 10,000 steps;
-- checkpoints every 500 steps, plus early checkpoints at 100 and 250 if the
-  existing save path safely supports them;
+- checkpoints every 500 steps;
 - teacher endpoint: 8 steps;
-- student deployment emphasis: one-step action endpoint;
-- action endpoint weight: 4.0;
-- bridge weight: 1.0;
-- bridge enabled from the beginning;
-- EMA decay: 0.0;
+- no DanceOPD action endpoint;
+- action OPD disabled;
+- joint action OPD rollout disabled;
+- EMA decay: 0.99 with FP32 action accumulation;
 - rollout and light diagnostics enabled.
 
 The final checkpoint is selected by closed-loop success, not by training step.
@@ -107,11 +95,11 @@ Monitor existing metrics:
 - `mechanism/action_error_teacher_joint_context`;
 - skipped steps, gradient norm, and learning rate.
 
-Add or activate:
+Add:
 
-- DanceOPD action endpoint loss and weighted contribution;
-- action endpoint share of auxiliary loss;
 - action-branch gradient norm;
+- video-branch and shared-branch gradient norms;
+- ratios `action/shared` and `action/video`;
 - target/online action-parameter maximum difference;
 - number of action tensors changed from Stage-1;
 - normalized action out-of-range fraction and gripper saturation on a fixed
@@ -121,28 +109,40 @@ Recommend termination to the user, but never terminate automatically, if any
 of the following holds:
 
 - non-finite loss or repeated skipped optimizer steps;
-- enabled bridge or action endpoint remains identically zero after its first
-  scheduled executions;
-- target and online differ with EMA decay zero;
+- an enabled existing action loss remains identically zero;
+- FP32 action EMA state is missing, incompatible, or non-finite;
 - no action-specific tensor has moved by the first checkpoint;
 - generated-history action error worsens by more than 20% from its initial
   baseline for three consecutive diagnostic windows;
 - checkpoint smoke evaluation remains at zero success after sufficient early
   evaluation episodes while Stage-1 succeeds on the same tasks.
 
-Recommend continuing when the action endpoint and bridge are active and finite,
-action tensors move, generated-history action error is stable or improving, and
-early closed-loop success is non-zero.
+Recommend continuing when existing action losses and gradients are finite,
+action EMA tensors move, generated-history action error is stable or improving,
+and early closed-loop success is non-zero.
+
+For the short gradient probe:
+
+- log every optimizer step for steps 1–10 and every 10 steps afterwards;
+- report median and p90 action, video, and shared gradient norms;
+- report the fraction of optimizer steps with non-zero action gradients;
+- report action/shared and action/video gradient ratios;
+- report per-checkpoint online action parameter movement and FP32 EMA movement;
+- treat an all-zero action gradient, non-finite branch norm, unchanged online
+  action branch, or unchanged FP32 action EMA as a launch blocker;
+- do not impose a universal numeric gradient-ratio threshold before observing
+  the probe, because parameter counts and branch scales differ substantially.
 
 ## Verification
 
 Before launch:
 
-- unit-test masked action endpoint reconstruction and weighting;
-- verify zero weight exactly preserves the old video-only DanceOPD behavior;
-- verify enabled action endpoint produces gradients in the action branch;
-- verify the new config cannot silently disable the bridge or action endpoint;
-- verify EMA decay zero produces exact target/online action equality;
+- reproduce that repeated BF16 EMA loses a representative small action update;
+- verify persistent FP32 action EMA accumulates the same update;
+- verify non-action parameters retain the existing EMA behavior;
+- verify action EMA state checkpoint save and restore;
+- verify incompatible or missing repaired EMA state fails explicitly on resume;
+- verify the video-only DanceOPD action losses remain disabled;
 - run launcher contract checks.
 
 After launch:
@@ -153,4 +153,3 @@ After launch:
   permit;
 - perform the final four-suite, 50-episode evaluation only on checkpoints chosen
   by closed-loop evidence.
-

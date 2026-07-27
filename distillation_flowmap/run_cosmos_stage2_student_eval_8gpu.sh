@@ -281,7 +281,7 @@ COSMOS_WORKER_CUDA_LIBRARY_PATH="$(
     resolve_path_list COSMOS_WORKER_CUDA_LIBRARY_PATH \
         "${COSMOS_WORKER_CUDA_LIBRARY_PATH:-$DEFAULT_COSMOS_WORKER_CUDA_LIBRARY_PATH}"
 )"
-WORKER_LD_LIBRARY_PATH="$COSMOS_WORKER_CUDA_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+WORKER_LD_LIBRARY_PATH="$COSMOS_WORKER_CUDA_LIBRARY_PATH"
 AUDITED_COSMOS_PREDICT2_REPO_COMMIT=1eb8457072b4a1adfe1f83c3076e4aa5452cbab2
 COSMOS_PREDICT2_REPO_COMMIT="$(
     GIT_OPTIONAL_LOCKS=0 \
@@ -302,8 +302,9 @@ cosmos_repo_status="$(
 )" || die "COSMOS_PREDICT2_REPO must be a readable Git repository"
 [[ -z "$cosmos_repo_status" ]] || die "COSMOS_PREDICT2_REPO must be clean"
 
-WORKER_PROBE_PYTHONPATH="$COSMOS_PREDICT2_REPO:$COSMOS_POLICY_EXTRA_PYTHONPATH:$COSMOS_WORKER_SITE_PACKAGES"
+WORKER_PROBE_PYTHONPATH="$COSMOS_PREDICT2_REPO"
 worker_probe_output="$(
+    cd "$SCRIPT_DIR" || exit 1
     /usr/bin/env -i \
         PATH=/usr/bin:/bin \
         HOME=/nonexistent \
@@ -314,9 +315,19 @@ worker_probe_output="$(
         PYTHONPATH="$WORKER_PROBE_PYTHONPATH" \
         LD_LIBRARY_PATH="$WORKER_LD_LIBRARY_PATH" \
         COSMOS_PREDICT2_REPO="$COSMOS_PREDICT2_REPO" \
+        COSMOS_POLICY_EXTRA_PYTHONPATH="$COSMOS_POLICY_EXTRA_PYTHONPATH" \
         "$COSMOS_POLICY_PYTHON" -c '
+import os
 import re
+import sys
 import torch
+
+repo = os.environ["COSMOS_PREDICT2_REPO"]
+sys.path.insert(0, repo)
+for path in os.environ["COSMOS_POLICY_EXTRA_PYTHONPATH"].split(os.pathsep):
+    if path and path not in sys.path:
+        sys.path.append(path)
+
 import cosmos_predict2
 
 cuda = torch.version.cuda or ""

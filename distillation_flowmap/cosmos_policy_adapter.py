@@ -700,8 +700,15 @@ class CosmosPolicyActionTeacher:
                 "Set COSMOS_POLICY_PYTHON to the official Cosmos env python."
             )
         env = os.environ.copy()
+        env["PYTHONNOUSERSITE"] = "1"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         if self.cosmos_repo_path:
-            env["PYTHONPATH"] = self.cosmos_repo_path + os.pathsep + env.get("PYTHONPATH", "")
+            # The wrapper preflights this exact worker import environment.
+            # Do not let the training process's ambient PYTHONPATH select a
+            # different Cosmos/runtime package after outputs have been created.
+            env["PYTHONPATH"] = self.cosmos_repo_path
+        else:
+            env.pop("PYTHONPATH", None)
         if self.cosmos_worker_cuda_visible_devices is not None:
             env["CUDA_VISIBLE_DEVICES"] = self.cosmos_worker_cuda_visible_devices
         elif self.device.type == "cuda" and self.device.index is not None:

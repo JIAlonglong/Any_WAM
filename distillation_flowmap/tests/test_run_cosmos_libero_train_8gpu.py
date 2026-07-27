@@ -439,6 +439,22 @@ def test_stage2_launcher_preserves_explicit_cosmos_extra_pythonpath(tmp_path):
     assert _assignments(result.stdout)["COSMOS_POLICY_EXTRA_PYTHONPATH"] == expected
 
 
+def test_stage2_launcher_replaces_ambient_ld_library_path_with_worker_contract(
+    tmp_path,
+):
+    env, _ = _env(tmp_path)
+    env["LD_LIBRARY_PATH"] = "/ambient/poison"
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assignments = _assignments(result.stdout)
+    assert assignments["LD_LIBRARY_PATH"] == assignments[
+        "COSMOS_WORKER_CUDA_LIBRARY_PATH"
+    ]
+    assert "/ambient/poison" not in assignments["LD_LIBRARY_PATH"]
+
+
 def test_dry_run_embeds_read_only_provenance_in_canonical_identity(tmp_path):
     env, _ = _env(tmp_path)
     output_root = tmp_path / "out"

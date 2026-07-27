@@ -440,6 +440,26 @@ def test_complete_worker_runtime_is_resolved_once_and_passed_to_both_children(
     )
 
 
+def test_wrapper_replaces_ambient_ld_library_path_before_probe_and_children(
+    tmp_path,
+):
+    env, output_root = _environment(tmp_path)
+    env["LD_LIBRARY_PATH"] = "/ambient/poison"
+
+    result = _invoke(tmp_path, env, output_root, "--phase", "check")
+
+    assert result.returncode == 0, result.stderr
+    values = dict(
+        line.split("=", 1)
+        for line in result.stdout.splitlines()
+        if "=" in line
+    )
+    expected = env["COSMOS_WORKER_CUDA_LIBRARY_PATH"]
+    assert values["WORKER_LD_LIBRARY_PATH"] == expected
+    assert "/ambient/poison" not in values["STAGE2_COMMAND"]
+    assert f"LD_LIBRARY_PATH={expected}" in values["STAGE2_COMMAND"]
+
+
 def test_worker_runtime_import_probe_fails_before_any_write(tmp_path):
     env, output_root = _environment(tmp_path)
     broken_worker = _executable(
@@ -641,7 +661,10 @@ def test_wrapper_forwards_signals_to_child_process_group_with_standard_exit_code
         cwd=ROOT,
         env=env,
         text=True,
-        stdout=subprocess.PIPE,
+        # The wrapper prints a full resolved contract before launching the
+        # child. This test does not consume stdout while waiting for the child,
+        # so piping it can deadlock once the contract exceeds the pipe buffer.
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
     # The audited lineage and worker-runtime preflights intentionally complete
@@ -653,9 +676,9 @@ def test_wrapper_forwards_signals_to_child_process_group_with_standard_exit_code
 
     started = time.monotonic()
     process.send_signal(sent_signal)
-    stdout, stderr = process.communicate(timeout=10)
+    _stdout, stderr = process.communicate(timeout=10)
 
-    assert process.returncode == expected_code, stdout + "\n" + stderr
+    assert process.returncode == expected_code, stderr
     assert observed.read_text(encoding="utf-8") == expected_name
     assert not completed.exists()
     assert time.monotonic() - started < 2

@@ -104,6 +104,56 @@ def test_cosmos_policy_teacher_maps_worker_gpu_list_by_rank(tmp_path, monkeypatc
     assert teacher.cosmos_worker_cuda_visible_devices == "6"
 
 
+def test_cosmos_policy_raw_worker_does_not_inherit_ambient_pythonpath(
+    tmp_path, monkeypatch
+):
+    import distillation_flowmap.cosmos_policy_adapter as adapter
+
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+    repo = tmp_path / "audited-cosmos-repo"
+    repo.mkdir()
+    ambient = tmp_path / "ambient-poison"
+    ambient.mkdir()
+    captured = {}
+
+    class FakeProcess:
+        stdin = None
+        stdout = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return FakeProcess()
+
+    monkeypatch.setenv("PYTHONPATH", str(ambient))
+    monkeypatch.setattr(adapter.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(adapter.atexit, "register", lambda *_args, **_kwargs: None)
+    teacher = adapter.CosmosPolicyActionTeacher(
+        str(ckpt),
+        dtype=torch.float32,
+        config=SimpleNamespace(
+            cosmos_policy_repo=str(repo),
+            cosmos_policy_python=sys.executable,
+            cosmos_policy_extra_pythonpath="/explicit/cosmos-cuda:/explicit/cosmos-oss",
+        ),
+    )
+
+    teacher._ensure_raw_worker()
+
+    assert captured["env"]["PYTHONPATH"] == str(repo)
+    assert str(ambient) not in captured["env"]["PYTHONPATH"]
+    assert captured["env"]["PYTHONNOUSERSITE"] == "1"
+    assert captured["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+    extra_index = captured["command"].index("--extra-pythonpath")
+    assert captured["command"][extra_index + 1] == (
+        "/explicit/cosmos-cuda:/explicit/cosmos-oss"
+    )
+
+
 def test_cosmos_policy_action_teacher_returns_latent_cdiff_tensors(tmp_path):
     from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
 

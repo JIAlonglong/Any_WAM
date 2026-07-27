@@ -25,6 +25,7 @@ _SHARDED_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 class ValidatedStage1Parent:
     canonical_path: str
     contract_identity: str
+    checkpoint_step: int
 
 
 @dataclass(frozen=True)
@@ -243,6 +244,7 @@ def validate_stage1_parent(
     return ValidatedStage1Parent(
         canonical_path=str(canonical),
         contract_identity=_canonical_json_digest(identity_payload),
+        checkpoint_step=expected_step,
     )
 
 
@@ -354,6 +356,42 @@ def validate_stage2_resume(
                     f"{variant} teacher_model_path does not match validated Stage-1 "
                     "Teacher"
                 )
+    sealed_parent_steps: dict[str, int | None] = {}
+    for variant, payload in payloads.items():
+        if "parent_stage1_expected_step" not in payload:
+            sealed_parent_steps[variant] = None
+            continue
+        raw_step = payload["parent_stage1_expected_step"]
+        if type(raw_step) is not int or raw_step <= 0:
+            raise ValueError(
+                f"{variant} parent_stage1_expected_step must be a positive integer"
+            )
+        sealed_parent_steps[variant] = raw_step
+    present_parent_steps = [
+        step for step in sealed_parent_steps.values() if step is not None
+    ]
+    if present_parent_steps:
+        if len(present_parent_steps) != len(sealed_parent_steps):
+            raise ValueError(
+                "online and target parent_stage1_expected_step fields must match"
+            )
+        if len(set(present_parent_steps)) != 1:
+            raise ValueError(
+                "online and target parent_stage1_expected_step fields must match"
+            )
+        sealed_parent_step = present_parent_steps[0]
+        if (
+            expected_parent is not None
+            and sealed_parent_step != expected_parent.checkpoint_step
+        ):
+            raise ValueError(
+                "parent_stage1_expected_step must match the validated Stage-1 step"
+            )
+    elif expected_parent is not None and expected_parent.checkpoint_step != 5000:
+        raise ValueError(
+            "legacy checkpoint without parent_stage1_expected_step is compatible "
+            "only with validated Stage-1 step 5000"
+        )
     if _contract_payload(payloads["online_student"]) != _contract_payload(
         payloads["target_student"]
     ):

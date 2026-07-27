@@ -640,6 +640,75 @@ def test_stage2_resume_rejects_teacher_different_from_parent(tmp_path):
         )
 
 
+def _parent_at_step(stage1: Path, step: int):
+    for variant in ("online_student", "target_student"):
+        _rewrite(_config(stage1, variant), checkpoint_step=step)
+    return validate_stage1_parent(stage1, expected_step=step)
+
+
+def _bind_checkpoint_parent_step(checkpoint: Path, parent, step: int):
+    for variant in ("online_student", "target_student"):
+        _rewrite(
+            _config(checkpoint, variant),
+            parent_stage1_contract_identity=parent.contract_identity,
+            parent_stage1_expected_step=step,
+        )
+
+
+def test_stage2_resume_rejects_mismatched_sealed_parent_steps(tmp_path):
+    stage1, arm, checkpoint, _wan_base, _teacher = _lineaged_stage2(tmp_path)
+    parent = _parent_at_step(stage1, 3000)
+    _bind_checkpoint_parent_step(checkpoint, parent, 3000)
+    _rewrite(_config(checkpoint, "target_student"), parent_stage1_expected_step=5000)
+
+    with pytest.raises(ValueError, match="parent_stage1_expected_step.*match"):
+        validate_stage2_resume(
+            checkpoint,
+            arm_root=arm,
+            expected_step=1000,
+            expected_parent=parent,
+        )
+
+
+def test_stage2_resume_rejects_sealed_parent_step_that_disagrees_with_parent(tmp_path):
+    stage1, arm, checkpoint, _wan_base, _teacher = _lineaged_stage2(tmp_path)
+    parent = _parent_at_step(stage1, 3000)
+    _bind_checkpoint_parent_step(checkpoint, parent, 5000)
+
+    with pytest.raises(ValueError, match="parent_stage1_expected_step.*validated"):
+        validate_stage2_resume(
+            checkpoint,
+            arm_root=arm,
+            expected_step=1000,
+            expected_parent=parent,
+        )
+
+
+def test_stage2_resume_accepts_a_matching_sealed_parent_step_3000(tmp_path):
+    stage1, arm, checkpoint, _wan_base, _teacher = _lineaged_stage2(tmp_path)
+    parent = _parent_at_step(stage1, 3000)
+    _bind_checkpoint_parent_step(checkpoint, parent, 3000)
+
+    assert validate_stage2_resume(
+        checkpoint,
+        arm_root=arm,
+        expected_step=1000,
+        expected_parent=parent,
+    ) == checkpoint.resolve()
+
+
+def test_stage2_resume_accepts_legacy_missing_parent_step_only_for_5000(tmp_path):
+    stage1, arm, checkpoint, _wan_base, _teacher = _lineaged_stage2(tmp_path)
+    parent = validate_stage1_parent(stage1, expected_step=5000)
+
+    assert validate_stage2_resume(
+        checkpoint,
+        arm_root=arm,
+        expected_step=1000,
+        expected_parent=parent,
+    ) == checkpoint.resolve()
+
+
 def test_inference_lineage_environment_is_derived_from_validated_checkpoint(
     tmp_path,
 ):

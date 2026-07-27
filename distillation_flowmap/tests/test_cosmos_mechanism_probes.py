@@ -748,6 +748,7 @@ def test_shared_query_builder_uses_k4_shifted_paths_and_distinct_legal_states(
 
     class Harness(FlowMapStepMixin):
         device = torch.device("cpu")
+        patch_size = (1, 1, 1)
 
         def __init__(self):
             self.student = object()
@@ -975,6 +976,7 @@ class _AlignedMechanismTeacher:
 
 class _AlignedMechanismHarness(FlowMapStepMixin):
     device = torch.device("cpu")
+    patch_size = (1, 1, 1)
 
     def __init__(self, teacher, *, action_snr_shift=0.05):
         self.teacher = teacher

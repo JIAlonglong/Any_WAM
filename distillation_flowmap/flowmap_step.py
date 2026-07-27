@@ -59,6 +59,37 @@ def _downsample_action_grid_id(grid_id, action_latents, factor):
     return grid_id.reshape(B, 4, F_action, N_action, W_action)[:, :, ::factor].reshape(B, 4, -1)
 
 
+def _build_video_grid_id(video_state, patch_size):
+    """Build the canonical WanVA video RoPE grid for one generated state."""
+    if video_state.ndim != 5:
+        raise ValueError("Generated video state must be rank 5")
+    batch_size, _, frames, height, width = video_state.shape
+    patch_f, patch_h, patch_w = (int(value) for value in patch_size)
+    if (
+        patch_f <= 0
+        or patch_h <= 0
+        or patch_w <= 0
+        or frames % patch_f
+        or height % patch_h
+        or width % patch_w
+    ):
+        raise ValueError(
+            "Aligned Cosmos generated video state must be divisible by "
+            f"patch_size={tuple(patch_size)}"
+        )
+    frame_ids = torch.arange(frames // patch_f, device=video_state.device)
+    height_ids = torch.arange(height // patch_h, device=video_state.device)
+    width_ids = torch.arange(width // patch_w, device=video_state.device)
+    ff, hh, ww = torch.meshgrid(
+        frame_ids, height_ids, width_ids, indexing="ij"
+    )
+    grid_id = torch.stack(
+        (ff, hh, ww, torch.zeros_like(ff)),
+        dim=0,
+    ).flatten(1)
+    return grid_id[None].repeat(batch_size, 1, 1)
+
+
 def _same_state_velocity_loss(
     student_v,
     teacher_v,
@@ -6132,11 +6163,16 @@ class FlowMapStepMixin:
                 device=video_state.device,
                 dtype=video_base["cond_timesteps"].dtype,
             )
+            video_grid_id = _build_video_grid_id(
+                video_state,
+                self.patch_size,
+            )
             return {
                 "video_base": {
                     **video_base,
                     "latent": video_state,
                     "cond_timesteps": video_cond_t,
+                    "grid_id": video_grid_id,
                 },
                 "action_latent": action_state,
                 "action_cond_t": action_cond_t,

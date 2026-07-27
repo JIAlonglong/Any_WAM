@@ -139,6 +139,7 @@ def _flowmap_method(name, **overrides):
         "all_ranks_finite": all_ranks_finite,
         "build_shifted_terminal_path": build_shifted_terminal_path,
         "dist": dist,
+        "_build_video_grid_id": flowmap_step_module._build_video_grid_id,
         "masked_video_velocity_mse": masked_video_velocity_mse,
         "pack_actions_for_downsample": pack_actions_for_downsample,
         "sample_nonterminal_semantic_query_indices": sample_nonterminal_semantic_query_indices,
@@ -453,6 +454,7 @@ def test_aligned_cosmos_video_opd_reuses_one_generated_canonical_joint_state():
     class Harness:
         def __init__(self, perturb=0.0):
             self.device = torch.device("cpu")
+            self.patch_size = (1, 1, 1)
             self.student = Student(perturb)
             self._action_teacher_model = Teacher()
             self.empty_emb = torch.zeros(1, 1, 1)
@@ -737,6 +739,7 @@ class _AlignedRecorderHarness:
         self.student = _AlignedRecorderStudent(events)
         self._action_teacher_model = teacher
         self.empty_emb = torch.zeros(1, 1, 1)
+        self.patch_size = (1, 1, 1)
         self.config = SimpleNamespace(
             rank=0,
             num_train_timesteps=1000,
@@ -836,6 +839,7 @@ class _AlignedRecorderHarness:
                 action=action,
                 video_t=joint_input["latent_dict"]["timesteps"],
                 video_cond_t=joint_input["latent_dict"]["cond_timesteps"],
+                video_grid_id=joint_input["latent_dict"].get("grid_id"),
                 action_t=joint_input["action_dict"]["timesteps"],
                 video_r=video_r,
                 action_r=action_r,
@@ -1170,6 +1174,46 @@ def test_aligned_cosmos_rebuilds_clean_condition_clock_for_generated_video_state
         assert call.video.shape[2] == 3
         assert call.video_cond_t.shape == (1, 3)
         assert torch.count_nonzero(call.video_cond_t).item() == 0
+
+
+def test_aligned_cosmos_rebuilds_rope_grid_for_generated_video_state():
+    harness, batch, _ = _aligned_recording_case(batch_size=1)
+    harness.patch_size = (1, 1, 1)
+
+    def mismatched_base_dict(_batch):
+        return {
+            "latent_dict": {
+                "latent": torch.zeros(1, 1, 16, 1, 1),
+                "cond_timesteps": torch.zeros(1, 16),
+                "text_emb": torch.zeros(1, 1, 1),
+                "grid_id": torch.zeros(1, 4, 512),
+            },
+            "action_dict": {
+                "latent": batch["actions"],
+                "cond_timesteps": torch.zeros(1, 16),
+                "text_emb": torch.zeros(1, 1, 1),
+                "grid_id": None,
+                "actions_mask": torch.ones_like(batch["actions"][:, :1]),
+            },
+            "chunk_size": 1,
+            "window_size": 1,
+        }
+
+    harness._prepare_base_dict = mismatched_base_dict
+    harness._build_cosmos_shifted_shared_query(
+        batch,
+        mismatched_base_dict(batch),
+        student_steps=2,
+    )
+
+    assert harness.student.calls
+    for call in harness.student.calls:
+        assert call.video.shape[2:] == (3, 1, 1)
+        assert call.video_grid_id.shape == (1, 4, 3)
+        torch.testing.assert_close(
+            call.video_grid_id[0, 0],
+            torch.tensor([0, 1, 2]),
+        )
 
 
 def test_aligned_cosmos_rejects_canonical_valid_video_mismatch_before_queries():

@@ -33,6 +33,7 @@ def _write_fake_launcher(path: Path) -> None:
         "        'shards': int(os.environ['S4_FORMAL_NUM_SHARDS']),\n"
         "        'layout': os.environ['S4_FORMAL_GPU_LAYOUT'],\n"
         "        'video_seeds': os.environ['S4_VIDEO_SEEDS'],\n"
+        "        'allocator': os.environ['PYTORCH_CUDA_ALLOC_CONF'],\n"
         "    }, sort_keys=True) + '\\n')\n",
         encoding="utf-8",
     )
@@ -153,6 +154,9 @@ def test_resume_skips_complete_k1_libero10_and_plans_remaining_eleven(tmp_path):
     assert all(call["shards"] == 4 for call in calls)
     assert all(call["layout"] == "colocated" for call in calls)
     assert all(call["video_seeds"] == "0" for call in calls)
+    assert all(
+        call["allocator"] == "max_split_size_mb:128" for call in calls
+    )
 
 
 def test_resume_rejects_existing_cell_without_complete_summary(tmp_path):

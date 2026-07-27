@@ -31,6 +31,7 @@ source "${SCRIPT_DIR}/cosmos_progressive_s4_env.sh"
 # PYTHONPATH. Make the CUDA/OSS extras visible there as well as to the raw
 # worker, matching the audited long-form launch command.
 export PYTHONPATH="${PROJECT_ROOT}:${COSMOS_POLICY_EXTRA_PYTHONPATH}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTORCH_CUDA_ALLOC_CONF="${COSMOS_EVAL_PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128}"
 export S4_CKPT_ROOT="${COSMOS_POLICY_PATH}"
 export S4_PROMPT_TABLE="${S4_PROMPT_TABLE:-${S4_EMPTY_EMBEDDING}}"
 export S4_MODEL_ROLE=official_teacher

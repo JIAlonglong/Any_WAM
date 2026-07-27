@@ -22,15 +22,24 @@ _stage1_ckpt = os.path.join(
     "step_1",
 )
 
+cfg.student_backend = "wan_flowmap"
 cfg.teacher_backend = "cosmos_policy"
-cfg.teacher_model_path = os.environ.get(
-    "COSMOS_POLICY_PATH",
-    "/root/nas/junjie/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B",
-)
-cfg.student_base_model_path = os.environ.get(
-    "STUDENT_BASE_MODEL_PATH",
-    "/root/nas/junjie/jj/Any_WAM/checkpoints/lingbot-va-posttrain-libero",
-)
+cfg.teacher_model_path = os.environ["COSMOS_POLICY_PATH"]
+_wan_student_path = os.environ.get("WAN_STUDENT_BASE_MODEL_PATH")
+_legacy_student_path = os.environ.get("STUDENT_BASE_MODEL_PATH")
+if _wan_student_path and _legacy_student_path:
+    if _wan_student_path != _legacy_student_path:
+        raise ValueError(
+            "WAN_STUDENT_BASE_MODEL_PATH and STUDENT_BASE_MODEL_PATH disagree"
+        )
+elif not _wan_student_path:
+    _wan_student_path = _legacy_student_path
+if not _wan_student_path:
+    raise ValueError(
+        "WAN_STUDENT_BASE_MODEL_PATH must be explicitly set "
+        "(STUDENT_BASE_MODEL_PATH is accepted as a compatibility alias)"
+    )
+cfg.student_base_model_path = _wan_student_path
 cfg.cosmos_policy_validate_weights = _env_bool("COSMOS_POLICY_VALIDATE_WEIGHTS", False)
 cfg.cosmos_policy_use_raw_inference = _env_bool("COSMOS_POLICY_USE_RAW_INFERENCE", False)
 cfg.return_raw_observation = cfg.cosmos_policy_use_raw_inference

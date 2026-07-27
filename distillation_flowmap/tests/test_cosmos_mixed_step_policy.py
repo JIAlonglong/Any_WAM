@@ -3,6 +3,7 @@ import json
 import math
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,7 @@ import distillation_flowmap.flowmap_step as flowmap_step
 from distillation_flowmap.flowmap_step import (
     FlowMapStepMixin,
 )
+from distillation_flowmap.cosmos_stage2_lineage import validate_stage1_parent
 
 
 @pytest.mark.parametrize(
@@ -114,6 +116,11 @@ class _EndpointTeacher:
         return {"cosmos_latent_x0": torch.zeros_like(noise)}
 
     def predict_raw_latent_velocity(self, _batch, *, query_latent, **_kwargs):
+        return {"cosmos_latent_velocity": torch.zeros_like(query_latent)}
+
+    def predict_raw_joint_latent_velocity(
+        self, _batch, *, query_latent, **_kwargs
+    ):
         return {"cosmos_latent_velocity": torch.zeros_like(query_latent)}
 
 
@@ -210,6 +217,11 @@ class _EndpointWireProbe(FlowMapStepMixin):
             "query_t_min": zero.detach(),
             "query_t_max": zero.detach(),
             "terminal_prior_max_error": zero.detach(),
+            "terminal_prior_reference_scale": zero.detach(),
+            "terminal_prior_atol": zero.detach(),
+            "terminal_prior_rtol": zero.detach(),
+            "terminal_prior_threshold": zero.detach(),
+            "terminal_prior_severity": zero.detach(),
             "rollout_steps": effective_rollout_steps,
             "state_count": effective_rollout_steps + int(
                 bool(kwargs.get("append_post_update_terminal"))
@@ -351,7 +363,73 @@ def test_selection_record_updates_pair_label_histogram_and_persists_provenance(t
     assert json.loads(path.read_text().strip()) == record
 
 
-def test_progressive_config_isolates_mixed_endpoint_pairs_from_generic_opd(monkeypatch):
+def _set_progressive_contract_env(monkeypatch, tmp_path):
+    stage1 = tmp_path / "stage1"
+    wan_base = tmp_path / "wan-base"
+    (wan_base / "transformer").mkdir(parents=True)
+    (wan_base / "transformer" / "config.json").write_text(
+        json.dumps({"_class_name": "WanTransformer3DModel"})
+    )
+    cosmos_teacher = tmp_path / "cosmos-teacher"
+    cosmos_teacher.mkdir()
+    (cosmos_teacher / "config.json").write_text(
+        json.dumps({"model_type": "cosmos-policy"})
+    )
+    for name in (
+        "Cosmos-Policy-LIBERO-Predict2-2B.pt",
+        "libero_dataset_statistics.json",
+        "libero_t5_embeddings.pkl",
+    ):
+        (cosmos_teacher / name).write_bytes(b"fixture")
+    payload = {
+        "contract_version": 2,
+        "training_contract_stage": "raw_stage1",
+        "action_packing_schema": "downsample_survivor_v2",
+        "action_downsample_factor": 4,
+        "action_chunk_shape": [4, 4],
+        "checkpoint_step": 5000,
+        "teacher_backend": "cosmos_policy",
+        "student_backend": "wan_flowmap",
+        "student_base_model_path": str(wan_base.resolve()),
+        "teacher_model_path": str(cosmos_teacher.resolve()),
+    }
+    for variant in ("online_student", "target_student"):
+        transformer = stage1 / variant / "transformer"
+        transformer.mkdir(parents=True)
+        (transformer / "config.json").write_text(json.dumps(payload))
+        (transformer / "diffusion_pytorch_model.safetensors").write_bytes(
+            b"weights"
+        )
+    parent = validate_stage1_parent(stage1)
+    lineage = json.dumps(
+        {
+            "parent_stage1_contract_identity": parent.contract_identity,
+            "parent_stage1_path": parent.canonical_path,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    values = {
+        "STUDENT_BASE_MODEL_PATH": str(stage1 / "target_student"),
+        "WAN_STUDENT_BASE_MODEL_PATH": str(wan_base),
+        "COSMOS_POLICY_PATH": str(cosmos_teacher),
+        "RESUME_FROM_PATH": str(stage1),
+        "PARENT_STAGE1_PATH": parent.canonical_path,
+        "PARENT_STAGE1_CONTRACT_IDENTITY": parent.contract_identity,
+        "STAGE2_LINEAGE_JSON": lineage,
+        "OUTPUT_DIR": str(tmp_path / "stage2-arm"),
+        "RESUME_ONLINE_FROM_TARGET": "1",
+        "RESET_RESUME_STEP": "1",
+        "RESUME_OPTIMIZER_STATE": "0",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_progressive_config_isolates_mixed_endpoint_pairs_from_generic_opd(
+    monkeypatch, tmp_path
+):
+    _set_progressive_contract_env(monkeypatch, tmp_path)
     monkeypatch.setenv("COSMOS_MIXED_STEP_POLICY", "universe")
     monkeypatch.setenv("COSMOS_MIXED_STEP_FORCE_SEQUENCE", "s1,s2,s4")
     monkeypatch.setenv("COSMOS_MIXED_STEP_SELECTOR_SEED", "31")

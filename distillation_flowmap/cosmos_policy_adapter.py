@@ -7,6 +7,7 @@ one narrow adapter.
 """
 
 import atexit
+import hashlib
 import inspect
 import json
 import os
@@ -19,6 +20,10 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+
+from distillation_flowmap.cosmos_training_contract import (
+    pack_actions_for_downsample,
+)
 
 
 COSMOS_POLICY_WEIGHT_NAMES = (
@@ -117,6 +122,23 @@ def _as_numpy(value):
     return np.asarray(value)
 
 
+def _array_sha256(value):
+    array = np.ascontiguousarray(value)
+    return hashlib.sha256(array.view(np.uint8)).hexdigest()
+
+
+def _require_exact_teacher_steps(value, *, error_cls=ValueError, source="request"):
+    if type(value) is not int:
+        raise error_cls(
+            f"same-prior {source} teacher steps must be an integer equal to 8"
+        )
+    if value != 8:
+        if source == "request":
+            raise error_cls("same-prior endpoint requires exactly 8 teacher steps")
+        raise error_cls(f"same-prior {source} teacher steps must equal 8")
+    return value
+
+
 def _as_task_list(value, batch_size):
     if isinstance(value, str):
         return [value] * batch_size
@@ -174,6 +196,9 @@ def cosmos_actions_to_flowmap_x0(
     inverse_used_action_channel_ids,
     device,
     dtype,
+    *,
+    packing_schema,
+    downsample_factor,
 ):
     """Map official Cosmos action chunks to FlowMap's normalized action x0."""
     if len(target_shape) != 5:
@@ -209,11 +234,40 @@ def cosmos_actions_to_flowmap_x0(
     valid_channel_mask = (inverse < action_dim).to(dtype=aligned.dtype).view(1, 1, channels)
     aligned = aligned * valid_channel_mask
 
-    flat = torch.zeros(batch_size, frames * per_frame, channels, device=device, dtype=actions.dtype)
-    num_tokens = min(aligned.shape[1], flat.shape[1])
-    flat[:, :num_tokens] = aligned[:, :num_tokens]
-    x0 = flat.reshape(batch_size, frames, per_frame, channels).permute(0, 3, 1, 2).unsqueeze(-1)
-    return x0.to(dtype=dtype)
+    return pack_actions_for_downsample(
+        aligned,
+        tuple(target_shape),
+        downsample_factor=downsample_factor,
+        schema=packing_schema,
+    ).to(dtype=dtype)
+
+
+def unpack_flowmap_action_query(
+    query_action,
+    *,
+    used_action_channel_ids,
+    packing_schema,
+    downsample_factor,
+):
+    """Unpack a normalized downsample_survivor_v2 state to Cosmos [B,16,7]."""
+    if packing_schema != "downsample_survivor_v2" or int(downsample_factor) != 4:
+        raise ValueError("joint Cosmos query requires downsample_survivor_v2")
+    action = torch.as_tensor(query_action)
+    if action.ndim != 5 or action.shape[-2:] != (4, 1):
+        raise ValueError("query_action must have shape [B,C,F,4,1]")
+    if action.shape[2] == 16:
+        action = action[:, :, ::4]
+    if action.shape[2] != 4:
+        raise ValueError("query_action must contain four compact survivor frames")
+    aligned = action[..., 0].permute(0, 2, 3, 1).reshape(
+        action.shape[0], 16, action.shape[1]
+    )
+    channel_ids = torch.as_tensor(
+        used_action_channel_ids, device=aligned.device, dtype=torch.long
+    )
+    if channel_ids.numel() != 7 or int(channel_ids.max()) >= aligned.shape[-1]:
+        raise ValueError("used_action_channel_ids must identify seven valid channels")
+    return aligned.index_select(-1, channel_ids).contiguous()
 
 
 def compute_masked_action_stats(teacher_x0, target_x0, mask=None):
@@ -336,6 +390,7 @@ class CosmosPolicyActionTeacher:
         self._raw_action_provider = None
         self._raw_latent_cdiff_provider = None
         self._raw_latent_velocity_provider = None
+        self._raw_joint_latent_velocity_provider = None
         self._raw_worker = None
         self._raw_worker_tmpdir = None
 
@@ -478,7 +533,7 @@ class CosmosPolicyActionTeacher:
             ar_value_prediction=False,
             ar_qvalue_prediction=False,
             num_denoising_steps_action=self.num_denoising_steps_action,
-            num_denoising_steps_future_state=1,
+            num_denoising_steps_future_state=self.num_denoising_steps_action,
             num_denoising_steps_value=1,
             shift=int(getattr(self.config, "cosmos_policy_shift", 5)) if self.config is not None else 5,
             unnormalize_actions=True,
@@ -524,6 +579,17 @@ class CosmosPolicyActionTeacher:
         self._official_model, _ = get_model(cfg)
         self._official_get_action = get_action
         self._official_cfg = cfg
+        from cosmos_predict2._src.predict2.cosmos_policy.experiments.robot import (
+            cosmos_utils,
+        )
+        from distillation_flowmap.cosmos_policy_raw_worker import (
+            _validate_same_prior_layout_source,
+        )
+        self._official_cosmos_source_identity = (
+            _validate_same_prior_layout_source(
+                self.cosmos_repo_path, cosmos_utils
+            )
+        )
 
     def _predict_raw_actions_inprocess(self, raw_batch):
         return self._predict_raw_action_result_inprocess(raw_batch, include_future=False)["actions"]
@@ -548,12 +614,23 @@ class CosmosPolicyActionTeacher:
             if value is not None
         }
 
-    def _predict_raw_action_result_inprocess(self, raw_batch, include_future=False):
+    def _predict_raw_action_result_inprocess(
+        self,
+        raw_batch,
+        include_future=False,
+        *,
+        video_steps=None,
+        action_steps=None,
+    ):
         primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
         self._ensure_official_inprocess()
         actions = []
         future_predictions = []
         value_predictions = []
+        observed_joint_nfes = []
+        from distillation_flowmap.cosmos_policy_raw_worker import (
+            _call_get_action_with_observed_joint_nfe,
+        )
         with torch.no_grad():
             for idx, task in enumerate(tasks):
                 obs = {
@@ -561,24 +638,51 @@ class CosmosPolicyActionTeacher:
                     "wrist_image": wrist[idx],
                     "proprio": proprio[idx],
                 }
-                result = self._official_get_action(
-                    self._official_cfg,
-                    self._official_model,
-                    self._official_dataset_stats,
-                    obs,
-                    task,
-                    seed=self.raw_seed,
-                    randomize_seed=False,
-                    num_denoising_steps_action=self.num_denoising_steps_action,
-                    generate_future_state_and_value_in_parallel=bool(include_future),
-                    worker_id=self.device.index or 0,
-                    batch_size=1,
+                result, observed_joint_nfe = _call_get_action_with_observed_joint_nfe(
+                    self._official_get_action,
+                    model=self._official_model,
+                    get_action_kwargs={
+                        "cfg": self._official_cfg,
+                        "dataset_stats": self._official_dataset_stats,
+                        "obs": obs,
+                        "task_label_or_embedding": task,
+                        "seed": self.raw_seed,
+                        "randomize_seed": False,
+                        "num_denoising_steps_action": self.num_denoising_steps_action,
+                        "generate_future_state_and_value_in_parallel": bool(include_future),
+                        "worker_id": self.device.index or 0,
+                        "batch_size": 1,
+                    },
                 )
+                observed_joint_nfes.append(observed_joint_nfe)
                 actions.append(np.asarray(result["actions"], dtype=np.float32))
                 if include_future:
                     future_predictions.append(self._future_predictions_from_official_result(result))
                     value_predictions.append(result.get("value_prediction"))
         output = {"actions": torch.from_numpy(np.stack(actions, axis=0))}
+        if video_steps is not None or action_steps is not None:
+            if (
+                type(video_steps) is not int
+                or type(action_steps) is not int
+                or video_steps != action_steps
+                or action_steps != self.num_denoising_steps_action
+                or action_steps not in (1, 2, 4)
+                or not observed_joint_nfes
+                or any(value != action_steps for value in observed_joint_nfes)
+            ):
+                raise RuntimeError(
+                    "official in-process matched-budget request does not match "
+                    "the configured Cosmos action/future steps"
+                )
+            output.update(
+                requested_video_steps=video_steps,
+                requested_action_steps=action_steps,
+                effective_video_steps=video_steps,
+                effective_action_steps=action_steps,
+                matched_budget_verified=True,
+                observed_joint_nfe=observed_joint_nfes[0],
+                **self._official_cosmos_source_identity,
+            )
         if include_future:
             output["future_image_predictions"] = future_predictions
             output["value_prediction"] = value_predictions
@@ -633,7 +737,77 @@ class CosmosPolicyActionTeacher:
     def _predict_raw_actions_subprocess(self, raw_batch):
         return self._predict_raw_action_result_subprocess(raw_batch, include_future=False)["actions"]
 
-    def _predict_raw_action_result_subprocess(self, raw_batch, include_future=False):
+    def _request_raw_worker_npz(self, payload, arrays):
+        """Exchange one NPZ request/response with the persistent raw worker."""
+        self._ensure_raw_worker()
+        owns_req_dir = self._raw_worker_tmpdir is None
+        req_dir = self._raw_worker_tmpdir or tempfile.mkdtemp(
+            prefix="cosmos_policy_raw_"
+        )
+        fd, npz_path = tempfile.mkstemp(prefix="request_", suffix=".npz", dir=req_dir)
+        os.close(fd)
+        response_path = npz_path.replace("request_", "actions_")
+        try:
+            np.savez_compressed(npz_path, **arrays)
+            request = dict(payload)
+            request.update(npz_path=npz_path, actions_path=response_path)
+            try:
+                self._raw_worker.stdin.write(json.dumps(request) + "\n")
+                self._raw_worker.stdin.flush()
+                line = self._raw_worker.stdout.readline()
+            except BrokenPipeError as exc:
+                raise RuntimeError(
+                    "Cosmos Policy raw worker exited before responding."
+                ) from exc
+            if not line:
+                try:
+                    code = self._raw_worker.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    code = self._raw_worker.poll()
+                raise RuntimeError(
+                    f"Cosmos Policy raw worker produced no response; exit code={code}"
+                )
+            response = json.loads(line)
+            if not response.get("ok", False):
+                raise RuntimeError(
+                    "Cosmos Policy raw worker failed:\n"
+                    + response.get("error", "unknown error")
+                )
+            actual_response_path = response.get("actions_path")
+            if actual_response_path != response_path:
+                raise RuntimeError(
+                    "Cosmos Policy raw worker returned an unexpected response path"
+                )
+            with np.load(response_path) as data:
+                result = {
+                    key: (
+                        data[key].item()
+                        if data[key].ndim == 0
+                        else data[key].copy()
+                    )
+                    for key in data.files
+                }
+            return result
+        finally:
+            for path in (npz_path, response_path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if owns_req_dir:
+                try:
+                    os.rmdir(req_dir)
+                except OSError:
+                    pass
+
+    def _predict_raw_action_result_subprocess(
+        self,
+        raw_batch,
+        include_future=False,
+        *,
+        video_steps=None,
+        action_steps=None,
+    ):
         primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
         self._ensure_raw_worker()
         req_dir = self._raw_worker_tmpdir or tempfile.mkdtemp(prefix="cosmos_policy_raw_")
@@ -648,6 +822,11 @@ class CosmosPolicyActionTeacher:
             "seed": self.raw_seed,
             "include_future_predictions": bool(include_future),
         }
+        if video_steps is not None or action_steps is not None:
+            payload.update(
+                requested_video_steps=video_steps,
+                requested_action_steps=action_steps,
+            )
         try:
             self._raw_worker.stdin.write(json.dumps(payload) + "\n")
             self._raw_worker.stdin.flush()
@@ -663,9 +842,25 @@ class CosmosPolicyActionTeacher:
         response = json.loads(line)
         if not response.get("ok", False):
             raise RuntimeError("Cosmos Policy raw worker failed:\n" + response.get("error", "unknown error"))
-        with np.load(response["actions_path"]) as data:
+        if response.get("actions_path") != actions_path:
+            raise RuntimeError(
+                "Cosmos Policy raw worker returned an unexpected response path"
+            )
+        with np.load(actions_path) as data:
             actions = torch.from_numpy(data["actions"].astype(np.float32))
             result = {"actions": actions}
+            for field in (
+                "requested_video_steps",
+                "requested_action_steps",
+                "effective_video_steps",
+                "effective_action_steps",
+                "matched_budget_verified",
+                "observed_joint_nfe",
+                "cosmos_repo_commit",
+                "cosmos_source_sha256",
+            ):
+                if field in data.files:
+                    result[field] = data[field].item()
             if include_future and "future_prediction_keys" in data.files:
                 keys = [str(key) for key in data["future_prediction_keys"].tolist()]
                 futures = [dict() for _ in range(actions.shape[0])]
@@ -678,7 +873,7 @@ class CosmosPolicyActionTeacher:
                     result["value_prediction"] = [
                         float(value) for value in data["value_prediction"].astype(np.float32).tolist()
                     ]
-        for path in (npz_path, response["actions_path"]):
+        for path in (npz_path, actions_path):
             try:
                 os.remove(path)
             except OSError:
@@ -815,7 +1010,9 @@ class CosmosPolicyActionTeacher:
             )
         return self._coerce_raw_latent_result(result, require_cdiff=include_cdiff)
 
-    def _predict_raw_latent_velocity_subprocess(self, raw_batch, query_latent, t):
+    def _predict_raw_latent_velocity_subprocess(
+        self, raw_batch, query_latent, t, query_action=None
+    ):
         primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
         self._ensure_raw_worker()
         profile = os.environ.get("COSMOS_POLICY_WORKER_PROFILE", "").lower() in (
@@ -829,14 +1026,16 @@ class CosmosPolicyActionTeacher:
         fd, npz_path = tempfile.mkstemp(prefix="request_", suffix=".npz", dir=req_dir)
         os.close(fd)
         actions_path = npz_path.replace("request_", "actions_")
-        np.savez_compressed(
-            npz_path,
+        fields = dict(
             primary_image=primary,
             wrist_image=wrist,
             proprio=proprio,
             cosmos_latent_query_x=_as_numpy(query_latent).astype(np.float32),
             cosmos_latent_query_t=_as_numpy(t).astype(np.float32),
         )
+        if query_action is not None:
+            fields["cosmos_action_query_x"] = _as_numpy(query_action).astype(np.float32)
+        np.savez_compressed(npz_path, **fields)
         payload = {
             "npz_path": npz_path,
             "actions_path": actions_path,
@@ -844,6 +1043,7 @@ class CosmosPolicyActionTeacher:
             "seed": self.raw_seed,
             "include_future_predictions": False,
             "include_latent_velocity_query": True,
+            "include_joint_action_query": query_action is not None,
         }
         try:
             wait_t0 = time.perf_counter() if profile else None
@@ -873,6 +1073,11 @@ class CosmosPolicyActionTeacher:
                 "actions": data["actions"].astype(np.float32),
                 "cosmos_latent_velocity": data["cosmos_latent_velocity"].astype(np.float32),
             }
+            if query_action is not None:
+                result["cosmos_joint_query"] = data["cosmos_joint_query"].astype(np.float32)
+                result["cosmos_video_frame_mask"] = data[
+                    "cosmos_video_frame_mask"
+                ].astype(bool)
         for path in (npz_path, response["actions_path"]):
             try:
                 os.remove(path)
@@ -890,13 +1095,289 @@ class CosmosPolicyActionTeacher:
     def predict_raw_actions(self, raw_batch):
         return self.predict_raw_action_result(raw_batch, include_future=False)["actions"]
 
-    def predict_raw_action_result(self, raw_batch, include_future=False):
+    def predict_raw_same_prior_endpoint(
+        self,
+        raw_batch,
+        *,
+        video_prior,
+        action_prior,
+        teacher_steps=8,
+    ):
+        """Run the official eight-step Cosmos teacher from caller-owned priors."""
+        _require_exact_teacher_steps(teacher_steps)
+
+        primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
+        video_prior_np = np.ascontiguousarray(_as_numpy(video_prior))
+        action_prior_np = np.ascontiguousarray(_as_numpy(action_prior))
+        if video_prior_np.dtype != np.float32:
+            raise ValueError("video_prior must use float32 without conversion")
+        if action_prior_np.dtype != np.float32:
+            raise ValueError("action_prior must use float32 without conversion")
+        if (
+            video_prior_np.ndim != 5
+            or tuple(video_prior_np.shape[1:]) != (16, 9, 28, 28)
+        ):
+            raise ValueError(
+                "video_prior must have Cosmos joint latent shape [B,16,9,28,28]"
+            )
+        if action_prior_np.ndim != 3 or action_prior_np.shape[1:] != (16, 7):
+            raise ValueError(
+                "action_prior must be native Cosmos-normalized shape [B,16,7]"
+            )
+        if video_prior_np.shape[0] != len(tasks):
+            raise ValueError(
+                "video_prior batch size must match the raw observation batch"
+            )
+        if action_prior_np.shape[0] != len(tasks):
+            raise ValueError(
+                "action_prior batch size must match the raw observation batch"
+            )
+        if not np.isfinite(video_prior_np).all():
+            raise ValueError("video_prior must contain only finite values")
+        if not np.isfinite(action_prior_np).all():
+            raise ValueError("action_prior must contain only finite values")
+
+        arrays = {
+            "primary_image": primary,
+            "wrist_image": wrist,
+            "proprio": proprio,
+            "video_prior": video_prior_np,
+            "action_prior": action_prior_np,
+        }
+        result = self._request_raw_worker_npz(
+            {
+                "mode": "same_prior_endpoint",
+                "tasks": tasks,
+                "teacher_steps": teacher_steps,
+            },
+            arrays,
+        )
+        required = (
+            "endpoint_video",
+            "video_frame_mask",
+            "effective_teacher_steps",
+            "video_prior_sha256",
+            "action_prior_sha256",
+        )
+        missing = [key for key in required if key not in result]
+        if missing:
+            raise RuntimeError(
+                f"same-prior worker response missing required fields: {missing}"
+            )
+        effective_steps = result["effective_teacher_steps"]
+        _require_exact_teacher_steps(
+            effective_steps,
+            error_cls=RuntimeError,
+            source="response effective",
+        )
+        if effective_steps != teacher_steps:
+            raise RuntimeError(
+                "same-prior worker returned an invalid effective teacher steps count"
+            )
+        if str(result["video_prior_sha256"]) != _array_sha256(video_prior_np):
+            raise RuntimeError("same-prior worker video prior fingerprint mismatch")
+        if str(result["action_prior_sha256"]) != _array_sha256(action_prior_np):
+            raise RuntimeError("same-prior worker action prior fingerprint mismatch")
+
+        endpoint = np.asarray(result["endpoint_video"])
+        frame_mask = np.asarray(result["video_frame_mask"])
+        if endpoint.shape != video_prior_np.shape:
+            raise RuntimeError(
+                "same-prior worker endpoint shape does not match video_prior"
+            )
+        if not np.issubdtype(endpoint.dtype, np.floating):
+            raise RuntimeError("same-prior worker endpoint must be floating point")
+        if not np.isfinite(endpoint).all():
+            raise RuntimeError("same-prior worker endpoint contains non-finite values")
+        expected_mask_shape = (video_prior_np.shape[0], video_prior_np.shape[2])
+        if frame_mask.dtype != np.bool_:
+            raise RuntimeError("same-prior worker video frame mask must be boolean")
+        if frame_mask.shape != expected_mask_shape:
+            raise RuntimeError(
+                "same-prior worker video frame mask has an invalid shape"
+            )
+        return {
+            "endpoint_video": torch.from_numpy(endpoint.astype(np.float32)),
+            "video_frame_mask": torch.from_numpy(frame_mask.copy()),
+            "effective_teacher_steps": effective_steps,
+            "video_prior_sha256": str(result["video_prior_sha256"]),
+            "action_prior_sha256": str(result["action_prior_sha256"]),
+        }
+
+    def predict_raw_joint_continuation_endpoint(
+        self,
+        raw_batch,
+        *,
+        canonical_joint_state,
+        normalized_t,
+        teacher_steps=8,
+    ):
+        """Continue an action-injected normalized joint state to clean x0."""
+        _require_exact_teacher_steps(teacher_steps)
+        primary, wrist, proprio, tasks = self._raw_batch_to_numpy(raw_batch)
+        canonical_np = np.ascontiguousarray(_as_numpy(canonical_joint_state))
+        normalized_t_np = np.ascontiguousarray(_as_numpy(normalized_t))
+        if canonical_np.dtype != np.float32:
+            raise ValueError(
+                "canonical_joint_state must use float32 without conversion"
+            )
+        if normalized_t_np.dtype != np.float32:
+            raise ValueError("normalized_t must use float32 without conversion")
+        if (
+            canonical_np.ndim != 5
+            or tuple(canonical_np.shape[1:]) != (16, 9, 28, 28)
+        ):
+            raise ValueError(
+                "canonical_joint_state must have Cosmos shape [B,16,9,28,28]"
+            )
+        batch_size = canonical_np.shape[0]
+        if batch_size != len(tasks):
+            raise ValueError(
+                "canonical_joint_state batch size must match observations"
+            )
+        if normalized_t_np.ndim == 1:
+            if normalized_t_np.shape != (batch_size,):
+                raise ValueError("normalized_t must have shape [B] or [B,F]")
+            per_sample_t = normalized_t_np
+        elif normalized_t_np.ndim == 2:
+            if normalized_t_np.shape[0] != batch_size:
+                raise ValueError(
+                    "normalized_t batch size must match canonical state"
+                )
+            if not np.array_equal(
+                normalized_t_np,
+                np.broadcast_to(normalized_t_np[:, :1], normalized_t_np.shape),
+            ):
+                raise ValueError(
+                    "normalized_t must be constant across frames per sample"
+                )
+            per_sample_t = normalized_t_np[:, 0]
+        else:
+            raise ValueError("normalized_t must have shape [B] or [B,F]")
+        if not np.isfinite(canonical_np).all():
+            raise ValueError(
+                "canonical_joint_state must contain only finite values"
+            )
+        if not np.isfinite(per_sample_t).all():
+            raise ValueError("normalized_t must contain only finite values")
+        if not (
+            (per_sample_t >= 4.0 / 5.0)
+            & (per_sample_t <= 80.0 / 81.0)
+        ).all():
+            raise ValueError(
+                "normalized_t must remain in the calibrated Cosmos band"
+            )
+
+        arrays = {
+            "primary_image": primary,
+            "wrist_image": wrist,
+            "proprio": proprio,
+            "canonical_joint_state": canonical_np,
+            "normalized_t": normalized_t_np,
+        }
+        result = self._request_raw_worker_npz(
+            {
+                "mode": "joint_continuation_endpoint",
+                "tasks": tasks,
+                "teacher_steps": teacher_steps,
+            },
+            arrays,
+        )
+        required = (
+            "endpoint_video",
+            "video_frame_mask",
+            "effective_teacher_steps",
+            "joint_state_sha256",
+            "normalized_t_sha256",
+            "normalized_t",
+            "edm_sigma",
+        )
+        missing = [key for key in required if key not in result]
+        if missing:
+            raise RuntimeError(
+                "joint continuation worker response missing required fields: "
+                f"{missing}"
+            )
+        effective_steps = result["effective_teacher_steps"]
+        _require_exact_teacher_steps(
+            effective_steps,
+            error_cls=RuntimeError,
+            source="response effective",
+        )
+        if str(result["joint_state_sha256"]) != _array_sha256(canonical_np):
+            raise RuntimeError(
+                "joint continuation worker state fingerprint mismatch"
+            )
+        if str(result["normalized_t_sha256"]) != _array_sha256(normalized_t_np):
+            raise RuntimeError(
+                "joint continuation worker time fingerprint mismatch"
+            )
+        endpoint = np.asarray(result["endpoint_video"])
+        frame_mask = np.asarray(result["video_frame_mask"])
+        returned_t = np.asarray(result["normalized_t"], dtype=np.float32)
+        edm_sigma = np.asarray(result["edm_sigma"], dtype=np.float32)
+        if endpoint.shape != canonical_np.shape or not np.isfinite(endpoint).all():
+            raise RuntimeError(
+                "joint continuation worker returned an invalid endpoint"
+            )
+        if frame_mask.dtype != np.bool_ or frame_mask.shape != (
+            batch_size,
+            canonical_np.shape[2],
+        ):
+            raise RuntimeError(
+                "joint continuation worker returned an invalid video mask"
+            )
+        if not frame_mask.any(axis=1).all():
+            raise RuntimeError(
+                "joint continuation worker video mask must be nonempty"
+            )
+        if returned_t.shape != (batch_size,) or not np.array_equal(
+            returned_t, per_sample_t
+        ):
+            raise RuntimeError(
+                "joint continuation worker normalized time mismatch"
+            )
+        expected_sigma = per_sample_t / (1.0 - per_sample_t)
+        if (
+            edm_sigma.shape != (batch_size,)
+            or not np.isfinite(edm_sigma).all()
+            or not np.allclose(edm_sigma, expected_sigma, rtol=1e-6, atol=1e-6)
+        ):
+            raise RuntimeError("joint continuation worker EDM sigma mismatch")
+        return {
+            "endpoint_video": torch.from_numpy(endpoint.astype(np.float32)),
+            "video_frame_mask": torch.from_numpy(frame_mask.copy()),
+            "effective_teacher_steps": effective_steps,
+            "joint_state_sha256": str(result["joint_state_sha256"]),
+            "normalized_t_sha256": str(result["normalized_t_sha256"]),
+            "normalized_t": torch.from_numpy(returned_t.copy()),
+            "edm_sigma": torch.from_numpy(edm_sigma.copy()),
+        }
+
+    def predict_raw_action_result(
+        self,
+        raw_batch,
+        include_future=False,
+        *,
+        video_steps=None,
+        action_steps=None,
+    ):
         if self._raw_action_provider is not None:
             return self._coerce_raw_action_result(self._raw_action_provider(raw_batch))
         if self.raw_inference_mode == "inprocess":
-            return self._predict_raw_action_result_inprocess(raw_batch, include_future=include_future)
+            return self._predict_raw_action_result_inprocess(
+                raw_batch,
+                include_future=include_future,
+                video_steps=video_steps,
+                action_steps=action_steps,
+            )
         if self.raw_inference_mode == "subprocess":
-            return self._predict_raw_action_result_subprocess(raw_batch, include_future=include_future)
+            return self._predict_raw_action_result_subprocess(
+                raw_batch,
+                include_future=include_future,
+                video_steps=video_steps,
+                action_steps=action_steps,
+            )
         raise ValueError(
             f"Unsupported cosmos_policy_inference_mode={self.raw_inference_mode!r}; "
             "expected 'subprocess' or 'inprocess'."
@@ -974,6 +1455,43 @@ class CosmosPolicyActionTeacher:
             )
         return self._predict_raw_latent_velocity_subprocess(raw_batch, query_latent, t)
 
+    def predict_raw_joint_latent_velocity(
+        self, raw_batch, query_latent, query_action, t
+    ):
+        """Query the official teacher at one calibrated unified video/action state."""
+        t = torch.as_tensor(t)
+        lower, upper = 4.0 / 5.0, 80.0 / 81.0
+        if not bool(((t >= lower) & (t <= upper)).all()):
+            raise ValueError(
+                "joint Cosmos teacher time must stay in the calibrated EDM sigma 4..80 band"
+            )
+        if self.config is None:
+            raise ValueError("config is required to unpack the joint action query")
+        action = unpack_flowmap_action_query(
+            query_action,
+            used_action_channel_ids=self.config.used_action_channel_ids,
+            packing_schema=self.config.action_packing_schema,
+            downsample_factor=self.config.action_downsample_factor,
+        )
+        if self._raw_joint_latent_velocity_provider is not None:
+            result = self._raw_joint_latent_velocity_provider(
+                raw_batch, query_latent, action, t
+            )
+        else:
+            if not self.raw_inference_enabled:
+                raise RuntimeError(
+                    "Cosmos joint latent velocity requires raw inference"
+                )
+            result = self._predict_raw_latent_velocity_subprocess(
+                raw_batch, query_latent, t, query_action=action
+            )
+        result = self._coerce_raw_latent_velocity_result(result)
+        for key in ("cosmos_joint_query", "cosmos_video_frame_mask"):
+            if key not in result:
+                raise KeyError(f"Cosmos joint latent velocity missing field {key}")
+            result[key] = torch.as_tensor(result[key])
+        return result
+
     def action_target_x0(self, action_dict, raw_batch=None):
         """Return FlowMap-normalized action x0 from official raw Cosmos inference."""
         if not self.raw_inference_enabled:
@@ -992,6 +1510,8 @@ class CosmosPolicyActionTeacher:
             inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
             device=target.device,
             dtype=target.dtype,
+            packing_schema=self.config.action_packing_schema,
+            downsample_factor=self.config.action_downsample_factor,
         )
 
     def __call__(self, input_dict, train_mode=True, **_kwargs):

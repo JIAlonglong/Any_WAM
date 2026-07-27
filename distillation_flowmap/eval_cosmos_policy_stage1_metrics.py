@@ -319,6 +319,8 @@ def main():
             inverse_used_action_channel_ids=cfg.inverse_used_action_channel_ids,
             device=base_input["action_dict"]["latent"].device,
             dtype=base_input["action_dict"]["latent"].dtype,
+            packing_schema=cfg.action_packing_schema,
+            downsample_factor=cfg.action_downsample_factor,
         )
         future_predictions = teacher_result.get("future_image_predictions")
         if future_predictions is not None:

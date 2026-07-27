@@ -187,6 +187,8 @@ def main():
                     inverse_used_action_channel_ids=cfg.inverse_used_action_channel_ids,
                     device="cpu",
                     dtype=torch.float32,
+                    packing_schema=cfg.action_packing_schema,
+                    downsample_factor=cfg.action_downsample_factor,
                 ).cpu()
                 _save_cache(path, {
                     "schema": "cosmos_progressive_teacher_cache_v1",

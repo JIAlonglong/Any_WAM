@@ -1,5 +1,6 @@
 """Stage 2 AnyFlow-style continuation for LIBERO full-parameter fine-tuning."""
 import copy
+import math
 import os
 
 from distillation_flowmap.config_libero_optimized import cfg as _base_cfg
@@ -86,6 +87,79 @@ cfg.opd_rollout_step_pairs = list(cfg.rollout_step_pairs)
 _opd_rollout_step_pairs = os.environ.get("OPD_ROLLOUT_STEP_PAIRS")
 if _opd_rollout_step_pairs:
     cfg.opd_rollout_step_pairs = _parse_step_pairs(_opd_rollout_step_pairs)
+
+# DanceOPD is opt-in for the LingBotVA Stage-2 continuation.  For a single
+# S4 endpoint budget, query exactly the deployment rollout states.  The
+# current sampler stores only pre-step states, so K=1/2 and mixed curricula
+# require an explicit dense query grid rather than silently sampling a
+# high-noise or mismatched trajectory.
+cfg.opd_query_mode = os.environ.get("OPD_QUERY_MODE", "legacy").lower()
+if cfg.opd_query_mode not in ("legacy", "danceopd"):
+    raise ValueError("OPD_QUERY_MODE must be legacy or danceopd")
+_danceopd_rollout_steps_env = os.environ.get("OPD_DANCEOPD_ROLLOUT_STEPS")
+if _danceopd_rollout_steps_env is None:
+    _danceopd_student_steps = {
+        int(pair[1]) for pair in cfg.opd_rollout_step_pairs
+    }
+    if cfg.opd_query_mode == "danceopd":
+        if len(_danceopd_student_steps) != 1:
+            raise ValueError(
+                "DanceOPD with mixed student budgets requires an explicit "
+                "OPD_DANCEOPD_ROLLOUT_STEPS query grid"
+            )
+        _danceopd_default_steps = next(iter(_danceopd_student_steps))
+        if _danceopd_default_steps < 4:
+            raise ValueError(
+                "Deployment-aligned DanceOPD defaults require K >= 4 because "
+                "the current sampler has no terminal-state query; set an "
+                "explicit OPD_DANCEOPD_ROLLOUT_STEPS dense grid for K=1/2"
+            )
+    else:
+        _danceopd_default_steps = 16
+else:
+    _danceopd_default_steps = int(_danceopd_rollout_steps_env)
+cfg.opd_danceopd_rollout_steps = int(_danceopd_default_steps)
+if cfg.opd_danceopd_rollout_steps <= 0:
+    raise ValueError("OPD_DANCEOPD_ROLLOUT_STEPS must be positive")
+cfg.opd_danceopd_query_alpha = float(
+    os.environ.get("OPD_DANCEOPD_QUERY_ALPHA", 5.0)
+)
+cfg.opd_danceopd_query_beta = float(
+    os.environ.get("OPD_DANCEOPD_QUERY_BETA", 2.0)
+)
+cfg.opd_danceopd_velocity_weight = float(
+    os.environ.get("OPD_DANCEOPD_VELOCITY_WEIGHT", 1.0)
+)
+cfg.opd_danceopd_endpoint_weight = float(
+    os.environ.get("OPD_DANCEOPD_ENDPOINT_WEIGHT", 1.0)
+)
+cfg.opd_danceopd_verify_terminal_prior = _env_bool(
+    "OPD_DANCEOPD_VERIFY_TERMINAL_PRIOR", True
+)
+cfg.opd_danceopd_terminal_prior_tolerance = float(
+    os.environ.get("OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE", 2e-6)
+)
+cfg.opd_danceopd_terminal_prior_warn_factor = float(
+    os.environ.get("OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR", 0.5)
+)
+if (
+    not math.isfinite(cfg.opd_danceopd_terminal_prior_tolerance)
+    or cfg.opd_danceopd_terminal_prior_tolerance < 0
+):
+    raise ValueError(
+        "OPD_DANCEOPD_TERMINAL_PRIOR_TOLERANCE must be finite and "
+        "non-negative"
+    )
+if (
+    not math.isfinite(cfg.opd_danceopd_terminal_prior_warn_factor)
+    or not 0 <= cfg.opd_danceopd_terminal_prior_warn_factor <= 1
+):
+    raise ValueError(
+        "OPD_DANCEOPD_TERMINAL_PRIOR_WARN_FACTOR must be finite and in [0, 1]"
+    )
+cfg.opd_danceopd_diagnostic_interval = int(
+    os.environ.get("OPD_DANCEOPD_DIAGNOSTIC_INTERVAL", 50)
+)
 
 # Keep the AnyFlow mixed timestep distribution by default, while making v1/a1
 # focused ablations possible without editing code.

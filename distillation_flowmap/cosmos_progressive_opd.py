@@ -1,8 +1,61 @@
 """Small, testable primitives for progressive Cosmos Stage 2 OPD."""
 
 import math
+from typing import NamedTuple
 
 import torch
+
+from distillation_flowmap.cosmos_deployment_rollout import (
+    should_run_deployment_joint_rollout,
+    should_run_raw_auxiliary,
+)
+
+
+class DeploymentMetricSpec(NamedTuple):
+    result_key: str
+    accumulator: str
+    average_name: str
+    log_name: str
+
+
+DEPLOYMENT_METRIC_SPECS = (
+    DeploymentMetricSpec(
+        "deployment_video_endpoint_loss",
+        "acc_deployment_video_endpoint_losses",
+        "avg_deployment_video_endpoint_loss",
+        "deployment/video_endpoint_loss",
+    ),
+    DeploymentMetricSpec(
+        "deployment_action_endpoint_loss",
+        "acc_deployment_action_endpoint_losses",
+        "avg_deployment_action_endpoint_loss",
+        "deployment/action_endpoint_loss",
+    ),
+    DeploymentMetricSpec(
+        "deployment_total_loss",
+        "acc_deployment_total_losses",
+        "avg_deployment_total_loss",
+        "deployment/total_loss",
+    ),
+    DeploymentMetricSpec(
+        "deployment_student_steps",
+        "acc_deployment_student_steps",
+        "avg_deployment_student_steps",
+        "deployment/student_steps",
+    ),
+    DeploymentMetricSpec(
+        "deployment_t_start",
+        "acc_deployment_t_starts",
+        "avg_deployment_t_start",
+        "deployment/t_start",
+    ),
+    DeploymentMetricSpec(
+        "deployment_t_end",
+        "acc_deployment_t_ends",
+        "avg_deployment_t_end",
+        "deployment/t_end",
+    ),
+)
 
 
 def _time_view(timesteps):
@@ -30,6 +83,75 @@ def build_uniform_timestep_path(timesteps, target_timesteps, num_steps):
     ).unsqueeze(0) * alpha.view(-1, 1, 1)
 
 
+def constrain_cosmos_teacher_timestep_pair(
+    timesteps,
+    target_timesteps,
+    *,
+    t_min,
+    t_max,
+    num_train_timesteps,
+):
+    """Keep a raw-Cosmos velocity rollout inside its supported time window.
+
+    Raw Cosmos latent velocities are only calibrated on an interior noise
+    interval.  Both endpoints must therefore be clamped before a rollout is
+    constructed; clamping only the teacher's reported time would pair a
+    low-noise state with the wrong noise label.
+    """
+    if timesteps.shape != target_timesteps.shape:
+        raise ValueError("timesteps and target_timesteps must have matching shapes")
+    if int(num_train_timesteps) <= 0:
+        raise ValueError("num_train_timesteps must be positive")
+    t_min = float(t_min)
+    t_max = float(t_max)
+    if not (
+        math.isfinite(t_min)
+        and math.isfinite(t_max)
+        and 0.0 < t_min < t_max < 1.0
+    ):
+        raise ValueError(
+            "Cosmos raw teacher window must satisfy 0 < t_min < t_max < 1"
+        )
+
+    lower = t_min * int(num_train_timesteps)
+    upper = t_max * int(num_train_timesteps)
+    timesteps = timesteps.clamp(min=lower, max=upper)
+    target_timesteps = target_timesteps.clamp(min=lower, max=upper)
+    return timesteps, torch.minimum(target_timesteps, timesteps)
+
+
+def build_cosmos_teacher_window_path(
+    *,
+    batch_size,
+    num_frames,
+    num_steps,
+    t_min,
+    t_max,
+    num_train_timesteps,
+    device,
+    dtype,
+):
+    """Build a full high-to-low raw-Cosmos rollout in the valid teacher band."""
+    if int(batch_size) <= 0 or int(num_frames) <= 0:
+        raise ValueError("batch_size and num_frames must be positive")
+    if int(num_steps) <= 0:
+        raise ValueError("num_steps must be positive")
+    if int(num_train_timesteps) <= 0:
+        raise ValueError("num_train_timesteps must be positive")
+
+    probe = torch.empty(
+        (int(batch_size), int(num_frames)), device=device, dtype=dtype
+    )
+    start, end = constrain_cosmos_teacher_timestep_pair(
+        torch.full_like(probe, float(t_max) * int(num_train_timesteps)),
+        torch.full_like(probe, float(t_min) * int(num_train_timesteps)),
+        t_min=t_min,
+        t_max=t_max,
+        num_train_timesteps=num_train_timesteps,
+    )
+    return build_uniform_timestep_path(start, end, num_steps)
+
+
 def broadcast_joint_action_timesteps(video_t, video_r, *, action_frames):
     """Map a scalar video endpoint pair to every action token in the joint state."""
     if video_t.ndim != 2 or video_r.ndim != 2 or video_t.shape != video_r.shape:
@@ -42,6 +164,30 @@ def broadcast_joint_action_timesteps(video_t, video_r, *, action_frames):
         raise ValueError("joint endpoint pairs must be constant across video frames")
     shape = (video_t.shape[0], int(action_frames))
     return video_t[:, :1].expand(shape), video_r[:, :1].expand(shape)
+
+
+def compose_cosmos_endpoint_loss(
+    video_endpoint_loss,
+    action_endpoint_loss,
+    *,
+    action_endpoint_weight,
+):
+    """Add the action endpoint term only when that objective is enabled.
+
+    In particular, avoid ``0 * NaN`` turning a video-only loss non-finite and
+    keep the disabled action branch out of the autograd graph.
+    """
+    action_endpoint_weight = float(action_endpoint_weight)
+    if (
+        not math.isfinite(action_endpoint_weight)
+        or action_endpoint_weight < 0.0
+    ):
+        raise ValueError(
+            "Cosmos OPD action endpoint weight must be finite and non-negative"
+        )
+    if action_endpoint_weight == 0.0:
+        return video_endpoint_loss
+    return video_endpoint_loss + action_endpoint_weight * action_endpoint_loss
 
 
 @torch.no_grad()
@@ -81,6 +227,8 @@ def apply_full_endpoint_focus(
     *,
     probability,
     num_train_timesteps,
+    focus_timestep=None,
+    focus_target_timestep=None,
 ):
     """Replace a sample-level subset of pairs with the full deployment path."""
     if timesteps.shape != target_timesteps.shape:
@@ -101,9 +249,27 @@ def apply_full_endpoint_focus(
     else:
         focus_mask = torch.rand(timesteps.shape[0], device=timesteps.device) < probability
 
+    focus_timestep = (
+        float(num_train_timesteps)
+        if focus_timestep is None
+        else float(focus_timestep)
+    )
+    focus_target_timestep = (
+        0.0 if focus_target_timestep is None else float(focus_target_timestep)
+    )
+    if not (
+        math.isfinite(focus_timestep)
+        and math.isfinite(focus_target_timestep)
+        and 0.0 <= focus_target_timestep <= focus_timestep <= int(num_train_timesteps)
+    ):
+        raise ValueError(
+            "focused endpoint pair must satisfy "
+            "0 <= focus_target_timestep <= focus_timestep <= num_train_timesteps"
+        )
+
     expanded_mask = focus_mask[:, None].expand_as(timesteps)
-    full_t = torch.full_like(timesteps, float(num_train_timesteps))
-    full_r = torch.zeros_like(target_timesteps)
+    full_t = torch.full_like(timesteps, focus_timestep)
+    full_r = torch.full_like(target_timesteps, focus_target_timestep)
     return (
         torch.where(expanded_mask, full_t, timesteps),
         torch.where(expanded_mask, full_r, target_timesteps),
@@ -118,6 +284,31 @@ def should_run_standalone_opd(*, step, warmup_steps, interval):
     if int(interval) <= 0:
         raise ValueError("interval must be positive")
     return int(step) >= int(warmup_steps) and int(step) % int(interval) == 0
+
+
+def select_progressive_training_objective(
+    *,
+    step,
+    deployment_enabled,
+    deployment_interval,
+    raw_auxiliary_enabled,
+    raw_auxiliary_warmup,
+    raw_auxiliary_interval,
+    raw_auxiliary_phase,
+):
+    """Choose exactly one optimizer objective for a progressive training step."""
+    if deployment_enabled and should_run_deployment_joint_rollout(
+        int(step), int(deployment_interval)
+    ):
+        return "deployment"
+    if raw_auxiliary_enabled and should_run_raw_auxiliary(
+        int(step),
+        warmup=int(raw_auxiliary_warmup),
+        interval=int(raw_auxiliary_interval),
+        phase=int(raw_auxiliary_phase),
+    ):
+        return "raw_auxiliary"
+    return "main"
 
 
 def should_stop_training_at_step(*, step, stop_after_step):

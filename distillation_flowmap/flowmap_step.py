@@ -79,6 +79,20 @@ def _same_state_velocity_loss(
         per_token = diff ** 2
     per_sample = per_token.mean(dim=[1, 2, 3, 4])
     return (per_sample * sample_weight.to(per_sample.device)).mean()
+
+
+def _synchronized_nonfinite_decision(*, loss, local_flags, device):
+    """Agree on named loss failures before any rank enters backward."""
+    flags = {
+        origin: bool(local_flags.get(origin, False))
+        for origin in NONFINITE_ORIGINS
+    }
+    if not bool(torch.isfinite(loss.detach()).all().item()) and not any(
+        flags.values()
+    ):
+        flags["teacher_or_gt"] = True
+    synchronized = reduce_nonfinite_origins(flags, device=device)
+    return not any(synchronized.values()), synchronized
 from einops import rearrange
 
 from utils import data_seq_to_patch, logger
@@ -89,6 +103,9 @@ from distillation_flowmap.cosmos_policy_adapter import (
     cosmos_actions_to_flowmap_x0,
     cosmos_latent_micro_step_index,
     cosmos_latent_should_request_cdiff,
+)
+from distillation_flowmap.cosmos_training_contract import (
+    pack_actions_for_downsample,
 )
 from distillation_flowmap.kto_reweighting import (
     compute_normalized_focal_weights,
@@ -101,20 +118,35 @@ from distillation_flowmap.opd_rollout_grad import (
     SUPPORTED_ROLLOUT_GRAD_MODES,
     rollout_step_requires_grad,
 )
+from distillation_flowmap.distributed_safety import (
+    NONFINITE_ORIGINS,
+    all_ranks_finite,
+    reduce_nonfinite_origins,
+)
 from distillation_flowmap.danceopd_query import (
     append_post_update_trajectory_state,
-    denoised_endpoint_mse,
-    direct_velocity_mse,
     interpolate_raw_flow_segment,
     legacy_danceopd_query_floor,
     require_query_timestep_floor,
+    aligned_anchor_mse,
+    build_shifted_terminal_path,
+    denoised_endpoint_mse,
+    direct_velocity_mse,
+    masked_video_velocity_mse,
+    sample_nonterminal_semantic_query_indices,
+    sample_endpoint_sigmas,
     sample_low_noise_query_indices,
+    sample_semantic_query_indices,
+    sample_uniform_rollout_step_pair,
     select_per_sample_trajectory_state,
 )
 from distillation_flowmap.cosmos_progressive_opd import (
     apply_full_endpoint_focus,
+    build_cosmos_teacher_window_path,
     broadcast_joint_action_timesteps,
     center_spatial_crop_slices,
+    compose_cosmos_endpoint_loss,
+    constrain_cosmos_teacher_timestep_pair,
     rollout_velocity_field,
 )
 from distillation_flowmap.cosmos_mixed_step_policy import (
@@ -200,6 +232,45 @@ def _select_cosmos_mixed_step_endpoint_rollout(
         forced_indices=forced_indices,
         selection_ordinal=int(selection_ordinal),
     )
+
+
+from distillation_flowmap.cosmos_deployment_rollout import (
+    deployment_endpoint_losses,
+)
+from distillation_flowmap.numerical_contracts import (
+    validate_terminal_prior_sources,
+)
+from distillation_flowmap.mechanism_diagnostics import (
+    compute_mechanism_metric_samples,
+    pack_finite_metric_stats,
+)
+
+
+def _validate_terminal_prior_pair(
+    *,
+    config,
+    video_actual,
+    video_expected,
+    video_source_dtype,
+    action_actual,
+    action_expected,
+    action_source_dtype,
+    reference,
+    error_context,
+):
+    """Execute the shared video/action terminal-prior production boundary."""
+    validation = validate_terminal_prior_sources(
+        {
+            "video": (video_actual, video_expected, video_source_dtype),
+            "action": (action_actual, action_expected, action_source_dtype),
+        },
+        config=config,
+        warning_callback=(
+            logger.warning if getattr(config, "rank", 0) == 0 else None
+        ),
+        error_context=error_context,
+    )
+    return validation, validation.diagnostic_tensors(reference)
 
 
 class FlowMapStepMixin:
@@ -1837,6 +1908,8 @@ class FlowMapStepMixin:
                     inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
                     device=batch["actions"].device,
                     dtype=batch["actions"].dtype,
+                    packing_schema=self.config.action_packing_schema,
+                    downsample_factor=self.config.action_downsample_factor,
                 )
                 batch["latents"] = cosmos_latent_teacher_result[
                     "cosmos_latent_x0"
@@ -1865,6 +1938,8 @@ class FlowMapStepMixin:
                     inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
                     device=batch["actions"].device,
                     dtype=batch["actions"].dtype,
+                    packing_schema=self.config.action_packing_schema,
+                    downsample_factor=self.config.action_downsample_factor,
                 )
                 batch["latents"] = self._encode_cosmos_future_video_latents(
                     raw_teacher_result.get("future_image_predictions"),
@@ -2281,7 +2356,20 @@ class FlowMapStepMixin:
                 scale = (loss_clip_value / loss.detach().clamp(min=1e-12)).clamp(max=1.0)
                 loss = loss * scale
 
-        if not torch.isfinite(loss):
+        local_nonfinite_origins = {
+            "video": not bool(torch.isfinite(video_loss.detach()).all().item()),
+            "action": not bool(torch.isfinite(action_loss.detach()).all().item())
+            or not bool(torch.isfinite(action_aware_loss.detach()).all().item()),
+            "teacher_or_gt": not bool(
+                torch.isfinite(gt_regression_loss.detach()).all().item()
+            ),
+        }
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags=local_nonfinite_origins,
+            device=self.device,
+        )
+        if not is_finite:
             if self.config.rank == 0:
                 logger.warning(f"[step {self.step}] NaN/Inf loss, skipping")
             return {
@@ -2306,6 +2394,7 @@ class FlowMapStepMixin:
                 "kto_main_threshold": zero_metric,
                 "should_sync": should_sync,
                 "skip_step": True,
+                "nonfinite_origins": nonfinite_origins,
             }
 
         _profile_mark("loss_compute")
@@ -2346,6 +2435,7 @@ class FlowMapStepMixin:
             "kto_main_threshold": zero_metric,
             "should_sync": should_sync,
             "skip_step": False,
+            "nonfinite_origins": nonfinite_origins,
         }
 
     def _train_step(self, batch, batch_idx):
@@ -3012,9 +3102,21 @@ class FlowMapStepMixin:
                 scale = (loss_clip_value / loss.detach().clamp(min=1e-12)).clamp(max=1.0)
                 loss = loss * scale
 
-        # 检查损失是否为 NaN/Inf，如果是则跳过这一步
-
-        if not torch.isfinite(loss):
+        # Agree before backward so every rank follows the same collective path.
+        local_nonfinite_origins = {
+            "video": not bool(torch.isfinite(video_loss.detach()).all().item()),
+            "action": not bool(torch.isfinite(action_loss.detach()).all().item())
+            or not bool(torch.isfinite(action_aware_loss.detach()).all().item()),
+            "teacher_or_gt": not bool(
+                torch.isfinite(gt_regression_loss.detach()).all().item()
+            ),
+        }
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags=local_nonfinite_origins,
+            device=self.device,
+        )
+        if not is_finite:
             if self.config.rank == 0:
                 logger.warning(f"[step {self.step}] NaN/Inf loss, skipping")
             zero_loss = torch.zeros((), device=self.device)
@@ -3033,6 +3135,7 @@ class FlowMapStepMixin:
                 "kto_main_threshold": kto_main_threshold.detach(),
                 "should_sync": should_sync,
                 "skip_step": True,
+                "nonfinite_origins": nonfinite_origins,
             }
 
         loss.backward()
@@ -3053,6 +3156,7 @@ class FlowMapStepMixin:
             "kto_main_threshold": kto_main_threshold.detach(),
             "should_sync": should_sync,
             "skip_step": False,
+            "nonfinite_origins": nonfinite_origins,
         }
 
     # ==================================================================
@@ -3086,7 +3190,8 @@ class FlowMapStepMixin:
                                    return_last_step_start=False,
                                    return_final_action=False,
                                    return_trajectory=False,
-                                   return_final_action_state=False):
+                                   return_final_action_state=False,
+                                   force_no_grad=False):
         """
         Student multi-step Euler integration from t to target_r.
 
@@ -3138,7 +3243,10 @@ class FlowMapStepMixin:
             if not getattr(self, '_nofsdp_synced', False):
                 self._sync_student_nofsdp()
                 self._nofsdp_synced = True
-            _rollout_model.train()
+            # Observation-only probes enter ``diagnostic_runtime`` in eval mode.
+            # Do not silently undo that contract on the no-FSDP rollout copy.
+            if not force_no_grad:
+                _rollout_model.train()
             _rt_latent = {k: _to_regular_tensor(v) if isinstance(v, torch.Tensor) else v
                           for k, v in base_input_dict['latent_dict'].items()}
             _rt_action = {k: _to_regular_tensor(v) if isinstance(v, torch.Tensor) else v
@@ -3232,7 +3340,7 @@ class FlowMapStepMixin:
                 last_step_start_x = current_x.detach()
                 last_step_start_t = t_i.detach()
 
-            keep_step_grad = rollout_step_requires_grad(
+            keep_step_grad = (not force_no_grad) and rollout_step_requires_grad(
                 mode=rollout_grad_mode,
                 step_index=i,
                 num_steps=K_steps,
@@ -3285,7 +3393,9 @@ class FlowMapStepMixin:
                 )
             )
 
-            if force_eval_checkpointing:
+            if force_no_grad:
+                grad_context = torch.no_grad()
+            elif force_eval_checkpointing:
                 grad_context = torch.enable_grad()
             else:
                 grad_context = torch.enable_grad() if keep_step_grad else torch.no_grad()
@@ -3364,7 +3474,13 @@ class FlowMapStepMixin:
                     self.student.blocks[_bi] = _block._orig_mod
         try:
             final_grad_context = (
-                torch.enable_grad() if force_eval_checkpointing else contextlib.nullcontext()
+                torch.no_grad()
+                if force_no_grad
+                else (
+                    torch.enable_grad()
+                    if force_eval_checkpointing
+                    else contextlib.nullcontext()
+                )
             )
             with final_grad_context:
                 final_forward = self._student_cfg_forward(
@@ -3962,7 +4078,26 @@ class FlowMapStepMixin:
         loss_clip_value = getattr(self.config, 'loss_clip_value', None)
         if loss_clip_value is not None and getattr(self.config, 'loss_clip_enabled', True):
             loss = torch.clamp(loss, min=0.0, max=loss_clip_value)
-        if not torch.isfinite(loss):
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags={
+                "video": not bool(
+                    torch.isfinite(video_transition_loss.detach()).all().item()
+                )
+                or not bool(torch.isfinite(local_fm_loss.detach()).all().item()),
+                "action": not bool(
+                    torch.isfinite(action_loss.detach()).all().item()
+                )
+                or not bool(
+                    torch.isfinite(action_aware_loss.detach()).all().item()
+                ),
+                "teacher_or_gt": not bool(
+                    torch.isfinite(gt_regression_loss.detach()).all().item()
+                ),
+            },
+            device=self.device,
+        )
+        if not is_finite:
             if self.config.rank == 0:
                 logger.warning(f"[step {self.step}] NaN/Inf loss, skipping")
             zero_loss = torch.zeros((), device=self.device)
@@ -3976,6 +4111,7 @@ class FlowMapStepMixin:
                 'gt_regression_loss': gt_regression_loss.detach() if self.distill_action else gt_regression_loss,
                 'should_sync': should_sync,
                 'skip_step': True,
+                'nonfinite_origins': nonfinite_origins,
             }
 
         loss.backward()
@@ -3998,6 +4134,7 @@ class FlowMapStepMixin:
             'video_r_mean': video_r.mean().item(),
             'should_sync': should_sync,
             'skip_step': False,
+            'nonfinite_origins': nonfinite_origins,
         }
 
     def _opd_aux_transition_step_kto_paopd(self, batch, batch_idx):
@@ -4006,6 +4143,1189 @@ class FlowMapStepMixin:
             batch_idx,
             kto_paopd=True,
         )
+
+    def _build_joint_input(
+        self,
+        video_x,
+        video_t,
+        action_x,
+        action_t,
+        *,
+        video_base,
+        action_latent,
+        action_cond_t,
+        action_text,
+        action_grid,
+        action_valid_mask,
+        chunk_size,
+        window_size,
+    ):
+        """Build one explicit Cosmos/WanVA joint state without stale GT tensors."""
+        action_dict = {
+            "noisy_latents": action_x,
+            "latent": action_latent,
+            "timesteps": action_t,
+            "cond_timesteps": action_cond_t,
+            "text_emb": action_text,
+        }
+        if action_grid is not None:
+            action_dict["grid_id"] = action_grid
+        if action_valid_mask is not None:
+            action_dict["actions_mask"] = action_valid_mask
+        return {
+            "latent_dict": {
+                **video_base,
+                "noisy_latents": video_x,
+                "timesteps": video_t,
+            },
+            "action_dict": action_dict,
+            "chunk_size": chunk_size,
+            "window_size": window_size,
+        }
+
+    def _init_joint_mask(self, joint_input):
+        """Initialize the actual packed attention mask for a joint query."""
+        from modules.model import FlexAttnFunc
+
+        latent_dict = joint_input["latent_dict"]
+        action_dict = joint_input["action_dict"]
+        total_length = (
+            latent_dict["noisy_latents"].flatten(0, 1).shape[0] * 2
+            + action_dict["noisy_latents"].flatten(0, 1).shape[0] * 2
+        )
+        padded_length = (128 - total_length % 128) % 128
+        FlexAttnFunc.init_mask(
+            latent_dict["noisy_latents"].shape,
+            action_dict["noisy_latents"].shape,
+            padded_length,
+            joint_input["chunk_size"],
+            window_size=joint_input["window_size"],
+            patch_size=self.patch_size,
+            device=self.device,
+        )
+
+    def _student_joint_forward(
+        self,
+        model,
+        joint_input,
+        model_empty_emb,
+        video_r_t,
+        action_r_t,
+        *,
+        cfg_scale,
+        batch_size,
+        ref_shape,
+        require_action,
+    ):
+        """Run one joint student query while safely bypassing compiled blocks."""
+        saved_blocks = None
+        if model is self.student and getattr(self, "_student_blocks_compiled", False):
+            saved_blocks = list(self.student.blocks)
+            for block_index, block in enumerate(saved_blocks):
+                if hasattr(block, "_orig_mod"):
+                    self.student.blocks[block_index] = block._orig_mod
+        try:
+            return self._student_cfg_forward(
+                model,
+                joint_input,
+                model_empty_emb,
+                cfg_scale,
+                batch_size,
+                ref_shape,
+                video_r_t,
+                action_r_t,
+                force_cfg=True,
+                return_action=require_action,
+            )
+        finally:
+            if saved_blocks is not None:
+                for block_index, block in enumerate(saved_blocks):
+                    self.student.blocks[block_index] = block
+
+    def _joint_euler_update(
+        self,
+        video_x,
+        action_x,
+        video_velocity,
+        action_velocity,
+        video_t,
+        video_r,
+        action_t,
+        action_r,
+    ):
+        video_sigma = self._timestep_to_sigma_5d(video_t)
+        video_sigma_next = self._timestep_to_sigma_5d(video_r)
+        action_sigma = (
+            action_t[:, None, :, None, None] / self.config.num_train_timesteps
+        )
+        action_sigma_next = (
+            action_r[:, None, :, None, None] / self.config.num_train_timesteps
+        )
+        return (
+            video_x
+            + video_velocity
+            * (video_sigma_next.to(video_velocity) - video_sigma.to(video_velocity)),
+            action_x
+            + action_velocity
+            * (
+                action_sigma_next.to(action_velocity)
+                - action_sigma.to(action_velocity)
+            ),
+        )
+
+    def _prepare_cosmos_mechanism_context(self, batch):
+        """Prepare immutable conditioning fields shared by every probe route."""
+        if hasattr(self, "convert_input_format"):
+            batch = self.convert_input_format(batch)
+        batch_size = int(batch["latents"].shape[0])
+        action_downsample = int(self.config.action_downsample_factor)
+        action_clean = batch["actions"][:, :, ::action_downsample]
+        if action_clean.shape[2] <= 0:
+            raise ValueError("Cosmos mechanism probe requires action frames")
+        input_dict = self._prepare_base_dict(batch)
+        action_base = input_dict["action_dict"]
+        action_mask = action_base.get("actions_mask")
+        if action_mask is not None:
+            action_mask = action_mask[:, :, ::action_downsample]
+        action_grid = _downsample_action_grid_id(
+            action_base.get("grid_id"),
+            action_base["latent"],
+            action_downsample,
+        )
+        student_model = getattr(self, "_student_nofsdp", None) or self.student
+        if student_model is not self.student:
+            if not getattr(self, "_nofsdp_synced", False):
+                self._sync_student_nofsdp()
+                self._nofsdp_synced = True
+            video_base = {
+                key: _to_regular_tensor(value)
+                if isinstance(value, torch.Tensor)
+                else value
+                for key, value in input_dict["latent_dict"].items()
+            }
+            action_latent = _to_regular_tensor(
+                action_base["latent"][:, :, ::action_downsample]
+            )
+            action_cond_t = _to_regular_tensor(
+                action_base["cond_timesteps"][:, ::action_downsample]
+            )
+            action_text = _to_regular_tensor(action_base["text_emb"])
+            action_grid = _to_regular_tensor(action_grid)
+            action_mask = _to_regular_tensor(action_mask)
+            empty_emb = _to_regular_tensor(
+                self.empty_emb.expand(batch_size, -1, -1)
+            )
+        else:
+            video_base = input_dict["latent_dict"]
+            action_latent = action_base["latent"][:, :, ::action_downsample]
+            action_cond_t = action_base["cond_timesteps"][:, ::action_downsample]
+            action_text = action_base["text_emb"]
+            empty_emb = self.empty_emb.expand(batch_size, -1, -1)
+        return {
+            "batch": batch,
+            "input_dict": input_dict,
+            "batch_size": batch_size,
+            "ref_shape": tuple(batch["latents"].shape),
+            "action_clean": action_clean,
+            "action_frames": int(action_clean.shape[2]),
+            "action_mask": action_mask,
+            "student_model": student_model,
+            "video_base": video_base,
+            "action_latent": action_latent,
+            "action_cond_t": action_cond_t,
+            "action_text": action_text,
+            "action_grid": action_grid,
+            "empty_emb": empty_emb,
+            "chunk_size": input_dict["chunk_size"],
+            "window_size": input_dict["window_size"],
+            "cfg_scale": (
+                float(getattr(self.config, "cfg_min", 1.0))
+                + float(getattr(self.config, "cfg_max", 1.0))
+            )
+            / 2.0,
+        }
+
+    def _mechanism_joint_input(
+        self, video_x, action_x, video_t, action_t, context
+    ):
+        return self._build_joint_input(
+            video_x,
+            video_t,
+            action_x,
+            action_t,
+            video_base=context["video_base"],
+            action_latent=context["action_latent"],
+            action_cond_t=context["action_cond_t"],
+            action_text=context["action_text"],
+            action_grid=context["action_grid"],
+            action_valid_mask=context["action_mask"],
+            chunk_size=context["chunk_size"],
+            window_size=context["window_size"],
+        )
+
+    def _cosmos_student_joint_map(
+        self,
+        video_x,
+        action_x,
+        video_t,
+        action_t,
+        video_r,
+        action_r,
+        *,
+        context,
+    ):
+        joint_input = self._mechanism_joint_input(
+            video_x, action_x, video_t, action_t, context
+        )
+        self._init_joint_mask(joint_input)
+        video_velocity, action_velocity_seq = self._student_joint_forward(
+            context["student_model"],
+            joint_input,
+            context["empty_emb"],
+            video_r,
+            action_r,
+            cfg_scale=context["cfg_scale"],
+            batch_size=context["batch_size"],
+            ref_shape=context["ref_shape"],
+            require_action=True,
+        )
+        if action_velocity_seq is None:
+            raise RuntimeError("Cosmos mechanism probe requires an action head")
+        action_velocity = self._extract_action_v(
+            action_velocity_seq, context["action_frames"]
+        )
+        next_video, next_action = self._joint_euler_update(
+            video_x,
+            action_x,
+            video_velocity,
+            action_velocity,
+            video_t,
+            video_r,
+            action_t,
+            action_r,
+        )
+        return next_video, next_action, video_velocity, action_velocity
+
+    def _cosmos_action_context_predictions(
+        self,
+        video_contexts,
+        *,
+        common_action,
+        action_t,
+        context,
+        action_s=None,
+    ):
+        """Query the real action head with replaced video and one held action state."""
+        predictions = {}
+        video_t = torch.zeros(
+            (context["batch_size"], context["ref_shape"][2]),
+            device=common_action.device,
+            dtype=action_t.dtype,
+        )
+        video_r = torch.zeros_like(video_t)
+        action_r = torch.zeros_like(action_t)
+        with torch.no_grad():
+            for name, video_x in video_contexts.items():
+                current_action = common_action
+                action_path = (
+                    (action_t, action_r)
+                    if action_s is None
+                    else (action_t, action_s, action_r)
+                )
+                for index in range(len(action_path) - 1):
+                    current_t = action_path[index]
+                    next_t = action_path[index + 1]
+                    joint_input = self._mechanism_joint_input(
+                        video_x, current_action, video_t, current_t, context
+                    )
+                    # Tiny unit harnesses intercept the forward before mask
+                    # setup; production always owns a real student module.
+                    if hasattr(self.student, "parameters"):
+                        self._init_joint_mask(joint_input)
+                    _, action_velocity_seq = self._student_joint_forward(
+                        context["student_model"],
+                        joint_input,
+                        context["empty_emb"],
+                        video_r,
+                        next_t,
+                        cfg_scale=context["cfg_scale"],
+                        batch_size=context["batch_size"],
+                        ref_shape=context["ref_shape"],
+                        require_action=True,
+                    )
+                    action_velocity = self._extract_action_v(
+                        action_velocity_seq, context["action_frames"]
+                    )
+                    current_sigma = (
+                        current_t[:, None, :, None, None]
+                        / self.config.num_train_timesteps
+                    )
+                    next_sigma = (
+                        next_t[:, None, :, None, None]
+                        / self.config.num_train_timesteps
+                    )
+                    current_action = current_action + action_velocity * (
+                        next_sigma.to(action_velocity)
+                        - current_sigma.to(action_velocity)
+                    )
+                predictions[name] = current_action.detach()
+        return predictions
+
+    def _validate_cosmos_mechanism_teacher_band(self, t_min, t_max):
+        t_min = float(t_min)
+        t_max = float(t_max)
+        calibrated_min = 4.0 / 5.0
+        calibrated_max = 80.0 / 81.0
+        if not (
+            calibrated_min <= t_min < t_max <= calibrated_max
+        ):
+            raise ValueError(
+                "Cosmos mechanism teacher band must remain inside the calibrated "
+                f"[{calibrated_min}, {calibrated_max}] interval"
+            )
+        return t_min, t_max
+
+    @staticmethod
+    def _cosmos_calibrated_noisy_state(*, teacher_x0, noise, normalized_t):
+        """Construct a calibrated-band state from the official teacher endpoint."""
+        normalized_t = torch.as_tensor(
+            normalized_t, device=teacher_x0.device, dtype=teacher_x0.dtype
+        )
+        return (1.0 - normalized_t) * teacher_x0 + normalized_t * noise
+
+    def _validate_cosmos_mechanism_preflight(
+        self, batch, *, teacher_steps, student_steps
+    ):
+        """Validate deterministic local contracts before entering model forwards."""
+        teacher_steps = int(teacher_steps)
+        student_steps = int(student_steps)
+        if teacher_steps != 8:
+            raise ValueError(
+                "Cosmos official mechanism teacher budget is fixed at 8 steps"
+            )
+        if student_steps not in (2, 4):
+            raise ValueError("mechanism student_steps must be 2 or 4")
+        if not isinstance(batch, dict):
+            raise TypeError("Cosmos mechanism diagnostic batch must be a mapping")
+        for key in ("latents", "actions"):
+            value = batch.get(key)
+            if not torch.is_tensor(value) or value.ndim < 3 or value.shape[0] <= 0:
+                raise ValueError(
+                    f"Cosmos mechanism diagnostic requires a non-empty {key} tensor"
+                )
+        teacher = getattr(self, "_action_teacher_model", None)
+        if not (
+            getattr(teacher, "raw_inference_enabled", False)
+            and hasattr(teacher, "predict_raw_latent_target")
+            and hasattr(teacher, "predict_raw_joint_latent_velocity")
+            and hasattr(teacher, "predict_raw_same_prior_endpoint")
+            and hasattr(teacher, "predict_raw_joint_continuation_endpoint")
+        ):
+            raise RuntimeError(
+                "Cosmos mechanism diagnostics require the official raw teacher "
+                "with same-prior and joint-continuation endpoints"
+            )
+        self._validate_cosmos_mechanism_teacher_band(
+            getattr(self.config, "mechanism_cosmos_t_min", 4.0 / 5.0),
+            getattr(self.config, "mechanism_cosmos_t_max", 80.0 / 81.0),
+        )
+
+    def _cosmos_teacher_field_probe(
+        self,
+        *,
+        teacher,
+        batch,
+        query_latent,
+        query_action,
+        t_norm,
+        raw_video_t,
+        raw_video_r,
+        raw_action_t,
+        raw_action_r,
+        context,
+    ):
+        """Query the raw worker, then route its post-injection state to student."""
+        calibrated_min, calibrated_max = 4.0 / 5.0, 80.0 / 81.0
+        if not bool(
+            ((t_norm >= calibrated_min) & (t_norm <= calibrated_max)).all()
+        ):
+            raise ValueError(
+                "Cosmos mechanism field query must stay in the calibrated band"
+            )
+        teacher_result = teacher.predict_raw_joint_latent_velocity(
+            batch,
+            query_latent=query_latent.float(),
+            query_action=query_action,
+            t=t_norm.detach().float(),
+        )
+        student_query_video = teacher_result["cosmos_joint_query"].to(
+            device=query_latent.device, dtype=query_latent.dtype
+        )
+        teacher_field_video = teacher_result["cosmos_latent_velocity"].to(
+            device=query_latent.device, dtype=query_latent.dtype
+        )
+        video_frame_mask = teacher_result["cosmos_video_frame_mask"].to(
+            device=query_latent.device, dtype=torch.bool
+        )
+        (
+            student_direct_video,
+            student_direct_action,
+            student_field_video,
+            student_action_field,
+        ) = self._cosmos_student_joint_map(
+            student_query_video,
+            query_action,
+            raw_video_t,
+            raw_action_t,
+            raw_video_r,
+            raw_action_r,
+            context=context,
+        )
+        return {
+            "student_query_video": student_query_video,
+            "teacher_field_video": teacher_field_video,
+            "video_frame_mask": video_frame_mask,
+            "student_direct_video": student_direct_video,
+            "student_direct_action": student_direct_action,
+            "student_field_video": student_field_video,
+            "student_action_field": student_action_field,
+        }
+
+    def _cosmos_teacher_video_continuation(
+        self,
+        *,
+        teacher,
+        batch,
+        start_video,
+        held_action,
+        t_min,
+        t_max,
+        teacher_steps,
+    ):
+        """Integrate only the supported teacher video field with held action."""
+        t_min, t_max = self._validate_cosmos_mechanism_teacher_band(
+            t_min, t_max
+        )
+        teacher_steps = int(teacher_steps)
+        if teacher_steps <= 0:
+            raise ValueError("Cosmos mechanism teacher_steps must be positive")
+        path = torch.linspace(
+            t_max,
+            t_min,
+            teacher_steps + 1,
+            device=start_video.device,
+            dtype=torch.float32,
+        )
+        current = start_video
+        for index in range(teacher_steps):
+            current_t = torch.full(
+                (start_video.shape[0], start_video.shape[2]),
+                float(path[index].item()),
+                device=start_video.device,
+            )
+            result = teacher.predict_raw_joint_latent_velocity(
+                batch,
+                query_latent=current.float(),
+                query_action=held_action,
+                t=current_t,
+            )
+            joint_query = result["cosmos_joint_query"].to(
+                device=start_video.device, dtype=start_video.dtype
+            )
+            velocity = result["cosmos_latent_velocity"].to(
+                device=start_video.device, dtype=start_video.dtype
+            )
+            current = joint_query + velocity * (
+                path[index + 1].to(velocity) - path[index].to(velocity)
+            )
+        return current
+
+    def _cosmos_teacher_direct_endpoint(
+        self,
+        *,
+        start_video,
+        teacher_field_video,
+        t_min,
+        t_max,
+    ):
+        """Take the direct teacher Euler route over the same calibrated interval."""
+        t_min, t_max = self._validate_cosmos_mechanism_teacher_band(
+            t_min, t_max
+        )
+        return start_video + teacher_field_video * (t_min - t_max)
+
+    @torch.no_grad()
+    def _run_cosmos_mechanism_probe_legacy(
+        self, batch, *, seed, teacher_steps, student_steps
+    ):
+        """Return additive Cosmos-native mechanism statistics without training."""
+        teacher_steps = int(teacher_steps)
+        student_steps = int(student_steps)
+        self._validate_cosmos_mechanism_preflight(
+            batch, teacher_steps=teacher_steps, student_steps=student_steps
+        )
+        dataset_gt_video = batch["latents"].detach().clone()
+        context = self._prepare_cosmos_mechanism_context(batch)
+        batch = context["batch"]
+        teacher = self._action_teacher_model
+        if not (
+            getattr(teacher, "raw_inference_enabled", False)
+            and hasattr(teacher, "predict_raw_latent_target")
+            and hasattr(teacher, "predict_raw_joint_latent_velocity")
+        ):
+            raise RuntimeError(
+                "Cosmos mechanism diagnostics require the official raw teacher"
+            )
+        t_min, t_max = self._validate_cosmos_mechanism_teacher_band(
+            getattr(self.config, "mechanism_cosmos_t_min", 4.0 / 5.0),
+            getattr(self.config, "mechanism_cosmos_t_max", 80.0 / 81.0),
+        )
+        B = context["batch_size"]
+        video_frames = context["ref_shape"][2]
+        action_frames = context["action_frames"]
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(int(seed))
+        video_noise = torch.randn(
+            context["ref_shape"],
+            device=self.device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        native_action_prior = torch.randn(
+            B,
+            16,
+            7,
+            device=self.device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        action_channels = int(batch["actions"].shape[1])
+        used_action_channel_ids = torch.as_tensor(
+            self.config.used_action_channel_ids,
+            device=self.device,
+            dtype=torch.long,
+        )
+        if (
+            used_action_channel_ids.numel() != 7
+            or int(used_action_channel_ids.min().item()) < 0
+            or int(used_action_channel_ids.max().item()) >= action_channels
+        ):
+            raise ValueError(
+                "Cosmos mechanism diagnostics require seven valid action "
+                "channel IDs"
+            )
+        aligned_action_prior = torch.zeros(
+            B,
+            16,
+            action_channels,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        aligned_action_prior[..., used_action_channel_ids] = native_action_prior
+        action_downsample = int(self.config.action_downsample_factor)
+        full_action_prior = pack_actions_for_downsample(
+            aligned_action_prior,
+            tuple(batch["actions"].shape),
+            downsample_factor=action_downsample,
+            schema=self.config.action_packing_schema,
+        )
+        action_noise = full_action_prior[:, :, ::action_downsample]
+        t_max_norm = torch.full(
+            (B, video_frames), t_max, device=self.device, dtype=torch.float32
+        )
+        t_min_norm = torch.full_like(t_max_norm, t_min)
+        endpoint_result = teacher.predict_raw_latent_target(
+            batch,
+            noise=video_noise,
+            t=t_max_norm,
+            r=t_min_norm,
+            epsilon=float(self.config.cosmos_latent_epsilon),
+            include_cdiff=False,
+        )
+        teacher_clean_video = endpoint_result["cosmos_latent_x0"].to(
+            device=self.device, dtype=batch["latents"].dtype
+        )
+        teacher_endpoint_action_full = cosmos_actions_to_flowmap_x0(
+            endpoint_result["actions"],
+            target_shape=tuple(batch["actions"].shape),
+            q01=self.config.norm_stat["q01"],
+            q99=self.config.norm_stat["q99"],
+            inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
+            device=self.device,
+            dtype=batch["actions"].dtype,
+            packing_schema=self.config.action_packing_schema,
+            downsample_factor=self.config.action_downsample_factor,
+        )
+        teacher_endpoint_action = teacher_endpoint_action_full[
+            :, :, ::action_downsample
+        ]
+
+        # The mechanism routes depart from one Student-reached z_r generated
+        # from the exact terminal priors later supplied to the same-prior
+        # Teacher endpoint.
+        terminal_video_t = torch.full(
+            (B, video_frames),
+            float(self.config.num_train_timesteps),
+            device=self.device,
+        )
+        raw_t_max = t_max_norm * self.config.num_train_timesteps
+        raw_t_min = t_min_norm * self.config.num_train_timesteps
+        terminal_action_t = torch.full(
+            (B, batch["actions"].shape[2]),
+            float(self.config.num_train_timesteps),
+            device=self.device,
+        )
+        full_action_t_max = torch.full_like(
+            terminal_action_t, t_max * self.config.num_train_timesteps
+        )
+        raw_action_t_max = torch.full(
+            (B, action_frames),
+            t_max * self.config.num_train_timesteps,
+            device=self.device,
+        )
+        raw_action_t_min = torch.full_like(
+            raw_action_t_max, t_min * self.config.num_train_timesteps
+        )
+        deployment_input = {
+            "latent_dict": {
+                **context["input_dict"]["latent_dict"],
+                "latent": video_noise,
+                "noisy_latents": video_noise,
+                "timesteps": terminal_video_t,
+            },
+            "action_dict": {
+                **context["input_dict"]["action_dict"],
+                "noisy_latents": action_noise,
+                "latent": action_noise,
+                "timesteps": terminal_action_t[:, ::action_downsample],
+                "cond_timesteps": context["action_cond_t"],
+                "grid_id": context["action_grid"],
+                "actions_mask": context["action_mask"],
+            },
+            "chunk_size": context["chunk_size"],
+            "window_size": context["window_size"],
+        }
+        deployment_result = self._student_euler_integrate(
+            noisy_latents=video_noise,
+            timesteps=terminal_video_t,
+            target_r=raw_t_max,
+            base_input_dict=deployment_input,
+            empty_emb=context["empty_emb"],
+            cfg_scale=context["cfg_scale"],
+            ref_shape=context["ref_shape"],
+            B=B,
+            num_frames=video_frames,
+            K_steps=student_steps,
+            action_target_r=full_action_t_max,
+            return_final_action=True,
+            return_final_action_state=True,
+            force_no_grad=True,
+        )
+        shared_student_video = deployment_result[0].detach()
+        shared_student_action = deployment_result[3].detach()
+        field_result = self._cosmos_teacher_field_probe(
+            teacher=teacher,
+            batch=batch,
+            query_latent=shared_student_video,
+            query_action=shared_student_action,
+            t_norm=t_max_norm,
+            raw_video_t=raw_t_max,
+            raw_video_r=raw_t_min,
+            raw_action_t=raw_action_t_max,
+            raw_action_r=raw_action_t_min,
+            context=context,
+        )
+        joint_video = field_result["student_query_video"]
+        teacher_field_video = field_result["teacher_field_video"]
+        video_frame_mask = field_result["video_frame_mask"]
+        student_direct_video = field_result["student_direct_video"]
+        student_field_video = field_result["student_field_video"]
+        expanded_mask = video_frame_mask[:, None, :, None, None].expand_as(
+            joint_video
+        )
+        shared_state_verified = torch.equal(
+            joint_video.masked_select(expanded_mask),
+            shared_student_video.to(joint_video).masked_select(expanded_mask),
+        )
+        if not shared_state_verified:
+            raise RuntimeError(
+                "Cosmos mechanism Teacher canonicalization changed valid "
+                "shared Student-state frames"
+            )
+        same_prior_result = teacher.predict_raw_same_prior_endpoint(
+            batch,
+            video_prior=video_noise,
+            action_prior=native_action_prior,
+            teacher_steps=teacher_steps,
+        )
+        required_same_prior = (
+            "endpoint_video",
+            "video_frame_mask",
+            "effective_teacher_steps",
+            "video_prior_sha256",
+            "action_prior_sha256",
+        )
+        if not all(key in same_prior_result for key in required_same_prior):
+            raise RuntimeError(
+                "Cosmos mechanism same-prior Teacher response is incomplete"
+            )
+        same_prior_teacher_endpoint_video = same_prior_result[
+            "endpoint_video"
+        ].to(device=self.device, dtype=joint_video.dtype)
+        same_prior_mask = same_prior_result["video_frame_mask"].to(
+            device=self.device, dtype=torch.bool
+        )
+        effective_teacher_steps = same_prior_result["effective_teacher_steps"]
+        same_prior_verified = (
+            same_prior_teacher_endpoint_video.shape == joint_video.shape
+            and same_prior_mask.shape == video_frame_mask.shape
+            and torch.equal(same_prior_mask, video_frame_mask)
+            and type(effective_teacher_steps) is int
+            and effective_teacher_steps == 8
+        )
+        if not same_prior_verified:
+            raise RuntimeError(
+                "Cosmos mechanism same-prior endpoint shape, mask, or "
+                "effective eight-step contract mismatch"
+            )
+        midpoint = (t_min + t_max) / 2.0
+        raw_mid_video = torch.full_like(
+            raw_t_max, midpoint * self.config.num_train_timesteps
+        )
+        raw_mid_action = torch.full_like(
+            raw_action_t_max, midpoint * self.config.num_train_timesteps
+        )
+        mid_video, mid_action, _, _ = self._cosmos_student_joint_map(
+            joint_video,
+            shared_student_action,
+            raw_t_max,
+            raw_action_t_max,
+            raw_mid_video,
+            raw_mid_action,
+            context=context,
+        )
+        student_composed_video, _, _, _ = self._cosmos_student_joint_map(
+            mid_video,
+            mid_action,
+            raw_mid_video,
+            raw_mid_action,
+            raw_t_min,
+            raw_action_t_min,
+            context=context,
+        )
+        teacher_cont_video = self._cosmos_teacher_video_continuation(
+            teacher=teacher,
+            batch=batch,
+            start_video=joint_video,
+            held_action=shared_student_action,
+            t_min=t_min,
+            t_max=t_max,
+            teacher_steps=teacher_steps,
+        )
+
+        diagnostic_r = float(getattr(self.config, "mechanism_diagnostic_r", 500))
+        common_action = (
+            (1.0 - diagnostic_r / self.config.num_train_timesteps)
+            * teacher_endpoint_action
+            + (diagnostic_r / self.config.num_train_timesteps) * action_noise
+        )
+        action_t = torch.full(
+            (B, action_frames), diagnostic_r, device=self.device
+        )
+        diagnostic_s = float(getattr(self.config, "mechanism_diagnostic_s", 250))
+        action_s = torch.full(
+            (B, action_frames), diagnostic_s, device=self.device
+        )
+        action_predictions = self._cosmos_action_context_predictions(
+            {
+                "gt": dataset_gt_video,
+                "student": student_direct_video,
+                "teacher_video": teacher_clean_video,
+            },
+            common_action=common_action,
+            action_t=action_t,
+            action_s=action_s,
+            context=context,
+        )
+        samples = compute_mechanism_metric_samples(
+            teacher_continuation_video=teacher_cont_video,
+            same_prior_teacher_endpoint_video=(
+                same_prior_teacher_endpoint_video
+            ),
+            direct_route_video=student_direct_video,
+            composed_route_video=student_composed_video,
+            student_field_video=student_field_video,
+            teacher_field_video=teacher_field_video,
+            video_frame_mask=video_frame_mask,
+            teacher_endpoint_action=teacher_endpoint_action,
+            action_gt_context=action_predictions["gt"],
+            action_student_context=action_predictions["student"],
+            action_teacher_video_context=action_predictions["teacher_video"],
+            action_teacher_joint_context=None,
+            action_mask=context["action_mask"],
+            teacher_joint_available=False,
+            shared_state_verified=shared_state_verified,
+            same_prior_verified=same_prior_verified,
+            effective_teacher_steps=effective_teacher_steps,
+        )
+        stats = pack_finite_metric_stats(samples)
+        stats["mechanism/teacher_steps_sum"] = torch.as_tensor(
+            float(teacher_steps * B), device=self.device
+        )
+        stats["mechanism/teacher_steps_count"] = torch.as_tensor(
+            float(B), device=self.device
+        )
+        stats["mechanism/student_steps_sum"] = torch.as_tensor(
+            float(student_steps * B), device=self.device
+        )
+        stats["mechanism/student_steps_count"] = torch.as_tensor(
+            float(B), device=self.device
+        )
+        return {name: value.detach() for name, value in stats.items()}
+
+    @torch.no_grad()
+    def _run_cosmos_mechanism_probe(
+        self, batch, *, seed, teacher_steps, student_steps
+    ):
+        """Run aligned observation-only G metrics from one shifted Student z_r."""
+        teacher_steps = int(teacher_steps)
+        student_steps = int(student_steps)
+        self._validate_cosmos_mechanism_preflight(
+            batch, teacher_steps=teacher_steps, student_steps=student_steps
+        )
+        dataset_gt_video = batch["latents"].detach().clone()
+        context = self._prepare_cosmos_mechanism_context(batch)
+        batch = context["batch"]
+        teacher = self._action_teacher_model
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(int(seed))
+        shared = self._build_cosmos_shifted_shared_query(
+            batch,
+            context["input_dict"],
+            student_steps=student_steps,
+            generator=generator,
+            student_model=context["student_model"],
+            cfg_scale=context["cfg_scale"],
+        )
+        query_video = shared["query_video"]
+        query_action = shared["query_action"]
+        query_video_t = shared["query_video_t"]
+        query_action_t = shared["query_action_t"]
+        query_sigma_frames = shared["query_sigma_frames"]
+
+        field_result = teacher.predict_raw_joint_latent_velocity(
+            batch,
+            query_latent=query_video.float(),
+            query_action=query_action,
+            t=query_sigma_frames.float(),
+        )
+        required_field = (
+            "cosmos_joint_query",
+            "cosmos_latent_velocity",
+            "cosmos_video_frame_mask",
+        )
+        if not all(key in field_result for key in required_field):
+            raise RuntimeError(
+                "Cosmos mechanism same-state Teacher response is incomplete"
+            )
+        canonical_video = field_result["cosmos_joint_query"].to(
+            device=self.device, dtype=query_video.dtype
+        ).detach()
+        teacher_field_video = field_result["cosmos_latent_velocity"].to(
+            device=self.device, dtype=canonical_video.dtype
+        ).detach()
+        video_frame_mask = field_result["cosmos_video_frame_mask"].to(
+            device=self.device, dtype=torch.bool
+        )
+        shape_ok = (
+            canonical_video.shape == query_video.shape
+            and teacher_field_video.shape == canonical_video.shape
+            and video_frame_mask.shape
+            == (shared["batch_size"], canonical_video.shape[2])
+            and bool(video_frame_mask.any(dim=1).all().item())
+        )
+        if not shape_ok:
+            raise RuntimeError(
+                "Cosmos mechanism canonical state, field, or nonempty mask "
+                "contract mismatch"
+            )
+        expanded_mask = video_frame_mask[:, None, :, None, None].expand_as(
+            canonical_video
+        )
+        shared_state_verified = torch.equal(
+            canonical_video.masked_select(expanded_mask),
+            query_video.to(canonical_video).masked_select(expanded_mask),
+        )
+        if not shared_state_verified:
+            raise RuntimeError(
+                "Cosmos mechanism canonical valid frames differ from shared z_r"
+            )
+
+        same_prior_result = teacher.predict_raw_same_prior_endpoint(
+            batch,
+            video_prior=shared["video_prior"],
+            action_prior=shared["native_action_prior"],
+            teacher_steps=teacher_steps,
+        )
+        required_same_prior = (
+            "endpoint_video",
+            "video_frame_mask",
+            "effective_teacher_steps",
+            "video_prior_sha256",
+            "action_prior_sha256",
+        )
+        if not all(key in same_prior_result for key in required_same_prior):
+            raise RuntimeError(
+                "Cosmos mechanism same-prior Teacher response is incomplete"
+            )
+        same_prior_endpoint = same_prior_result["endpoint_video"].to(
+            device=self.device, dtype=canonical_video.dtype
+        ).detach()
+        same_prior_mask = same_prior_result["video_frame_mask"].to(
+            device=self.device, dtype=torch.bool
+        )
+        same_prior_steps = same_prior_result["effective_teacher_steps"]
+        same_prior_verified = (
+            same_prior_endpoint.shape == canonical_video.shape
+            and same_prior_mask.shape == video_frame_mask.shape
+            and bool(same_prior_mask.any(dim=1).all().item())
+            and torch.equal(same_prior_mask, video_frame_mask)
+            and type(same_prior_steps) is int
+            and same_prior_steps == 8
+        )
+        if not same_prior_verified:
+            raise RuntimeError(
+                "Cosmos mechanism same-prior mask or observed eight-step "
+                "provenance mismatch"
+            )
+
+        normalized_action_clock = query_action_t / float(
+            self.config.num_train_timesteps
+        )
+        video_clock_per_sample = query_sigma_frames[:, :1]
+        action_clock_per_sample = normalized_action_clock[:, :1]
+        if not torch.equal(
+            query_sigma_frames,
+            video_clock_per_sample.expand_as(query_sigma_frames),
+        ):
+            raise RuntimeError(
+                "Cosmos mechanism video clock differs across frames"
+            )
+        if not torch.equal(
+            normalized_action_clock,
+            action_clock_per_sample.expand_as(normalized_action_clock),
+        ):
+            raise RuntimeError(
+                "Cosmos mechanism action clock differs across frames"
+            )
+        anchor_available = torch.equal(
+            video_clock_per_sample, action_clock_per_sample
+        )
+        mixed_clock = not anchor_available
+        teacher_continuation = None
+        continuation_steps = None
+        continuation_verified = False
+        if anchor_available:
+            continuation_result = (
+                teacher.predict_raw_joint_continuation_endpoint(
+                    batch,
+                    canonical_joint_state=canonical_video.float(),
+                    normalized_t=query_sigma_frames.float(),
+                    teacher_steps=teacher_steps,
+                )
+            )
+            required_continuation = (
+                "endpoint_video",
+                "video_frame_mask",
+                "effective_teacher_steps",
+                "joint_state_sha256",
+                "normalized_t_sha256",
+                "normalized_t",
+                "edm_sigma",
+            )
+            if not all(
+                key in continuation_result for key in required_continuation
+            ):
+                raise RuntimeError(
+                    "Cosmos mechanism continuation Teacher response is "
+                    "incomplete"
+                )
+            teacher_continuation = continuation_result["endpoint_video"].to(
+                device=self.device, dtype=canonical_video.dtype
+            ).detach()
+            continuation_mask = continuation_result["video_frame_mask"].to(
+                device=self.device, dtype=torch.bool
+            )
+            continuation_steps = continuation_result[
+                "effective_teacher_steps"
+            ]
+            continuation_verified = (
+                teacher_continuation.shape == canonical_video.shape
+                and continuation_mask.shape == video_frame_mask.shape
+                and bool(continuation_mask.any(dim=1).all().item())
+                and torch.equal(continuation_mask, video_frame_mask)
+                and type(continuation_steps) is int
+                and continuation_steps == 8
+            )
+            if not continuation_verified:
+                raise RuntimeError(
+                    "Cosmos mechanism continuation mask or observed "
+                    "eight-step provenance mismatch"
+                )
+
+        route_context = shared["joint_context"](canonical_video, query_action)
+        field_input = self._mechanism_joint_input(
+            canonical_video,
+            query_action,
+            query_video_t,
+            query_action_t,
+            route_context,
+        )
+        self._init_joint_mask(field_input)
+        student_field_video = self._student_joint_forward(
+            route_context["student_model"],
+            field_input,
+            route_context["empty_emb"],
+            query_video_t,
+            query_action_t,
+            cfg_scale=route_context["cfg_scale"],
+            batch_size=route_context["batch_size"],
+            ref_shape=route_context["ref_shape"],
+            require_action=False,
+        )
+
+        zero_video_t = torch.zeros_like(query_video_t)
+        zero_action_t = torch.zeros_like(query_action_t)
+        direct_video, _, _, _ = self._cosmos_student_joint_map(
+            canonical_video,
+            query_action,
+            query_video_t,
+            query_action_t,
+            zero_video_t,
+            zero_action_t,
+            context=route_context,
+        )
+        diagnostic_s = float(
+            getattr(self.config, "mechanism_diagnostic_s", 250.0)
+        )
+        composed_video_s = torch.full_like(query_video_t, diagnostic_s)
+        if not bool(
+            ((composed_video_s >= 0) & (composed_video_s < query_video_t)).all()
+        ):
+            raise ValueError(
+                "mechanism diagnostic s must satisfy 0 <= s < every shared r"
+            )
+        action_fraction = (
+            composed_video_s[:, :1] / query_video_t[:, :1]
+        )
+        composed_action_s = query_action_t * action_fraction
+        mid_video, mid_action, _, _ = self._cosmos_student_joint_map(
+            canonical_video,
+            query_action,
+            query_video_t,
+            query_action_t,
+            composed_video_s,
+            composed_action_s,
+            context=route_context,
+        )
+        mid_context = shared["joint_context"](mid_video, mid_action)
+        composed_video, _, _, _ = self._cosmos_student_joint_map(
+            mid_video,
+            mid_action,
+            composed_video_s,
+            composed_action_s,
+            zero_video_t,
+            zero_action_t,
+            context=mid_context,
+        )
+
+        # Legacy target inference remains isolated to action-context sanity
+        # metrics and cannot affect either G input.
+        legacy_t = torch.full_like(query_sigma_frames, 80.0 / 81.0)
+        legacy_r = torch.full_like(query_sigma_frames, 4.0 / 5.0)
+        legacy_target = teacher.predict_raw_latent_target(
+            batch,
+            noise=shared["video_prior"],
+            t=legacy_t,
+            r=legacy_r,
+            epsilon=float(self.config.cosmos_latent_epsilon),
+            include_cdiff=False,
+        )
+        teacher_clean_video = legacy_target["cosmos_latent_x0"].to(
+            device=self.device, dtype=batch["latents"].dtype
+        )
+        teacher_endpoint_action_full = cosmos_actions_to_flowmap_x0(
+            legacy_target["actions"],
+            target_shape=tuple(batch["actions"].shape),
+            q01=self.config.norm_stat["q01"],
+            q99=self.config.norm_stat["q99"],
+            inverse_used_action_channel_ids=(
+                self.config.inverse_used_action_channel_ids
+            ),
+            device=self.device,
+            dtype=batch["actions"].dtype,
+            packing_schema=self.config.action_packing_schema,
+            downsample_factor=self.config.action_downsample_factor,
+        )
+        action_downsample = int(self.config.action_downsample_factor)
+        teacher_endpoint_action = teacher_endpoint_action_full[
+            :, :, ::action_downsample
+        ]
+        diagnostic_r = float(
+            getattr(self.config, "mechanism_diagnostic_r", 500.0)
+        )
+        action_t = torch.full(
+            (shared["batch_size"], shared["action_frame_count"]),
+            diagnostic_r,
+            device=self.device,
+        )
+        action_s = torch.full_like(action_t, diagnostic_s)
+        action_predictions = self._cosmos_action_context_predictions(
+            {
+                "gt": dataset_gt_video,
+                "student": direct_video,
+                "teacher_video": teacher_clean_video,
+            },
+            common_action=query_action,
+            action_t=action_t,
+            action_s=action_s,
+            context=context,
+        )
+        samples = compute_mechanism_metric_samples(
+            teacher_continuation_video=teacher_continuation,
+            same_prior_teacher_endpoint_video=same_prior_endpoint,
+            direct_route_video=direct_video,
+            composed_route_video=composed_video,
+            student_field_video=student_field_video,
+            teacher_field_video=teacher_field_video,
+            video_frame_mask=video_frame_mask,
+            teacher_endpoint_action=teacher_endpoint_action,
+            action_gt_context=action_predictions["gt"],
+            action_student_context=action_predictions["student"],
+            action_teacher_video_context=action_predictions["teacher_video"],
+            action_teacher_joint_context=None,
+            action_mask=context["action_mask"],
+            teacher_joint_available=False,
+            shared_state_verified=shared_state_verified,
+            same_prior_verified=same_prior_verified,
+            continuation_verified=continuation_verified,
+            effective_teacher_steps=continuation_steps,
+            anchor_available=anchor_available,
+            anchor_unavailable_mixed_clock=mixed_clock,
+        )
+        stats = pack_finite_metric_stats(samples)
+        batch_size = shared["batch_size"]
+        for name, value in (
+            ("teacher_steps", same_prior_steps),
+            ("student_steps", shared["student_steps"]),
+        ):
+            stats[f"mechanism/{name}_sum"] = torch.as_tensor(
+                float(value * batch_size), device=self.device
+            )
+            stats[f"mechanism/{name}_count"] = torch.as_tensor(
+                float(batch_size), device=self.device
+            )
+        return {name: value.detach() for name, value in stats.items()}
 
     def _cosmos_danceopd_velocity_loss(
         self,
@@ -4020,7 +5340,7 @@ class FlowMapStepMixin:
     ):
         """Return DanceOPD's local video-field loss for a raw Cosmos teacher.
 
-        The rollout trajectory jointly evolves the student video and action
+        The configured trajectory jointly evolves the student video and action
         states, but the official Cosmos API only exposes a video latent field.
         Thus the local loss supervises the video field at a state conditioned
         on the on-policy action state instead of fabricating an action field.
@@ -4034,30 +5354,39 @@ class FlowMapStepMixin:
         if action_frames <= 0:
             raise ValueError("Cosmos DanceOPD requires action frames after downsampling")
 
-        effective_rollout_steps = (
-            int(rollout_steps)
-            if rollout_steps is not None
-            else int(getattr(self.config, 'opd_danceopd_rollout_steps', 16))
-        )
+        if rollout_steps is None:
+            rollout_step_choices = tuple(
+                int(value)
+                for value in getattr(
+                    self.config,
+                    'opd_danceopd_rollout_step_choices',
+                    (getattr(self.config, 'opd_danceopd_rollout_steps', 4),),
+                )
+            )
+            if (
+                not rollout_step_choices
+                or any(value <= 0 for value in rollout_step_choices)
+            ):
+                raise ValueError(
+                    'opd_danceopd_rollout_step_choices must be positive'
+                )
+            if len(rollout_step_choices) == 1:
+                effective_rollout_steps = rollout_step_choices[0]
+            else:
+                choice_index = torch.randint(
+                    len(rollout_step_choices), (1,), device=self.device
+                )
+                if dist.is_initialized():
+                    dist.broadcast(choice_index, src=0)
+                effective_rollout_steps = rollout_step_choices[
+                    choice_index.item()
+                ]
+        else:
+            effective_rollout_steps = int(rollout_steps)
         if effective_rollout_steps <= 0:
             raise ValueError("Cosmos DanceOPD rollout steps must be positive")
         query_alpha = float(getattr(self.config, 'opd_danceopd_query_alpha', 5.0))
         query_beta = float(getattr(self.config, 'opd_danceopd_query_beta', 2.0))
-
-        terminal_video_t = torch.full(
-            (B, video_frames),
-            float(self.config.num_train_timesteps),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        terminal_action_t = torch.full(
-            (B, action_frames),
-            float(self.config.num_train_timesteps),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        zero_video_t = torch.zeros_like(terminal_video_t)
-        zero_action_t = torch.zeros_like(terminal_action_t)
         full_dance_noise = None
         if teacher_crop_context is None:
             video_noise = torch.randn_like(batch['latents'])
@@ -4069,32 +5398,106 @@ class FlowMapStepMixin:
                 ..., teacher_crop_context['h_slice'], teacher_crop_context['w_slice']
             ].to(batch['latents'])
         action_noise = torch.randn_like(action_clean)
-        current_video = self.train_scheduler_latent.add_noise(
-            batch['latents'], video_noise, terminal_video_t, t_dim=2
-        )
-        current_action = self.train_scheduler_action.add_noise(
-            action_clean, action_noise, terminal_action_t, t_dim=2
-        )
-        terminal_prior_error = torch.maximum(
-            (current_video.float() - video_noise.float()).abs().amax(),
-            (current_action.float() - action_noise.float()).abs().amax(),
-        )
-        if (
-            bool(getattr(self.config, 'opd_danceopd_verify_terminal_prior', True))
-            and terminal_prior_error.detach().item() > float(getattr(
-                self.config, 'opd_danceopd_terminal_prior_tolerance', 1e-6
-            ))
-        ):
-            raise RuntimeError(
-                "Cosmos DanceOPD terminal state is not pure scheduler noise: "
-                f"max_error={terminal_prior_error.detach().item():.3e}"
+        if append_post_update_terminal:
+            terminal_video_t = torch.full(
+                (B, video_frames),
+                float(self.config.num_train_timesteps),
+                device=self.device,
+                dtype=torch.float32,
             )
-
-        video_path = self._build_timestep_path(
-            terminal_video_t, zero_video_t, effective_rollout_steps
-        )
-        action_path = self._build_timestep_path(
-            terminal_action_t, zero_action_t, effective_rollout_steps
+            terminal_action_t = torch.full(
+                (B, action_frames),
+                float(self.config.num_train_timesteps),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            zero_video_t = torch.zeros_like(terminal_video_t)
+            zero_action_t = torch.zeros_like(terminal_action_t)
+            current_video = self.train_scheduler_latent.add_noise(
+                batch['latents'], video_noise, terminal_video_t, t_dim=2
+            )
+            current_action = self.train_scheduler_action.add_noise(
+                action_clean, action_noise, terminal_action_t, t_dim=2
+            )
+            expected_video_start = video_noise
+            expected_action_start = action_noise
+            video_path = self._build_timestep_path(
+                terminal_video_t, zero_video_t, effective_rollout_steps
+            )
+            action_path = self._build_timestep_path(
+                terminal_action_t, zero_action_t, effective_rollout_steps
+            )
+            prior_error_context = (
+                "Cosmos DanceOPD terminal state is not pure scheduler noise"
+            )
+        else:
+            cosmos_t_min = float(
+                getattr(self.config, 'cosmos_latent_t_min', 4.0 / 5.0)
+            )
+            cosmos_t_max = float(
+                getattr(self.config, 'cosmos_latent_t_max', 80.0 / 81.0)
+            )
+            video_path = build_cosmos_teacher_window_path(
+                batch_size=B,
+                num_frames=video_frames,
+                num_steps=effective_rollout_steps,
+                t_min=cosmos_t_min,
+                t_max=cosmos_t_max,
+                num_train_timesteps=self.config.num_train_timesteps,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            action_path = build_cosmos_teacher_window_path(
+                batch_size=B,
+                num_frames=action_frames,
+                num_steps=effective_rollout_steps,
+                t_min=cosmos_t_min,
+                t_max=cosmos_t_max,
+                num_train_timesteps=self.config.num_train_timesteps,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            video_start_sigma = self._timestep_to_sigma_5d(
+                video_path[0]
+            ).to(batch['latents'])
+            action_start_sigma = self._timestep_to_sigma_5d(
+                action_path[0]
+            ).to(action_clean)
+            # Raw Cosmos velocity uses x_t=(1-t)x0+t*noise. Keep the teacher
+            # query rollout inside the validated raw-teacher time band.
+            current_video = (
+                (1.0 - video_start_sigma) * batch['latents']
+                + video_start_sigma * video_noise
+            )
+            current_action = (
+                (1.0 - action_start_sigma) * action_clean
+                + action_start_sigma * action_noise
+            )
+            expected_video_start = (
+                (1.0 - video_start_sigma) * batch['latents']
+                + video_start_sigma * video_noise
+            )
+            expected_action_start = (
+                (1.0 - action_start_sigma) * action_clean
+                + action_start_sigma * action_noise
+            )
+            prior_error_context = (
+                "Cosmos DanceOPD window start state is inconsistent with "
+                "the raw-teacher interpolation"
+            )
+        (
+            terminal_prior_validation,
+            terminal_prior_diagnostics,
+        ) = _validate_terminal_prior_pair(
+            config=self.config,
+            video_actual=current_video,
+            video_expected=expected_video_start,
+            video_source_dtype=batch["latents"].dtype,
+            action_actual=current_action,
+            action_expected=expected_action_start,
+            action_source_dtype=action_clean.dtype,
+            reference=current_video,
+            error_context=prior_error_context,
         )
         action_base = input_dict['action_dict']
         action_grid_id = _downsample_action_grid_id(
@@ -4104,73 +5507,21 @@ class FlowMapStepMixin:
         if action_mask is not None:
             action_mask = action_mask[:, :, ::action_downsample]
 
-        def _build_joint_input(video_x, video_t, action_x, action_t):
-            action_dict = {
-                'noisy_latents': action_x,
-                'latent': action_base['latent'][:, :, ::action_downsample],
-                'timesteps': action_t,
-                'cond_timesteps': action_base['cond_timesteps'][:, ::action_downsample],
-                'text_emb': action_base['text_emb'],
-            }
-            if action_grid_id is not None:
-                action_dict['grid_id'] = action_grid_id
-            if action_mask is not None:
-                action_dict['actions_mask'] = action_mask
-            return {
-                'latent_dict': {
-                    **input_dict['latent_dict'],
-                    'noisy_latents': video_x,
-                    'timesteps': video_t,
-                },
-                'action_dict': action_dict,
-                'chunk_size': input_dict['chunk_size'],
-                'window_size': input_dict['window_size'],
-            }
-
-        def _init_joint_mask(joint_input):
-            from modules.model import FlexAttnFunc
-
-            latent_dict = joint_input['latent_dict']
-            action_dict = joint_input['action_dict']
-            total_length = (
-                latent_dict['noisy_latents'].flatten(0, 1).shape[0] * 2
-                + action_dict['noisy_latents'].flatten(0, 1).shape[0] * 2
-            )
-            padded_length = (128 - total_length % 128) % 128
-            FlexAttnFunc.init_mask(
-                latent_dict['noisy_latents'].shape,
-                action_dict['noisy_latents'].shape,
-                padded_length,
-                joint_input['chunk_size'],
-                window_size=joint_input['window_size'],
-                patch_size=self.patch_size,
-                device=self.device,
-            )
-
-        def _student_joint_forward(joint_input, video_r_t, action_r_t, *, return_action):
-            saved_blocks = None
-            if getattr(self, '_student_blocks_compiled', False):
-                saved_blocks = list(self.student.blocks)
-                for block_index, block in enumerate(saved_blocks):
-                    if hasattr(block, '_orig_mod'):
-                        self.student.blocks[block_index] = block._orig_mod
-            try:
-                return self._student_cfg_forward(
-                    self.student,
-                    joint_input,
-                    self.empty_emb.expand(B, -1, -1),
-                    cfg_scale,
-                    B,
-                    ref_shape,
-                    video_r_t,
-                    action_r_t,
-                    force_cfg=True,
-                    return_action=return_action,
-                )
-            finally:
-                if saved_blocks is not None:
-                    for block_index, block in enumerate(saved_blocks):
-                        self.student.blocks[block_index] = block
+        joint_context = {
+            "video_base": input_dict["latent_dict"],
+            "action_latent": action_base["latent"][:, :, ::action_downsample],
+            "action_cond_t": action_base["cond_timesteps"][:, ::action_downsample],
+            "action_text": action_base["text_emb"],
+            "action_grid": action_grid_id,
+            "action_mask": action_mask,
+            "chunk_size": input_dict["chunk_size"],
+            "window_size": input_dict["window_size"],
+            "student_model": self.student,
+            "empty_emb": self.empty_emb.expand(B, -1, -1),
+            "cfg_scale": cfg_scale,
+            "batch_size": B,
+            "ref_shape": ref_shape,
+        }
 
         video_states = []
         action_states = []
@@ -4193,12 +5544,20 @@ class FlowMapStepMixin:
                 video_timesteps.append(video_t.detach().clone())
                 action_timesteps.append(action_t.detach().clone())
 
-                joint_input = _build_joint_input(
-                    current_video, video_t, current_action, action_t
+                joint_input = self._mechanism_joint_input(
+                    current_video, current_action, video_t, action_t, joint_context
                 )
-                _init_joint_mask(joint_input)
-                video_velocity, action_velocity_seq = _student_joint_forward(
-                    joint_input, video_r, action_r, return_action=True
+                self._init_joint_mask(joint_input)
+                video_velocity, action_velocity_seq = self._student_joint_forward(
+                    self.student,
+                    joint_input,
+                    joint_context["empty_emb"],
+                    video_r,
+                    action_r,
+                    cfg_scale=cfg_scale,
+                    batch_size=B,
+                    ref_shape=ref_shape,
+                    require_action=True,
                 )
                 if action_velocity_seq is None:
                     raise RuntimeError(
@@ -4303,13 +5662,16 @@ class FlowMapStepMixin:
             if dist.is_initialized():
                 dist.all_reduce(query_t_min, op=dist.ReduceOp.MIN)
                 dist.all_reduce(query_t_max, op=dist.ReduceOp.MAX)
-        query_input = _build_joint_input(
-            query_video, query_video_t, query_action, query_action_t
-        )
-        _init_joint_mask(query_input)
-        student_velocity = _student_joint_forward(
-            query_input, query_video_t, query_action_t, return_action=False
-        )
+        state_count = len(video_states)
+        diagnostic_device = current_video.device
+        # Only the selected query state is needed by the trainable forwards
+        # below. Release the no-grad rollout trajectory before building those
+        # graphs, which keeps the Cosmos joint rollout's peak memory bounded.
+        del video_states, action_states, video_timesteps, action_timesteps
+        del current_video, current_action, joint_input
+        del video_velocity, action_velocity_seq, action_velocity
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         with torch.no_grad():
             teacher_query = query_video.detach().float()
             if teacher_crop_context is not None:
@@ -4326,42 +5688,883 @@ class FlowMapStepMixin:
                 teacher_query[
                     ..., teacher_crop_context['h_slice'], teacher_crop_context['w_slice']
                 ] = query_video.detach().float().to(teacher_query)
-            teacher_result = teacher.predict_raw_latent_velocity(
+            teacher_result = teacher.predict_raw_joint_latent_velocity(
                 batch,
                 query_latent=teacher_query,
+                query_action=query_action,
                 t=(query_video_t / self.config.num_train_timesteps).detach().float(),
             )
             teacher_velocity = teacher_result['cosmos_latent_velocity'].to(
-                device=student_velocity.device, dtype=student_velocity.dtype
+                device=query_video.device, dtype=query_video.dtype
+            )
+            student_query_video = teacher_result['cosmos_joint_query'].to(
+                device=query_video.device, dtype=query_video.dtype
+            )
+            video_frame_mask = teacher_result['cosmos_video_frame_mask'].to(
+                device=query_video.device, dtype=torch.bool
             )
             if teacher_crop_context is not None:
                 teacher_velocity = teacher_velocity[
                     ..., teacher_crop_context['h_slice'], teacher_crop_context['w_slice']
                 ]
-        velocity_loss = direct_velocity_mse(student_velocity, teacher_velocity)
+                student_query_video = student_query_video[
+                    ..., teacher_crop_context['h_slice'], teacher_crop_context['w_slice']
+                ]
+        query_input = self._mechanism_joint_input(
+            student_query_video,
+            query_action,
+            query_video_t,
+            query_action_t,
+            joint_context,
+        )
+        self._init_joint_mask(query_input)
+        student_velocity = self._student_joint_forward(
+            self.student,
+            query_input,
+            joint_context["empty_emb"],
+            query_video_t,
+            query_action_t,
+            cfg_scale=cfg_scale,
+            batch_size=B,
+            ref_shape=ref_shape,
+            require_action=False,
+        )
+        velocity_loss = masked_video_velocity_mse(
+            student_velocity, teacher_velocity, video_frame_mask
+        )
         diagnostics = {
             'query_index_mean': query_indices.float().mean().detach(),
             'query_sigma_mean': (
                 query_video_t.float() / self.config.num_train_timesteps
             ).mean().detach(),
-            'terminal_prior_max_error': terminal_prior_error.detach(),
+            'terminal_prior_max_error': terminal_prior_diagnostics['max_error'],
+            'terminal_prior_reference_scale': terminal_prior_diagnostics['reference_scale'],
+            'terminal_prior_atol': terminal_prior_diagnostics['atol'],
+            'terminal_prior_rtol': terminal_prior_diagnostics['rtol'],
+            'terminal_prior_threshold': terminal_prior_diagnostics['threshold'],
+            'terminal_prior_severity': terminal_prior_diagnostics['severity'],
             'rollout_steps': effective_rollout_steps,
-            'state_count': len(video_states),
+            'state_count': state_count,
         }
         if append_post_update_terminal:
             diagnostics['terminal_query_sigma'] = torch.tensor(
                 terminal_query_timestep / self.config.num_train_timesteps,
-                device=current_video.device,
+                device=diagnostic_device,
                 dtype=torch.float32,
             )
             diagnostics['terminal_query_timestep'] = torch.tensor(
                 terminal_query_timestep,
-                device=current_video.device,
+                device=diagnostic_device,
                 dtype=torch.float32,
             )
             diagnostics['query_t_min'] = query_t_min
             diagnostics['query_t_max'] = query_t_max
         return velocity_loss, diagnostics
+
+    def _cosmos_deployment_joint_rollout_step(
+        self, batch, batch_idx, *, student_steps
+    ):
+        """Train one full joint student rollout from deployment noise to x0."""
+        student_steps = int(student_steps)
+        if student_steps not in (1, 2, 4):
+            raise ValueError("deployment student_steps must be one of 1, 2, 4")
+        if self.gradient_accumulation_steps != 1:
+            raise ValueError(
+                "deployment joint rollout requires gradient_accumulation_steps=1"
+            )
+        rollout_grad_mode = str(
+            getattr(self.config, "opd_rollout_grad_mode", "endpoint")
+        ).lower()
+        if rollout_grad_mode == "endpoint":
+            raise ValueError(
+                "deployment joint rollout is incompatible with "
+                "opd_rollout_grad_mode='endpoint' because final video/action "
+                "states are detached"
+            )
+
+        batch = self.convert_input_format(batch)
+        teacher = self._action_teacher_model
+        if not (
+            hasattr(teacher, "predict_raw_latent_target")
+            and getattr(teacher, "raw_inference_enabled", False)
+        ):
+            raise RuntimeError(
+                "Cosmos deployment rollout requires raw latent endpoint inference."
+            )
+
+        B = int(batch["actions"].shape[0])
+        latent_shape = (
+            B,
+            int(getattr(self.config, "cosmos_latent_channels", 16)),
+            int(getattr(self.config, "cosmos_latent_frames", 9)),
+            int(getattr(self.config, "cosmos_latent_height", 28)),
+            int(getattr(self.config, "cosmos_latent_width", 28)),
+        )
+        video_frames = latent_shape[2]
+        anchor_t_norm = torch.full(
+            (B, video_frames),
+            float(getattr(self.config, "cosmos_latent_t_max", 80.0 / 81.0)),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        anchor_r_norm = torch.full(
+            (B, video_frames),
+            float(getattr(self.config, "cosmos_latent_t_min", 4.0 / 5.0)),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        anchor_noise = torch.randn(
+            latent_shape, device=self.device, dtype=batch["actions"].dtype
+        )
+        with torch.no_grad():
+            endpoint_result = teacher.predict_raw_latent_target(
+                batch,
+                noise=anchor_noise,
+                t=anchor_t_norm,
+                r=anchor_r_norm,
+                epsilon=float(self.config.cosmos_latent_epsilon),
+                include_cdiff=False,
+            )
+        video_x0 = endpoint_result["cosmos_latent_x0"].to(
+            device=self.device, dtype=batch["latents"].dtype
+        )
+        action_x0_full = cosmos_actions_to_flowmap_x0(
+            endpoint_result["actions"],
+            target_shape=tuple(batch["actions"].shape),
+            q01=self.config.norm_stat["q01"],
+            q99=self.config.norm_stat["q99"],
+            inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
+            device=self.device,
+            dtype=batch["actions"].dtype,
+            packing_schema=self.config.action_packing_schema,
+            downsample_factor=self.config.action_downsample_factor,
+        )
+
+        batch["latents"] = video_x0
+        ref_shape = video_x0.shape
+        video_t = torch.full(
+            (B, video_frames), 1000.0, device=self.device
+        )
+        video_r = torch.zeros_like(video_t)
+        action_t, action_r = broadcast_joint_action_timesteps(
+            video_t, video_r, action_frames=batch["actions"].shape[2]
+        )
+        video_noise = anchor_noise.to(device=self.device, dtype=video_x0.dtype)
+        action_noise = torch.randn_like(action_x0_full)
+
+        input_dict = self._prepare_base_dict(batch)
+        input_dict["latent_dict"]["noisy_latents"] = video_noise
+        input_dict["latent_dict"]["timesteps"] = video_t
+        input_dict["latent_dict"]["targets"] = (
+            self.train_scheduler_latent.training_target(
+                video_x0, video_noise, video_t
+            )
+        )
+        action_base = input_dict["action_dict"]
+        action_base["noisy_latents"] = action_noise
+        action_base["timesteps"] = action_t
+        action_base["targets"] = self.train_scheduler_action.training_target(
+            batch["actions"], action_noise, action_t
+        )
+        action_downsample = int(self.config.action_downsample_factor)
+        student_action_dict = {
+            "noisy_latents": action_noise[:, :, ::action_downsample],
+            "latent": action_base["latent"][:, :, ::action_downsample],
+            "timesteps": action_t[:, ::action_downsample],
+            "cond_timesteps": action_base["cond_timesteps"][
+                :, ::action_downsample
+            ],
+            "text_emb": action_base["text_emb"],
+            "grid_id": _downsample_action_grid_id(
+                action_base.get("grid_id"),
+                action_base["latent"],
+                action_downsample,
+            )
+            if action_base.get("grid_id") is not None
+            else None,
+            "actions_mask": batch["actions_mask"][:, :, ::action_downsample],
+        }
+        student_input = {
+            "latent_dict": input_dict["latent_dict"],
+            "action_dict": student_action_dict,
+            "chunk_size": input_dict["chunk_size"],
+            "window_size": input_dict["window_size"],
+        }
+        cfg_scale = self.config.cfg_min + torch.rand(1).item() * (
+            self.config.cfg_max - self.config.cfg_min
+        )
+        empty_emb = self.empty_emb.expand(B, -1, -1)
+        video_final, _, _, action_final = self._student_euler_integrate(
+            noisy_latents=video_noise,
+            timesteps=video_t,
+            target_r=video_r,
+            base_input_dict=student_input,
+            empty_emb=empty_emb,
+            cfg_scale=cfg_scale,
+            ref_shape=ref_shape,
+            B=B,
+            num_frames=video_frames,
+            K_steps=student_steps,
+            action_target_r=action_r,
+            return_final_action=True,
+            return_final_action_state=True,
+        )
+        endpoint_losses = deployment_endpoint_losses(
+            video_final,
+            video_x0,
+            action_final,
+            batch["actions"][:, :, ::action_downsample],
+            batch["actions_mask"][:, :, ::action_downsample],
+            action_weight=float(self.config.deployment_action_weight),
+        )
+        loss = endpoint_losses["total"]
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags={
+                "video": not bool(
+                    torch.isfinite(endpoint_losses["video"].detach()).all().item()
+                ),
+                "action": not bool(
+                    torch.isfinite(endpoint_losses["action"].detach()).all().item()
+                ),
+            },
+            device=self.device,
+        )
+        zero = torch.zeros((), device=self.device, dtype=loss.dtype)
+        if is_finite:
+            loss.backward()
+        deployment_video_loss = (
+            endpoint_losses["video"].detach() if is_finite else zero
+        )
+        deployment_action_loss = (
+            endpoint_losses["action"].detach() if is_finite else zero
+        )
+        deployment_total_loss = loss.detach() if is_finite else zero
+        return {
+            "loss": deployment_total_loss,
+            "deployment_video_endpoint_loss": deployment_video_loss,
+            "deployment_action_endpoint_loss": deployment_action_loss,
+            "deployment_total_loss": deployment_total_loss,
+            "deployment_student_steps": torch.tensor(
+                float(student_steps), device=self.device
+            ),
+            "deployment_t_start": video_t[0, 0].detach(),
+            "deployment_t_end": video_r[0, 0].detach(),
+            "should_sync": True,
+            "skip_step": not is_finite,
+            "nonfinite_origins": nonfinite_origins,
+        }
+
+    def _build_cosmos_shifted_shared_query(
+        self,
+        batch,
+        input_dict,
+        *,
+        student_steps=None,
+        generator=None,
+        student_model=None,
+        cfg_scale=None,
+    ):
+        """Build the detached shifted-grid joint z_r shared by training/probes."""
+        batch_size = int(batch["latents"].shape[0])
+        latent_shape = (
+            batch_size,
+            int(getattr(self.config, "cosmos_latent_channels", 16)),
+            int(getattr(self.config, "cosmos_latent_frames", 9)),
+            int(getattr(self.config, "cosmos_latent_height", 28)),
+            int(getattr(self.config, "cosmos_latent_width", 28)),
+        )
+        action_shape = tuple(batch["actions"].shape)
+        if len(action_shape) != 5:
+            raise ValueError("Aligned Cosmos query requires rank-5 actions")
+        action_downsample = int(self.config.action_downsample_factor)
+        action_frames = action_shape[2] // action_downsample
+        if action_frames <= 0:
+            raise ValueError("Aligned Cosmos query requires compact action frames")
+
+        rollout_choices = getattr(
+            self.config, "opd_danceopd_rollout_steps", (2, 4)
+        )
+        if isinstance(rollout_choices, int):
+            rollout_choices = (rollout_choices,)
+        rollout_choices = tuple(int(value) for value in rollout_choices)
+        canonical_rollout_choices = {
+            (1,),
+            (2,),
+            (4,),
+            (2, 4),
+        }
+        if rollout_choices not in canonical_rollout_choices:
+            raise ValueError(
+                "Aligned Cosmos rollout steps must be one canonical choice set: "
+                "(1,), (2,), (4,), or (2, 4)"
+            )
+        if student_steps is None:
+            choice_index = torch.randint(
+                0, len(rollout_choices), (1,), device=self.device
+            )
+            if dist.is_available() and dist.is_initialized():
+                dist.broadcast(choice_index, src=0)
+            student_steps = rollout_choices[int(choice_index.item())]
+        else:
+            student_steps = int(student_steps)
+            if student_steps not in rollout_choices:
+                raise ValueError(
+                    "Aligned Cosmos shared query student_steps must belong to "
+                    f"the canonical configured choices {rollout_choices!r}"
+                )
+        if (
+            student_steps == 1
+            and float(
+                getattr(
+                    self.config,
+                    "opd_danceopd_velocity_weight",
+                    1.0,
+                )
+            )
+            > 0.0
+        ):
+            raise ValueError(
+                "Aligned Cosmos K=1 has no nonterminal state for a field loss"
+            )
+
+        video_sigmas = build_shifted_terminal_path(
+            steps=student_steps,
+            shift=float(self.config.snr_shift),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        action_sigmas = build_shifted_terminal_path(
+            steps=student_steps,
+            shift=float(self.config.action_snr_shift),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        num_train_timesteps = float(self.config.num_train_timesteps)
+        video_path = (
+            video_sigmas[:, None, None]
+            .expand(student_steps + 1, batch_size, latent_shape[2])
+            * num_train_timesteps
+        )
+        action_path = (
+            action_sigmas[:, None, None]
+            .expand(student_steps + 1, batch_size, action_frames)
+            * num_train_timesteps
+        )
+
+        video_prior = torch.randn(
+            latent_shape,
+            device=self.device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        native_action_prior = torch.randn(
+            batch_size,
+            16,
+            7,
+            device=self.device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        action_channels = action_shape[1]
+        used_action_channel_ids = torch.as_tensor(
+            self.config.used_action_channel_ids,
+            device=self.device,
+            dtype=torch.long,
+        )
+        if (
+            used_action_channel_ids.numel() != 7
+            or int(used_action_channel_ids.min().item()) < 0
+            or int(used_action_channel_ids.max().item()) >= action_channels
+        ):
+            raise ValueError(
+                "Aligned Cosmos query requires seven valid action channel IDs"
+            )
+        aligned_action_prior = torch.zeros(
+            batch_size,
+            16,
+            action_channels,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        aligned_action_prior[..., used_action_channel_ids] = native_action_prior
+        full_action_prior = pack_actions_for_downsample(
+            aligned_action_prior,
+            action_shape,
+            downsample_factor=action_downsample,
+            schema=self.config.action_packing_schema,
+        )
+        current_video = video_prior
+        current_action = full_action_prior[:, :, ::action_downsample]
+
+        video_base = {
+            key: value
+            for key, value in input_dict["latent_dict"].items()
+            if key not in ("latent", "noisy_latents", "targets", "timesteps")
+        }
+        action_base = input_dict["action_dict"]
+        action_cond_t = action_base["cond_timesteps"][:, ::action_downsample]
+        action_grid = _downsample_action_grid_id(
+            action_base.get("grid_id"),
+            action_base["latent"],
+            action_downsample,
+        )
+        action_mask = action_base.get("actions_mask")
+        if action_mask is not None:
+            action_mask = action_mask[:, :, ::action_downsample]
+        empty_emb = self.empty_emb.expand(batch_size, -1, -1)
+        if cfg_scale is None:
+            cfg_scale = float(self.config.cfg_min) + torch.rand(1).item() * (
+                float(self.config.cfg_max) - float(self.config.cfg_min)
+            )
+        if student_model is None:
+            student_model = self.student
+
+        def joint_context(video_state, action_state):
+            return {
+                "video_base": {**video_base, "latent": video_state},
+                "action_latent": action_state,
+                "action_cond_t": action_cond_t,
+                "action_text": action_base["text_emb"],
+                "action_grid": action_grid,
+                "action_mask": action_mask,
+                "chunk_size": input_dict["chunk_size"],
+                "window_size": input_dict["window_size"],
+                "student_model": student_model,
+                "empty_emb": empty_emb,
+                "cfg_scale": cfg_scale,
+                "batch_size": batch_size,
+                "ref_shape": latent_shape,
+                "action_frames": action_frames,
+            }
+
+        if student_steps == 1:
+            # K=1 has no nonterminal deployment state.  Its endpoint-only arm
+            # compares the Student's direct prior->endpoint prediction with
+            # the Teacher's same-prior 8-step endpoint.  Do not invent a
+            # nonterminal z_r or a meaningless field query.
+            query_indices = torch.zeros(
+                batch_size, device=self.device, dtype=torch.long
+            )
+            query_video = current_video.detach()
+            query_action = current_action.detach()
+            query_video_t = video_path[0].detach()
+            query_action_t = action_path[0].detach()
+        else:
+            video_states = []
+            action_states = []
+            with torch.no_grad():
+                for step_index in range(student_steps):
+                    video_t = video_path[step_index]
+                    video_r = video_path[step_index + 1]
+                    action_t = action_path[step_index]
+                    action_r = action_path[step_index + 1]
+                    context = joint_context(current_video, current_action)
+                    joint_input = self._mechanism_joint_input(
+                        current_video,
+                        current_action,
+                        video_t,
+                        action_t,
+                        context,
+                    )
+                    self._init_joint_mask(joint_input)
+                    video_velocity, action_velocity_seq = (
+                        self._student_joint_forward(
+                            student_model,
+                            joint_input,
+                            empty_emb,
+                            video_r,
+                            action_r,
+                            cfg_scale=cfg_scale,
+                            batch_size=batch_size,
+                            ref_shape=latent_shape,
+                            require_action=True,
+                        )
+                    )
+                    if action_velocity_seq is None:
+                        raise RuntimeError(
+                            "Aligned Cosmos query requires a Student action head"
+                        )
+                    action_velocity = self._extract_action_v(
+                        action_velocity_seq, action_frames
+                    )
+                    current_video, current_action = self._joint_euler_update(
+                        current_video,
+                        current_action,
+                        video_velocity,
+                        action_velocity,
+                        video_t,
+                        video_r,
+                        action_t,
+                        action_r,
+                    )
+                    video_states.append(current_video.detach())
+                    action_states.append(current_action.detach())
+
+            query_indices = sample_nonterminal_semantic_query_indices(
+                video_sigmas, batch_size
+            )
+            state_indices = query_indices - 1
+            query_video = select_per_sample_trajectory_state(
+                torch.stack(video_states), state_indices
+            ).detach()
+            query_action = select_per_sample_trajectory_state(
+                torch.stack(action_states), state_indices
+            ).detach()
+            query_video_t = select_per_sample_trajectory_state(
+                video_path, query_indices
+            ).detach()
+            query_action_t = select_per_sample_trajectory_state(
+                action_path, query_indices
+            ).detach()
+        return {
+            "student_steps": student_steps,
+            "video_prior": video_prior,
+            "native_action_prior": native_action_prior,
+            "query_indices": query_indices,
+            "query_video": query_video,
+            "query_action": query_action,
+            "query_video_t": query_video_t,
+            "query_action_t": query_action_t,
+            "query_sigma_frames": query_video_t / num_train_timesteps,
+            "query_sigma": query_video_t[:, 0] / num_train_timesteps,
+            "joint_context": joint_context,
+            "video_frame_count": latent_shape[2],
+            "action_frame_count": action_frames,
+            "batch_size": batch_size,
+            "latent_shape": latent_shape,
+            "empty_emb": empty_emb,
+            "cfg_scale": cfg_scale,
+            "action_mask": action_mask,
+        }
+
+    def _cosmos_aligned_video_opd_step(self, batch, batch_idx):
+        """Match one canonical deployment-reached joint state to Cosmos video targets."""
+        del batch_idx
+        endpoint_weight = float(
+            getattr(self.config, "opd_danceopd_endpoint_weight", 1.0)
+        )
+        field_weight = float(
+            getattr(self.config, "opd_danceopd_velocity_weight", 1.0)
+        )
+        if (
+            not float("-inf") < endpoint_weight < float("inf")
+            or endpoint_weight < 0.0
+            or not float("-inf") < field_weight < float("inf")
+            or field_weight < 0.0
+        ):
+            raise ValueError(
+                "Aligned Cosmos OPD endpoint/field weights must be finite and "
+                "non-negative"
+            )
+        endpoint_enabled = endpoint_weight > 0.0
+        field_enabled = field_weight > 0.0
+        if not endpoint_enabled and not field_enabled:
+            zero = torch.zeros((), device=self.device, dtype=torch.float32)
+            return {
+                "loss": zero,
+                "opd_endpoint_loss": zero,
+                "opd_same_state_velocity_loss": zero,
+                "opd_endpoint_contrib": zero,
+                "opd_same_state_velocity_contrib": zero,
+                "opd_query_sigma": zero,
+                "opd_query_index": zero,
+                "opd_student_steps": zero,
+                "opd_teacher_steps": zero,
+                "opd_valid_video_frames": zero,
+                "opd_same_prior_verified": zero,
+                "opd_canonical_state_verified": zero,
+                "should_sync": True,
+                "skip_step": False,
+                "nonfinite_origins": {},
+            }
+
+        batch = self.convert_input_format(batch)
+        teacher = self._action_teacher_model
+        teacher_contract_ok = getattr(
+            teacher, "raw_inference_enabled", False
+        )
+        teacher_contract_ok &= (
+            not field_enabled
+            or hasattr(teacher, "predict_raw_joint_latent_velocity")
+        )
+        teacher_contract_ok &= (
+            not endpoint_enabled
+            or hasattr(teacher, "predict_raw_same_prior_endpoint")
+        )
+        if not teacher_contract_ok:
+            raise RuntimeError(
+                "Aligned Cosmos video OPD requires each enabled raw Teacher API"
+            )
+
+        input_dict = self._prepare_base_dict(batch)
+        shared = self._build_cosmos_shifted_shared_query(
+            batch, input_dict
+        )
+        student_steps = shared["student_steps"]
+        batch_size = shared["batch_size"]
+        latent_shape = shared["latent_shape"]
+        action_frames = shared["action_frame_count"]
+        video_prior = shared["video_prior"]
+        native_action_prior = shared["native_action_prior"]
+        query_indices = shared["query_indices"]
+        query_video = shared["query_video"]
+        query_action = shared["query_action"]
+        query_video_t = shared["query_video_t"]
+        query_action_t = shared["query_action_t"]
+        query_sigma_frames = shared["query_sigma_frames"]
+        query_sigma = shared["query_sigma"]
+        joint_context = shared["joint_context"]
+        empty_emb = shared["empty_emb"]
+        cfg_scale = shared["cfg_scale"]
+
+        def synchronized_teacher_call(label, callback):
+            local_error = None
+            result = None
+            try:
+                result = callback()
+            except Exception as exc:
+                local_error = exc
+            if not all_ranks_finite(local_error is None, device=self.device):
+                raise RuntimeError(
+                    f"Aligned Cosmos OPD {label} failed on at least one rank"
+                ) from local_error
+            return result
+
+        field_result = None
+        endpoint_result = None
+        with torch.no_grad():
+            if field_enabled:
+                field_result = synchronized_teacher_call(
+                    "same-state Teacher query",
+                    lambda: teacher.predict_raw_joint_latent_velocity(
+                        batch,
+                        query_latent=query_video.float(),
+                        query_action=query_action,
+                        t=query_sigma_frames.float(),
+                    ),
+                )
+            if endpoint_enabled:
+                endpoint_result = synchronized_teacher_call(
+                    "same-prior Teacher endpoint",
+                    lambda: teacher.predict_raw_same_prior_endpoint(
+                        batch,
+                        video_prior=video_prior,
+                        action_prior=native_action_prior,
+                        teacher_steps=8,
+                    ),
+                )
+
+        required_field_keys = (
+            "cosmos_joint_query",
+            "cosmos_latent_velocity",
+            "cosmos_video_frame_mask",
+        )
+        required_endpoint_keys = (
+            "endpoint_video",
+            "video_frame_mask",
+            "effective_teacher_steps",
+            "video_prior_sha256",
+            "action_prior_sha256",
+        )
+        local_contract_ok = (
+            not field_enabled
+            or all(key in field_result for key in required_field_keys)
+        )
+        local_contract_ok &= (
+            not endpoint_enabled
+            or all(key in endpoint_result for key in required_endpoint_keys)
+        )
+        if not all_ranks_finite(local_contract_ok, device=self.device):
+            raise RuntimeError(
+                "Aligned Cosmos OPD Teacher response contract mismatch"
+            )
+
+        if field_enabled:
+            canonical_video = field_result["cosmos_joint_query"].to(
+                device=self.device, dtype=query_video.dtype
+            ).detach()
+            teacher_field = field_result["cosmos_latent_velocity"].to(
+                device=self.device, dtype=canonical_video.dtype
+            ).detach()
+            field_mask = field_result["cosmos_video_frame_mask"].to(
+                device=self.device, dtype=torch.bool
+            )
+        else:
+            canonical_video = query_video.detach()
+            teacher_field = None
+            field_mask = None
+
+        if endpoint_enabled:
+            teacher_endpoint = endpoint_result["endpoint_video"].to(
+                device=self.device, dtype=canonical_video.dtype
+            ).detach()
+            endpoint_mask = endpoint_result["video_frame_mask"].to(
+                device=self.device, dtype=torch.bool
+            )
+            effective_teacher_steps = endpoint_result[
+                "effective_teacher_steps"
+            ]
+        else:
+            teacher_endpoint = None
+            endpoint_mask = None
+            effective_teacher_steps = 0
+
+        video_frame_mask = field_mask if field_enabled else endpoint_mask
+        shape_contract_ok = (
+            canonical_video.shape == query_video.shape
+            and video_frame_mask.shape
+            == (batch_size, canonical_video.shape[2])
+            and bool(video_frame_mask.any(dim=1).all().item())
+        )
+        shape_contract_ok &= (
+            not field_enabled
+            or teacher_field.shape == canonical_video.shape
+        )
+        shape_contract_ok &= (
+            not endpoint_enabled
+            or (
+                teacher_endpoint.shape == canonical_video.shape
+                and endpoint_mask.shape == video_frame_mask.shape
+                and type(effective_teacher_steps) is int
+                and effective_teacher_steps == 8
+            )
+        )
+        shape_contract_ok &= (
+            not (field_enabled and endpoint_enabled)
+            or torch.equal(video_frame_mask, endpoint_mask)
+        )
+        if not all_ranks_finite(shape_contract_ok, device=self.device):
+            raise RuntimeError(
+                "Aligned Cosmos OPD Teacher shape, mask, or step contract mismatch"
+            )
+
+        expanded_mask = video_frame_mask[:, None, :, None, None].expand_as(
+            canonical_video
+        )
+        canonical_state_verified = torch.equal(
+            canonical_video.masked_select(expanded_mask),
+            query_video.to(canonical_video).masked_select(expanded_mask),
+        )
+        if not all_ranks_finite(
+            canonical_state_verified, device=self.device
+        ):
+            raise RuntimeError(
+                "Aligned Cosmos OPD canonical valid-video frames differ from "
+                "the selected Student state"
+            )
+
+        zero = torch.zeros(
+            (), device=self.device, dtype=canonical_video.dtype
+        )
+        field_loss = zero
+        if field_enabled:
+            field_context = joint_context(canonical_video, query_action)
+            field_input = self._mechanism_joint_input(
+                canonical_video,
+                query_action,
+                query_video_t,
+                query_action_t,
+                field_context,
+            )
+            self._init_joint_mask(field_input)
+            student_field = self._student_joint_forward(
+                self.student,
+                field_input,
+                empty_emb,
+                query_video_t,
+                query_action_t,
+                cfg_scale=cfg_scale,
+                batch_size=batch_size,
+                ref_shape=latent_shape,
+                require_action=False,
+            )
+            field_loss = masked_video_velocity_mse(
+                student_field,
+                teacher_field,
+                video_frame_mask,
+            )
+
+        endpoint_loss = zero
+        if endpoint_enabled:
+            anchor_context = joint_context(canonical_video, query_action)
+            anchor_input = self._mechanism_joint_input(
+                canonical_video,
+                query_action,
+                query_video_t,
+                query_action_t,
+                anchor_context,
+            )
+            self._init_joint_mask(anchor_input)
+            student_anchor = self._student_joint_forward(
+                self.student,
+                anchor_input,
+                empty_emb,
+                torch.zeros_like(query_video_t),
+                torch.zeros_like(query_action_t),
+                cfg_scale=cfg_scale,
+                batch_size=batch_size,
+                ref_shape=latent_shape,
+                require_action=False,
+            )
+            endpoint_loss = aligned_anchor_mse(
+                canonical_video,
+                query_sigma,
+                student_anchor,
+                teacher_endpoint,
+                video_frame_mask,
+            )
+
+        endpoint_contrib = endpoint_loss * endpoint_weight
+        field_contrib = field_loss * field_weight
+        loss = endpoint_contrib + field_contrib
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags={
+                "opd_endpoint": bool(
+                    endpoint_enabled
+                    and not torch.isfinite(endpoint_loss.detach()).all().item()
+                ),
+                "opd_compositional": bool(
+                    field_enabled
+                    and not torch.isfinite(field_loss.detach()).all().item()
+                ),
+            },
+            device=self.device,
+        )
+        if is_finite and loss.requires_grad:
+            loss.backward()
+        return {
+            "loss": loss.detach() if is_finite else zero,
+            "opd_endpoint_loss": endpoint_loss.detach() if is_finite else zero,
+            "opd_same_state_velocity_loss": (
+                field_loss.detach() if is_finite else zero
+            ),
+            "opd_endpoint_contrib": (
+                endpoint_contrib.detach() if is_finite else zero
+            ),
+            "opd_same_state_velocity_contrib": (
+                field_contrib.detach() if is_finite else zero
+            ),
+            "opd_query_sigma": query_sigma.float().mean().detach(),
+            "opd_query_index": query_indices.float().mean().detach(),
+            "opd_student_steps": torch.tensor(
+                float(student_steps), device=self.device
+            ),
+            "opd_teacher_steps": torch.tensor(
+                float(effective_teacher_steps), device=self.device
+            ),
+            "opd_valid_video_frames": video_frame_mask.float().sum().detach(),
+            "opd_same_prior_verified": torch.tensor(
+                float(endpoint_enabled), device=self.device
+            ),
+            "opd_canonical_state_verified": torch.tensor(
+                float(canonical_state_verified), device=self.device
+            ),
+            "should_sync": True,
+            "skip_step": not is_finite,
+            "nonfinite_origins": nonfinite_origins,
+        }
 
     def _cosmos_latent_full_opd_aux_transition_step(self, batch, batch_idx, kto_paopd=False):
         """Cosmos full OPD: independent endpoint rollout plus DanceOPD field loss."""
@@ -4374,6 +6577,7 @@ class FlowMapStepMixin:
         if not (
             hasattr(teacher, 'predict_raw_latent_target')
             and hasattr(teacher, 'predict_raw_latent_velocity')
+            and hasattr(teacher, 'predict_raw_joint_latent_velocity')
             and getattr(teacher, 'raw_inference_enabled', False)
         ):
             raise RuntimeError(
@@ -4399,9 +6603,41 @@ class FlowMapStepMixin:
             video_r,
             probability=float(getattr(self.config, 'opd_endpoint_focus_prob', 0.0)),
             num_train_timesteps=self.config.num_train_timesteps,
+            focus_timestep=float(getattr(
+                self.config, 'cosmos_latent_t_max', 80.0 / 81.0
+            )) * self.config.num_train_timesteps,
+            focus_target_timestep=float(getattr(
+                self.config, 'cosmos_latent_t_min', 4.0 / 5.0
+            )) * self.config.num_train_timesteps,
         )
+        video_t, video_r = constrain_cosmos_teacher_timestep_pair(
+            video_t,
+            video_r,
+            t_min=float(getattr(self.config, 'cosmos_latent_t_min', 4.0 / 5.0)),
+            t_max=float(getattr(self.config, 'cosmos_latent_t_max', 80.0 / 81.0)),
+            num_train_timesteps=self.config.num_train_timesteps,
+        )
+        teacher_target_r = video_r
+        mixed_policy_name = str(
+            getattr(self.config, 'cosmos_mixed_step_policy', '') or ''
+        ).strip()
+        if not mixed_policy_name:
+            endpoint_sigma = sample_endpoint_sigmas(
+                batch_size=B,
+                alpha=5.0,
+                beta=2.0,
+                max_sigma=0.25,
+                device=self.device,
+            )
+            video_r = (
+                endpoint_sigma[:, None].expand(B, num_frames)
+                * self.config.num_train_timesteps
+            )
         video_t_norm = (video_t / self.config.num_train_timesteps).clamp(0.0, 1.0)
         video_r_norm = (video_r / self.config.num_train_timesteps).clamp(0.0, 1.0)
+        teacher_target_r_norm = (
+            teacher_target_r / self.config.num_train_timesteps
+        ).clamp(0.0, 1.0)
         video_noise_teacher = torch.randn(
             latent_shape, device=self.device, dtype=torch.float32
         )
@@ -4410,7 +6646,7 @@ class FlowMapStepMixin:
                 batch,
                 noise=video_noise_teacher,
                 t=video_t_norm,
-                r=video_r_norm,
+                r=teacher_target_r_norm,
                 epsilon=float(getattr(self.config, 'cosmos_latent_epsilon', 0.001)),
                 include_cdiff=False,
             )
@@ -4429,6 +6665,8 @@ class FlowMapStepMixin:
                 inverse_used_action_channel_ids=self.config.inverse_used_action_channel_ids,
                 device=self.device,
                 dtype=batch['actions'].dtype,
+                packing_schema=self.config.action_packing_schema,
+                downsample_factor=self.config.action_downsample_factor,
             )
         full_video_noise = video_noise_teacher.to(
             device=self.device, dtype=full_anchor.dtype
@@ -4518,9 +6756,6 @@ class FlowMapStepMixin:
             student_input = input_dict
 
         mixed_step_selection = None
-        mixed_policy_name = str(
-            getattr(self.config, 'cosmos_mixed_step_policy', '') or ''
-        ).strip()
         if mixed_policy_name:
             selection_ordinal = int(
                 getattr(self, '_cosmos_mixed_step_selection_ordinal', 0)
@@ -4576,18 +6811,19 @@ class FlowMapStepMixin:
                             exc,
                         )
         else:
-            # Retain the legacy progressive behavior exactly when no mixed
-            # policy is requested, including its single-pair non-distributed
-            # fallback and rank-zero broadcast in distributed training.
             rollout_step_pairs = getattr(self.config, 'opd_rollout_step_pairs', [[8, 4]])
             if not rollout_step_pairs:
                 raise ValueError('opd_rollout_step_pairs must contain at least one (N, K) pair')
-            if dist.is_initialized():
-                pair_index = torch.randint(0, len(rollout_step_pairs), (1,), device=self.device)
-                dist.broadcast(pair_index, src=0)
-                teacher_steps, student_steps = rollout_step_pairs[pair_index.item()]
-            else:
-                teacher_steps, student_steps = rollout_step_pairs[0]
+            broadcast_index = (
+                (lambda index: dist.broadcast(index, src=0))
+                if dist.is_initialized()
+                else None
+            )
+            teacher_steps, student_steps = sample_uniform_rollout_step_pair(
+                rollout_step_pairs,
+                device=self.device,
+                broadcast_index=broadcast_index,
+            )
             teacher_steps = max(1, int(teacher_steps))
             student_steps = max(1, int(student_steps))
         cfg_scale = self.config.cfg_min + torch.rand(1).item() * (
@@ -4618,38 +6854,59 @@ class FlowMapStepMixin:
             student_x_r, student_v_r = rollout_out
             student_action_seq = student_action_x_r = None
 
-        def _teacher_velocity_field(state, t_norm):
-            result = teacher.predict_raw_latent_velocity(
-                batch,
-                query_latent=state.detach().float(),
-                t=t_norm.detach().float(),
-            )
-            return result['cosmos_latent_velocity'].to(
-                device=state.device, dtype=state.dtype
-            )
-
-        with torch.no_grad():
-            teacher_x_r, teacher_v_r, _ = rollout_velocity_field(
-                full_video_noisy_t.detach().float(),
-                video_t_norm,
-                video_r_norm,
-                num_steps=teacher_steps,
-                velocity_field=_teacher_velocity_field,
-            )
-        if teacher_crop_context is not None:
-            teacher_x_r = teacher_x_r[..., h_slice, w_slice].contiguous()
-            teacher_v_r = teacher_v_r[..., h_slice, w_slice].contiguous()
         sigma_r = video_r_norm[:, None, :, None, None]
-        video_endpoint_loss = denoised_endpoint_mse(
-            student_x_r, student_v_r, teacher_x_r, teacher_v_r, sigma_r
-        )
-        action_endpoint_loss = torch.zeros((), device=self.device, dtype=video_endpoint_loss.dtype)
+        if mixed_step_selection is not None:
+            def _teacher_velocity_field(state, t_norm):
+                result = teacher.predict_raw_latent_velocity(
+                    batch,
+                    query_latent=state.detach().float(),
+                    t=t_norm.detach().float(),
+                )
+                return result['cosmos_latent_velocity'].to(
+                    device=state.device, dtype=state.dtype
+                )
+
+            with torch.no_grad():
+                teacher_x_r, teacher_v_r, _ = rollout_velocity_field(
+                    full_video_noisy_t.detach().float(),
+                    video_t_norm,
+                    video_r_norm,
+                    num_steps=teacher_steps,
+                    velocity_field=_teacher_velocity_field,
+                )
+            if teacher_crop_context is not None:
+                teacher_x_r = teacher_x_r[
+                    ..., h_slice, w_slice
+                ].contiguous()
+                teacher_v_r = teacher_v_r[
+                    ..., h_slice, w_slice
+                ].contiguous()
+            video_endpoint_loss = denoised_endpoint_mse(
+                student_x_r,
+                student_v_r,
+                teacher_x_r,
+                teacher_v_r,
+                sigma_r,
+            )
+        else:
+            student_x0 = student_x_r - sigma_r.to(student_v_r) * student_v_r
+            video_endpoint_loss = F.mse_loss(
+                student_x0.float(), batch['latents'].detach().float()
+            )
         action_endpoint_weight = float(getattr(
             self.config, 'opd_danceopd_action_endpoint_weight', 0.0
         ))
-        if not math.isfinite(action_endpoint_weight) or action_endpoint_weight < 0:
-            raise ValueError('Cosmos OPD action endpoint weight must be finite and non-negative')
-        if joint_action_rollout:
+        if (
+            not math.isfinite(action_endpoint_weight)
+            or action_endpoint_weight < 0.0
+        ):
+            raise ValueError(
+                'Cosmos OPD action endpoint weight must be finite and non-negative'
+            )
+        action_endpoint_loss = torch.zeros(
+            (), device=self.device, dtype=video_endpoint_loss.dtype
+        )
+        if joint_action_rollout and action_endpoint_weight > 0.0:
             action_downsample = int(getattr(self.config, 'action_downsample_factor', 4))
             student_action_v = self._extract_action_v(
                 student_action_seq, student_action_x_r.shape[2]
@@ -4668,55 +6925,15 @@ class FlowMapStepMixin:
             action_diff = (student_action_x0.float() - action_target_x0.detach().float()) * action_mask
             action_denom = (action_mask.sum() * student_action_x0.shape[1]).clamp(min=1.0)
             action_endpoint_loss = action_diff.square().sum() / action_denom
-        endpoint_loss = video_endpoint_loss + action_endpoint_weight * action_endpoint_loss
+        endpoint_loss = compose_cosmos_endpoint_loss(
+            video_endpoint_loss,
+            action_endpoint_loss,
+            action_endpoint_weight=action_endpoint_weight,
+        )
         dance_schedule = (
             get_mixed_danceopd_schedule(mixed_step_selection)
             if mixed_step_selection is not None else None
         )
-        velocity_loss, dance_diagnostics = self._cosmos_danceopd_velocity_loss(
-            batch,
-            teacher,
-            self._prepare_base_dict(batch),
-            cfg_scale=cfg_scale,
-            teacher_crop_context=teacher_crop_context,
-            rollout_steps=(dance_schedule.rollout_steps if dance_schedule else None),
-            append_post_update_terminal=(dance_schedule is not None),
-        )
-        if mixed_step_selection is not None:
-            query_metrics_path = getattr(
-                self.config, 'opd_danceopd_query_metrics_path', None
-            )
-            rank_is_zero = (
-                dist.get_rank() == 0 if dist.is_initialized()
-                else int(getattr(self.config, 'rank', 0)) == 0
-            )
-            if rank_is_zero and query_metrics_path:
-                query_record = {
-                    'record_type': 'danceopd_query',
-                    'policy_name': mixed_step_selection.policy_name,
-                    'forced': bool(mixed_step_selection.forced),
-                    'pair_label': mixed_step_selection.label,
-                    'pair_index': int(mixed_step_selection.index),
-                    'teacher_steps': int(mixed_step_selection.teacher_steps),
-                    'student_steps': int(mixed_step_selection.student_steps),
-                    'global_step': int(self.step),
-                    'selection_ordinal': int(selection_ordinal),
-                    'rollout_steps': int(dance_diagnostics['rollout_steps']),
-                    'terminal_query_timestep': float(
-                        dance_diagnostics['terminal_query_timestep'].item()
-                    ),
-                    'query_t_min': float(dance_diagnostics['query_t_min'].item()),
-                    'query_t_max': float(dance_diagnostics['query_t_max'].item()),
-                }
-                try:
-                    append_selection_jsonl(query_metrics_path, query_record)
-                except OSError as exc:
-                    logger.warning(
-                        '[step %s] failed to append Cosmos DanceOPD query evidence: %s',
-                        self.step,
-                        exc,
-                    )
-
         endpoint_weight = float(getattr(self.config, 'opd_danceopd_endpoint_weight', 1.0))
         velocity_weight = (
             dance_schedule.velocity_weight if dance_schedule is not None
@@ -4729,6 +6946,76 @@ class FlowMapStepMixin:
             or velocity_weight < 0
         ):
             raise ValueError('Cosmos OPD endpoint and velocity weights must be finite and non-negative')
+        if endpoint_weight == 0.0 and velocity_weight == 0.0:
+            raise ValueError('Cosmos OPD requires a non-zero endpoint or velocity weight')
+        if velocity_weight > 0:
+            velocity_loss, dance_diagnostics = self._cosmos_danceopd_velocity_loss(
+                batch,
+                teacher,
+                self._prepare_base_dict(batch),
+                cfg_scale=cfg_scale,
+                teacher_crop_context=teacher_crop_context,
+                rollout_steps=(
+                    dance_schedule.rollout_steps
+                    if dance_schedule is not None else None
+                ),
+                append_post_update_terminal=(dance_schedule is not None),
+            )
+            if mixed_step_selection is not None:
+                query_metrics_path = getattr(
+                    self.config, 'opd_danceopd_query_metrics_path', None
+                )
+                rank_is_zero = (
+                    dist.get_rank() == 0 if dist.is_initialized()
+                    else int(getattr(self.config, 'rank', 0)) == 0
+                )
+                if rank_is_zero and query_metrics_path:
+                    query_record = {
+                        'record_type': 'danceopd_query',
+                        'policy_name': mixed_step_selection.policy_name,
+                        'forced': bool(mixed_step_selection.forced),
+                        'pair_label': mixed_step_selection.label,
+                        'pair_index': int(mixed_step_selection.index),
+                        'teacher_steps': int(mixed_step_selection.teacher_steps),
+                        'student_steps': int(mixed_step_selection.student_steps),
+                        'global_step': int(self.step),
+                        'selection_ordinal': int(selection_ordinal),
+                        'rollout_steps': int(dance_diagnostics['rollout_steps']),
+                        'terminal_query_timestep': float(
+                            dance_diagnostics['terminal_query_timestep'].item()
+                        ),
+                        'query_t_min': float(
+                            dance_diagnostics['query_t_min'].item()
+                        ),
+                        'query_t_max': float(
+                            dance_diagnostics['query_t_max'].item()
+                        ),
+                    }
+                    try:
+                        append_selection_jsonl(query_metrics_path, query_record)
+                    except OSError as exc:
+                        logger.warning(
+                            '[step %s] failed to append Cosmos DanceOPD '
+                            'query evidence: %s',
+                            self.step,
+                            exc,
+                        )
+        else:
+            velocity_loss = torch.zeros(
+                (), device=self.device, dtype=endpoint_loss.dtype
+            )
+            dance_diagnostics = {
+                'query_index_mean': velocity_loss,
+                'query_sigma_mean': velocity_loss,
+                'terminal_prior_max_error': velocity_loss,
+                'terminal_prior_reference_scale': velocity_loss,
+                'terminal_prior_atol': velocity_loss,
+                'terminal_prior_rtol': velocity_loss,
+                'terminal_prior_threshold': velocity_loss,
+                'terminal_prior_severity': velocity_loss,
+                'rollout_steps': 0,
+                'state_count': 0,
+            }
         aux_weight = float(getattr(self.config, 'opd_aux_weight', 1.0))
         endpoint_contrib = endpoint_weight * endpoint_loss * aux_weight
         velocity_contrib = velocity_weight * velocity_loss * aux_weight
@@ -4737,7 +7024,21 @@ class FlowMapStepMixin:
         contrib_denom = (
             endpoint_contrib.detach().abs() + velocity_contrib.detach().abs()
         ).clamp(min=1e-12)
-        is_finite = bool(torch.isfinite(loss.detach()).item())
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags={
+                "opd_endpoint": not bool(
+                    torch.isfinite(video_endpoint_loss.detach()).all().item()
+                ),
+                "opd_action": not bool(
+                    torch.isfinite(action_endpoint_loss.detach()).all().item()
+                ),
+                "opd_compositional": not bool(
+                    torch.isfinite(velocity_loss.detach()).all().item()
+                ),
+            },
+            device=self.device,
+        )
         result = {
             'loss': loss.detach() if is_finite else zero,
             'opd_aux_loss': loss.detach() if is_finite else zero,
@@ -4770,6 +7071,11 @@ class FlowMapStepMixin:
             'danceopd_velocity_rollout_steps': dance_diagnostics['rollout_steps'],
             'danceopd_velocity_state_count': dance_diagnostics['state_count'],
             'danceopd_velocity_weight': velocity_weight,
+            'danceopd_terminal_prior_reference_scale': dance_diagnostics['terminal_prior_reference_scale'],
+            'danceopd_terminal_prior_atol': dance_diagnostics['terminal_prior_atol'],
+            'danceopd_terminal_prior_rtol': dance_diagnostics['terminal_prior_rtol'],
+            'danceopd_terminal_prior_threshold': dance_diagnostics['terminal_prior_threshold'],
+            'danceopd_terminal_prior_severity': dance_diagnostics['terminal_prior_severity'],
             'cosmos_opd_endpoint_focus_ratio': focused_mask.float().mean().detach(),
             'danceopd_endpoint_teacher_steps': teacher_steps,
             'danceopd_endpoint_student_steps': student_steps,
@@ -4779,6 +7085,7 @@ class FlowMapStepMixin:
             'teacher_steps': teacher_steps,
             'should_sync': True,
             'skip_step': not is_finite,
+            'nonfinite_origins': nonfinite_origins,
         }
         if mixed_step_selection is not None:
             # These scalar fields make the selected endpoint mode visible to
@@ -4859,6 +7166,13 @@ class FlowMapStepMixin:
             )
         )
         video_r = self._apply_opd_low_noise_query_bias(video_t, video_r)
+        video_t, video_r = constrain_cosmos_teacher_timestep_pair(
+            video_t,
+            video_r,
+            t_min=float(getattr(self.config, 'cosmos_latent_t_min', 4.0 / 5.0)),
+            t_max=float(getattr(self.config, 'cosmos_latent_t_max', 80.0 / 81.0)),
+            num_train_timesteps=self.config.num_train_timesteps,
+        )
         video_r_norm = (video_r / self.config.num_train_timesteps).clamp(0.0, 1.0)
 
         video_noise_teacher = torch.randn(
@@ -5096,8 +7410,27 @@ class FlowMapStepMixin:
                 scale = (loss_clip_value / loss.detach().clamp(min=1e-12)).clamp(max=1.0)
                 loss = loss * scale
 
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags={
+                "opd_endpoint": not bool(
+                    torch.isfinite(opd_endpoint_aux_loss.detach()).all().item()
+                ),
+                "opd_compositional": not bool(
+                    torch.isfinite(video_transition_loss.detach()).all().item()
+                )
+                or not bool(torch.isfinite(local_fm_loss.detach()).all().item()),
+                "opd_action": not bool(
+                    torch.isfinite(opd_action_transition_loss.detach()).all().item()
+                )
+                or not bool(
+                    torch.isfinite(opd_action_local_fm_loss.detach()).all().item()
+                ),
+            },
+            device=self.device,
+        )
         result = {
-            'loss': loss.detach() if torch.isfinite(loss) else zero,
+            'loss': loss.detach() if is_finite else zero,
             'opd_aux_loss': weighted_aux_loss.detach(),
             'opd_video_transition_loss': video_transition_loss.detach(),
             'opd_endpoint_aux_loss': opd_endpoint_aux_loss.detach(),
@@ -5123,10 +7456,11 @@ class FlowMapStepMixin:
             'rollout_steps': max(1, int(K_steps)),
             'teacher_steps': 1,
             'should_sync': should_sync,
-            'skip_step': not bool(torch.isfinite(loss)),
+            'skip_step': not is_finite,
+            'nonfinite_origins': nonfinite_origins,
         }
 
-        if not torch.isfinite(loss):
+        if not is_finite:
             if self.config.rank == 0:
                 logger.warning(f"[step {self.step}] NaN/Inf Cosmos OPD aux loss, skipping")
             return result
@@ -5299,11 +7633,25 @@ class FlowMapStepMixin:
         cfg_scale = self.config.cfg_min + torch.rand(1).item() * (
             self.config.cfg_max - self.config.cfg_min
         )
-        rollout_steps = int(getattr(self.config, 'opd_danceopd_rollout_steps', 16))
+        rollout_step_choices = tuple(
+            int(value)
+            for value in getattr(
+                self.config,
+                "opd_danceopd_rollout_step_choices",
+                (getattr(self.config, "opd_danceopd_rollout_steps", 4),),
+            )
+        )
+        if not rollout_step_choices or any(value <= 0 for value in rollout_step_choices):
+            raise ValueError("opd_danceopd_rollout_step_choices must be positive")
+        if len(rollout_step_choices) == 1:
+            rollout_steps = rollout_step_choices[0]
+        else:
+            choice_index = torch.randint(len(rollout_step_choices), (1,), device=self.device)
+            if dist.is_initialized():
+                dist.broadcast(choice_index, src=0)
+            rollout_steps = rollout_step_choices[choice_index.item()]
         query_alpha = float(getattr(self.config, 'opd_danceopd_query_alpha', 5.0))
         query_beta = float(getattr(self.config, 'opd_danceopd_query_beta', 2.0))
-        if rollout_steps <= 0:
-            raise ValueError("opd_danceopd_rollout_steps must be positive")
 
         terminal_video_t = torch.full(
             (B, video_frames),
@@ -5330,22 +7678,21 @@ class FlowMapStepMixin:
         current_action = self.train_scheduler_action.add_noise(
             action_clean, action_noise, terminal_action_t, t_dim=2
         )
-        danceopd_terminal_prior_max_error = torch.maximum(
-            (current_video.float() - video_noise.float()).abs().amax(),
-            (current_action.float() - action_noise.float()).abs().amax(),
+        (
+            terminal_prior_validation,
+            terminal_prior_diagnostics,
+        ) = _validate_terminal_prior_pair(
+            config=self.config,
+            video_actual=current_video,
+            video_expected=video_noise,
+            video_source_dtype=batch["latents"].dtype,
+            action_actual=current_action,
+            action_expected=action_noise,
+            action_source_dtype=action_clean.dtype,
+            reference=current_video,
+            error_context="DanceOPD terminal state is not pure scheduler noise",
         )
-        terminal_prior_tolerance = float(getattr(
-            self.config, 'opd_danceopd_terminal_prior_tolerance', 1e-6
-        ))
-        if (
-            bool(getattr(self.config, 'opd_danceopd_verify_terminal_prior', True))
-            and danceopd_terminal_prior_max_error.detach().item() > terminal_prior_tolerance
-        ):
-            raise RuntimeError(
-                "DanceOPD terminal state is not pure scheduler noise: "
-                f"max_error={danceopd_terminal_prior_max_error.detach().item():.3e}, "
-                f"tolerance={terminal_prior_tolerance:.3e}"
-            )
+        danceopd_terminal_prior_max_error = terminal_prior_diagnostics['max_error']
 
         video_path = self._build_timestep_path(
             terminal_video_t, zero_video_t, rollout_steps
@@ -5389,76 +7736,21 @@ class FlowMapStepMixin:
             video_path = _to_regular_tensor(video_path)
             action_path = _to_regular_tensor(action_path)
 
-        def _build_joint_input(video_x, video_t, action_x, action_t, *, video_base,
-                               action_latent, action_cond_t, action_text,
-                               action_grid, action_valid_mask):
-            action_dict = {
-                'noisy_latents': action_x,
-                'latent': action_latent,
-                'timesteps': action_t,
-                'cond_timesteps': action_cond_t,
-                'text_emb': action_text,
-            }
-            if action_grid is not None:
-                action_dict['grid_id'] = action_grid
-            if action_valid_mask is not None:
-                action_dict['actions_mask'] = action_valid_mask
-            return {
-                'latent_dict': {
-                    **video_base,
-                    'noisy_latents': video_x,
-                    'timesteps': video_t,
-                },
-                'action_dict': action_dict,
-                'chunk_size': input_dict['chunk_size'],
-                'window_size': input_dict['window_size'],
-            }
-
-        def _init_joint_mask(joint_input):
-            from modules.model import FlexAttnFunc
-
-            latent_dict = joint_input['latent_dict']
-            action_dict = joint_input['action_dict']
-            total_length = (
-                latent_dict['noisy_latents'].flatten(0, 1).shape[0] * 2
-                + action_dict['noisy_latents'].flatten(0, 1).shape[0] * 2
-            )
-            padded_length = (128 - total_length % 128) % 128
-            FlexAttnFunc.init_mask(
-                latent_dict['noisy_latents'].shape,
-                action_dict['noisy_latents'].shape,
-                padded_length,
-                joint_input['chunk_size'],
-                window_size=joint_input['window_size'],
-                patch_size=self.patch_size,
-                device=self.device,
-            )
-
-        def _student_joint_forward(model, joint_input, model_empty_emb,
-                                   video_r_t, action_r_t, *, require_action):
-            saved_blocks = None
-            if model is self.student and getattr(self, '_student_blocks_compiled', False):
-                saved_blocks = list(self.student.blocks)
-                for block_index, block in enumerate(saved_blocks):
-                    if hasattr(block, '_orig_mod'):
-                        self.student.blocks[block_index] = block._orig_mod
-            try:
-                return self._student_cfg_forward(
-                    model,
-                    joint_input,
-                    model_empty_emb,
-                    cfg_scale,
-                    B,
-                    ref_shape,
-                    video_r_t,
-                    action_r_t,
-                    force_cfg=True,
-                    return_action=require_action,
-                )
-            finally:
-                if saved_blocks is not None:
-                    for block_index, block in enumerate(saved_blocks):
-                        self.student.blocks[block_index] = block
+        rollout_context = {
+            "video_base": rollout_video_base,
+            "action_latent": rollout_action_latent,
+            "action_cond_t": rollout_action_cond_t,
+            "action_text": rollout_action_text,
+            "action_grid": action_grid_id,
+            "action_mask": action_mask,
+            "chunk_size": input_dict["chunk_size"],
+            "window_size": input_dict["window_size"],
+            "student_model": rollout_model,
+            "empty_emb": rollout_empty_emb,
+            "cfg_scale": cfg_scale,
+            "batch_size": B,
+            "ref_shape": ref_shape,
+        }
 
         video_states = []
         action_states = []
@@ -5475,22 +7767,23 @@ class FlowMapStepMixin:
                 video_timesteps.append(video_t.detach().clone())
                 action_timesteps.append(action_t.detach().clone())
 
-                rollout_input = _build_joint_input(
-                    current_video, video_t, current_action, action_t,
-                    video_base=rollout_video_base,
-                    action_latent=rollout_action_latent,
-                    action_cond_t=rollout_action_cond_t,
-                    action_text=rollout_action_text,
-                    action_grid=action_grid_id,
-                    action_valid_mask=action_mask,
+                rollout_input = self._mechanism_joint_input(
+                    current_video,
+                    current_action,
+                    video_t,
+                    action_t,
+                    rollout_context,
                 )
-                _init_joint_mask(rollout_input)
-                video_velocity, action_velocity_seq = _student_joint_forward(
+                self._init_joint_mask(rollout_input)
+                video_velocity, action_velocity_seq = self._student_joint_forward(
                     rollout_model,
                     rollout_input,
                     rollout_empty_emb,
                     video_r,
                     action_r,
+                    cfg_scale=cfg_scale,
+                    batch_size=B,
+                    ref_shape=ref_shape,
                     require_action=True,
                 )
                 if action_velocity_seq is None:
@@ -5546,27 +7839,38 @@ class FlowMapStepMixin:
                 danceopd_terminal_prior_max_error.detach().item(),
             )
 
-        student_query_input = _build_joint_input(
-            query_video, query_video_t, query_action, query_action_t,
-            video_base=input_dict['latent_dict'],
-            action_latent=action_base['latent'][:, :, ::action_downsample],
-            action_cond_t=action_base['cond_timesteps'][:, ::action_downsample],
-            action_text=action_base['text_emb'],
-            action_grid=_downsample_action_grid_id(
+        query_context = {
+            "video_base": input_dict["latent_dict"],
+            "action_latent": action_base["latent"][:, :, ::action_downsample],
+            "action_cond_t": action_base["cond_timesteps"][:, ::action_downsample],
+            "action_text": action_base["text_emb"],
+            "action_grid": _downsample_action_grid_id(
                 action_base.get('grid_id'), action_base['latent'], action_downsample
             ),
-            action_valid_mask=(
+            "action_mask": (
                 action_base['actions_mask'][:, :, ::action_downsample]
                 if action_base.get('actions_mask') is not None else None
             ),
+            "chunk_size": input_dict["chunk_size"],
+            "window_size": input_dict["window_size"],
+        }
+        student_query_input = self._mechanism_joint_input(
+            query_video,
+            query_action,
+            query_video_t,
+            query_action_t,
+            query_context,
         )
-        _init_joint_mask(student_query_input)
-        student_video_velocity = _student_joint_forward(
+        self._init_joint_mask(student_query_input)
+        student_video_velocity = self._student_joint_forward(
             self.student,
             student_query_input,
             empty_emb,
             query_video_t,
             query_action_t,
+            cfg_scale=cfg_scale,
+            batch_size=B,
+            ref_shape=ref_shape,
             require_action=False,
         )
         with torch.no_grad():
@@ -5613,6 +7917,18 @@ class FlowMapStepMixin:
         contrib_denom = (
             velocity_contrib.detach().abs() + endpoint_contrib.detach().abs()
         ).clamp(min=1e-12)
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags={
+                "opd_endpoint": not bool(
+                    torch.isfinite(endpoint_loss.detach()).all().item()
+                ),
+                "opd_compositional": not bool(
+                    torch.isfinite(velocity_loss.detach()).all().item()
+                ),
+            },
+            device=self.device,
+        )
         result = {
             'loss': loss.detach(),
             'opd_aux_loss': loss.detach(),
@@ -5641,6 +7957,11 @@ class FlowMapStepMixin:
             'danceopd_query_index_mean': danceopd_query_index_mean,
             'danceopd_query_sigma_mean': danceopd_query_sigma_mean,
             'danceopd_terminal_prior_max_error': danceopd_terminal_prior_max_error.detach(),
+            'danceopd_terminal_prior_reference_scale': terminal_prior_diagnostics['reference_scale'],
+            'danceopd_terminal_prior_atol': terminal_prior_diagnostics['atol'],
+            'danceopd_terminal_prior_rtol': terminal_prior_diagnostics['rtol'],
+            'danceopd_terminal_prior_threshold': terminal_prior_diagnostics['threshold'],
+            'danceopd_terminal_prior_severity': terminal_prior_diagnostics['severity'],
             'danceopd_endpoint_teacher_steps': endpoint_diagnostics.get(
                 'teacher_steps', 1
             ),
@@ -5652,7 +7973,8 @@ class FlowMapStepMixin:
             'rollout_steps': rollout_steps,
             'teacher_steps': endpoint_diagnostics.get('teacher_steps', 1),
             'should_sync': True,
-            'skip_step': not bool(torch.isfinite(loss.detach())),
+            'skip_step': not is_finite,
+            'nonfinite_origins': nonfinite_origins,
         }
         if result['skip_step']:
             if self.config.rank == 0:
@@ -6518,7 +8840,29 @@ class FlowMapStepMixin:
                 scale = (loss_clip_value / loss.detach().clamp(min=1e-12)).clamp(max=1.0)
                 loss = loss * scale
 
-        if not torch.isfinite(loss):
+        is_finite, nonfinite_origins = _synchronized_nonfinite_decision(
+            loss=loss,
+            local_flags={
+                "opd_endpoint": not bool(
+                    torch.isfinite(opd_endpoint_aux_loss.detach()).all().item()
+                ),
+                "opd_compositional": not bool(
+                    torch.isfinite(video_transition_loss.detach()).all().item()
+                )
+                or not bool(
+                    torch.isfinite(opd_same_state_velocity_loss.detach()).all().item()
+                )
+                or not bool(torch.isfinite(local_fm_loss.detach()).all().item()),
+                "opd_action": not bool(
+                    torch.isfinite(opd_action_transition_loss.detach()).all().item()
+                )
+                or not bool(
+                    torch.isfinite(opd_action_local_fm_loss.detach()).all().item()
+                ),
+            },
+            device=self.device,
+        )
+        if not is_finite:
             if self.config.rank == 0:
                 logger.warning(f"[step {self.step}] NaN/Inf OPD aux loss, skipping")
             zero_loss = torch.zeros((), device=self.device)
@@ -6551,6 +8895,7 @@ class FlowMapStepMixin:
                 'opd_action_local_fm_ratio': (opd_action_local_fm_contrib.detach().abs() / contrib_denom),
                 'should_sync': should_sync,
                 'skip_step': True,
+                'nonfinite_origins': nonfinite_origins,
             }
             if kto_paopd:
                 result.update({
@@ -6603,6 +8948,7 @@ class FlowMapStepMixin:
             'teacher_steps': effective_teacher_steps,
             'should_sync': should_sync,
             'skip_step': False,
+            'nonfinite_origins': nonfinite_origins,
         }
         if kto_paopd:
             result.update({

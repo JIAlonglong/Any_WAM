@@ -21,6 +21,7 @@ FlowMapDistiller：Flow Map 蒸馏训练主类。
 import gc
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import torch
@@ -43,13 +44,39 @@ from modules.utils import WanVAEStreamingWrapper, load_transformer, load_vae
 from utils import logger, warmup_constant_lambda, FlowMatchScheduler
 from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
 from distillation_flowmap.cosmos_progressive_opd import (
-    should_run_standalone_opd,
+    select_progressive_training_objective,
     should_stop_training_at_step,
+)
+from distillation_flowmap.cosmos_deployment_rollout import (
+    mechanism_diagnostic_joint_step_for_update,
+)
+from distillation_flowmap.cosmos_training_contract import contract_metadata
+from distillation_flowmap.cosmos_hybrid_backend import (
+    STUDENT_BACKEND,
+    validate_cosmos_teacher_model_path,
+    validate_wan_student_base_model_path,
 )
 from distillation_flowmap.cosmos_teacher_roles import resolve_teacher_roles
 from distillation_flowmap.ablation.robotwin_diagnostics import (
     classify_parameter_branch,
     opd_diagnostic_aliases,
+)
+from distillation_flowmap.distributed_safety import (
+    accumulation_backward_allowed,
+    finish_accumulation_window,
+    initialize_nonfinite_safety,
+    record_nonfinite_origins,
+)
+from distillation_flowmap.mechanism_diagnostics import (
+    MechanismDiagnosticScheduler,
+    capture_diagnostic_snapshot_if_due,
+    diagnostic_seed,
+    diagnostic_runtime,
+    fatal_mechanism_process_exit,
+    fan_out_mechanism_metrics,
+    materialize_diagnostic_snapshot,
+    means_from_reduced_stats,
+    reduce_metric_stats,
 )
 
 try:
@@ -64,6 +91,68 @@ try:
 except ImportError:
     HAS_TENSORBOARD = False
 
+
+_ALIGNED_VIDEO_OPD_METRIC_KEYS = (
+    "opd_endpoint_loss",
+    "opd_same_state_velocity_loss",
+    "opd_endpoint_contrib",
+    "opd_same_state_velocity_contrib",
+    "opd_endpoint_ratio",
+    "opd_same_state_velocity_ratio",
+    "opd_query_sigma",
+    "opd_query_index",
+    "opd_student_steps",
+    "opd_teacher_steps",
+    "opd_valid_video_frames",
+    "opd_same_prior_verified",
+    "opd_canonical_state_verified",
+)
+
+
+def _aligned_video_opd_metrics(result, zero_tensor):
+    metrics = {
+        key: result.get(key, zero_tensor)
+        for key in _ALIGNED_VIDEO_OPD_METRIC_KEYS
+        if key not in ("opd_endpoint_ratio", "opd_same_state_velocity_ratio")
+    }
+    denominator = (
+        metrics["opd_endpoint_contrib"].detach().abs()
+        + metrics["opd_same_state_velocity_contrib"].detach().abs()
+    ).clamp(min=1e-12)
+    metrics["opd_endpoint_ratio"] = (
+        metrics["opd_endpoint_contrib"].detach().abs() / denominator
+    )
+    metrics["opd_same_state_velocity_ratio"] = (
+        metrics["opd_same_state_velocity_contrib"].detach().abs() / denominator
+    )
+    return metrics
+
+
+def _aligned_video_opd_log_values(metrics):
+    return {
+        "loss/opd_endpoint": metrics["opd_endpoint_loss"],
+        "loss/opd_same_state_velocity": metrics[
+            "opd_same_state_velocity_loss"
+        ],
+        "loss_weighted/opd_endpoint": metrics["opd_endpoint_contrib"],
+        "loss_weighted/opd_same_state_velocity": metrics[
+            "opd_same_state_velocity_contrib"
+        ],
+        "loss_ratio/opd_endpoint": metrics["opd_endpoint_ratio"],
+        "loss_ratio/opd_same_state_velocity": metrics[
+            "opd_same_state_velocity_ratio"
+        ],
+        "opd/query_sigma": metrics["opd_query_sigma"],
+        "opd/query_index": metrics["opd_query_index"],
+        "opd/student_steps": metrics["opd_student_steps"],
+        "opd/teacher_steps": metrics["opd_teacher_steps"],
+        "opd/valid_video_frames": metrics["opd_valid_video_frames"],
+        "opd/same_prior_verified": metrics["opd_same_prior_verified"],
+        "opd/canonical_state_verified": metrics[
+            "opd_canonical_state_verified"
+        ],
+    }
+
 try:
     from peft import LoraConfig, get_peft_model
     HAS_PEFT = True
@@ -74,6 +163,55 @@ from distillation.data import DataMixin
 from distillation.ema import update_ema
 from flowmap_step import FlowMapStepMixin
 from model_flowmap import setup_flowmap_model, patch_model_forward
+
+
+def _select_progressive_training_objective(
+    config,
+    *,
+    completed_updates,
+    deployment_enabled,
+    raw_auxiliary_enabled,
+):
+    completed_updates = int(completed_updates)
+    if completed_updates < 0:
+        raise ValueError("completed_updates must be non-negative")
+    optimizer_update = completed_updates + 1
+    selected = select_progressive_training_objective(
+        step=optimizer_update,
+        deployment_enabled=deployment_enabled,
+        deployment_interval=int(getattr(
+            config, "aligned_video_opd_interval", 4
+        )),
+        raw_auxiliary_enabled=raw_auxiliary_enabled,
+        raw_auxiliary_warmup=int(getattr(config, "opd_aux_warmup_steps", 0)),
+        raw_auxiliary_interval=int(getattr(config, "opd_aux_interval", 4)),
+        raw_auxiliary_phase=int(getattr(config, "opd_aux_phase", 2)),
+    )
+    return {
+        "deployment": "aligned_video_opd",
+        "raw_auxiliary": "action_opd",
+        "main": "main_anyflow",
+    }.get(selected, selected)
+
+
+def _write_json_atomic(path, payload):
+    path = Path(path)
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
 
 # DMD 判别器（仅在 use_dmd=True 时导入）
 try:
@@ -245,6 +383,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         self.dtype = config.param_dtype                        # 模型参数精度（bf16）
         self.patch_size = config.patch_size                    # 视频 patch 大小
         self.gradient_accumulation_steps = config.gradient_accumulation_steps  # 梯度累积步数
+        initialize_nonfinite_safety(self)
 
         # k: 在 1000 步 schedule 中的跳步数
         # 例如：1000 / 2 = 500，意味着每次跳 500 步
@@ -370,6 +509,23 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             self.tb_writer = SummaryWriter(log_dir=str(tb_dir))
             print(f"[TensorBoard] Logging to {tb_dir}")
 
+        self._mechanism_diagnostics_enabled = bool(getattr(
+            config, "mechanism_diagnostics", False
+        ))
+        self._mechanism_diagnostic_scheduler = MechanismDiagnosticScheduler(
+            int(getattr(config, "mechanism_diagnostic_interval", 100))
+        )
+        self._mechanism_diagnostic_snapshot = None
+        self._mechanism_diagnostic_index = 0
+        self._mechanism_diagnostic_runner = (
+            self._run_cosmos_mechanism_diagnostics
+            if hasattr(self, "_run_cosmos_mechanism_probe")
+            else None
+        )
+        self._mechanism_metrics_path = (
+            Path(config.output_dir) / "diagnostics" / "mechanism_metrics.jsonl"
+        )
+
         # ==============================================================
         # 调度器初始化 — 与原始 FlashWAMDistiller 完全一致
         # ==============================================================
@@ -455,22 +611,27 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         # 三个模型的初始化
         # ==============================================================
         if self.is_cosmos_policy_teacher:
+            student_backend = getattr(config, "student_backend", None)
+            if student_backend != STUDENT_BACKEND:
+                raise ValueError(
+                    "teacher_backend='cosmos_policy' hybrid training requires "
+                    f"cfg.student_backend={STUDENT_BACKEND!r}, got "
+                    f"{student_backend!r}"
+                )
             student_base_model_path = getattr(config, 'student_base_model_path', None)
             if student_base_model_path is None:
                 raise ValueError(
                     "teacher_backend='cosmos_policy' requires cfg.student_base_model_path "
-                    "pointing to a WanVA teacher/checkpoint root for student initialization."
+                    "pointing to the explicit Wan FlowMap Student base."
                 )
-            student_base_model_path = os.path.abspath(os.path.expanduser(student_base_model_path))
-            if os.path.basename(student_base_model_path) == "transformer":
-                teacher_path = student_base_model_path
-            else:
-                teacher_path = os.path.join(student_base_model_path, "transformer")
-            if not os.path.isfile(os.path.join(teacher_path, "config.json")):
-                raise FileNotFoundError(
-                    "Invalid student_base_model_path for Cosmos Policy backend: "
-                    f"expected {os.path.join(teacher_path, 'config.json')}"
-                )
+            student_base_model_path = str(
+                validate_wan_student_base_model_path(student_base_model_path)
+            )
+            config.student_base_model_path = student_base_model_path
+            config.teacher_model_path = str(
+                validate_cosmos_teacher_model_path(config.teacher_model_path)
+            )
+            teacher_path = os.path.join(student_base_model_path, "transformer")
         else:
             teacher_path = os.path.join(config.teacher_model_path, "transformer")
 
@@ -1232,13 +1393,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         注意：保存的模型已经包含 Flow Map 改造（delta_embedder 等），
         恢复时可以直接加载，无需再次调用 setup_flowmap_model。
         """
-        model = self.student if which == "online_student" else self.target_student
-        if model is None:
-            if self.config.rank == 0:
-                logger.info(f"  Skipped {which} checkpoint because target student is disabled.")
-            if dist.is_initialized():
-                dist.barrier(device_ids=[torch.cuda.current_device()])
-            return
+        target_is_online_snapshot = (
+            which == "target_student" and self.target_student is None
+        )
+        model = (
+            self.student
+            if which == "online_student" or target_is_online_snapshot
+            else self.target_student
+        )
+        stage_name = getattr(self.config, "training_contract_stage", None)
+        persisted_contract = None
+        if stage_name is not None:
+            persisted_contract = contract_metadata(self.config, stage=stage_name)
         try:
             if self.use_lora:
                 # LoRA 模式：只保存 adapter 权重（不含基座模型权重，文件更小）
@@ -1272,14 +1438,36 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 config_dict['distill_mode'] = getattr(self.config, 'distill_mode', 'flashwam')
                 config_dict['checkpoint_step'] = self.step
                 _set_video_channel_config_from_heads(config_dict, model, state_dict_bf16)
+                if persisted_contract is not None:
+                    config_dict.update(persisted_contract)
+                if self.target_student is None:
+                    config_dict["target_student_source"] = (
+                        "online_student_snapshot"
+                    )
+                for metadata_field in (
+                    "student_backend",
+                    "teacher_backend",
+                    "student_base_model_path",
+                    "teacher_model_path",
+                    "parent_stage1_path",
+                    "parent_stage1_contract_identity",
+                    "stage2_lineage_json",
+                    "cosmos_libero_variant_json",
+                    "cosmos_libero_provenance_json",
+                ):
+                    metadata_value = getattr(
+                        self.config, metadata_field, None
+                    )
+                    if metadata_value is not None:
+                        config_dict[metadata_field] = metadata_value
                 # 保存 LoRA 元信息，方便恢复时重建 LoRA 结构
                 if self.use_lora:
                     config_dict['use_lora'] = True
                     config_dict['lora_rank'] = self.config.lora_rank
                     config_dict['lora_alpha'] = self.config.lora_alpha
                     config_dict['lora_target_modules'] = self.config.lora_target_modules
-                with open(ckpt_dir / "config.json", "w") as f:
-                    json.dump(config_dict, f, indent=2)
+                config_path = ckpt_dir / "config.json"
+                _write_json_atomic(config_path, config_dict)
                 logger.info(f"  Saved {which} -> {ckpt_dir} ({'LoRA adapter' if self.use_lora else 'full model'})")
 
                 if which == "online_student":
@@ -2470,6 +2658,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         acc_video_losses = []        # 累积的视频损失
         acc_cosmos_video_endpoint_losses = []
         acc_cosmos_video_cdiff_losses = []
+        acc_deployment_video_endpoint_losses = []
+        acc_deployment_action_endpoint_losses = []
+        acc_deployment_total_losses = []
+        acc_deployment_student_steps = []
+        acc_deployment_t_starts = []
+        acc_deployment_t_ends = []
         acc_video_local_fm_losses = []  # 累积的视频 local FM 损失
         acc_action_losses = []       # 累积的动作损失
         acc_action_local_fm_losses = []  # 累积的动作 local FM 损失
@@ -2507,6 +2701,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         acc_opd_anchor_scales = []
         acc_opd_transition_group_ratios = []
         acc_opd_anchor_group_ratios = []
+        acc_aligned_video_opd_metrics = {
+            key: [] for key in _ALIGNED_VIDEO_OPD_METRIC_KEYS
+        }
         acc_kto_good_ratios = []
         acc_kto_weight_means = []
         acc_kto_weight_mins = []
@@ -2539,6 +2736,16 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         ):
             # 获取下一个数据批次
             batch = self._get_next_batch()
+            if self._mechanism_diagnostics_enabled:
+                # Capture before any training route can replace dataset GT fields.
+                # The retained copy is immutable and CPU-only.
+                self._mechanism_diagnostic_snapshot = (
+                    capture_diagnostic_snapshot_if_due(
+                        self._mechanism_diagnostic_scheduler,
+                        batch,
+                        completed_step=self.step + 1,
+                    )
+                )
 
             # ---- 训练步：FlowMap 主目标始终优先；旧 on-policy replacement 仅作 legacy ablation ----
             use_onpolicy = self.use_onpolicy_transition
@@ -2552,34 +2759,90 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 and self.use_opd_aux
                 and not use_onpolicy_now
             )
-            if standalone_opd and self.gradient_accumulation_steps != 1:
+            aligned_video_opd_enabled = (
+                bool(getattr(
+                    self.config,
+                    "aligned_video_opd_enabled",
+                    getattr(
+                        self.config,
+                        "deployment_joint_rollout_enabled",
+                        False,
+                    ),
+                ))
+                and not use_onpolicy_now
+            )
+            if (
+                (standalone_opd or aligned_video_opd_enabled)
+                and self.gradient_accumulation_steps != 1
+            ):
                 raise ValueError(
-                    'opd_aux_standalone_step requires gradient_accumulation_steps=1 '
-                    'so every scheduled OPD update starts from zero gradients.'
+                    'standalone progressive objectives require '
+                    'gradient_accumulation_steps=1 so every scheduled update '
+                    'starts from zero gradients.'
                 )
 
-            if standalone_opd:
-                opd_aux_interval = max(1, int(getattr(self.config, 'opd_aux_interval', 1)))
-                use_opd_aux_now = should_run_standalone_opd(
-                    step=self.step,
-                    warmup_steps=getattr(self.config, 'opd_aux_warmup_steps', 0),
-                    interval=opd_aux_interval,
-                )
+            scheduled_kind = _select_progressive_training_objective(
+                self.config,
+                completed_updates=self.step,
+                deployment_enabled=aligned_video_opd_enabled,
+                raw_auxiliary_enabled=standalone_opd,
+            )
+            use_opd_aux_now = scheduled_kind == "action_opd"
+            if use_opd_aux_now:
                 opd_aux_prob = float(getattr(self.config, 'opd_aux_prob', 1.0))
-                if use_opd_aux_now and opd_aux_prob < 1.0:
+                if opd_aux_prob < 1.0:
                     if dist.is_initialized():
                         aux_draw = torch.rand(1, device=self.device)
                         dist.broadcast(aux_draw, src=0)
                         use_opd_aux_now = aux_draw.item() < opd_aux_prob
                     else:
                         use_opd_aux_now = torch.rand(1).item() < opd_aux_prob
+                    if not use_opd_aux_now:
+                        scheduled_kind = "main_anyflow"
 
             def _run_opd_aux():
                 if self.opd_aux_variant in ('kto_paopd', 'kto_paopd_norm_focal'):
                     return self._opd_aux_transition_step_kto_paopd(batch, step_in_acc)
                 return self._opd_aux_transition_step(batch, step_in_acc)
 
-            if standalone_opd and use_opd_aux_now:
+            if scheduled_kind == "aligned_video_opd":
+                if hasattr(self.student, 'set_requires_gradient_sync'):
+                    self.student.set_requires_gradient_sync(True)
+                result = self._cosmos_aligned_video_opd_step(batch, step_in_acc)
+                aligned_metrics = _aligned_video_opd_metrics(
+                    result, zero_tensor
+                )
+                opd_aux_result = {
+                    **result,
+                    **aligned_metrics,
+                    "opd_aux_loss": result.get("loss", zero_tensor),
+                    "opd_endpoint_aux_loss": result.get(
+                        "opd_endpoint_loss", zero_tensor
+                    ),
+                    "opd_endpoint_aux_contrib": result.get(
+                        "opd_endpoint_contrib", zero_tensor
+                    ),
+                    "opd_endpoint_aux_ratio": aligned_metrics[
+                        "opd_endpoint_ratio"
+                    ],
+                }
+                for metric_name in (
+                    'video_loss',
+                    'cosmos_video_endpoint_loss',
+                    'cosmos_video_cdiff_loss',
+                    'local_fm_loss',
+                    'action_loss',
+                    'action_local_fm_loss',
+                    'action_aware_loss',
+                    'gt_regression_loss',
+                    'raw_teacher_gt_mse',
+                    'raw_teacher_gt_l1',
+                    'raw_teacher_abs_mean',
+                    'raw_gt_abs_mean',
+                    'raw_teacher_enabled',
+                ):
+                    result.setdefault(metric_name, zero_tensor)
+            elif scheduled_kind == "action_opd":
                 if hasattr(self.student, 'set_requires_gradient_sync'):
                     self.student.set_requires_gradient_sync(True)
                 if (bool(getattr(self.config, 'opd_aux_empty_cache', False))
@@ -2614,10 +2877,15 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 else:
                     result = self._train_step(batch, step_in_acc)
 
+                record_nonfinite_origins(
+                    self,
+                    result.get("nonfinite_origins", {}),
+                    device=self.device,
+                )
                 if (not standalone_opd and self.use_opd_aux and not use_onpolicy_now and
                         result.get("should_sync", False) and
                         self.step >= getattr(self.config, 'opd_aux_warmup_steps', 0) and
-                        not result.get("skip_step", False)):
+                        accumulation_backward_allowed(self)):
                     opd_aux_interval = max(1, int(getattr(self.config, 'opd_aux_interval', 1)))
                     use_opd_aux_now = (self.step % opd_aux_interval == 0)
                     opd_aux_prob = float(getattr(self.config, 'opd_aux_prob', 1.0))
@@ -2637,11 +2905,24 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         self.config, 'opd_aux_gradient_checkpointing', False))
                     opd_aux_result = _call_with_student_checkpointing(
                         self.student, opd_aux_checkpointing, _run_opd_aux)
+                    record_nonfinite_origins(
+                        self,
+                        opd_aux_result.get("nonfinite_origins", {}),
+                        device=self.device,
+                    )
                     result["loss"] = result["loss"] + opd_aux_result.get("loss", zero_tensor)
                     result["skip_step"] = (
                         result.get("skip_step", False) or
                         opd_aux_result.get("skip_step", False)
                     )
+
+            if scheduled_kind in ("aligned_video_opd", "action_opd"):
+                record_nonfinite_origins(
+                    self,
+                    result.get("nonfinite_origins", {}),
+                    device=self.device,
+                )
+            result["skip_step"] = self.skip_accumulation_window
 
             # 累积损失值
             acc_losses.append(result["loss"])
@@ -2653,6 +2934,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 "cosmos_video_endpoint_loss", zero_tensor))
             acc_cosmos_video_cdiff_losses.append(result.get(
                 "cosmos_video_cdiff_loss", zero_tensor))
+            acc_deployment_video_endpoint_losses.append(result.get(
+                "deployment_video_endpoint_loss", zero_tensor))
+            acc_deployment_action_endpoint_losses.append(result.get(
+                "deployment_action_endpoint_loss", zero_tensor))
+            acc_deployment_total_losses.append(result.get(
+                "deployment_total_loss", zero_tensor))
+            acc_deployment_student_steps.append(result.get(
+                "deployment_student_steps", zero_tensor))
+            acc_deployment_t_starts.append(result.get(
+                "deployment_t_start", zero_tensor))
+            acc_deployment_t_ends.append(result.get(
+                "deployment_t_end", zero_tensor))
             acc_video_local_fm_losses.append(result.get(
                 "local_fm_loss", zero_tensor))
             acc_action_losses.append(result["action_loss"])
@@ -2746,6 +3039,14 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
             acc_opd_anchor_group_ratios.append(
                 opd_aux_result.get("opd_anchor_group_ratio", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
+            aligned_video_metrics = _aligned_video_opd_metrics(
+                result if scheduled_kind == "aligned_video_opd" else {},
+                zero_tensor,
+            )
+            for metric_name in _ALIGNED_VIDEO_OPD_METRIC_KEYS:
+                acc_aligned_video_opd_metrics[metric_name].append(
+                    aligned_video_metrics[metric_name]
+                )
             acc_kto_good_ratios.append(
                 opd_aux_result.get("kto_good_ratio", zero_tensor)
                 if opd_aux_result is not None else zero_tensor)
@@ -2777,9 +3078,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                            and self.distill_action
                            and self.step >= dmd_warmup_steps
                            and result["should_sync"]
-                           and not skip_step
+                           and accumulation_backward_allowed(self)
                            and not use_onpolicy_now
-                           and not use_opd_aux_now)
+                           and scheduled_kind == "main_anyflow")
 
             if use_dmd_now:
                 if self.step >= dmd_warmup_steps + dmd_discriminator_warmup:
@@ -2815,9 +3116,8 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     (self.step + 1 >= config.max_train_steps)
                 )
                 grad_branch_norms = {}
-                if skip_step:
-                    total_norm = torch.tensor(float("nan"), device=self.device)
-                    self.optimizer.zero_grad()
+                if self.skip_accumulation_window:
+                    total_norm = torch.zeros((), device=self.device)
                 else:
                     if (
                         bool(getattr(config, "enable_grad_branch_diagnostics", False))
@@ -2828,31 +3128,39 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     total_norm = torch.nn.utils.clip_grad_norm_(
                         self.student.parameters(), config.max_grad_norm)
 
-                    if not torch.isfinite(total_norm):
-                        # 梯度范数为 NaN/Inf，跳过这一步
-                        if config.rank == 0:
-                            logger.warning(f"[step {self.step}] NaN grad norm, skipping")
-                        self.optimizer.zero_grad()
-                    else:
-                        # 正常更新参数
-                        self.optimizer.step()
-                        self.lr_scheduler.step()
-                        self.optimizer.zero_grad()
-                        self._nofsdp_synced = False  # invalidate dirty flag after weight update
+                def _update_target_ema():
+                    # FSDP1 with use_orig_params=True preserves original names.
+                    ema_warmup_steps = int(getattr(
+                        config, 'ema_warmup_steps', 0
+                    ))
+                    ema_decay = (
+                        0.0 if self.step < ema_warmup_steps else config.ema_decay
+                    )
+                    self._last_ema_decay = float(ema_decay)
+                    if self.target_student is not None:
+                        update_ema(
+                            self.target_student.parameters(),
+                            self.student.parameters(),
+                            rate=ema_decay,
+                        )
 
-                        # EMA 更新只在正常参数更新后执行（跳过 NaN/Inf 梯度时不更新 EMA，
-                        # 避免将异常梯度产生的错误权重传播到目标学生）
-                        # FSDP1 with use_orig_params=True preserves original parameter names,
-                        # so model.parameters() works directly (no .module needed)
-                        ema_warmup_steps = int(getattr(config, 'ema_warmup_steps', 0))
-                        ema_decay = 0.0 if self.step < ema_warmup_steps else config.ema_decay
-                        self._last_ema_decay = float(ema_decay)
-                        if self.target_student is not None:
-                            update_ema(
-                                self.target_student.parameters(),
-                                self.student.parameters(),
-                                rate=ema_decay,
-                            )
+                skipped_optimizer_step, total_norm, grad_branch_norms = (
+                    finish_accumulation_window(
+                        self,
+                        total_norm=total_norm,
+                        grad_branch_norms=grad_branch_norms,
+                        update_ema_fn=_update_target_ema,
+                    )
+                )
+                skip_step = skipped_optimizer_step
+                if skipped_optimizer_step:
+                    if config.rank == 0:
+                        logger.warning(
+                            "[step %s] synchronized non-finite window skipped",
+                            self.step,
+                        )
+                else:
+                    self._nofsdp_synced = False
 
                 # 计算平均损失（跨所有进程）
                 lr = self.lr_scheduler.get_last_lr()[0]
@@ -2861,6 +3169,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     torch.stack(acc_video_losses).sum(),
                     torch.stack(acc_cosmos_video_endpoint_losses).sum(),
                     torch.stack(acc_cosmos_video_cdiff_losses).sum(),
+                    torch.stack(acc_deployment_video_endpoint_losses).sum(),
+                    torch.stack(acc_deployment_action_endpoint_losses).sum(),
+                    torch.stack(acc_deployment_total_losses).sum(),
+                    torch.stack(acc_deployment_student_steps).sum(),
+                    torch.stack(acc_deployment_t_starts).sum(),
+                    torch.stack(acc_deployment_t_ends).sum(),
                     torch.stack(acc_video_local_fm_losses).sum(),
                     torch.stack(acc_action_losses).sum(),
                     torch.stack(acc_action_local_fm_losses).sum(),
@@ -2899,6 +3213,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     torch.stack(acc_opd_transition_group_ratios).sum(),
                     torch.stack(acc_opd_anchor_group_ratios).sum(),
                 ]
+                metric_tensors.extend(
+                    torch.stack(acc_aligned_video_opd_metrics[key]).sum()
+                    for key in _ALIGNED_VIDEO_OPD_METRIC_KEYS
+                )
                 kto_main_enabled = bool(getattr(self.config, 'kto_main_video_reweight', False))
                 if kto_main_enabled:
                     metric_tensors.extend([
@@ -2919,12 +3237,18 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     ])
                 metric_values = torch.stack(metric_tensors).float()
                 metric_results = dist_mean(metric_values).tolist()
-                base_metric_count = 41
+                base_metric_count = 47
                 (
                     avg_loss,
                     avg_video_loss,
                     avg_cosmos_video_endpoint_loss,
                     avg_cosmos_video_cdiff_loss,
+                    avg_deployment_video_endpoint_loss,
+                    avg_deployment_action_endpoint_loss,
+                    avg_deployment_total_loss,
+                    avg_deployment_student_steps,
+                    avg_deployment_t_start,
+                    avg_deployment_t_end,
                     avg_video_local_fm_loss,
                     avg_action_loss,
                     avg_action_local_fm_loss,
@@ -2964,6 +3288,14 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     avg_opd_anchor_group_ratio,
                 ) = metric_results[:base_metric_count]
                 metric_cursor = base_metric_count
+                avg_aligned_video_opd_metrics = dict(zip(
+                    _ALIGNED_VIDEO_OPD_METRIC_KEYS,
+                    metric_results[
+                        metric_cursor:
+                        metric_cursor + len(_ALIGNED_VIDEO_OPD_METRIC_KEYS)
+                    ],
+                ))
+                metric_cursor += len(_ALIGNED_VIDEO_OPD_METRIC_KEYS)
                 if kto_main_enabled:
                     (
                         avg_kto_main_active,
@@ -3011,6 +3343,12 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_video_losses = []
                 acc_cosmos_video_endpoint_losses = []
                 acc_cosmos_video_cdiff_losses = []
+                acc_deployment_video_endpoint_losses = []
+                acc_deployment_action_endpoint_losses = []
+                acc_deployment_total_losses = []
+                acc_deployment_student_steps = []
+                acc_deployment_t_starts = []
+                acc_deployment_t_ends = []
                 acc_video_local_fm_losses = []
                 acc_action_losses = []
                 acc_action_local_fm_losses = []
@@ -3048,6 +3386,9 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 acc_opd_anchor_scales = []
                 acc_opd_transition_group_ratios = []
                 acc_opd_anchor_group_ratios = []
+                acc_aligned_video_opd_metrics = {
+                    key: [] for key in _ALIGNED_VIDEO_OPD_METRIC_KEYS
+                }
                 acc_kto_good_ratios = []
                 acc_kto_weight_means = []
                 acc_kto_weight_mins = []
@@ -3081,11 +3422,35 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         "train/grad_norm": total_norm.item(),
                         "train/lr": lr,
                         "train/ema_decay": getattr(self, '_last_ema_decay', config.ema_decay),
+                        "safety/nonfinite_skipped_windows": self.nonfinite_skipped_windows,
+                        "safety/nonfinite_video": self.nonfinite_origin_counters["video"],
+                        "safety/nonfinite_action": self.nonfinite_origin_counters["action"],
+                        "safety/nonfinite_teacher_or_gt": self.nonfinite_origin_counters["teacher_or_gt"],
+                        "safety/nonfinite_opd_endpoint": self.nonfinite_origin_counters["opd_endpoint"],
+                        "safety/nonfinite_opd_compositional": self.nonfinite_origin_counters["opd_compositional"],
+                        "safety/nonfinite_opd_action": self.nonfinite_origin_counters["opd_action"],
+                        "safety/nonfinite_gradient": self.nonfinite_origin_counters["gradient"],
                     }
                     if grad_branch_norms:
                         log_dict["grad_norm/video_branch"] = grad_branch_norms["video"]
                         log_dict["grad_norm/action_branch"] = grad_branch_norms["action"]
                         log_dict["grad_norm/shared_branch"] = grad_branch_norms["shared"]
+                    if scheduled_kind == "aligned_video_opd":
+                        postfix["dep"] = f"{avg_deployment_total_loss:.4f}"
+                        log_dict["deployment/video_endpoint_loss"] = (
+                            avg_deployment_video_endpoint_loss
+                        )
+                        log_dict["deployment/action_endpoint_loss"] = (
+                            avg_deployment_action_endpoint_loss
+                        )
+                        log_dict["deployment/total_loss"] = (
+                            avg_deployment_total_loss
+                        )
+                        log_dict["deployment/student_steps"] = (
+                            avg_deployment_student_steps
+                        )
+                        log_dict["deployment/t_start"] = avg_deployment_t_start
+                        log_dict["deployment/t_end"] = avg_deployment_t_end
                     if self.distill_video:
                         if use_onpolicy_now:
                             postfix["vt"] = f"{avg_video_loss:.4f}"
@@ -3126,6 +3491,10 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                         postfix["aa"] = f"{avg_action_aware_loss:.4f}"
                         log_dict["loss/action_local_fm"] = avg_action_local_fm_loss
                         log_dict["loss/action_aware"] = avg_action_aware_loss
+                    if scheduled_kind == "aligned_video_opd":
+                        log_dict.update(_aligned_video_opd_log_values(
+                            avg_aligned_video_opd_metrics
+                        ))
                     if avg_opd_aux_loss > 0:
                         postfix["opd"] = f"{avg_opd_aux_loss:.4f}"
                         postfix["ovt"] = f"{avg_opd_video_transition_loss:.2e}"
@@ -3203,6 +3572,11 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
 
                 self.step += 1
 
+                self._maybe_run_mechanism_diagnostics(
+                    completed_step=self.step,
+                    optimizer_succeeded=not skipped_optimizer_step,
+                )
+
                 # Lightweight deterministic eval. All ranks run this because
                 # the student may be FSDP-wrapped; only rank 0 logs results.
                 light_eval_interval = int(getattr(config, "light_eval_interval", 0))
@@ -3248,8 +3622,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                 # 定期保存检查点（保留最近 3 个 + 最佳 loss 的）
                 if self.step % config.save_interval == 0:
                     self._save_checkpoint("online_student")
-                    if self.target_student is not None:
-                        self._save_checkpoint("target_student")
+                    self._save_checkpoint("target_student")
 
 
             # 常规训练不需要每个 microbatch barrier；仅保留可选 debug barrier。
@@ -3262,9 +3635,127 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
         logger.info("Flow Map distillation completed!")
         # 保存最终检查点
         self._save_checkpoint("online_student")
-        if self.target_student is not None:
-            self._save_checkpoint("target_student")
+        self._save_checkpoint("target_student")
         # 关闭 TensorBoard writer
         if self.tb_writer is not None:
             self.tb_writer.flush()
             self.tb_writer.close()
+
+    def _sync_cosmos_mechanism_preflight(self, local_ready: bool) -> None:
+        status = torch.tensor(
+            [1.0 if local_ready else 0.0], device=self.device
+        )
+        if dist.is_initialized():
+            dist.all_reduce(status, op=dist.ReduceOp.MIN)
+        if status.item() != 1.0:
+            raise RuntimeError(
+                "Cosmos mechanism preflight failed on at least one rank"
+            )
+
+    def _run_cosmos_mechanism_diagnostics(self, *, completed_step: int):
+        del completed_step
+        self._sync_cosmos_mechanism_preflight(
+            self._mechanism_diagnostic_snapshot is not None
+        )
+        diagnostic_index = self._mechanism_diagnostic_index
+        rank = int(getattr(self.config, "rank", 0))
+        seed = diagnostic_seed(
+            int(self.config.mechanism_diagnostic_seed),
+            diagnostic_index,
+            0,
+            rank,
+        )
+        student_steps = mechanism_diagnostic_joint_step_for_update(
+            diagnostic_index
+        )
+        local_preflight_error = None
+        diagnostic_batch = None
+        try:
+            diagnostic_batch = materialize_diagnostic_snapshot(
+                self._mechanism_diagnostic_snapshot, device=self.device
+            )
+            self._validate_cosmos_mechanism_preflight(
+                diagnostic_batch,
+                teacher_steps=int(
+                    self.config.mechanism_diagnostic_teacher_steps
+                ),
+                student_steps=student_steps,
+            )
+        except Exception as error:
+            local_preflight_error = error
+        self._sync_cosmos_mechanism_preflight(local_preflight_error is None)
+        if local_preflight_error is not None:
+            raise RuntimeError(
+                "Cosmos mechanism deterministic preflight failed locally"
+            ) from local_preflight_error
+        models = []
+        seen = set()
+        for name in ("student", "_student_nofsdp", "target_student"):
+            model = getattr(self, name, None)
+            if (
+                isinstance(model, torch.nn.Module)
+                and id(model) not in seen
+            ):
+                seen.add(id(model))
+                models.append(model)
+        try:
+            with diagnostic_runtime(seed=seed, models=tuple(models)):
+                local_stats = self._run_cosmos_mechanism_probe(
+                    diagnostic_batch,
+                    seed=seed,
+                    teacher_steps=int(
+                        self.config.mechanism_diagnostic_teacher_steps
+                    ),
+                    student_steps=student_steps,
+                )
+        except Exception as error:
+            fatal_mechanism_process_exit(
+                error, distributed=dist.is_initialized()
+            )
+        reduced = reduce_metric_stats(local_stats)
+        self._mechanism_diagnostic_index += 1
+        return means_from_reduced_stats(reduced)
+
+    def _maybe_run_mechanism_diagnostics(
+        self,
+        *,
+        completed_step: int,
+        optimizer_succeeded: bool,
+    ) -> None:
+        """Schedule an optional post-update backend probe and fan out its metrics.
+
+        The runner must execute on every rank and return already globally
+        reduced, finite ``mechanism/*`` metrics.  It is intentionally supplied
+        by the backend-specific Task 6 integration rather than inferred here.
+        """
+        if not self._mechanism_diagnostics_enabled:
+            self._mechanism_diagnostic_snapshot = None
+            return
+        if not self._mechanism_diagnostic_scheduler.observe(
+            completed_step=completed_step,
+            optimizer_succeeded=optimizer_succeeded,
+        ):
+            self._mechanism_diagnostic_snapshot = None
+            return
+        if self._mechanism_diagnostic_runner is None:
+            self._mechanism_diagnostic_snapshot = None
+            logger.warning(
+                "Mechanism diagnostic was due at step %s but no backend probe is installed",
+                completed_step,
+            )
+            return
+        try:
+            metrics = self._mechanism_diagnostic_runner(
+                completed_step=completed_step
+            )
+        finally:
+            # Never retain a GPU batch (or a stale CPU snapshot) past the probe.
+            self._mechanism_diagnostic_snapshot = None
+        fan_out_mechanism_metrics(
+            metrics,
+            step=completed_step,
+            rank=self.config.rank,
+            tb_writer=self.tb_writer,
+            wandb_module=wandb if self.config.enable_wandb and HAS_WANDB else None,
+            jsonl_path=self._mechanism_metrics_path,
+        )

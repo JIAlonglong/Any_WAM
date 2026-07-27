@@ -1,3 +1,4 @@
+import hashlib
 import importlib
 import json
 import os
@@ -6,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 
@@ -196,6 +198,409 @@ def test_cosmos_policy_action_teacher_returns_latent_velocity_query(tmp_path):
     assert torch.all(result["cosmos_latent_velocity"] == 2.0)
 
 
+def test_downsample_survivor_action_query_unpacks_to_native_cosmos_chunk():
+    from distillation_flowmap.cosmos_policy_adapter import (
+        unpack_flowmap_action_query,
+    )
+
+    normalized = torch.arange(16 * 7, dtype=torch.float32).reshape(1, 16, 7)
+    compact = torch.zeros(1, 30, 4, 4, 1)
+    compact[:, :7] = normalized.reshape(1, 4, 4, 7).permute(0, 3, 1, 2)[..., None]
+
+    unpacked = unpack_flowmap_action_query(
+        compact,
+        used_action_channel_ids=tuple(range(7)),
+        packing_schema="downsample_survivor_v2",
+        downsample_factor=4,
+    )
+
+    assert torch.equal(unpacked, normalized)
+
+
+def test_joint_query_injects_native_action_only_at_dynamic_carrier_frame():
+    from distillation_flowmap.cosmos_policy_raw_worker import (
+        _inject_normalized_action_chunk,
+    )
+
+    latent = torch.zeros(2, 3, 5, 2, 2)
+    action = torch.arange(2 * 4 * 2, dtype=torch.float32).reshape(2, 4, 2)
+    indices = torch.tensor([1, 3])
+
+    injected = _inject_normalized_action_chunk(latent, action, indices)
+
+    for batch_index, frame_index in enumerate((1, 3)):
+        expected = action[batch_index].flatten().repeat(2)[:12].reshape(3, 2, 2)
+        assert torch.equal(injected[batch_index, :, frame_index], expected)
+        untouched = injected[batch_index].clone()
+        untouched[:, frame_index] = 0
+        assert torch.count_nonzero(untouched) == 0
+    assert torch.count_nonzero(latent) == 0
+
+
+def test_joint_latent_velocity_provider_receives_unpacked_action_and_supported_time(
+    tmp_path,
+):
+    from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+    teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32)
+    teacher.config = type(
+        "Config",
+        (),
+        {
+            "used_action_channel_ids": tuple(range(7)),
+            "action_packing_schema": "downsample_survivor_v2",
+            "action_downsample_factor": 4,
+        },
+    )()
+    captured = {}
+
+    def provider(raw_batch, query_latent, query_action, t):
+        captured.update(
+            latent=query_latent.clone(),
+            action=query_action.clone(),
+            time=t.clone(),
+        )
+        return {
+            "actions": torch.zeros(1, 16, 7),
+            "cosmos_latent_velocity": torch.ones_like(query_latent),
+            "cosmos_joint_query": query_latent,
+            "cosmos_video_frame_mask": torch.tensor(
+                [[False, False, False, False, False, False, True, True, False]]
+            ),
+        }
+
+    teacher._raw_joint_latent_velocity_provider = provider
+    compact = torch.zeros(1, 30, 4, 4, 1)
+    compact[:, :7] = 0.25
+    query_t = torch.full((1, 9), 0.9)
+    result = teacher.predict_raw_joint_latent_velocity(
+        {"raw_task": ["pick up the cup"]},
+        query_latent=torch.zeros(1, 16, 9, 28, 28),
+        query_action=compact,
+        t=query_t,
+    )
+
+    assert captured["action"].shape == (1, 16, 7)
+    assert torch.all(captured["action"] == 0.25)
+    assert torch.equal(captured["time"], query_t)
+    assert result["cosmos_video_frame_mask"].tolist() == [
+        [False, False, False, False, False, False, True, True, False]
+    ]
+    with pytest.raises(ValueError, match="calibrated"):
+        teacher.predict_raw_joint_latent_velocity(
+            {"raw_task": ["pick up the cup"]},
+            query_latent=torch.zeros(1, 16, 9, 28, 28),
+            query_action=compact,
+            t=torch.full((1, 9), 0.5),
+        )
+
+
+def test_joint_velocity_subprocess_payload_carries_normalized_action(tmp_path):
+    from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+    teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32)
+    teacher._raw_worker_tmpdir = str(tmp_path)
+    teacher._raw_batch_to_numpy = lambda raw_batch: (
+        np.zeros((1, 2, 2, 3), np.uint8),
+        np.zeros((1, 2, 2, 3), np.uint8),
+        np.zeros((1, 9), np.float32),
+        ["task"],
+    )
+    captured = {}
+    response = {}
+
+    class FakeStdin:
+        def write(self, line):
+            payload = json.loads(line)
+            with np.load(payload["npz_path"]) as request:
+                captured["action"] = request["cosmos_action_query_x"].copy()
+            np.savez_compressed(
+                payload["actions_path"],
+                actions=np.zeros((1, 16, 7), np.float32),
+                cosmos_latent_velocity=np.zeros((1, 16, 9, 2, 2), np.float32),
+                cosmos_joint_query=np.zeros((1, 16, 9, 2, 2), np.float32),
+                cosmos_video_frame_mask=np.ones((1, 9), bool),
+            )
+            response["line"] = json.dumps(
+                {"ok": True, "actions_path": payload["actions_path"]}
+            )
+
+        def flush(self):
+            pass
+
+    class FakeStdout:
+        def readline(self):
+            return response["line"]
+
+    teacher._raw_worker = SimpleNamespace(stdin=FakeStdin(), stdout=FakeStdout())
+    teacher._ensure_raw_worker = lambda: None
+    action = torch.full((1, 16, 7), 0.375)
+    teacher._predict_raw_latent_velocity_subprocess(
+        {"raw_task": ["task"]},
+        torch.zeros(1, 16, 9, 2, 2),
+        torch.full((1, 9), 0.9),
+        query_action=action,
+    )
+
+    np.testing.assert_array_equal(captured["action"], action.numpy())
+
+
+def _sha256_array(value):
+    array = np.ascontiguousarray(value)
+    return hashlib.sha256(array.view(np.uint8)).hexdigest()
+
+
+def _make_same_prior_teacher(tmp_path):
+    from distillation_flowmap.cosmos_policy_adapter import CosmosPolicyActionTeacher
+
+    ckpt = tmp_path / "cosmos_policy"
+    _write_minimal_cosmos_policy_checkpoint(ckpt)
+    teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32)
+    teacher._raw_batch_to_numpy = lambda raw_batch: (
+        np.zeros((1, 2, 2, 3), np.uint8),
+        np.zeros((1, 2, 2, 3), np.uint8),
+        np.zeros((1, 9), np.float32),
+        ["task"],
+    )
+    return teacher
+
+
+def test_same_prior_endpoint_request_round_trips_exact_priors_and_eight_steps(
+    tmp_path,
+):
+    teacher = _make_same_prior_teacher(tmp_path)
+    video_prior = torch.randn(1, 16, 9, 28, 28)
+    action_prior = torch.randn(1, 16, 7)
+    captured = {}
+
+    def fake_worker(payload, arrays):
+        captured.update(payload)
+        torch.testing.assert_close(torch.from_numpy(arrays["video_prior"]), video_prior)
+        torch.testing.assert_close(torch.from_numpy(arrays["action_prior"]), action_prior)
+        return {
+            "endpoint_video": np.zeros_like(arrays["video_prior"]),
+            "video_frame_mask": np.ones((1, video_prior.shape[2]), dtype=bool),
+            "effective_teacher_steps": 8,
+            "video_prior_sha256": _sha256_array(arrays["video_prior"]),
+            "action_prior_sha256": _sha256_array(arrays["action_prior"]),
+        }
+
+    teacher._request_raw_worker_npz = fake_worker
+    result = teacher.predict_raw_same_prior_endpoint(
+        {"raw_task": ["task"]},
+        video_prior=video_prior,
+        action_prior=action_prior,
+        teacher_steps=8,
+    )
+
+    assert captured["mode"] == "same_prior_endpoint"
+    assert captured["teacher_steps"] == 8
+    assert result["effective_teacher_steps"] == 8
+    assert result["endpoint_video"].dtype == torch.float32
+    assert result["video_frame_mask"].dtype == torch.bool
+
+
+def test_joint_continuation_request_round_trips_state_time_and_provenance(tmp_path):
+    teacher = _make_same_prior_teacher(tmp_path)
+    canonical = torch.randn(1, 16, 9, 28, 28, dtype=torch.float32)
+    normalized_t = torch.full((1, 9), 5.0 / 6.0, dtype=torch.float32)
+    captured = {}
+
+    def fake_worker(payload, arrays):
+        captured.update(payload)
+        np.testing.assert_array_equal(
+            arrays["canonical_joint_state"], canonical.numpy()
+        )
+        np.testing.assert_array_equal(arrays["normalized_t"], normalized_t.numpy())
+        return {
+            "endpoint_video": np.zeros_like(arrays["canonical_joint_state"]),
+            "video_frame_mask": np.ones((1, 9), dtype=bool),
+            "effective_teacher_steps": 8,
+            "joint_state_sha256": _sha256_array(
+                arrays["canonical_joint_state"]
+            ),
+            "normalized_t_sha256": _sha256_array(arrays["normalized_t"]),
+            "normalized_t": arrays["normalized_t"][:, 0],
+            "edm_sigma": np.asarray([5.0], dtype=np.float32),
+        }
+
+    teacher._request_raw_worker_npz = fake_worker
+    result = teacher.predict_raw_joint_continuation_endpoint(
+        {"raw_task": ["task"]},
+        canonical_joint_state=canonical,
+        normalized_t=normalized_t,
+        teacher_steps=8,
+    )
+
+    assert captured["mode"] == "joint_continuation_endpoint"
+    assert captured["teacher_steps"] == 8
+    assert result["effective_teacher_steps"] == 8
+    torch.testing.assert_close(result["normalized_t"], torch.tensor([5.0 / 6.0]))
+    torch.testing.assert_close(result["edm_sigma"], torch.tensor([5.0]))
+
+
+def test_joint_continuation_adapter_rejects_empty_mask_and_bad_fingerprint(
+    tmp_path,
+):
+    teacher = _make_same_prior_teacher(tmp_path)
+    canonical = torch.zeros(1, 16, 9, 28, 28)
+    normalized_t = torch.full((1,), 5.0 / 6.0)
+
+    def fake_worker(payload, arrays):
+        del payload
+        return {
+            "endpoint_video": np.zeros_like(arrays["canonical_joint_state"]),
+            "video_frame_mask": np.zeros((1, 9), dtype=bool),
+            "effective_teacher_steps": 8,
+            "joint_state_sha256": "wrong",
+            "normalized_t_sha256": _sha256_array(arrays["normalized_t"]),
+            "normalized_t": arrays["normalized_t"],
+            "edm_sigma": np.asarray([5.0], dtype=np.float32),
+        }
+
+    teacher._request_raw_worker_npz = fake_worker
+    with pytest.raises(RuntimeError, match="fingerprint|nonempty"):
+        teacher.predict_raw_joint_continuation_endpoint(
+            {"raw_task": ["task"]},
+            canonical_joint_state=canonical,
+            normalized_t=normalized_t,
+            teacher_steps=8,
+        )
+
+
+def test_same_prior_endpoint_rejects_non_eight_steps_before_worker_start(tmp_path):
+    teacher = _make_same_prior_teacher(tmp_path)
+    teacher._ensure_raw_worker = lambda: pytest.fail("worker must not start")
+
+    with pytest.raises(ValueError, match="exactly 8"):
+        teacher.predict_raw_same_prior_endpoint(
+            {"raw_task": ["task"]},
+            video_prior=torch.zeros(1, 16, 9, 28, 28),
+            action_prior=torch.zeros(1, 16, 7),
+            teacher_steps=7,
+        )
+
+
+@pytest.mark.parametrize("teacher_steps", [8.5, "8", True])
+def test_same_prior_endpoint_rejects_non_integer_budget_before_worker_start(
+    tmp_path, teacher_steps
+):
+    teacher = _make_same_prior_teacher(tmp_path)
+    teacher._ensure_raw_worker = lambda: pytest.fail("worker must not start")
+
+    with pytest.raises((TypeError, ValueError), match="integer"):
+        teacher.predict_raw_same_prior_endpoint(
+            {"raw_task": ["task"]},
+            video_prior=torch.zeros(1, 16, 9, 28, 28),
+            action_prior=torch.zeros(1, 16, 7),
+            teacher_steps=teacher_steps,
+        )
+
+
+@pytest.mark.parametrize(
+    "response_override,match",
+    [
+        ({"video_prior_sha256": "wrong"}, "video prior fingerprint"),
+        ({"action_prior_sha256": "wrong"}, "action prior fingerprint"),
+        ({"effective_teacher_steps": 7}, "effective teacher steps"),
+    ],
+)
+def test_same_prior_endpoint_rejects_worker_contract_mismatch(
+    tmp_path, response_override, match
+):
+    teacher = _make_same_prior_teacher(tmp_path)
+    video_prior = torch.zeros(1, 16, 9, 28, 28)
+    action_prior = torch.zeros(1, 16, 7)
+
+    def fake_worker(payload, arrays):
+        response = {
+            "endpoint_video": np.zeros_like(arrays["video_prior"]),
+            "video_frame_mask": np.ones((1, video_prior.shape[2]), dtype=bool),
+            "effective_teacher_steps": 8,
+            "video_prior_sha256": _sha256_array(arrays["video_prior"]),
+            "action_prior_sha256": _sha256_array(arrays["action_prior"]),
+        }
+        response.update(response_override)
+        return response
+
+    teacher._request_raw_worker_npz = fake_worker
+    with pytest.raises(RuntimeError, match=match):
+        teacher.predict_raw_same_prior_endpoint(
+            {"raw_task": ["task"]},
+            video_prior=video_prior,
+            action_prior=action_prior,
+        )
+
+
+@pytest.mark.parametrize("effective_steps", [8.5, "8", True])
+def test_same_prior_endpoint_rejects_non_integer_response_budget(
+    tmp_path, effective_steps
+):
+    teacher = _make_same_prior_teacher(tmp_path)
+    video_prior = torch.zeros(1, 16, 9, 28, 28)
+    action_prior = torch.zeros(1, 16, 7)
+
+    def fake_worker(payload, arrays):
+        return {
+            "endpoint_video": np.zeros_like(arrays["video_prior"]),
+            "video_frame_mask": np.ones((1, video_prior.shape[2]), dtype=bool),
+            "effective_teacher_steps": effective_steps,
+            "video_prior_sha256": _sha256_array(arrays["video_prior"]),
+            "action_prior_sha256": _sha256_array(arrays["action_prior"]),
+        }
+
+    teacher._request_raw_worker_npz = fake_worker
+    with pytest.raises(RuntimeError, match="integer"):
+        teacher.predict_raw_same_prior_endpoint(
+            {"raw_task": ["task"]},
+            video_prior=video_prior,
+            action_prior=action_prior,
+        )
+
+
+@pytest.mark.parametrize(
+    "worker_line",
+    [
+        "not-json\n",
+        json.dumps({"ok": False, "error": "expected failure"}) + "\n",
+        json.dumps({"ok": True, "actions_path": "/unexpected/response.npz"}) + "\n",
+    ],
+)
+def test_raw_worker_npz_transport_cleans_owned_files_on_every_error(
+    tmp_path, worker_line
+):
+    teacher = _make_same_prior_teacher(tmp_path)
+    teacher._raw_worker_tmpdir = str(tmp_path)
+
+    class FakeStdin:
+        def write(self, line):
+            payload = json.loads(line)
+            np.savez_compressed(payload["actions_path"], partial=np.zeros(1))
+
+        def flush(self):
+            pass
+
+    class FakeStdout:
+        def readline(self):
+            return worker_line
+
+    teacher._raw_worker = SimpleNamespace(stdin=FakeStdin(), stdout=FakeStdout())
+    teacher._ensure_raw_worker = lambda: None
+    existing = set(tmp_path.iterdir())
+
+    with pytest.raises((RuntimeError, json.JSONDecodeError)):
+        teacher._request_raw_worker_npz(
+            {"mode": "same_prior_endpoint", "tasks": ["task"], "teacher_steps": 8},
+            {"video_prior": np.zeros((1, 16, 9, 2, 2), dtype=np.float32)},
+        )
+
+    assert set(tmp_path.iterdir()) == existing
+
+
 def test_cosmos_latent_target_mode_controls_cdiff_requests():
     from distillation_flowmap.cosmos_policy_adapter import (
         cosmos_latent_should_request_cdiff,
@@ -335,24 +740,134 @@ def test_cosmos_actions_map_to_flowmap_x0_with_quantile_norm():
         [[[0.25, 0.50, 0.75, 0.00, 1.00, -0.50, 0.10],
           [0.50, 0.25, 0.00, 1.00, 0.50, 0.25, -0.10]]],
         dtype=torch.float32,
-    )
+    ).repeat(1, 8, 1)
     inverse_ids = list(range(7)) + [7] * 23
     x0 = cosmos_actions_to_flowmap_x0(
         actions,
-        target_shape=(1, 30, 2, 4, 1),
+        target_shape=(1, 30, 16, 4, 1),
         q01=[0.0] * 30,
         q99=[1.0] * 30,
         inverse_used_action_channel_ids=inverse_ids,
         device=torch.device("cpu"),
         dtype=torch.float32,
+        packing_schema="downsample_survivor_v2",
+        downsample_factor=4,
     )
 
-    assert x0.shape == (1, 30, 2, 4, 1)
-    flat = x0.permute(0, 2, 3, 4, 1).reshape(1, 8, 30)
+    assert x0.shape == (1, 30, 16, 4, 1)
+    flat = x0[:, :, ::4].permute(0, 2, 3, 4, 1).reshape(1, 16, 30)
     assert torch.allclose(flat[0, 0, :7], actions[0, 0] * 2.0 - 1.0, atol=2e-6)
     assert torch.allclose(flat[0, 1, :7], actions[0, 1] * 2.0 - 1.0, atol=2e-6)
     assert torch.count_nonzero(flat[0, :, 7:]) == 0
-    assert torch.count_nonzero(flat[0, 2:]) == 0
+
+
+def test_cosmos_action_packing_v2_preserves_all_sixteen_actions_after_downsample():
+    from distillation_flowmap.cosmos_policy_adapter import cosmos_actions_to_flowmap_x0
+
+    actions = torch.arange(1, 16 * 7 + 1, dtype=torch.float32).reshape(1, 16, 7)
+    q01 = torch.zeros(30)
+    q99 = torch.ones(30) * 200
+    inverse = list(range(7)) + [7] * 23
+
+    full = cosmos_actions_to_flowmap_x0(
+        actions,
+        target_shape=(1, 30, 16, 4, 1),
+        q01=q01,
+        q99=q99,
+        inverse_used_action_channel_ids=inverse,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        packing_schema="downsample_survivor_v2",
+        downsample_factor=4,
+    )
+    compact = full[:, :, ::4]
+    expected = ((actions - q01[:7]) / (q99[:7] - q01[:7] + 1e-6) * 2 - 1)
+    observed = compact[:, :7, :, :, 0].permute(0, 2, 3, 1).reshape(1, 16, 7)
+
+    assert torch.allclose(observed, expected)
+    assert full[:, :7, 1:4].abs().sum() == 0
+
+
+@pytest.mark.parametrize(
+    ("aligned_shape", "target_shape", "downsample_factor"),
+    [
+        ((1, 8, 30), (1, 30, 16, 2, 1), 4),
+        ((1, 32, 30), (1, 30, 16, 8, 1), 4),
+        ((1, 16, 30), (1, 30, 8, 4, 1), 2),
+        ((1, 8, 30), (1, 30, 8, 4, 1), 4),
+    ],
+    ids=("n2", "n8", "factor2", "compact_frames2"),
+)
+def test_cosmos_action_packing_v2_rejects_non_production_geometry(
+    aligned_shape,
+    target_shape,
+    downsample_factor,
+):
+    from distillation_flowmap.cosmos_training_contract import (
+        ACTION_PACKING_SCHEMA,
+        pack_actions_for_downsample,
+    )
+
+    with pytest.raises(ValueError, match="production action carrier"):
+        pack_actions_for_downsample(
+            torch.ones(aligned_shape),
+            target_shape,
+            downsample_factor=downsample_factor,
+            schema=ACTION_PACKING_SCHEMA,
+        )
+
+
+def test_cosmos_action_packing_v2_round_trips_through_production_decoder():
+    from distillation_flowmap.cosmos_policy_adapter import cosmos_actions_to_flowmap_x0
+    from distillation_flowmap.cosmos_training_contract import ACTION_PACKING_SCHEMA
+    from evaluation.libero.cosmos_progressive_s4_server import (
+        ActionDecodingTemplate,
+        decode_student_action,
+    )
+
+    actions = torch.arange(1, 16 * 7 + 1, dtype=torch.float32).reshape(1, 16, 7)
+    q01 = torch.zeros(30)
+    q99 = torch.ones(30) * 200
+    inverse = tuple(range(7)) + (7,) * 23
+    full = cosmos_actions_to_flowmap_x0(
+        actions,
+        target_shape=(1, 30, 16, 4, 1),
+        q01=q01,
+        q99=q99,
+        inverse_used_action_channel_ids=inverse,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        packing_schema=ACTION_PACKING_SCHEMA,
+        downsample_factor=4,
+    )
+
+    decoded = decode_student_action(
+        full[:, :, ::4],
+        ActionDecodingTemplate(
+            q01=q01,
+            q99=q99,
+            inverse_used_action_channel_ids=inverse,
+            action_dim=7,
+        ),
+    )
+
+    assert decoded.shape == (16, 7)
+    np.testing.assert_allclose(decoded, actions[0].numpy(), rtol=0, atol=1e-4)
+
+
+@pytest.mark.parametrize("schema", ["", "legacy_dense_v1", "unknown"])
+def test_corrected_cosmos_training_rejects_non_v2_packing(schema):
+    from distillation_flowmap.cosmos_training_contract import (
+        pack_actions_for_downsample,
+    )
+
+    with pytest.raises(ValueError, match="action packing schema"):
+        pack_actions_for_downsample(
+            torch.ones(1, 16, 7),
+            (1, 30, 16, 4, 1),
+            downsample_factor=4,
+            schema=schema,
+        )
 
 
 def test_raw_cosmos_teacher_uses_provider_action_x0(tmp_path):
@@ -364,12 +879,14 @@ def test_raw_cosmos_teacher_uses_provider_action_x0(tmp_path):
         cosmos_policy_use_raw_inference=True,
         norm_stat={"q01": [0.0] * 30, "q99": [1.0] * 30},
         inverse_used_action_channel_ids=list(range(7)) + [7] * 23,
+        action_packing_schema="downsample_survivor_v2",
+        action_downsample_factor=4,
     )
     teacher = CosmosPolicyActionTeacher(str(ckpt), dtype=torch.float32, config=cfg)
-    teacher._raw_action_provider = lambda raw_batch: torch.ones(1, 2, 7) * 0.5
+    teacher._raw_action_provider = lambda raw_batch: torch.ones(1, 16, 7) * 0.5
 
     x0 = teacher.action_target_x0(
-        {"latent": torch.zeros(1, 30, 2, 4, 1)},
+        {"latent": torch.zeros(1, 30, 16, 4, 1)},
         raw_batch={
             "raw_primary_image": torch.zeros(1, 128, 128, 3, dtype=torch.uint8),
             "raw_wrist_image": torch.zeros(1, 128, 128, 3, dtype=torch.uint8),
@@ -378,8 +895,8 @@ def test_raw_cosmos_teacher_uses_provider_action_x0(tmp_path):
         },
     )
 
-    flat = x0.permute(0, 2, 3, 4, 1).reshape(1, 8, 30)
-    assert torch.allclose(flat[0, :2, :7], torch.zeros(2, 7), atol=2e-6)
+    flat = x0[:, :, ::4].permute(0, 2, 3, 4, 1).reshape(1, 16, 30)
+    assert torch.allclose(flat[0, :, :7], torch.zeros(16, 7), atol=2e-6)
     assert torch.count_nonzero(flat[0, :, 7:]) == 0
 
 
@@ -689,6 +1206,7 @@ def test_convert_input_format_preserves_raw_non_tensor_fields():
 
 def test_libero_cosmos_policy_configs_are_action_only(monkeypatch):
     monkeypatch.setenv("COSMOS_POLICY_PATH", "/tmp/cosmos-policy")
+    monkeypatch.setenv("WAN_STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")
     monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/tmp/wanva-base")
     sys.modules.pop("distillation_flowmap.config_libero_cosmos_policy_stage1", None)
     sys.modules.pop("distillation_flowmap.config_libero_cosmos_policy_stage2", None)
@@ -697,6 +1215,7 @@ def test_libero_cosmos_policy_configs_are_action_only(monkeypatch):
     stage2 = importlib.import_module("distillation_flowmap.config_libero_cosmos_policy_stage2").cfg
 
     for cfg in (stage1, stage2):
+        assert cfg.student_backend == "wan_flowmap"
         assert cfg.teacher_backend == "cosmos_policy"
         assert cfg.teacher_model_path == "/tmp/cosmos-policy"
         assert cfg.student_base_model_path == "/tmp/wanva-base"
@@ -706,6 +1225,44 @@ def test_libero_cosmos_policy_configs_are_action_only(monkeypatch):
         assert cfg.use_opd_aux is False
         assert cfg.cosmos_policy_use_raw_inference is False
         assert cfg.return_raw_observation is False
+
+
+def test_legacy_action_stage2_requires_explicit_hybrid_paths(monkeypatch):
+    module_name = "distillation_flowmap.config_libero_cosmos_policy_stage2"
+    for name in (
+        "COSMOS_POLICY_PATH",
+        "WAN_STUDENT_BASE_MODEL_PATH",
+        "STUDENT_BASE_MODEL_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    sys.modules.pop(module_name, None)
+
+    with pytest.raises(KeyError, match="COSMOS_POLICY_PATH"):
+        importlib.import_module(module_name)
+
+    monkeypatch.setenv("COSMOS_POLICY_PATH", "/explicit/cosmos-teacher")
+    sys.modules.pop(module_name, None)
+    with pytest.raises(ValueError, match="WAN_STUDENT_BASE_MODEL_PATH"):
+        importlib.import_module(module_name)
+
+
+def test_legacy_action_stage2_accepts_old_student_alias_and_rejects_conflict(
+    monkeypatch,
+):
+    module_name = "distillation_flowmap.config_libero_cosmos_policy_stage2"
+    monkeypatch.setenv("COSMOS_POLICY_PATH", "/explicit/cosmos-teacher")
+    monkeypatch.delenv("WAN_STUDENT_BASE_MODEL_PATH", raising=False)
+    monkeypatch.setenv("STUDENT_BASE_MODEL_PATH", "/explicit/legacy-wan")
+    sys.modules.pop(module_name, None)
+
+    cfg = importlib.import_module(module_name).cfg
+    assert cfg.student_backend == "wan_flowmap"
+    assert cfg.student_base_model_path == "/explicit/legacy-wan"
+
+    monkeypatch.setenv("WAN_STUDENT_BASE_MODEL_PATH", "/explicit/new-wan")
+    sys.modules.pop(module_name, None)
+    with pytest.raises(ValueError, match="disagree"):
+        importlib.import_module(module_name)
 
 
 def test_cosmos_dual_teacher_stage1_config_imports(monkeypatch):

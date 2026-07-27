@@ -8,27 +8,56 @@ import copy
 import os
 
 from distillation_flowmap.config_libero_fullfinetune_stage1_warmup import cfg as _base_cfg
+from distillation_flowmap.cosmos_training_contract import (
+    ACTION_PACKING_SCHEMA,
+    CONTRACT_VERSION,
+)
 
 cfg = copy.deepcopy(_base_cfg)
 _this_dir = os.path.dirname(os.path.abspath(__file__))
+
+cfg.contract_version = CONTRACT_VERSION
+cfg.action_packing_schema = ACTION_PACKING_SCHEMA
+cfg.action_downsample_factor = 4
+cfg.action_chunk_shape = [4, 4]
+cfg.training_contract_stage = "raw_stage1"
 
 
 def _env_bool(name, default):
     val = os.environ.get(name)
     if val is None:
         return default
-    return val.lower() in ("1", "true", "yes", "on")
+    normalized = val.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(
+        f"{name} must be a boolean (1/0, true/false, yes/no, or on/off), got {val!r}"
+    )
+
+
+def _env_int(name, default):
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {val!r}") from None
+
+
+cfg.resume_from_path = os.environ.get("RESUME_FROM_PATH") or None
+cfg.resume_online_from_target = _env_bool("RESUME_ONLINE_FROM_TARGET", False)
+cfg.reset_resume_step = _env_bool("RESET_RESUME_STEP", False)
+cfg.resume_optimizer_state = _env_bool("RESUME_OPTIMIZER_STATE", False)
+cfg.seed = _env_int("TRAIN_SEED", cfg.seed)
 
 
 cfg.teacher_backend = "cosmos_policy"
-cfg.teacher_model_path = os.environ.get(
-    "COSMOS_POLICY_PATH",
-    "/root/nas/junjie/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B",
-)
-cfg.student_base_model_path = os.environ.get(
-    "STUDENT_BASE_MODEL_PATH",
-    "/root/nas/junjie/jj/Any_WAM/checkpoints/lingbot-va-posttrain-libero",
-)
+cfg.student_backend = "wan_flowmap"
+cfg.teacher_model_path = os.environ["COSMOS_POLICY_PATH"]
+cfg.student_base_model_path = os.environ["WAN_STUDENT_BASE_MODEL_PATH"]
 cfg.cosmos_policy_validate_weights = _env_bool("COSMOS_POLICY_VALIDATE_WEIGHTS", False)
 cfg.cosmos_policy_use_raw_inference = _env_bool("COSMOS_POLICY_USE_RAW_INFERENCE", False)
 cfg.return_raw_observation = cfg.cosmos_policy_use_raw_inference

@@ -1,7 +1,10 @@
 import importlib
+import json
 import os
 import sys
+from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -12,7 +15,15 @@ for path in (FLOWMAP_DIR, WANVA_DIR):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from distillation_flowmap.flowmap_trainer import _set_video_channel_config_from_heads
+from distillation_flowmap.flowmap_trainer import (
+    FlowMapDistiller,
+    _set_video_channel_config_from_heads,
+    _write_json_atomic,
+)
+from distillation_flowmap.cosmos_stage2_lineage import (
+    validate_stage1_parent,
+    validate_stage2_resume,
+)
 
 
 class _FakeModel:
@@ -53,3 +64,434 @@ def test_cosmos_latent_stage2_defaults_are_memory_safe(monkeypatch):
     assert module.cfg.opd_aux_warmup_steps >= 8
     assert module.cfg.opd_rollout_step_pairs == [[1, 1]]
     assert module.cfg.opd_transition_group_weight <= 1e-2
+
+
+def _hybrid_roots(tmp_path):
+    wan_base = tmp_path / "wan-base"
+    (wan_base / "transformer").mkdir(parents=True)
+    (wan_base / "transformer" / "config.json").write_text(
+        json.dumps({"_class_name": "WanTransformer3DModel"})
+    )
+    cosmos_teacher = tmp_path / "cosmos-teacher"
+    cosmos_teacher.mkdir()
+    (cosmos_teacher / "config.json").write_text(
+        json.dumps({"model_type": "cosmos-policy"})
+    )
+    for name in (
+        "Cosmos-Policy-LIBERO-Predict2-2B.pt",
+        "libero_dataset_statistics.json",
+        "libero_t5_embeddings.pkl",
+    ):
+        (cosmos_teacher / name).write_bytes(b"fixture")
+    return wan_base, cosmos_teacher
+
+
+def _set_valid_progressive_lineage(monkeypatch, tmp_path):
+    stage1 = tmp_path / "stage1"
+    wan_base, cosmos_teacher = _hybrid_roots(tmp_path)
+    payload = {
+        "contract_version": 2,
+        "training_contract_stage": "raw_stage1",
+        "action_packing_schema": "downsample_survivor_v2",
+        "action_downsample_factor": 4,
+        "action_chunk_shape": [4, 4],
+        "checkpoint_step": 5000,
+        "teacher_backend": "cosmos_policy",
+        "student_backend": "wan_flowmap",
+        "student_base_model_path": str(wan_base.resolve()),
+        "teacher_model_path": str(cosmos_teacher.resolve()),
+    }
+    for variant in ("online_student", "target_student"):
+        transformer = stage1 / variant / "transformer"
+        transformer.mkdir(parents=True)
+        (transformer / "config.json").write_text(json.dumps(payload))
+        (transformer / "diffusion_pytorch_model.safetensors").write_bytes(
+            b"weights"
+        )
+    parent = validate_stage1_parent(stage1)
+    lineage = json.dumps(
+        {
+            "parent_stage1_contract_identity": parent.contract_identity,
+            "parent_stage1_path": parent.canonical_path,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    for name, value in {
+        "STUDENT_BASE_MODEL_PATH": str(stage1 / "target_student"),
+        "WAN_STUDENT_BASE_MODEL_PATH": str(wan_base),
+        "COSMOS_POLICY_PATH": str(cosmos_teacher),
+        "RESUME_FROM_PATH": str(stage1),
+        "PARENT_STAGE1_PATH": parent.canonical_path,
+        "PARENT_STAGE1_CONTRACT_IDENTITY": parent.contract_identity,
+        "STAGE2_LINEAGE_JSON": lineage,
+        "RESUME_ONLINE_FROM_TARGET": "1",
+        "RESET_RESUME_STEP": "1",
+        "RESUME_OPTIMIZER_STATE": "0",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_stage_configs_identify_their_persisted_training_contract(
+    monkeypatch, tmp_path
+):
+    _set_valid_progressive_lineage(monkeypatch, tmp_path)
+    stage1 = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage1"
+    )
+    stage2 = importlib.import_module(
+        "distillation_flowmap.config_libero_cosmos_policy_stage2_progressive"
+    )
+
+    assert stage1.cfg.training_contract_stage == "raw_stage1"
+    assert stage1.cfg.student_backend == "wan_flowmap"
+    assert stage2.cfg.training_contract_stage == "progressive_stage2"
+    assert stage2.cfg.student_backend == "wan_flowmap"
+    assert stage1.cfg.action_chunk_shape == [4, 4]
+    assert stage2.cfg.action_chunk_shape == [4, 4]
+
+
+class _CheckpointModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(1))
+        self.config = {"in_channels": 16, "out_channels": 16}
+
+
+class _Stateful:
+    def state_dict(self):
+        return {}
+
+
+def _patch_checkpoint_io(monkeypatch):
+    import distillation_flowmap.flowmap_trainer as trainer_module
+
+    monkeypatch.setattr(
+        trainer_module,
+        "get_model_state_dict",
+        lambda model, options: model.state_dict(),
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "save_file",
+        lambda state, path: path.write_bytes(b"weights"),
+    )
+    monkeypatch.setattr(
+        trainer_module.torch,
+        "save",
+        lambda state, path: path.write_bytes(b"state"),
+    )
+
+
+def _checkpoint_trainer(save_dir, *, step, config, target_student=True):
+    trainer = FlowMapDistiller.__new__(FlowMapDistiller)
+    trainer.student = _CheckpointModel()
+    trainer.target_student = _CheckpointModel() if target_student else None
+    trainer.use_lora = False
+    trainer.use_dmd = False
+    trainer.discriminator = None
+    trainer.save_dir = save_dir
+    trainer.step = step
+    trainer.optimizer = _Stateful()
+    trainer.lr_scheduler = _Stateful()
+    trainer.config = config
+    return trainer
+
+
+def test_real_checkpoint_writer_persists_stage1_backend_and_stage2_lineage(
+    tmp_path, monkeypatch
+):
+    _patch_checkpoint_io(monkeypatch)
+    wan_base, cosmos_teacher = _hybrid_roots(tmp_path)
+    stage1_save = tmp_path / "raw-stage1" / "checkpoints"
+    stage1_config = SimpleNamespace(
+        rank=0,
+        training_contract_stage="raw_stage1",
+        contract_version=2,
+        action_packing_schema="downsample_survivor_v2",
+        action_downsample_factor=4,
+        action_chunk_shape=[4, 4],
+        teacher_backend="cosmos_policy",
+        student_backend="wan_flowmap",
+        student_base_model_path=str(wan_base),
+        teacher_model_path=str(cosmos_teacher),
+    )
+    stage1_trainer = _checkpoint_trainer(
+        stage1_save, step=5000, config=stage1_config
+    )
+    stage1_trainer._save_checkpoint("online_student")
+    stage1_trainer._save_checkpoint("target_student")
+    stage1_checkpoint = stage1_save / "step_5000"
+
+    parent = validate_stage1_parent(stage1_checkpoint)
+    stage1_payload = json.loads(
+        (
+            stage1_checkpoint
+            / "online_student"
+            / "transformer"
+            / "config.json"
+        ).read_text()
+    )
+    assert stage1_payload["teacher_backend"] == "cosmos_policy"
+    assert stage1_payload["student_backend"] == "wan_flowmap"
+    assert stage1_payload["student_base_model_path"] == str(wan_base)
+    assert stage1_payload["teacher_model_path"] == str(cosmos_teacher)
+
+    arm_root = tmp_path / "progressive-stage2"
+    lineage_json = json.dumps(
+        {
+            "parent_stage1_contract_identity": parent.contract_identity,
+            "parent_stage1_path": parent.canonical_path,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    variant_json = json.dumps(
+        {
+            "name": "apm",
+            "output_dir": str(arm_root),
+            "video_endpoint_weight": 1.0,
+            "video_velocity_weight": 1.0,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    provenance_json = json.dumps(
+        {
+            "schema": "flashwam_cosmos_provenance_v1",
+            "identity_sha256": "fixture-provenance",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    stage2_config = SimpleNamespace(
+        rank=0,
+        training_contract_stage="progressive_stage2",
+        contract_version=2,
+        action_packing_schema="downsample_survivor_v2",
+        action_downsample_factor=4,
+        action_chunk_shape=[4, 4],
+        deployment_timestep_start=1000,
+        deployment_timestep_end=0,
+        deployment_joint_steps=(1, 2, 4),
+        deployment_joint_rollout_interval=4,
+        deployment_action_weight=1.0,
+        raw_teacher_window_is_auxiliary=True,
+        student_backend="wan_flowmap",
+        teacher_backend="cosmos_policy",
+        student_base_model_path=str(stage1_checkpoint / "target_student"),
+        teacher_model_path=str(cosmos_teacher),
+        parent_stage1_path=parent.canonical_path,
+        parent_stage1_contract_identity=parent.contract_identity,
+        stage2_lineage_json=lineage_json,
+        cosmos_libero_variant_json=variant_json,
+        cosmos_libero_provenance_json=provenance_json,
+    )
+    stage2_trainer = _checkpoint_trainer(
+        arm_root / "checkpoints",
+        step=1000,
+        config=stage2_config,
+        target_student=False,
+    )
+    assert stage2_trainer.target_student is None
+    stage2_trainer._save_checkpoint("online_student")
+    stage2_trainer._save_checkpoint("target_student")
+    stage2_checkpoint = arm_root / "checkpoints" / "step_1000"
+
+    assert validate_stage2_resume(
+        stage2_checkpoint,
+        arm_root=arm_root,
+        expected_step=1000,
+        expected_parent=parent,
+    ) == stage2_checkpoint.resolve()
+    for variant in ("online_student", "target_student"):
+        payload = json.loads(
+            (
+                stage2_checkpoint / variant / "transformer" / "config.json"
+            ).read_text()
+        )
+        assert payload["parent_stage1_path"] == parent.canonical_path
+        assert (
+            payload["parent_stage1_contract_identity"]
+            == parent.contract_identity
+        )
+        assert payload["stage2_lineage_json"] == lineage_json
+        assert payload["cosmos_libero_variant_json"] == variant_json
+        assert payload["cosmos_libero_provenance_json"] == provenance_json
+    target_payload = json.loads(
+        (
+            stage2_checkpoint
+            / "target_student"
+            / "transformer"
+            / "config.json"
+        ).read_text()
+    )
+    assert target_payload["target_student_source"] == "online_student_snapshot"
+    online_weight = (
+        stage2_checkpoint
+        / "online_student"
+        / "transformer"
+        / "diffusion_pytorch_model.safetensors"
+    )
+    target_weight = (
+        stage2_checkpoint
+        / "target_student"
+        / "transformer"
+        / "diffusion_pytorch_model.safetensors"
+    )
+    assert online_weight.stat().st_ino != target_weight.stat().st_ino
+
+
+def test_checkpoint_config_persists_stage2_contract_atomically(tmp_path, monkeypatch):
+    import distillation_flowmap.flowmap_trainer as trainer_module
+
+    trainer = FlowMapDistiller.__new__(FlowMapDistiller)
+    trainer.student = _CheckpointModel()
+    trainer.target_student = None
+    trainer.use_lora = False
+    trainer.use_dmd = False
+    trainer.discriminator = None
+    trainer.save_dir = tmp_path
+    trainer.step = 17
+    trainer.optimizer = _Stateful()
+    trainer.lr_scheduler = _Stateful()
+    trainer.config = SimpleNamespace(
+        rank=0,
+        training_contract_stage="progressive_stage2",
+        contract_version=2,
+        action_packing_schema="downsample_survivor_v2",
+        action_downsample_factor=4,
+        action_chunk_shape=[4, 4],
+        deployment_timestep_start=1000,
+        deployment_timestep_end=0,
+        deployment_joint_steps=(1, 2, 4),
+        deployment_joint_rollout_interval=4,
+        deployment_action_weight=1.0,
+        raw_teacher_window_is_auxiliary=True,
+        student_backend="wan_flowmap",
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "get_model_state_dict",
+        lambda model, options: model.state_dict(),
+    )
+    monkeypatch.setattr(trainer_module, "save_file", lambda state, path: None)
+    monkeypatch.setattr(trainer_module.torch, "save", lambda state, path: None)
+    replacements = []
+    real_replace = os.replace
+
+    def recording_replace(source, destination):
+        replacements.append((os.fspath(source), os.fspath(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(trainer_module.os, "replace", recording_replace)
+
+    trainer._save_checkpoint()
+
+    config_path = (
+        tmp_path / "step_17" / "online_student" / "transformer" / "config.json"
+    )
+    payload = json.loads(config_path.read_text())
+    assert payload["training_contract_stage"] == "progressive_stage2"
+    assert payload["action_chunk_shape"] == [4, 4]
+    assert payload["joint_student_steps"] == [1, 2, 4]
+    assert payload["deployment_action_weight"] == 1.0
+    source, destination = replacements[-1]
+    assert os.path.dirname(source) == os.fspath(config_path.parent)
+    assert os.path.basename(source).startswith(".config.json.")
+    assert os.path.basename(source).endswith(".tmp")
+    assert destination == os.fspath(config_path)
+    assert not os.path.exists(source)
+
+
+def test_atomic_checkpoint_config_failure_preserves_prior_file(tmp_path, monkeypatch):
+    import distillation_flowmap.flowmap_trainer as trainer_module
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"prior": true}\n')
+
+    def fail_json_dump(payload, handle, **kwargs):
+        handle.write('{"partial":')
+        raise RuntimeError("serialization failed")
+
+    monkeypatch.setattr(trainer_module.json, "dump", fail_json_dump)
+
+    with pytest.raises(RuntimeError, match="serialization failed"):
+        _write_json_atomic(config_path, {"next": True})
+
+    assert config_path.read_text() == '{"prior": true}\n'
+    assert not (tmp_path / ".config.json.tmp").exists()
+
+
+@pytest.mark.parametrize("stale_kind", ["file", "dangling_symlink"])
+def test_atomic_checkpoint_config_ignores_fixed_stale_temp(
+    tmp_path, stale_kind
+):
+    config_path = tmp_path / "config.json"
+    stale_path = tmp_path / ".config.json.tmp"
+    victim_path = tmp_path / "victim.json"
+    if stale_kind == "file":
+        stale_path.write_text("stale")
+    else:
+        stale_path.symlink_to(victim_path.name)
+
+    _write_json_atomic(config_path, {"complete": True})
+
+    assert json.loads(config_path.read_text()) == {"complete": True}
+    if stale_kind == "file":
+        assert stale_path.read_text() == "stale"
+    else:
+        assert stale_path.is_symlink()
+        assert not victim_path.exists()
+
+
+def test_invalid_contract_prevents_all_checkpoint_writes(tmp_path, monkeypatch):
+    import distillation_flowmap.flowmap_trainer as trainer_module
+
+    trainer = FlowMapDistiller.__new__(FlowMapDistiller)
+    trainer.student = _CheckpointModel()
+    trainer.target_student = None
+    trainer.use_lora = False
+    trainer.use_dmd = False
+    trainer.discriminator = None
+    trainer.save_dir = tmp_path
+    trainer.step = 17
+    trainer.optimizer = _Stateful()
+    trainer.lr_scheduler = _Stateful()
+    trainer.config = SimpleNamespace(
+        rank=0,
+        training_contract_stage="progressive_stage2",
+        contract_version=2,
+        action_packing_schema="downsample_survivor_v2",
+        action_downsample_factor=4,
+        action_chunk_shape=[4, 4],
+        deployment_timestep_start=1000,
+        deployment_timestep_end=0,
+        deployment_joint_steps=(1, 2, 4),
+        deployment_joint_rollout_interval=4,
+        deployment_action_weight=2.0,
+        raw_teacher_window_is_auxiliary=True,
+        student_backend="wan_flowmap",
+    )
+    writes = []
+    monkeypatch.setattr(
+        trainer_module,
+        "get_model_state_dict",
+        lambda *args, **kwargs: writes.append("state_dict") or {},
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "save_file",
+        lambda *args, **kwargs: writes.append("weights"),
+    )
+    monkeypatch.setattr(
+        trainer_module.torch,
+        "save",
+        lambda *args, **kwargs: writes.append("torch_save"),
+    )
+
+    with pytest.raises(ValueError, match="deployment_action_weight"):
+        trainer._save_checkpoint()
+
+    assert writes == []
+    assert not list(tmp_path.iterdir())

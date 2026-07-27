@@ -1,5 +1,7 @@
 import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -18,7 +20,7 @@ def _worker_fields(line):
 
 def test_check_only_launches_isolated_s2_and_s4_four_worker_plans(tmp_path):
     checkpoint = tmp_path / "base" / "transformer"
-    checkpoint.mkdir(parents=True)
+    checkpoint.mkdir(parents=True, exist_ok=True)
     s2_root = tmp_path / "fresh-s2-results"
     s4_root = tmp_path / "fresh-s4-results"
     env = {
@@ -78,3 +80,141 @@ def test_check_only_launches_isolated_s2_and_s4_four_worker_plans(tmp_path):
     assert result.stdout.count("CHECK_ONLY=1: verified 4 dynamic workers") == 2
     assert not s2_root.exists()
     assert not s4_root.exists()
+
+
+def _run_check_only_with_overrides(tmp_path, overrides):
+    checkpoint = tmp_path / "base" / "transformer"
+    checkpoint.mkdir(parents=True, exist_ok=True)
+    s2_root = tmp_path / "fresh-s2-results"
+    s4_root = tmp_path / "fresh-s4-results"
+    return subprocess.run(
+        ["bash", str(SCRIPT)],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "CHECK_ONLY": "1",
+            "CHECKPOINT": str(checkpoint),
+            "S2_OUTPUT_ROOT": str(s2_root),
+            "S4_OUTPUT_ROOT": str(s4_root),
+            **overrides,
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_check_only_rejects_overlapping_sibling_overrides_before_launching(tmp_path):
+    shared_root = tmp_path / "shared-results"
+    cases = [
+        (
+            {"S2_OUTPUT_ROOT": str(shared_root), "S4_OUTPUT_ROOT": str(shared_root)},
+            "S2_OUTPUT_ROOT and S4_OUTPUT_ROOT must not overlap",
+        ),
+        (
+            {"S2_GPU_IDS": "0,1", "S4_GPU_IDS": "1,2"},
+            "S2_GPU_IDS and S4_GPU_IDS must not overlap",
+        ),
+        (
+            {
+                "S2_MASTER_PORT_BASE": "36000",
+                "S4_MASTER_PORT_BASE": "36003",
+            },
+            "S2 and S4 master port ranges must not overlap",
+        ),
+        (
+            {"S2_WS_PORT_BASE": "37000", "S4_WS_PORT_BASE": "37003"},
+            "S2 and S4 WebSocket port ranges must not overlap",
+        ),
+    ]
+
+    for overrides, expected_error in cases:
+        result = _run_check_only_with_overrides(tmp_path, overrides)
+
+        assert result.returncode != 0
+        assert expected_error in result.stderr
+        assert "WORKER " not in result.stdout
+
+
+def test_check_only_accepts_non_overlapping_sibling_overrides(tmp_path):
+    result = _run_check_only_with_overrides(
+        tmp_path,
+        {
+            "S2_GPU_IDS": "4",
+            "S4_GPU_IDS": "5",
+            "S2_REPLICAS_PER_GPU": "1",
+            "S4_REPLICAS_PER_GPU": "1",
+            "S2_MASTER_PORT_BASE": "38000",
+            "S2_WS_PORT_BASE": "38100",
+            "S4_MASTER_PORT_BASE": "38200",
+            "S4_WS_PORT_BASE": "38300",
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    workers = [
+        _worker_fields(line)
+        for line in result.stdout.splitlines()
+        if line.startswith("WORKER ")
+    ]
+    assert {(worker["steps"], worker["gpu"]) for worker in workers} == {
+        ("2", "4"),
+        ("4", "5"),
+    }
+    assert {worker["master_port"] for worker in workers} == {"38000", "38200"}
+    assert {worker["ws_port"] for worker in workers} == {"38100", "38300"}
+
+
+def test_sigint_terminates_only_the_live_s4_child_when_s2_has_exited(tmp_path):
+    checkpoint = tmp_path / "base" / "transformer"
+    checkpoint.mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    signal_log = tmp_path / "signal.log"
+    fake_bash = fake_bin / "bash"
+    fake_bash.write_text(
+        """#!/bin/sh
+if [ "$(basename "$1")" = "run_lingbotva_native_teacher_4gpu_2replica_formal.sh" ]; then
+    printf 'started budget=%s pid=%s\\n' "$BUDGETS" "$$" >> "$SIGNAL_LOG"
+    if [ "$BUDGETS" = "2" ]; then
+        exit 0
+    fi
+    trap 'printf "terminated budget=%s pid=%s\\n" "$BUDGETS" "$$" >> "$SIGNAL_LOG"; exit 0' TERM
+    while :; do sleep 1; done
+fi
+exec /bin/bash "$@"
+"""
+    )
+    fake_bash.chmod(0o755)
+    env = {
+        **os.environ,
+        "CHECKPOINT": str(checkpoint),
+        "S2_OUTPUT_ROOT": str(tmp_path / "s2-results"),
+        "S4_OUTPUT_ROOT": str(tmp_path / "s4-results"),
+        "SIGNAL_LOG": str(signal_log),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+    }
+    process = subprocess.Popen(
+        ["bash", str(SCRIPT)], cwd=ROOT, env=env, text=True
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while (
+            (not signal_log.exists() or signal_log.read_text().count("started") != 2)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+        assert signal_log.exists()
+        assert signal_log.read_text().count("started") == 2
+        time.sleep(0.2)
+
+        process.send_signal(signal.SIGINT)
+        assert process.wait(timeout=5) != 0
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+
+    log_lines = signal_log.read_text().splitlines()
+    assert "terminated budget=4" in "\n".join(log_lines)
+    assert not any("terminated budget=2" in line for line in log_lines)

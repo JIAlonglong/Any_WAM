@@ -27,6 +27,26 @@ positive() {
     [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "$1 must be a positive integer"
 }
 
+ACTIVE_SHARD_PIDS=()
+stop_shard_process_groups() {
+    local signal_name="$1" pid
+    for pid in "${ACTIVE_SHARD_PIDS[@]}"; do
+        /bin/kill -s "$signal_name" -- "-$pid" 2>/dev/null || true
+    done
+    for pid in "${ACTIVE_SHARD_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    ACTIVE_SHARD_PIDS=()
+}
+forward_signal() {
+    local signal_name="$1" exit_code="$2"
+    trap - INT TERM
+    stop_shard_process_groups "$signal_name"
+    exit "$exit_code"
+}
+trap 'forward_signal INT 130' INT
+trap 'forward_signal TERM 143' TERM
+
 emit_command() {
     local student_gpu="$1" worker_gpu="$2"
     shift 2
@@ -263,6 +283,39 @@ launch_shard() {
     done
 }
 
+launch_shard_process_group() {
+    local shard="$1" student_gpu="$2" worker_gpu="$3"
+    local task_start="$4" task_end="$5" seed_count="$6"
+    setsid --wait env \
+        "PYTHON_BIN=$PYTHON_BIN" \
+        "S4_CKPT_ROOT=$S4_CKPT_ROOT" \
+        "EVAL_ROOT=$EVAL_ROOT" \
+        "S4_PROMPT_TABLE=$S4_PROMPT_TABLE" \
+        "S4_EMPTY_EMBEDDING=$S4_EMPTY_EMBEDDING" \
+        "S4_DATASET_PATH=$S4_DATASET_PATH" \
+        "S4_CONFIG=$S4_CONFIG" \
+        "COSMOS_POLICY_PATH=$COSMOS_POLICY_PATH" \
+        "COSMOS_POLICY_TEACHER_LOCK=$COSMOS_POLICY_TEACHER_LOCK" \
+        "COSMOS_POLICY_TEACHER_IDENTITY=$COSMOS_POLICY_TEACHER_IDENTITY" \
+        "S4_INITIAL_STATES_JSON=$S4_INITIAL_STATES_JSON" \
+        "S4_LIBERO_BENCHMARK=$S4_LIBERO_BENCHMARK" \
+        "S4_STUDENT_STEPS=$S4_STUDENT_STEPS" \
+        "S4_EPISODES_PER_TASK=$S4_EPISODES_PER_TASK" \
+        "S4_MODEL_ROLE=$S4_MODEL_ROLE" \
+        "S4_EVAL_CLASSIFICATION=$S4_EVAL_CLASSIFICATION" \
+        "S4_EVAL_IS_FORMAL=$S4_EVAL_IS_FORMAL" \
+        "S4_ALIGNMENT_VERIFIED=$S4_ALIGNMENT_VERIFIED" \
+        "S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH=$S4_ALLOW_KNOWN_ALIGNMENT_MISMATCH" \
+        "S4_FORMAL_NUM_SHARDS=$S4_FORMAL_NUM_SHARDS" \
+        "S4_FORMAL_GPU_LAYOUT=$S4_FORMAL_GPU_LAYOUT" \
+        "S4_VIDEO_SEEDS=$S4_VIDEO_SEEDS" \
+        "S4_DRY_RUN=0" \
+        bash "$SCRIPT_DIR/run_cosmos_progressive_s4_eval.sh" \
+            __formal-shard "$shard" "$student_gpu" "$worker_gpu" \
+            "$task_start" "$task_end" "$seed_count" &
+    ACTIVE_SHARD_PIDS+=("$!")
+}
+
 run_live_evaluation() {
     local live_mode="$1" seed_count="$2"
     ensure_new_output_root
@@ -311,20 +364,32 @@ run_live_evaluation() {
                 "${task_starts[index]}" "${task_ends[index]}" "${seed_count}"
         done
     else
-        local -a pids=()
+        command -v setsid >/dev/null 2>&1 || \
+            die "setsid is required for shard process-group management"
+        ACTIVE_SHARD_PIDS=()
         for index in "${!shard_ids[@]}"; do
-            launch_shard \
+            launch_shard_process_group \
                 "${shard_ids[index]}" "${student_gpus[index]}" "${worker_gpus[index]}" \
-                "${task_starts[index]}" "${task_ends[index]}" "${seed_count}" &
-            pids+=("$!")
+                "${task_starts[index]}" "${task_ends[index]}" "${seed_count}"
         done
-        local status=0 pid
-        for pid in "${pids[@]}"; do
-            if ! wait "${pid}"; then
-                status=1
+        local completed_pid="" status=0 pid
+        while (( ${#ACTIVE_SHARD_PIDS[@]} > 0 )); do
+            completed_pid=""
+            if wait -n -p completed_pid "${ACTIVE_SHARD_PIDS[@]}"; then
+                status=0
+            else
+                status=$?
+            fi
+            local -a remaining=()
+            for pid in "${ACTIVE_SHARD_PIDS[@]}"; do
+                [[ "$pid" == "$completed_pid" ]] || remaining+=("$pid")
+            done
+            ACTIVE_SHARD_PIDS=("${remaining[@]}")
+            if (( status != 0 )); then
+                stop_shard_process_groups TERM
+                return "$status"
             fi
         done
-        (( status == 0 )) || return "${status}"
     fi
     verify_formal_results "${seed_count}" "${shard_plan}"
 }
@@ -362,9 +427,25 @@ run_smoke() {
     verify_smoke_summary "${smoke_root}/summary.json"
 }
 
-[[ $# -eq 1 ]] || { usage >&2; exit 2; }
-MODE="$1"
-case "${MODE}" in smoke|gate|formal|dry-run) ;; *) usage >&2; die "mode must be smoke, gate, formal, or dry-run" ;; esac
+INTERNAL_SHARD=0
+if [[ "${1:-}" == "__formal-shard" ]]; then
+    [[ $# -eq 7 ]] || die "internal formal shard requires six arguments"
+    INTERNAL_SHARD=1
+    MODE="$1"
+    INTERNAL_SHARD_ID="$2"
+    INTERNAL_STUDENT_GPU="$3"
+    INTERNAL_WORKER_GPU="$4"
+    INTERNAL_TASK_START="$5"
+    INTERNAL_TASK_END="$6"
+    INTERNAL_SEED_COUNT="$7"
+else
+    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    MODE="$1"
+fi
+case "${MODE}" in
+    smoke|gate|formal|dry-run|__formal-shard) ;;
+    *) usage >&2; die "mode must be smoke, gate, formal, or dry-run" ;;
+esac
 
 : "${EVAL_ROOT:?set a new empty result root}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -537,5 +618,12 @@ case "${MODE}" in
         require_env "S4_EMPTY_EMBEDDING"
         emit_kv "PLAN_MODE" "formal"
         run_live_evaluation formal "${S4_EPISODES_PER_TASK}"
+        ;;
+    __formal-shard)
+        require_env "S4_PROMPT_TABLE"
+        require_env "S4_EMPTY_EMBEDDING"
+        launch_shard \
+            "$INTERNAL_SHARD_ID" "$INTERNAL_STUDENT_GPU" "$INTERNAL_WORKER_GPU" \
+            "$INTERNAL_TASK_START" "$INTERNAL_TASK_END" "$INTERNAL_SEED_COUNT"
         ;;
 esac

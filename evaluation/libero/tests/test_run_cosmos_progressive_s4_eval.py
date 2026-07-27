@@ -4,6 +4,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -741,7 +742,7 @@ def test_live_formal_launcher_rejects_unclassified_or_unknown_before_child(
     assert not marker.exists()
 
 
-def test_formal_waits_for_every_shard_and_skips_merge_when_one_shard_fails(tmp_path):
+def test_formal_fails_fast_and_kills_other_shard_process_groups(tmp_path):
     env = _launcher_env(tmp_path)
     env.update(
         {
@@ -751,11 +752,17 @@ def test_formal_waits_for_every_shard_and_skips_merge_when_one_shard_fails(tmp_p
         }
     )
     log = tmp_path / "sentinel.log"
+    leaked_descendant = tmp_path / "leaked-descendant"
+    leak_code = (
+        "import pathlib,time; time.sleep(0.5); "
+        f"pathlib.Path({str(leaked_descendant)!r}).write_text('leaked')"
+    )
     sentinel = tmp_path / "multi shard sentinel.py"
     sentinel.write_text(
         "#!/usr/bin/env python3\n"
-        "import os, pathlib, sys\n"
+        "import os, pathlib, subprocess, sys, time\n"
         f"log = pathlib.Path({str(log)!r})\n"
+        f"leaked = pathlib.Path({str(leaked_descendant)!r})\n"
         "with log.open('a', encoding='utf-8') as stream:\n"
         "    if '--preflight' in sys.argv:\n"
         "        stream.write(f'preflight:{os.environ.get(\"CUDA_VISIBLE_DEVICES\")}\\n')\n"
@@ -767,19 +774,24 @@ def test_formal_waits_for_every_shard_and_skips_merge_when_one_shard_fails(tmp_p
         "    gpu = os.environ['CUDA_VISIBLE_DEVICES']\n"
         "    stream.write(f'rollout:{gpu}:{seed}\\n')\n"
         "if gpu == '0' and seed == '0':\n"
-        "    raise SystemExit(17)\n",
+        "    raise SystemExit(17)\n"
+        "if seed == '0':\n"
+        f"    subprocess.Popen([sys.executable, '-c', {leak_code!r}])\n"
+        "    time.sleep(2)\n",
         encoding="utf-8",
     )
     sentinel.chmod(sentinel.stat().st_mode | stat.S_IXUSR)
     env["PYTHON_BIN"] = str(sentinel)
 
     result = run_launcher("formal", env=env)
+    time.sleep(0.8)
 
-    assert result.returncode != 0
+    assert result.returncode == 17
     lines = log.read_text(encoding="utf-8").splitlines()
-    assert "rollout:2:49" in lines
-    assert "rollout:4:49" in lines
-    assert "rollout:6:49" in lines
+    assert "rollout:2:49" not in lines
+    assert "rollout:4:49" not in lines
+    assert "rollout:6:49" not in lines
+    assert not leaked_descendant.exists()
     assert "MERGE" not in lines
 
 

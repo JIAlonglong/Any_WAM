@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
+import fcntl
 import json
 import os
 import shutil
@@ -141,6 +142,34 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
         raise OSError(error, os.strerror(error), destination)
 
 
+def _publish_directory_noreplace(source: Path, destination: Path) -> None:
+    try:
+        _rename_noreplace(source, destination)
+        return
+    except OSError as exc:
+        unsupported = {errno.EINVAL, errno.ENOSYS}
+        if hasattr(errno, "EOPNOTSUPP"):
+            unsupported.add(errno.EOPNOTSUPP)
+        if exc.errno not in unsupported:
+            raise
+
+    # Some distributed filesystems (including KPFS) reject renameat2 flags for
+    # directories. Serialize cooperating publishers on the parent inode, then
+    # re-check the no-overwrite condition immediately before atomic rename(2).
+    parent = destination.parent
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(parent_fd, fcntl.LOCK_EX)
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError(f"lock output already exists: {destination}")
+        os.rename(source, destination)
+    finally:
+        try:
+            fcntl.flock(parent_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(parent_fd)
+
+
 def _write_atomic(output: Path, payloads: dict[str, dict]) -> None:
     parent = output.parent.resolve(strict=True)
     if output.exists() or output.is_symlink():
@@ -157,7 +186,7 @@ def _write_atomic(output: Path, payloads: dict[str, dict]) -> None:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-        _rename_noreplace(temporary, output)
+        _publish_directory_noreplace(temporary, output)
         parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(parent_fd)

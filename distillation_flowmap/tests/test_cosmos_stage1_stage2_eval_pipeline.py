@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import stat
@@ -183,6 +184,26 @@ def test_lock_cli_dry_run_is_write_free(tmp_path):
     assert not output.exists()
     assert "dataset.lock.json=" in result.stdout
     assert "video_vae.lock.json=" in result.stdout
+
+
+def test_atomic_lock_publication_supports_filesystems_without_renameat2_noreplace(
+    tmp_path, monkeypatch
+):
+    import distillation_flowmap.prepare_cosmos_libero_provenance_locks as locks
+
+    output = tmp_path / "locks"
+
+    def reject_renameat2(_source, destination):
+        raise OSError(errno.EINVAL, "Invalid argument", destination)
+
+    monkeypatch.setattr(locks, "_rename_noreplace", reject_renameat2)
+
+    locks._write_atomic(output, {"dataset.lock.json": {"contract": "test"}})
+
+    assert json.loads((output / "dataset.lock.json").read_text()) == {
+        "contract": "test"
+    }
+    assert not any(tmp_path.glob(".locks.tmp-*"))
 
 
 def test_universal_video_action_retains_target_required_by_action_opd(tmp_path):

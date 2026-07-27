@@ -238,6 +238,43 @@ def test_stage1_expected_step_resolver_defaults_and_rejects_non_decimal_input():
             resolve_stage1_expected_step(invalid)
 
 
+def test_scoped_stage1_step_action_manifest_rejects_ambient_drift():
+    environment = {"COSMOS_STAGE1_EXPECTED_STEP": "3000"}
+    actions = launcher_action_manifest(
+        environment,
+        canonical_names=(),
+        pinned_names={"COSMOS_STAGE1_EXPECTED_STEP"},
+        cleared_legacy_names=(),
+    )
+
+    assert actions == {
+        "COSMOS_STAGE1_EXPECTED_STEP": {
+            "action": "set_pinned",
+            "value": "3000",
+        }
+    }
+    validate_launcher_environment(
+        environment,
+        actions=actions,
+        canonical_names=(),
+        pinned_names={"COSMOS_STAGE1_EXPECTED_STEP"},
+        cleared_legacy_names=(),
+    )
+    with pytest.raises(EnvSchemaError, match="action manifest"):
+        validate_launcher_environment(
+            environment,
+            actions={
+                "COSMOS_STAGE1_EXPECTED_STEP": {
+                    "action": "set_pinned",
+                    "value": "5000",
+                }
+            },
+            canonical_names=(),
+            pinned_names={"COSMOS_STAGE1_EXPECTED_STEP"},
+            cleared_legacy_names=(),
+        )
+
+
 def test_newly_classified_pinned_read_requires_an_exact_action_spec(
     tmp_path, monkeypatch
 ):

@@ -75,6 +75,8 @@ COSMOS_STAGE1_EXPECTED_STEP="${COSMOS_STAGE1_EXPECTED_STEP:-5000}"
 [[ "$COSMOS_STAGE1_EXPECTED_STEP" =~ ^[1-9][0-9]*$ ]] || \
     die "COSMOS_STAGE1_EXPECTED_STEP must be a positive integer"
 export COSMOS_STAGE1_EXPECTED_STEP
+[[ -z "${ENV_CONTRACT_ACTIONS_JSON+x}" ]] || die \
+    "ENV_CONTRACT_ACTIONS_JSON is launcher-owned and cannot be inherited"
 STUDENT_BASE_MODEL_PATH="$STUDENT_BASE_MODEL_PATH"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_cosmos_independent_dance_4way_8gpu_20260721}"
 DATASET_PATH="${DATASET_PATH:-/kpfs-intern/jialongliu/projects/Flash-WAM/training_data/libero-long-lerobot}"
@@ -345,6 +347,50 @@ export COSMOS_POLICY_EXTRA_PYTHONPATH
 export COSMOS_WORKER_CUDA_LIBRARY_PATH
 export LD_LIBRARY_PATH="${COSMOS_WORKER_CUDA_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
+env_contract_code='import json, os
+from distillation_flowmap.cosmos_progressive_env_schema import (
+    launcher_action_manifest,
+    resolve_pinned_environment,
+    validate_launcher_environment,
+)
+pinned_names = {"COSMOS_STAGE1_EXPECTED_STEP"}
+pinned = resolve_pinned_environment(os.environ, pinned_names=pinned_names)
+actions = launcher_action_manifest(
+    os.environ,
+    canonical_names=(),
+    pinned_names=pinned_names,
+    cleared_legacy_names=(),
+)
+expected = {"action": "set_pinned", "value": pinned["COSMOS_STAGE1_EXPECTED_STEP"]}
+if actions.get("COSMOS_STAGE1_EXPECTED_STEP") != expected:
+    raise RuntimeError("Stage-1 expected-step action does not match pinned value")
+validate_launcher_environment(
+    os.environ,
+    actions=actions,
+    canonical_names=(),
+    pinned_names=pinned_names,
+    cleared_legacy_names=(),
+)
+print(
+    "ENV_CONTRACT_ACTIONS_JSON="
+    + json.dumps(actions, sort_keys=True, separators=(",", ":"))
+)'
+env_contract_output="$(
+    cd "$PROJECT_ROOT"
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va:$PROJECT_ROOT/distillation_flowmap:${PYTHONPATH:-}" \
+        "$PREFLIGHT_BIN" -c "$env_contract_code"
+)" || die "launcher environment contract preflight failed"
+while IFS='=' read -r key value; do
+    case "$key" in
+        ENV_CONTRACT_ACTIONS_JSON)
+            printf -v "$key" '%s' "$value"
+            export "$key"
+            ;;
+        *) die "unexpected environment contract output: $key" ;;
+    esac
+done <<< "$env_contract_output"
+
 config_preflight_code='import os
 from importlib import import_module
 cfg = import_module(os.environ["CONFIG_FILE"]).cfg
@@ -404,6 +450,7 @@ for key in \
     ENABLE_WANDB \
     WANDB_MODE \
     COSMOS_STAGE1_EXPECTED_STEP \
+    ENV_CONTRACT_ACTIONS_JSON \
     STUDENT_BASE_MODEL_PATH \
     PARENT_STAGE1_PATH \
     PARENT_STAGE1_CONTRACT_IDENTITY \

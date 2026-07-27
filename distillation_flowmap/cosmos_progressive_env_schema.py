@@ -547,8 +547,25 @@ def validate_environment_contract(
         )
 
 
+def _selected_environment_names(
+    names: Iterable[str] | None,
+    *,
+    allowed: frozenset[str],
+    label: str,
+) -> frozenset[str]:
+    selected = allowed if names is None else frozenset(names)
+    unexpected = selected - allowed
+    if unexpected:
+        raise EnvSchemaError(
+            f"unknown {label} environment names: {sorted(unexpected)}"
+        )
+    return selected
+
+
 def resolve_pinned_environment(
     environment: Mapping[str, str],
+    *,
+    pinned_names: Iterable[str] | None = None,
 ) -> dict[str, str]:
     expected_names = set(PINNED_OPERATIONAL_ENV)
     actual_names = set(PINNED_ENV_EXPECTED_VALUES)
@@ -558,8 +575,13 @@ def resolve_pinned_environment(
             f"missing={sorted(expected_names - actual_names)}, "
             f"extra={sorted(actual_names - expected_names)}"
         )
+    selected_pinned = _selected_environment_names(
+        pinned_names,
+        allowed=PINNED_OPERATIONAL_ENV,
+        label="pinned",
+    )
     resolved = {}
-    for name in sorted(PINNED_OPERATIONAL_ENV):
+    for name in sorted(selected_pinned):
         source, value = PINNED_ENV_EXPECTED_VALUES[name]
         if source == "literal":
             resolved[name] = value
@@ -580,23 +602,37 @@ def resolve_pinned_environment(
 
 def launcher_action_manifest(
     environment: Mapping[str, str],
+    *,
+    canonical_names: Iterable[str] | None = None,
+    pinned_names: Iterable[str] | None = None,
+    cleared_legacy_names: Iterable[str] | None = None,
 ) -> dict[str, dict[str, str]]:
-    pinned = resolve_pinned_environment(environment)
-    missing_canonical = CANONICAL_ENV - set(environment)
+    selected_canonical = _selected_environment_names(
+        canonical_names,
+        allowed=CANONICAL_ENV,
+        label="canonical",
+    )
+    selected_cleared = _selected_environment_names(
+        cleared_legacy_names,
+        allowed=CLEARED_LEGACY_ENV,
+        label="cleared legacy",
+    )
+    pinned = resolve_pinned_environment(environment, pinned_names=pinned_names)
+    missing_canonical = selected_canonical - set(environment)
     if missing_canonical:
         raise EnvSchemaError(
             "canonical launcher actions are missing values: "
             f"{sorted(missing_canonical)}"
         )
     actions: dict[str, dict[str, str]] = {}
-    for name in sorted(CANONICAL_ENV):
+    for name in sorted(selected_canonical):
         actions[name] = {
             "action": "set_canonical",
             "value": str(environment[name]),
         }
     for name, value in pinned.items():
         actions[name] = {"action": "set_pinned", "value": value}
-    for name in sorted(CLEARED_LEGACY_ENV):
+    for name in sorted(selected_cleared):
         actions[name] = {"action": "unset_legacy"}
     return actions
 
@@ -605,13 +641,28 @@ def validate_launcher_environment(
     environment: Mapping[str, str],
     *,
     actions: Mapping[str, Mapping[str, str]] | None = None,
+    canonical_names: Iterable[str] | None = None,
+    pinned_names: Iterable[str] | None = None,
+    cleared_legacy_names: Iterable[str] | None = None,
 ) -> None:
-    missing = CANONICAL_ENV - set(environment)
+    selected_canonical = _selected_environment_names(
+        canonical_names,
+        allowed=CANONICAL_ENV,
+        label="canonical",
+    )
+    selected_cleared = _selected_environment_names(
+        cleared_legacy_names,
+        allowed=CLEARED_LEGACY_ENV,
+        label="cleared legacy",
+    )
+    missing = selected_canonical - set(environment)
     if missing:
         raise EnvSchemaError(
             f"launcher environment is missing sealed values: {sorted(missing)}"
         )
-    expected_pinned = resolve_pinned_environment(environment)
+    expected_pinned = resolve_pinned_environment(
+        environment, pinned_names=pinned_names
+    )
     wrong_pinned = {
         name: (environment.get(name), expected)
         for name, expected in expected_pinned.items()
@@ -621,11 +672,16 @@ def validate_launcher_environment(
         raise EnvSchemaError(
             f"launcher pinned values differ from expected actions: {wrong_pinned}"
         )
-    leaked = {name for name in CLEARED_LEGACY_ENV if name in environment}
+    leaked = {name for name in selected_cleared if name in environment}
     if leaked:
         raise EnvSchemaError(
             f"launcher environment retained cleared legacy values: {sorted(leaked)}"
         )
-    expected_actions = launcher_action_manifest(environment)
+    expected_actions = launcher_action_manifest(
+        environment,
+        canonical_names=selected_canonical,
+        pinned_names=pinned_names,
+        cleared_legacy_names=selected_cleared,
+    )
     if actions is not None and dict(actions) != expected_actions:
         raise EnvSchemaError("launcher action manifest does not match exact actions")

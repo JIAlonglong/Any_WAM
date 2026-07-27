@@ -183,6 +183,24 @@ def test_stage2_launcher_keeps_explicit_parent_step_through_config_preflight(
     assert _assignments(result.stdout)["COSMOS_STAGE1_EXPECTED_STEP"] == "3000"
 
 
+def test_stage2_launcher_rejects_ambient_stage1_step_action_manifest(tmp_path):
+    env, _ = _env(tmp_path, parent_step=3000)
+    env["COSMOS_STAGE1_EXPECTED_STEP"] = "3000"
+    env["ENV_CONTRACT_ACTIONS_JSON"] = json.dumps(
+        {
+            "COSMOS_STAGE1_EXPECTED_STEP": {
+                "action": "set_pinned",
+                "value": "5000",
+            }
+        }
+    )
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "ENV_CONTRACT_ACTIONS_JSON" in result.stderr
+
+
 def test_stage2_launcher_defaults_parent_step_to_5000(tmp_path):
     env, _ = _env(tmp_path, parent_step=5000)
     env.pop("COSMOS_STAGE1_EXPECTED_STEP", None)

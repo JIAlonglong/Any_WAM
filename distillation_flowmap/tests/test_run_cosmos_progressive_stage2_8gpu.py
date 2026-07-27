@@ -49,10 +49,11 @@ def _transformer(root: Path, payload: dict | None = None) -> Path:
     return root
 
 
-def _layout(tmp_path: Path):
+def _layout(tmp_path: Path, *, parent_step: int = 5000):
+    raw_contract = {**RAW_CONTRACT, "checkpoint_step": parent_step}
     stage1 = tmp_path / "stage1"
     for variant in ("online_student", "target_student"):
-        _transformer(stage1 / variant / "transformer")
+        _transformer(stage1 / variant / "transformer", raw_contract)
 
     output = tmp_path / "output"
     dataset = tmp_path / "dataset"
@@ -70,7 +71,7 @@ def _layout(tmp_path: Path):
     (policy / "Cosmos-Policy-LIBERO-Predict2-2B.pt").write_bytes(b"policy")
     (policy / "libero_t5_embeddings.pkl").write_bytes(b"embeddings")
     stage1_payload = {
-        **RAW_CONTRACT,
+        **raw_contract,
         "_class_name": "WanTransformer3DModel",
         "student_base_model_path": str(stage1 / "target_student"),
         "teacher_model_path": str(policy),
@@ -87,8 +88,10 @@ def _layout(tmp_path: Path):
     return stage1, output, dataset, policy, repo, local_model, worker_python
 
 
-def _env(tmp_path: Path):
-    stage1, output, dataset, policy, repo, local_model, worker_python = _layout(tmp_path)
+def _env(tmp_path: Path, *, parent_step: int = 5000):
+    stage1, output, dataset, policy, repo, local_model, worker_python = _layout(
+        tmp_path, parent_step=parent_step
+    )
     env = os.environ.copy()
     env.update(
         {
@@ -155,6 +158,36 @@ def _assignments(stdout: str) -> dict[str, str]:
         for key, value in [line.split("=", 1)]
         if key.isupper()
     }
+
+
+def test_stage2_launcher_accepts_explicit_stage1_step_3000(tmp_path):
+    env, _ = _env(tmp_path, parent_step=3000)
+    env["COSMOS_STAGE1_EXPECTED_STEP"] = "3000"
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "COSMOS_STAGE1_EXPECTED_STEP=3000" in result.stdout
+
+
+def test_stage2_launcher_defaults_parent_step_to_5000(tmp_path):
+    env, _ = _env(tmp_path, parent_step=5000)
+    env.pop("COSMOS_STAGE1_EXPECTED_STEP", None)
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "COSMOS_STAGE1_EXPECTED_STEP=5000" in result.stdout
+
+
+def test_stage2_launcher_rejects_parent_metadata_that_disagrees(tmp_path):
+    env, _ = _env(tmp_path, parent_step=5000)
+    env["COSMOS_STAGE1_EXPECTED_STEP"] = "3000"
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "step" in result.stderr.lower()
 
 
 @pytest.mark.parametrize(

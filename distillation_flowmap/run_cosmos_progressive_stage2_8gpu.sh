@@ -71,6 +71,10 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 [[ -n "${STUDENT_BASE_MODEL_PATH:-}" ]] || die \
     "STUDENT_BASE_MODEL_PATH must be explicitly set"
 STAGE1_ROOT="$COSMOS_STAGE1_ROOT"
+COSMOS_STAGE1_EXPECTED_STEP="${COSMOS_STAGE1_EXPECTED_STEP:-5000}"
+[[ "$COSMOS_STAGE1_EXPECTED_STEP" =~ ^[1-9][0-9]*$ ]] || \
+    die "COSMOS_STAGE1_EXPECTED_STEP must be a positive integer"
+export COSMOS_STAGE1_EXPECTED_STEP
 STUDENT_BASE_MODEL_PATH="$STUDENT_BASE_MODEL_PATH"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/kpfs-intern/jialongliu/projects/Flash-WAM/distillation_flowmap/output_libero_cosmos_independent_dance_4way_8gpu_20260721}"
 DATASET_PATH="${DATASET_PATH:-/kpfs-intern/jialongliu/projects/Flash-WAM/training_data/libero-long-lerobot}"
@@ -235,7 +239,10 @@ stage1 = Path(os.environ["COSMOS_STAGE1_ROOT"])
 output = Path(os.environ["OUTPUT_DIR"])
 resume_raw = os.environ.get("STAGE2_RESUME_CHECKPOINT", "")
 resume = Path(resume_raw) if resume_raw else None
-parent = validate_stage1_parent(stage1, expected_step=5000)
+parent = validate_stage1_parent(
+    stage1,
+    expected_step=int(os.environ["COSMOS_STAGE1_EXPECTED_STEP"]),
+)
 validate_stage2_path_isolation(
     stage1_root=stage1,
     output_dir=output,
@@ -396,6 +403,7 @@ for key in \
     MECHANISM_COSMOS_T_MAX \
     ENABLE_WANDB \
     WANDB_MODE \
+    COSMOS_STAGE1_EXPECTED_STEP \
     STUDENT_BASE_MODEL_PATH \
     PARENT_STAGE1_PATH \
     PARENT_STAGE1_CONTRACT_IDENTITY \

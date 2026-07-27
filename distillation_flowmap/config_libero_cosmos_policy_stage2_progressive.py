@@ -213,7 +213,8 @@ if cfg.cosmos_libero_variant_json is not None:
                 "COSMOS_LIBERO provenance does not match the variant"
             )
 _validated_parent = validate_stage1_parent(
-    Path(cfg.parent_stage1_path), expected_step=5000
+    Path(cfg.parent_stage1_path),
+    expected_step=int(os.environ["COSMOS_STAGE1_EXPECTED_STEP"]),
 )
 _, _parent_teacher_model_path = validated_stage1_hybrid_model_paths(
     _validated_parent

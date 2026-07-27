@@ -131,6 +131,10 @@ TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 [[ -n "${COSMOS_STAGE1_ROOT:-}" ]] || die "COSMOS_STAGE1_ROOT must be explicitly set"
 [[ -n "${STUDENT_BASE_MODEL_PATH:-}" ]] || die "STUDENT_BASE_MODEL_PATH must be explicitly set"
 STAGE1_ROOT="$COSMOS_STAGE1_ROOT"
+COSMOS_STAGE1_EXPECTED_STEP="${COSMOS_STAGE1_EXPECTED_STEP:-5000}"
+[[ "$COSMOS_STAGE1_EXPECTED_STEP" =~ ^[1-9][0-9]*$ ]] || \
+    die "COSMOS_STAGE1_EXPECTED_STEP must be a positive integer"
+export COSMOS_STAGE1_EXPECTED_STEP
 DATASET_PATH="${DATASET_PATH:-/kpfs-intern/jialongliu/projects/Flash-WAM/training_data/libero-long-lerobot}"
 COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B}"
 COSMOS_WORKER_ENV_ROOT="${COSMOS_WORKER_ENV_ROOT:-/kpfs-intern/jialongliu/envs/cosmos-predict2-cu128-py310}"
@@ -478,7 +482,10 @@ output = Path(os.environ["OUTPUT_DIR"])
 resume_raw = os.environ.get("STAGE2_RESUME_CHECKPOINT", "")
 resume = Path(resume_raw) if resume_raw else None
 expected_variant = os.environ["COSMOS_LIBERO_VARIANT_JSON"]
-parent = validate_stage1_parent(stage1, expected_step=5000)
+parent = validate_stage1_parent(
+    stage1,
+    expected_step=int(os.environ["COSMOS_STAGE1_EXPECTED_STEP"]),
+)
 validate_stage2_path_isolation(
     stage1_root=stage1, output_dir=output, resume_checkpoint=resume,
 )
@@ -738,6 +745,7 @@ for key in \
     COSMOS_PREDICT2_REPO COSMOS_PREDICT25_LOCAL_MODEL_DIR \
     COSMOS_POLICY_EXTRA_PYTHONPATH COSMOS_WORKER_CUDA_LIBRARY_PATH \
     ATTN_MODE \
+    COSMOS_STAGE1_EXPECTED_STEP \
     STUDENT_BASE_MODEL_PATH PARENT_STAGE1_PATH \
     PARENT_STAGE1_CONTRACT_IDENTITY STAGE2_LINEAGE_JSON \
     COSMOS_LIBERO_VARIANT_JSON CUDA_VISIBLE_DEVICES \

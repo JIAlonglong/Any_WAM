@@ -153,14 +153,14 @@ def test_launcher_runtime_validator_requires_set_and_unset_actions():
         {
             "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
             "SAVE_INTERVAL": "1000",
+            "COSMOS_STAGE1_EXPECTED_STEP": "5000",
         }
     )
     for name, expected in expected_values.items():
-        environment[name] = (
-            environment[expected[1]]
-            if expected[0] == "environment"
-            else expected[1]
-        )
+        if expected[0] in {"environment", "positive_decimal_environment"}:
+            environment[name] = environment[expected[1]]
+        else:
+            environment[name] = expected[1]
     validate_launcher_environment(environment)
     actions = launcher_action_manifest(environment)
     assert actions["USE_FSDP1"] == {
@@ -184,6 +184,45 @@ def test_launcher_runtime_validator_requires_set_and_unset_actions():
     leaked[next(iter(CLEARED_LEGACY_ENV))] = "hostile"
     with pytest.raises(EnvSchemaError, match="cleared|legacy"):
         validate_launcher_environment(leaked)
+
+
+def test_stage1_expected_step_is_pinned_as_a_positive_decimal_contract():
+    expected_values = getattr(env_schema, "PINNED_ENV_EXPECTED_VALUES", {})
+    environment = {name: "sealed" for name in CANONICAL_ENV}
+    environment.update(
+        {
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+            "SAVE_INTERVAL": "1000",
+            "COSMOS_STAGE1_EXPECTED_STEP": "3000",
+        }
+    )
+    for name, expected in expected_values.items():
+        if expected[0] in {"environment", "positive_decimal_environment"}:
+            environment[name] = environment[expected[1]]
+        else:
+            environment[name] = expected[1]
+
+    actions = launcher_action_manifest(environment)
+
+    assert "COSMOS_STAGE1_EXPECTED_STEP" in PINNED_OPERATIONAL_ENV
+    assert actions["COSMOS_STAGE1_EXPECTED_STEP"] == {
+        "action": "set_pinned",
+        "value": "3000",
+    }
+    validate_launcher_environment(environment, actions=actions)
+    for invalid in ("0", "-1", "3e3"):
+        invalid_environment = dict(environment)
+        invalid_environment["COSMOS_STAGE1_EXPECTED_STEP"] = invalid
+        with pytest.raises(EnvSchemaError, match="COSMOS_STAGE1_EXPECTED_STEP|positive"):
+            launcher_action_manifest(invalid_environment)
+
+    drifted_actions = dict(actions)
+    drifted_actions["COSMOS_STAGE1_EXPECTED_STEP"] = {
+        "action": "set_pinned",
+        "value": "5000",
+    }
+    with pytest.raises(EnvSchemaError, match="action manifest"):
+        validate_launcher_environment(environment, actions=drifted_actions)
 
 
 def test_newly_classified_pinned_read_requires_an_exact_action_spec(
@@ -213,14 +252,14 @@ def test_newly_classified_pinned_read_requires_an_exact_action_spec(
             "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
             "SAVE_INTERVAL": "1000",
             "NEW_PINNED": "1",
+            "COSMOS_STAGE1_EXPECTED_STEP": "5000",
         }
     )
     for name, expected in expected_values.items():
-        hostile[name] = (
-            hostile[expected[1]]
-            if expected[0] == "environment"
-            else expected[1]
-        )
+        if expected[0] in {"environment", "positive_decimal_environment"}:
+            hostile[name] = hostile[expected[1]]
+        else:
+            hostile[name] = expected[1]
     with pytest.raises(EnvSchemaError, match="NEW_PINNED|action|spec"):
         launcher_action_manifest(hostile)
 

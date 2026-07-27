@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -75,6 +76,7 @@ PINNED_OPERATIONAL_ENV = frozenset(
         "USE_FSDP1",
         "VIDEO_ACTION_BRIDGE",
         "WANDB_MODE",
+        "COSMOS_STAGE1_EXPECTED_STEP",
     }
 )
 
@@ -134,6 +136,10 @@ PINNED_ENV_EXPECTED_VALUES: Mapping[str, tuple[str, str]] = {
     "USE_FSDP1": ("literal", "1"),
     "VIDEO_ACTION_BRIDGE": ("literal", "0"),
     "WANDB_MODE": ("literal", "offline"),
+    "COSMOS_STAGE1_EXPECTED_STEP": (
+        "positive_decimal_environment",
+        "COSMOS_STAGE1_EXPECTED_STEP",
+    ),
 }
 
 _ALL_CURRENT_ENV = frozenset(
@@ -552,6 +558,17 @@ def resolve_pinned_environment(
                     f"pinned environment source is missing for {name}: {value}"
                 )
             resolved[name] = str(environment[value])
+        elif source == "positive_decimal_environment":
+            if value not in environment:
+                raise EnvSchemaError(
+                    f"pinned environment source is missing for {name}: {value}"
+                )
+            resolved_value = str(environment[value])
+            if re.fullmatch(r"[1-9][0-9]*", resolved_value) is None:
+                raise EnvSchemaError(
+                    f"{name} must be a positive decimal integer: {resolved_value}"
+                )
+            resolved[name] = resolved_value
         else:
             raise EnvSchemaError(
                 f"unknown pinned environment source for {name}: {source}"

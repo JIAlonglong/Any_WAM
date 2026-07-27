@@ -99,10 +99,11 @@ def test_aligned_opd_contract_rejects_cross_arm_settings(
         )
 
 
-def _layout(tmp_path: Path):
+def _layout(tmp_path: Path, *, parent_step: int = 5000):
+    raw_contract = {**RAW_CONTRACT, "checkpoint_step": parent_step}
     stage1 = tmp_path / "stage1"
     for variant in ("online_student", "target_student"):
-        _transformer(stage1 / variant / "transformer", RAW_CONTRACT)
+        _transformer(stage1 / variant / "transformer", raw_contract)
     dataset = tmp_path / "dataset"
     (dataset / "meta").mkdir(parents=True)
     for name in (
@@ -132,7 +133,7 @@ def _layout(tmp_path: Path):
     (policy / "Cosmos-Policy-LIBERO-Predict2-2B.pt").write_bytes(b"policy")
     (policy / "libero_t5_embeddings.pkl").write_bytes(b"embeddings")
     stage1_payload = {
-        **RAW_CONTRACT,
+        **raw_contract,
         "_class_name": "WanTransformer3DModel",
         "student_base_model_path": str(stage1 / "target_student"),
         "teacher_model_path": str(policy),
@@ -284,7 +285,7 @@ def _layout(tmp_path: Path):
     )
 
 
-def _env(tmp_path: Path):
+def _env(tmp_path: Path, *, parent_step: int = 5000):
     (
         stage1,
         dataset,
@@ -295,7 +296,7 @@ def _env(tmp_path: Path):
         site_packages,
         flashwam_repo,
         lock_root,
-    ) = _layout(tmp_path)
+    ) = _layout(tmp_path, parent_step=parent_step)
     env = os.environ.copy()
     env.update(
         {
@@ -391,6 +392,36 @@ def _assignments(stdout: str) -> dict[str, str]:
         for key, value in [line.split("=", 1)]
         if key.isupper()
     }
+
+
+def test_stage2_launcher_accepts_explicit_stage1_step_3000(tmp_path):
+    env, _ = _env(tmp_path, parent_step=3000)
+    env["COSMOS_STAGE1_EXPECTED_STEP"] = "3000"
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "COSMOS_STAGE1_EXPECTED_STEP=3000" in result.stdout
+
+
+def test_stage2_launcher_defaults_parent_step_to_5000(tmp_path):
+    env, _ = _env(tmp_path, parent_step=5000)
+    env.pop("COSMOS_STAGE1_EXPECTED_STEP", None)
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "COSMOS_STAGE1_EXPECTED_STEP=5000" in result.stdout
+
+
+def test_stage2_launcher_rejects_parent_metadata_that_disagrees(tmp_path):
+    env, _ = _env(tmp_path, parent_step=5000)
+    env["COSMOS_STAGE1_EXPECTED_STEP"] = "3000"
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "step" in result.stderr.lower()
 
 
 def test_dry_run_embeds_read_only_provenance_in_canonical_identity(tmp_path):

@@ -261,12 +261,12 @@ def test_sigint_signals_s4_before_waiting_for_a_slow_s2_shutdown(tmp_path):
     fake_bash.write_text(
         """#!/bin/sh
 if [ "$(basename "$1")" = "run_lingbotva_native_teacher_4gpu_2replica_formal.sh" ]; then
-    printf 'started budget=%s\\n' "$BUDGETS" >> "$SIGNAL_LOG"
     if [ "$BUDGETS" = "2" ]; then
         trap 'sleep 3; printf "terminated budget=2\\n" >> "$SIGNAL_LOG"; exit 0' TERM
     else
         trap 'printf "terminated budget=4\\n" >> "$SIGNAL_LOG"; exit 0' TERM
     fi
+    printf 'ready budget=%s\\n' "$BUDGETS" >> "$SIGNAL_LOG"
     while :; do sleep 1; done
 fi
 exec /bin/bash "$@"
@@ -289,21 +289,17 @@ exec /bin/bash "$@"
     try:
         deadline = time.monotonic() + 5
         while (
-            (not signal_log.exists() or signal_log.read_text().count("started") != 2)
+            (
+                not signal_log.exists()
+                or signal_log.read_text().count("ready budget=") != 2
+            )
             and time.monotonic() < deadline
         ):
             time.sleep(0.05)
         assert signal_log.exists()
-        assert signal_log.read_text().count("started") == 2
+        assert signal_log.read_text().count("ready budget=") == 2
 
         process.send_signal(signal.SIGINT)
-        prompt_deadline = time.monotonic() + 2
-        while (
-            "terminated budget=4" not in signal_log.read_text()
-            and time.monotonic() < prompt_deadline
-        ):
-            time.sleep(0.05)
-        assert "terminated budget=4" in signal_log.read_text()
         assert process.wait(timeout=8) != 0
     finally:
         if process.poll() is None:

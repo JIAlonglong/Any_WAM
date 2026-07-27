@@ -183,6 +183,10 @@ def _environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
     worker_root = tmp_path / "cosmos-worker"
     worker_python = _executable(
         worker_root / "bin" / "python",
+        "if [[ \"${1:-}\" == \"-c\" ]]; then\n"
+        "  printf 'COSMOS_WORKER_RUNTIME_OK=12.8\\n'\n"
+        "  exit 0\n"
+        "fi\n"
         f"exec {str(Path(sys.executable).resolve())!r} \"$@\"\n",
     )
     worker_site = worker_root / "lib/python3.10/site-packages"
@@ -436,6 +440,25 @@ def test_complete_worker_runtime_is_resolved_once_and_passed_to_both_children(
     )
 
 
+def test_worker_runtime_import_probe_fails_before_any_write(tmp_path):
+    env, output_root = _environment(tmp_path)
+    broken_worker = _executable(
+        tmp_path / "cosmos-worker" / "bin" / "broken-python",
+        "printf 'worker import failed\\n' >&2\nexit 17\n",
+    )
+    env["COSMOS_POLICY_PYTHON"] = str(broken_worker)
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    result = _invoke(tmp_path, env, output_root, "--phase", "all")
+
+    after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    assert result.returncode != 0
+    assert "worker runtime probe" in result.stderr.lower()
+    assert before == after
+    assert not output_root.exists()
+    assert not Path(env["CALLS_LOG"]).exists()
+
+
 def test_real_stage1_lineage_is_validated_before_any_output_or_child(tmp_path):
     env, output_root = _environment(tmp_path)
     config = (
@@ -529,6 +552,40 @@ def test_wrapper_rejects_symlinked_run_root_component_before_any_write(tmp_path)
     assert not Path(env["CALLS_LOG"]).exists()
 
 
+def test_relative_symlinked_output_root_uses_the_callers_cwd_for_preflight(tmp_path):
+    env, _output_root = _environment(tmp_path)
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    real_parent = tmp_path / "real-relative-parent"
+    real_parent.mkdir()
+    (caller / "linked-parent").symlink_to(real_parent, target_is_directory=True)
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "--phase",
+            "check",
+            "--stage1-root",
+            str(tmp_path / "stage1"),
+            "--output-root",
+            "linked-parent/outputs",
+            "--run-tag",
+            "student-eval",
+        ],
+        cwd=caller,
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "symlink" in result.stderr.lower()
+    assert not (real_parent / "outputs").exists()
+    assert not Path(env["CALLS_LOG"]).exists()
+
+
 @pytest.mark.parametrize(
     ("sent_signal", "expected_code", "expected_name"),
     [
@@ -587,7 +644,9 @@ def test_wrapper_forwards_signals_to_child_process_group_with_standard_exit_code
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    deadline = time.monotonic() + 30
+    # The audited lineage and worker-runtime preflights intentionally complete
+    # before the child process starts; allow them to finish on a loaded host.
+    deadline = time.monotonic() + 60
     while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
         time.sleep(0.02)
     assert ready.exists(), process.communicate(timeout=5)

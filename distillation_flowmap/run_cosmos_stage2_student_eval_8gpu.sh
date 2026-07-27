@@ -31,6 +31,11 @@ canonical() {
         'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=False))' \
         "$1"
 }
+absolute_lexical_from() {
+    "$PYTHON_BIN" -c \
+        'import os, sys; print(os.path.abspath(os.path.join(sys.argv[1], sys.argv[2])))' \
+        "$1" "$2"
+}
 resolve_executable() {
     local label="$1" raw="$2" resolved
     [[ -e "$raw" && -x "$raw" ]] || die "$label is not executable: $raw"
@@ -137,12 +142,15 @@ command -v setsid >/dev/null 2>&1 || die "setsid is required for process-group s
 PYTHON_BIN="${PYTHON_BIN:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python}"
 [[ -x "$PYTHON_BIN" ]] || die "PYTHON_BIN is not executable: $PYTHON_BIN"
 export PYTHON_BIN
+CALLER_CWD="$(pwd -P)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 HELPER_PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/wan_va${PYTHONPATH:+:$PYTHONPATH}"
 
-RAW_STAGE1_CHECKPOINT="$STAGE1_ROOT/checkpoints/step_$STAGE1_STEP"
-RAW_RUN_ROOT="$OUTPUT_ROOT/$RUN_TAG"
+RAW_STAGE1_ROOT="$(absolute_lexical_from "$CALLER_CWD" "$STAGE1_ROOT")"
+RAW_OUTPUT_ROOT="$(absolute_lexical_from "$CALLER_CWD" "$OUTPUT_ROOT")"
+RAW_STAGE1_CHECKPOINT="$RAW_STAGE1_ROOT/checkpoints/step_$STAGE1_STEP"
+RAW_RUN_ROOT="$RAW_OUTPUT_ROOT/$RUN_TAG"
 if ! (
     cd "$PROJECT_ROOT"
     PYTHONDONTWRITEBYTECODE=1 \
@@ -166,8 +174,8 @@ PY
     die "RUN_ROOT/Stage-2 path isolation or symlink-component preflight failed"
 fi
 
-STAGE1_ROOT="$(canonical "$STAGE1_ROOT")"
-OUTPUT_ROOT="$(canonical "$OUTPUT_ROOT")"
+STAGE1_ROOT="$(canonical "$RAW_STAGE1_ROOT")"
+OUTPUT_ROOT="$(canonical "$RAW_OUTPUT_ROOT")"
 STAGE1_CHECKPOINT="$STAGE1_ROOT/checkpoints/step_$STAGE1_STEP"
 RUN_ROOT="$OUTPUT_ROOT/$RUN_TAG"
 STAGE2_OUTPUT="$RUN_ROOT/universal-video-action"
@@ -293,6 +301,35 @@ cosmos_repo_status="$(
             --porcelain=v1 --untracked-files=all
 )" || die "COSMOS_PREDICT2_REPO must be a readable Git repository"
 [[ -z "$cosmos_repo_status" ]] || die "COSMOS_PREDICT2_REPO must be clean"
+
+WORKER_PROBE_PYTHONPATH="$COSMOS_PREDICT2_REPO:$COSMOS_POLICY_EXTRA_PYTHONPATH:$COSMOS_WORKER_SITE_PACKAGES"
+worker_probe_output="$(
+    /usr/bin/env -i \
+        PATH=/usr/bin:/bin \
+        HOME=/nonexistent \
+        LANG=C.UTF-8 \
+        LC_ALL=C.UTF-8 \
+        PYTHONNOUSERSITE=1 \
+        PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONPATH="$WORKER_PROBE_PYTHONPATH" \
+        LD_LIBRARY_PATH="$WORKER_LD_LIBRARY_PATH" \
+        COSMOS_PREDICT2_REPO="$COSMOS_PREDICT2_REPO" \
+        "$COSMOS_POLICY_PYTHON" -c '
+import re
+import torch
+import cosmos_predict2
+
+cuda = torch.version.cuda or ""
+match = re.fullmatch(r"([0-9]+)\.([0-9]+)(?:\.[0-9]+)?", cuda)
+if match is None or (int(match.group(1)), int(match.group(2))) < (12, 8):
+    raise SystemExit(
+        f"Cosmos worker CUDA runtime {cuda!r} is incompatible; requires CUDA >=12.8"
+    )
+print("COSMOS_WORKER_RUNTIME_OK=" + cuda)
+'
+)" || die "Cosmos worker runtime probe failed before any output write"
+[[ "$worker_probe_output" == COSMOS_WORKER_RUNTIME_OK=* ]] || \
+    die "Cosmos worker runtime probe returned an invalid response"
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 [[ "$CUDA_VISIBLE_DEVICES" == "0,1,2,3,4,5,6,7" ]] || \

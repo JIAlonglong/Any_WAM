@@ -424,6 +424,21 @@ def test_stage2_launcher_rejects_parent_metadata_that_disagrees(tmp_path):
     assert "step" in result.stderr.lower()
 
 
+def test_stage2_launcher_preserves_explicit_cosmos_extra_pythonpath(tmp_path):
+    env, _ = _env(tmp_path)
+    custom_cuda = tmp_path / "custom-cosmos-cuda"
+    custom_oss = tmp_path / "custom-cosmos-oss"
+    custom_cuda.mkdir()
+    custom_oss.mkdir()
+    expected = f"{custom_cuda}:{custom_oss}"
+    env["COSMOS_POLICY_EXTRA_PYTHONPATH"] = expected
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert _assignments(result.stdout)["COSMOS_POLICY_EXTRA_PYTHONPATH"] == expected
+
+
 def test_dry_run_embeds_read_only_provenance_in_canonical_identity(tmp_path):
     env, _ = _env(tmp_path)
     output_root = tmp_path / "out"

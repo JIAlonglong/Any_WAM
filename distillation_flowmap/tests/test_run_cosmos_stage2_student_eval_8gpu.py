@@ -162,6 +162,7 @@ def test_check_only_prints_full_plan_without_writes(tmp_path):
     assert result.returncode == 0, result.stderr
     assert before == after
     assert "STAGE2_STEPS=5000" in result.stdout
+    assert "MAX_TRAIN_STEPS=5000" in result.stdout
     assert "stage2_target" in result.stdout
     assert "K=1,2,4" in result.stdout
     assert result.stdout.count("MATRIX_STEP=") == 12

@@ -212,6 +212,7 @@ printf 'PHASE=%s\n' "$PHASE"
 printf 'RUN_ROOT=%s\n' "$RUN_ROOT"
 printf 'STAGE1_CHECKPOINT=%s\n' "$STAGE1_CHECKPOINT"
 printf 'STAGE2_STEPS=%s\n' "$STAGE2_STEPS"
+printf 'MAX_TRAIN_STEPS=%s\n' "$STAGE2_STEPS"
 printf 'STAGE2_TARGET_TRANSFORMER=%s\n' "$STAGE2_TARGET_TRANSFORMER"
 printf 'EVAL_CHECKPOINT_ROLES=stage2_target\n'
 printf 'EVAL_PROTOCOL=student-only Full40 K=1,2,4; %s episodes per task\n' "$EPISODES"

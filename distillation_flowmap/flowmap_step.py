@@ -6121,8 +6121,23 @@ class FlowMapStepMixin:
             student_model = self.student
 
         def joint_context(video_state, action_state):
+            # The aligned Cosmos deployment state has the configured generated
+            # video horizon (9 frames), while the dataset conditioning tensor
+            # may retain the 16-frame observation horizon.  Once the generated
+            # state replaces the conditioning video, rebuild its clean clock
+            # on that same temporal grid instead of reusing the stale GT clock.
+            video_cond_t = torch.zeros(
+                batch_size,
+                video_state.shape[2],
+                device=video_state.device,
+                dtype=video_base["cond_timesteps"].dtype,
+            )
             return {
-                "video_base": {**video_base, "latent": video_state},
+                "video_base": {
+                    **video_base,
+                    "latent": video_state,
+                    "cond_timesteps": video_cond_t,
+                },
                 "action_latent": action_state,
                 "action_cond_t": action_cond_t,
                 "action_text": action_base["text_emb"],

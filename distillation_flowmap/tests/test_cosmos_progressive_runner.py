@@ -835,6 +835,7 @@ class _AlignedRecorderHarness:
                 video=video,
                 action=action,
                 video_t=joint_input["latent_dict"]["timesteps"],
+                video_cond_t=joint_input["latent_dict"]["cond_timesteps"],
                 action_t=joint_input["action_dict"]["timesteps"],
                 video_r=video_r,
                 action_r=action_r,
@@ -1133,6 +1134,42 @@ def test_aligned_cosmos_gathers_distinct_per_sample_joint_states_and_shifted_tim
     assert torch.equal(anchor.video_r, torch.zeros_like(expected_video_t))
     assert torch.equal(anchor.action_r, torch.zeros_like(expected_action_t))
     assert result["opd_query_index"].item() == pytest.approx(1.5)
+
+
+def test_aligned_cosmos_rebuilds_clean_condition_clock_for_generated_video_state():
+    harness, batch, _ = _aligned_recording_case(batch_size=1)
+
+    def mismatched_base_dict(_batch):
+        return {
+            "latent_dict": {
+                "latent": torch.zeros(1, 1, 16, 1, 1),
+                "cond_timesteps": torch.zeros(1, 16),
+                "text_emb": torch.zeros(1, 1, 1),
+                "grid_id": None,
+            },
+            "action_dict": {
+                "latent": batch["actions"],
+                "cond_timesteps": torch.zeros(1, 16),
+                "text_emb": torch.zeros(1, 1, 1),
+                "grid_id": None,
+                "actions_mask": torch.ones_like(batch["actions"][:, :1]),
+            },
+            "chunk_size": 1,
+            "window_size": 1,
+        }
+
+    harness._prepare_base_dict = mismatched_base_dict
+    harness._build_cosmos_shifted_shared_query(
+        batch,
+        mismatched_base_dict(batch),
+        student_steps=2,
+    )
+
+    assert harness.student.calls
+    for call in harness.student.calls:
+        assert call.video.shape[2] == 3
+        assert call.video_cond_t.shape == (1, 3)
+        assert torch.count_nonzero(call.video_cond_t).item() == 0
 
 
 def test_aligned_cosmos_rejects_canonical_valid_video_mismatch_before_queries():

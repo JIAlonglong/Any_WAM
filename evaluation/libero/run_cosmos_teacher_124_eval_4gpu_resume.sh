@@ -27,6 +27,10 @@ export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-osmesa}"
 # shellcheck source=evaluation/libero/cosmos_progressive_s4_env.sh
 source "${SCRIPT_DIR}/cosmos_progressive_s4_env.sh"
 
+# The evaluator preflight starts COSMOS_POLICY_PYTHON with inherited
+# PYTHONPATH. Make the CUDA/OSS extras visible there as well as to the raw
+# worker, matching the audited long-form launch command.
+export PYTHONPATH="${PROJECT_ROOT}:${COSMOS_POLICY_EXTRA_PYTHONPATH}${PYTHONPATH:+:${PYTHONPATH}}"
 export S4_CKPT_ROOT="${COSMOS_POLICY_PATH}"
 export S4_PROMPT_TABLE="${S4_PROMPT_TABLE:-${S4_EMPTY_EMBEDDING}}"
 export S4_MODEL_ROLE=official_teacher

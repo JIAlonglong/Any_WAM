@@ -21,6 +21,7 @@ SUITES = ("libero_10", "libero_spatial", "libero_object", "libero_goal")
 def _write_fake_launcher(path: Path) -> None:
     path.write_text(
         "#!/usr/bin/env python3\n"
+        "import cosmos_cuda\n"
         "import json, os, pathlib, sys\n"
         "capture = pathlib.Path(os.environ['CAPTURE_PATH'])\n"
         "with capture.open('a', encoding='utf-8') as handle:\n"
@@ -39,6 +40,15 @@ def _write_fake_launcher(path: Path) -> None:
 
 
 def _env(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path]:
+    cosmos_repo = tmp_path / "cosmos repo"
+    cosmos_cuda = (
+        cosmos_repo / "packages" / "cosmos-cuda" / "cosmos_cuda"
+    )
+    cosmos_cuda.mkdir(parents=True)
+    (cosmos_cuda / "__init__.py").write_text(
+        "__version__ = 'test'\n", encoding="utf-8"
+    )
+    (cosmos_repo / "packages" / "cosmos-oss").mkdir(parents=True)
     teacher = tmp_path / "official teacher"
     teacher.mkdir()
     dataset = tmp_path / "dataset"
@@ -59,6 +69,8 @@ def _env(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path]:
         {
             "COSMOS_POLICY_PATH": str(teacher),
             "COSMOS_POLICY_TEACHER_LOCK": str(lock),
+            "COSMOS_PREDICT2_REPO": str(cosmos_repo),
+            "COSMOS_POLICY_PYTHON": sys.executable,
             "S4_DATASET_PATH": str(dataset),
             "S4_EMPTY_EMBEDDING": str(empty),
             "S4_PROMPT_TABLE": str(prompts),

@@ -137,8 +137,8 @@ PINNED_ENV_EXPECTED_VALUES: Mapping[str, tuple[str, str]] = {
     "VIDEO_ACTION_BRIDGE": ("literal", "0"),
     "WANDB_MODE": ("literal", "offline"),
     "COSMOS_STAGE1_EXPECTED_STEP": (
-        "positive_decimal_environment",
-        "COSMOS_STAGE1_EXPECTED_STEP",
+        "stage1_expected_step",
+        "",
     ),
 }
 
@@ -257,6 +257,17 @@ DYNAMIC_ENV_SITES: Mapping[str, str] = {}
 
 class EnvSchemaError(ValueError):
     """Raised when the audited config environment contract drifts."""
+
+
+def resolve_stage1_expected_step(value: str | None) -> int:
+    """Resolve the Stage-1 parent step at every config/schema boundary."""
+    raw = "5000" if value is None else str(value)
+    if re.fullmatch(r"[1-9][0-9]*", raw) is None:
+        raise EnvSchemaError(
+            "COSMOS_STAGE1_EXPECTED_STEP must be a positive decimal integer: "
+            f"{raw}"
+        )
+    return int(raw)
 
 
 @dataclass(frozen=True, order=True)
@@ -558,17 +569,8 @@ def resolve_pinned_environment(
                     f"pinned environment source is missing for {name}: {value}"
                 )
             resolved[name] = str(environment[value])
-        elif source == "positive_decimal_environment":
-            if value not in environment:
-                raise EnvSchemaError(
-                    f"pinned environment source is missing for {name}: {value}"
-                )
-            resolved_value = str(environment[value])
-            if re.fullmatch(r"[1-9][0-9]*", resolved_value) is None:
-                raise EnvSchemaError(
-                    f"{name} must be a positive decimal integer: {resolved_value}"
-                )
-            resolved[name] = resolved_value
+        elif source == "stage1_expected_step":
+            resolved[name] = str(resolve_stage1_expected_step(environment.get(name)))
         else:
             raise EnvSchemaError(
                 f"unknown pinned environment source for {name}: {source}"

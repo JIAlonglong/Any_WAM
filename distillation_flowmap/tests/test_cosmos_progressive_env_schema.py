@@ -19,6 +19,7 @@ from distillation_flowmap.cosmos_progressive_env_schema import (
     EnvSchemaError,
     extract_config_env_reads,
     launcher_action_manifest,
+    resolve_stage1_expected_step,
     validate_config_chain,
     validate_environment_contract,
     validate_launcher_environment,
@@ -157,8 +158,10 @@ def test_launcher_runtime_validator_requires_set_and_unset_actions():
         }
     )
     for name, expected in expected_values.items():
-        if expected[0] in {"environment", "positive_decimal_environment"}:
+        if expected[0] == "environment":
             environment[name] = environment[expected[1]]
+        elif expected[0] == "stage1_expected_step":
+            environment[name] = "5000"
         else:
             environment[name] = expected[1]
     validate_launcher_environment(environment)
@@ -197,8 +200,10 @@ def test_stage1_expected_step_is_pinned_as_a_positive_decimal_contract():
         }
     )
     for name, expected in expected_values.items():
-        if expected[0] in {"environment", "positive_decimal_environment"}:
+        if expected[0] == "environment":
             environment[name] = environment[expected[1]]
+        elif expected[0] == "stage1_expected_step":
+            environment[name] = "3000"
         else:
             environment[name] = expected[1]
 
@@ -223,6 +228,14 @@ def test_stage1_expected_step_is_pinned_as_a_positive_decimal_contract():
     }
     with pytest.raises(EnvSchemaError, match="action manifest"):
         validate_launcher_environment(environment, actions=drifted_actions)
+
+
+def test_stage1_expected_step_resolver_defaults_and_rejects_non_decimal_input():
+    assert resolve_stage1_expected_step(None) == 5000
+    assert resolve_stage1_expected_step("3000") == 3000
+    for invalid in ("0", "-1", "+3000", " 3000", "3000 ", "3e3"):
+        with pytest.raises(EnvSchemaError, match="COSMOS_STAGE1_EXPECTED_STEP"):
+            resolve_stage1_expected_step(invalid)
 
 
 def test_newly_classified_pinned_read_requires_an_exact_action_spec(
@@ -256,8 +269,10 @@ def test_newly_classified_pinned_read_requires_an_exact_action_spec(
         }
     )
     for name, expected in expected_values.items():
-        if expected[0] in {"environment", "positive_decimal_environment"}:
+        if expected[0] == "environment":
             hostile[name] = hostile[expected[1]]
+        elif expected[0] == "stage1_expected_step":
+            hostile[name] = "5000"
         else:
             hostile[name] = expected[1]
     with pytest.raises(EnvSchemaError, match="NEW_PINNED|action|spec"):

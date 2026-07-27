@@ -170,6 +170,19 @@ def test_stage2_launcher_accepts_explicit_stage1_step_3000(tmp_path):
     assert "COSMOS_STAGE1_EXPECTED_STEP=3000" in result.stdout
 
 
+def test_stage2_launcher_keeps_explicit_parent_step_through_config_preflight(
+    tmp_path,
+):
+    env, _ = _env(tmp_path, parent_step=3000)
+    env["COSMOS_STAGE1_EXPECTED_STEP"] = "3000"
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "Cosmos progressive Stage-2 config preflight passed" in result.stdout
+    assert _assignments(result.stdout)["COSMOS_STAGE1_EXPECTED_STEP"] == "3000"
+
+
 def test_stage2_launcher_defaults_parent_step_to_5000(tmp_path):
     env, _ = _env(tmp_path, parent_step=5000)
     env.pop("COSMOS_STAGE1_EXPECTED_STEP", None)

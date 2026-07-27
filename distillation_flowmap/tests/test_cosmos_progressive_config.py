@@ -226,6 +226,32 @@ def test_progressive_config_validates_lineage_outside_launcher(
     assert result.returncode == 0, result.stderr
 
 
+def test_progressive_config_defaults_stage1_expected_step_to_5000(
+    _explicit_cosmos_paths,
+):
+    env = dict(_explicit_cosmos_paths["env"])
+    env.pop("COSMOS_STAGE1_EXPECTED_STEP", None)
+
+    result = _import_progressive(env)
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "value", ("0", "-1", "+3000", " 3000", "3000 ", "3e3")
+)
+def test_progressive_config_rejects_invalid_stage1_expected_step(
+    _explicit_cosmos_paths, value
+):
+    env = dict(_explicit_cosmos_paths["env"])
+    env["COSMOS_STAGE1_EXPECTED_STEP"] = value
+
+    result = _import_progressive(env)
+
+    assert result.returncode != 0
+    assert "COSMOS_STAGE1_EXPECTED_STEP" in result.stderr
+
+
 def _write_stage2_resume(
     root, *, step, parent, missing=None, parent_identity=None
 ):

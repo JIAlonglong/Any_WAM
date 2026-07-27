@@ -23,6 +23,33 @@ path_is_within() {
     [ "$child" = "$parent" ] || [[ "$child" == "$parent/"* ]]
 }
 
+canonical_decimal() {
+    local label="$1"
+    local value="$2"
+    local minimum="$3"
+    local maximum="$4"
+    local kind="$5"
+
+    case "$value" in
+        ''|*[!0-9]*)
+            echo "${label} must be a decimal ${kind} from ${minimum} to ${maximum}" >&2
+            exit 2
+            ;;
+    esac
+    while [ "${#value}" -gt 1 ] && [ "${value#0}" != "$value" ]; do
+        value="${value#0}"
+    done
+    if [ "${#value}" -gt "${#maximum}" ] || { [ "${#value}" -eq "${#maximum}" ] && [[ "$value" > "$maximum" ]]; }; then
+        echo "${label} must be a decimal ${kind} from ${minimum} to ${maximum}" >&2
+        exit 2
+    fi
+    if [ "$minimum" -eq 1 ] && [ "$value" = "0" ]; then
+        echo "${label} must be a decimal ${kind} from ${minimum} to ${maximum}" >&2
+        exit 2
+    fi
+    CANONICAL_DECIMAL="$value"
+}
+
 parse_gpu_ids() {
     local label="$1"
     local gpu_ids="$2"
@@ -43,7 +70,10 @@ parse_gpu_ids() {
                 exit 2
                 ;;
         esac
-        gpu=$((10#$gpu))
+        # CUDA indices are bounded to signed 32-bit values, far beyond
+        # practical physical GPU allocations, before any arithmetic occurs.
+        canonical_decimal "$label" "$gpu" 0 2147483647 "GPU ID"
+        gpu="$CANONICAL_DECIMAL"
         for seen in "${PARSED_GPU_IDS[@]-}"; do
             if [ "$gpu" = "$seen" ]; then
                 echo "${label} must not contain duplicate GPU IDs" >&2
@@ -71,17 +101,8 @@ validate_port_base() {
     local port="$2"
     local lane_count="$3"
     local normalized_port
-    case "$port" in
-        ''|*[!0-9]*)
-            echo "${label} must be a positive integer" >&2
-            exit 2
-            ;;
-    esac
-    normalized_port=$((10#$port))
-    if (( normalized_port == 0 )); then
-        echo "${label} must be a positive integer" >&2
-        exit 2
-    fi
+    canonical_decimal "$label" "$port" 1 65535 "port"
+    normalized_port="$CANONICAL_DECIMAL"
     if (( normalized_port + lane_count - 1 > 65535 )); then
         echo "${label} range must end at or below 65535" >&2
         exit 2

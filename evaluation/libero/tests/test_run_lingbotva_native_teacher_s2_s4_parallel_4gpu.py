@@ -176,6 +176,26 @@ def test_check_only_accepts_non_overlapping_sibling_overrides(tmp_path):
     assert {worker["ws_port"] for worker in workers} == {"38100", "38300"}
 
 
+def test_check_only_rejects_overflowing_gpu_and_port_overrides(tmp_path):
+    cases = [
+        (
+            {"S2_GPU_IDS": "18446744073709551615"},
+            "S2_GPU_IDS must be a decimal GPU ID from 0 to 2147483647",
+        ),
+        (
+            {"S2_MASTER_PORT_BASE": "18446744073709551615"},
+            "S2_MASTER_PORT_BASE must be a decimal port from 1 to 65535",
+        ),
+    ]
+
+    for overrides, expected_error in cases:
+        result = _run_check_only_with_overrides(tmp_path, overrides)
+
+        assert result.returncode != 0
+        assert expected_error in result.stderr
+        assert "WORKER " not in result.stdout
+
+
 def test_sigint_terminates_only_the_live_s4_child_when_s2_has_exited(tmp_path):
     checkpoint = tmp_path / "base" / "transformer"
     checkpoint.mkdir(parents=True)
@@ -243,7 +263,7 @@ def test_sigint_signals_s4_before_waiting_for_a_slow_s2_shutdown(tmp_path):
 if [ "$(basename "$1")" = "run_lingbotva_native_teacher_4gpu_2replica_formal.sh" ]; then
     printf 'started budget=%s\\n' "$BUDGETS" >> "$SIGNAL_LOG"
     if [ "$BUDGETS" = "2" ]; then
-        trap 'sleep 2; printf "terminated budget=2\\n" >> "$SIGNAL_LOG"; exit 0' TERM
+        trap 'sleep 3; printf "terminated budget=2\\n" >> "$SIGNAL_LOG"; exit 0' TERM
     else
         trap 'printf "terminated budget=4\\n" >> "$SIGNAL_LOG"; exit 0' TERM
     fi
@@ -277,15 +297,20 @@ exec /bin/bash "$@"
         assert signal_log.read_text().count("started") == 2
 
         process.send_signal(signal.SIGINT)
-        prompt_deadline = time.monotonic() + 1
+        prompt_deadline = time.monotonic() + 2
         while (
             "terminated budget=4" not in signal_log.read_text()
             and time.monotonic() < prompt_deadline
         ):
             time.sleep(0.05)
         assert "terminated budget=4" in signal_log.read_text()
-        assert process.wait(timeout=5) != 0
+        assert process.wait(timeout=8) != 0
     finally:
         if process.poll() is None:
             process.terminate()
-            process.wait(timeout=5)
+            process.wait(timeout=8)
+
+    log_lines = signal_log.read_text().splitlines()
+    assert "terminated budget=4" in log_lines
+    assert "terminated budget=2" in log_lines
+    assert log_lines.index("terminated budget=4") < log_lines.index("terminated budget=2")

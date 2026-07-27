@@ -116,6 +116,10 @@ def test_check_only_rejects_overlapping_sibling_overrides_before_launching(tmp_p
             "S2_GPU_IDS and S4_GPU_IDS must not overlap",
         ),
         (
+            {"S2_GPU_IDS": "01", "S4_GPU_IDS": "1"},
+            "S2_GPU_IDS and S4_GPU_IDS must not overlap",
+        ),
+        (
             {
                 "S2_MASTER_PORT_BASE": "36000",
                 "S4_MASTER_PORT_BASE": "36003",
@@ -125,6 +129,13 @@ def test_check_only_rejects_overlapping_sibling_overrides_before_launching(tmp_p
         (
             {"S2_WS_PORT_BASE": "37000", "S4_WS_PORT_BASE": "37003"},
             "S2 and S4 WebSocket port ranges must not overlap",
+        ),
+        (
+            {
+                "S2_MASTER_PORT_BASE": "036000",
+                "S4_MASTER_PORT_BASE": "36003",
+            },
+            "S2 and S4 master port ranges must not overlap",
         ),
     ]
 
@@ -218,3 +229,63 @@ exec /bin/bash "$@"
     log_lines = signal_log.read_text().splitlines()
     assert "terminated budget=4" in "\n".join(log_lines)
     assert not any("terminated budget=2" in line for line in log_lines)
+
+
+def test_sigint_signals_s4_before_waiting_for_a_slow_s2_shutdown(tmp_path):
+    checkpoint = tmp_path / "base" / "transformer"
+    checkpoint.mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    signal_log = tmp_path / "signal.log"
+    fake_bash = fake_bin / "bash"
+    fake_bash.write_text(
+        """#!/bin/sh
+if [ "$(basename "$1")" = "run_lingbotva_native_teacher_4gpu_2replica_formal.sh" ]; then
+    printf 'started budget=%s\\n' "$BUDGETS" >> "$SIGNAL_LOG"
+    if [ "$BUDGETS" = "2" ]; then
+        trap 'sleep 2; printf "terminated budget=2\\n" >> "$SIGNAL_LOG"; exit 0' TERM
+    else
+        trap 'printf "terminated budget=4\\n" >> "$SIGNAL_LOG"; exit 0' TERM
+    fi
+    while :; do sleep 1; done
+fi
+exec /bin/bash "$@"
+"""
+    )
+    fake_bash.chmod(0o755)
+    process = subprocess.Popen(
+        ["bash", str(SCRIPT)],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "CHECKPOINT": str(checkpoint),
+            "S2_OUTPUT_ROOT": str(tmp_path / "s2-results"),
+            "S4_OUTPUT_ROOT": str(tmp_path / "s4-results"),
+            "SIGNAL_LOG": str(signal_log),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while (
+            (not signal_log.exists() or signal_log.read_text().count("started") != 2)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+        assert signal_log.exists()
+        assert signal_log.read_text().count("started") == 2
+
+        process.send_signal(signal.SIGINT)
+        prompt_deadline = time.monotonic() + 1
+        while (
+            "terminated budget=4" not in signal_log.read_text()
+            and time.monotonic() < prompt_deadline
+        ):
+            time.sleep(0.05)
+        assert "terminated budget=4" in signal_log.read_text()
+        assert process.wait(timeout=5) != 0
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)

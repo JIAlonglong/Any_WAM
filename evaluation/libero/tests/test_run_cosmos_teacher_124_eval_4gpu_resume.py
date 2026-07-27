@@ -200,3 +200,18 @@ def test_resume_dry_run_plans_twelve_cells_without_creating_matrix(tmp_path):
     assert not matrix.exists()
     assert f"MATRIX_SUMMARY_PLAN={matrix / 'matrix_summary.json'}" in result.stdout
     assert f"MATRIX_SUMMARY_CSV_PLAN={matrix / 'matrix_summary.csv'}" in result.stdout
+
+
+@pytest.mark.parametrize("steps", (1, 2, 4))
+def test_resume_can_plan_only_one_requested_k_without_matrix_merge(tmp_path, steps):
+    env, matrix, _teacher, capture = _env(tmp_path)
+    env["COSMOS_TEACHER_STEPS"] = str(steps)
+
+    result = _run(env, matrix)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [(call["steps"], call["suite"]) for call in _calls(capture)] == [
+        (steps, suite) for suite in SUITES
+    ]
+    assert "MATRIX_SUMMARY_PLAN=" not in result.stdout
+    assert not matrix.exists()

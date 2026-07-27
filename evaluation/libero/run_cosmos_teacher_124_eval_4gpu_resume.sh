@@ -51,7 +51,21 @@ export S4_EPISODES_PER_TASK="${S4_EPISODES_PER_TASK:-50}"
 FORMAL_LAUNCHER="${COSMOS_TEACHER_FORMAL_LAUNCHER:-${SCRIPT_DIR}/run_cosmos_progressive_s4_eval.sh}"
 [[ -x "${FORMAL_LAUNCHER}" ]] || die "formal launcher is not executable: ${FORMAL_LAUNCHER}"
 
-readonly STEPS=(1 2 4)
+SELECTED_STEPS="${COSMOS_TEACHER_STEPS:-}"
+case "${SELECTED_STEPS}" in
+    "")
+        STEPS=(1 2 4)
+        DEFER_MATRIX_MERGE=0
+        ;;
+    1|2|4)
+        STEPS=("${SELECTED_STEPS}")
+        DEFER_MATRIX_MERGE=1
+        ;;
+    *)
+        die "COSMOS_TEACHER_STEPS must be one of 1, 2, or 4 when set"
+        ;;
+esac
+readonly STEPS
 readonly SUITES=(libero_10 libero_spatial libero_object libero_goal)
 DRY_RUN="${S4_DRY_RUN:-0}"
 case "${DRY_RUN}" in
@@ -136,6 +150,12 @@ for steps in "${STEPS[@]}"; do
         fi
     done
 done
+
+if [[ "${DEFER_MATRIX_MERGE}" == "1" ]]; then
+    printf 'MATRIX_SUMMARY_DEFERRED=%s/matrix_summary.json\n' "${MATRIX_ROOT}"
+    printf 'MATRIX_SUMMARY_CSV_DEFERRED=%s/matrix_summary.csv\n' "${MATRIX_ROOT}"
+    exit 0
+fi
 
 if [[ "${DRY_RUN}" == "1" ]]; then
     printf 'MATRIX_SUMMARY_PLAN=%s/matrix_summary.json\n' "${MATRIX_ROOT}"

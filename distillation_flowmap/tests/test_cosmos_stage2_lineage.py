@@ -686,6 +686,31 @@ def test_inference_lineage_environment_is_derived_from_validated_checkpoint(
         )
 
 
+def test_inference_resolver_uses_sealed_stage2_parent_step_metadata(tmp_path):
+    stage1, _arm, checkpoint, _wan_base_path, _cosmos_teacher = _lineaged_stage2(
+        tmp_path
+    )
+    for variant in ("online_student", "target_student"):
+        _rewrite(_config(stage1, variant), checkpoint_step=3000)
+    parent = validate_stage1_parent(stage1, expected_step=3000)
+    for variant in ("online_student", "target_student"):
+        _rewrite(
+            _config(checkpoint, variant),
+            parent_stage1_contract_identity=parent.contract_identity,
+            parent_stage1_expected_step=3000,
+        )
+
+    resolved = resolve_cosmos_inference_checkpoint(
+        model_role="stage2_target",
+        checkpoint_transformer=checkpoint / "target_student" / "transformer",
+    )
+
+    assert resolved.parent_stage1_path == parent.canonical_path
+    assert stage2_inference_lineage_environment(resolved)[
+        "COSMOS_STAGE1_EXPECTED_STEP"
+    ] == "3000"
+
+
 def test_inference_resolver_accepts_only_explicit_validated_student_roles(tmp_path):
     stage1, _arm, checkpoint, wan_base, _cosmos_teacher = _lineaged_stage2(tmp_path)
 

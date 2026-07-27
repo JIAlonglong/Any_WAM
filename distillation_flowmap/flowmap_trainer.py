@@ -1451,6 +1451,7 @@ class FlowMapDistiller(DataMixin, FlowMapStepMixin):
                     "teacher_model_path",
                     "parent_stage1_path",
                     "parent_stage1_contract_identity",
+                    "parent_stage1_expected_step",
                     "stage2_lineage_json",
                     "cosmos_libero_variant_json",
                     "cosmos_libero_provenance_json",

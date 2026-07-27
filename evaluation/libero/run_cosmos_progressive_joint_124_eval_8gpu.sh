@@ -43,6 +43,7 @@ require_env "S4_PROMPT_TABLE"
     die "MATRIX_ROOT already exists; no-overwrite policy requires a new root: ${MATRIX_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
+export PYTHON_BIN
 S4_FORMAL_LAUNCHER="${S4_FORMAL_LAUNCHER:-${SCRIPT_DIR}/run_cosmos_progressive_s4_eval.sh}"
 [[ -x "${S4_FORMAL_LAUNCHER}" ]] || die "formal launcher is not executable: ${S4_FORMAL_LAUNCHER}"
 S4_EPISODES_PER_TASK="${S4_EPISODES_PER_TASK:-50}"

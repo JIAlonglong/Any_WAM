@@ -772,7 +772,7 @@ def test_entire_inherited_config_environment_is_sealed_against_hostile_ambient(
         "LIGHT_EVAL_NUM_BATCHES": "999",
         "LIGHT_EVAL_SEED": "999",
         "LIGHT_EVAL_START_INDEX": "999",
-        "PYTORCH_CUDA_ALLOC_CONF": "hostile",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "HF_HOME": "/hostile/hf",
     }
     env.update(hostile)
@@ -908,6 +908,31 @@ def test_dry_and_check_only_do_lineage_preflight_but_never_create_output_parent(
     assert result.returncode == 0, result.stderr
     assert "PARENT_STAGE1_CONTRACT_IDENTITY=" in result.stdout
     assert not output_root.exists()
+
+
+def test_launcher_allows_a_strict_allocator_override_without_changing_default(tmp_path):
+    env, _ = _env(tmp_path)
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert _assignments(result.stdout)["PYTORCH_CUDA_ALLOC_CONF"] == (
+        "max_split_size_mb:128"
+    )
+
+
+@pytest.mark.parametrize(
+    "value", ("max_split_size_mb:0", "max_split_size_mb:128,garbage")
+)
+def test_launcher_rejects_an_invalid_allocator_override(tmp_path, value):
+    env, _ = _env(tmp_path)
+    env["PYTORCH_CUDA_ALLOC_CONF"] = value
+
+    result = _run("s4", "--dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "PYTORCH_CUDA_ALLOC_CONF" in result.stderr
 
 
 @pytest.mark.parametrize("arm", ("anchor_only", "apm"))

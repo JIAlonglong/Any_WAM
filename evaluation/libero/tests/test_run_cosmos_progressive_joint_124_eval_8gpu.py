@@ -124,6 +124,22 @@ def test_matrix_dry_run_honors_two_shard_four_gpu_layout(tmp_path):
     assert not root.exists()
 
 
+def test_matrix_exports_its_selected_python_to_dry_run_children(tmp_path):
+    env = _base_env(tmp_path)
+    child = tmp_path / "child.sh"
+    child.write_text(
+        "#!/usr/bin/env bash\nprintf 'CHILD_PYTHON_BIN=%s\\n' \"$PYTHON_BIN\"\n",
+        encoding="utf-8",
+    )
+    child.chmod(child.stat().st_mode | stat.S_IXUSR)
+    env["S4_FORMAL_LAUNCHER"] = str(child)
+
+    result = _run("dry-run", env=env)
+
+    _assert_success(result)
+    assert result.stdout.count(f"CHILD_PYTHON_BIN={sys.executable}") == 12
+
+
 def test_matrix_rejects_existing_root_before_starting_a_child(tmp_path):
     env = _base_env(tmp_path)
     root = Path(env["MATRIX_ROOT"])

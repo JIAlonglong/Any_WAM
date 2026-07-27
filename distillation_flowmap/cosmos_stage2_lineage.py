@@ -36,6 +36,7 @@ class ResolvedCosmosInferenceCheckpoint:
     transformer_path: str
     checkpoint_path: str
     parent_stage1_path: str | None
+    parent_stage1_expected_step: int | None
     student_backend: str
     teacher_backend: str
     wan_student_base_model_path: str
@@ -447,6 +448,7 @@ def resolve_cosmos_inference_checkpoint(
             transformer_path=str(canonical_transformer),
             checkpoint_path=parent.canonical_path,
             parent_stage1_path=None,
+            parent_stage1_expected_step=None,
             student_backend=STUDENT_BACKEND,
             teacher_backend=TEACHER_BACKEND,
             wan_student_base_model_path=wan_base,
@@ -464,7 +466,13 @@ def resolve_cosmos_inference_checkpoint(
     parent_path = payload.get("parent_stage1_path")
     if not isinstance(parent_path, str) or not parent_path:
         raise ValueError("Stage-2 inference checkpoint is missing parent_stage1_path")
-    parent = validate_stage1_parent(Path(parent_path), expected_step=5000)
+    parent_step = payload.get("parent_stage1_expected_step", 5000)
+    if type(parent_step) is not int or parent_step <= 0:
+        raise ValueError(
+            "Stage-2 inference checkpoint parent_stage1_expected_step must be "
+            "a positive integer"
+        )
+    parent = validate_stage1_parent(Path(parent_path), expected_step=parent_step)
     wan_base, cosmos_teacher = _validated_hybrid_model_paths(parent)
     arm_root = checkpoint.parent.parent
     canonical_checkpoint = validate_stage2_resume(
@@ -501,6 +509,7 @@ def resolve_cosmos_inference_checkpoint(
         transformer_path=str(canonical_transformer),
         checkpoint_path=str(canonical_checkpoint),
         parent_stage1_path=parent.canonical_path,
+        parent_stage1_expected_step=parent_step,
         student_backend=STUDENT_BACKEND,
         teacher_backend=TEACHER_BACKEND,
         wan_student_base_model_path=wan_base,
@@ -562,7 +571,14 @@ def stage2_inference_lineage_environment(
         )
     if not resolved.parent_stage1_path:
         raise ValueError("Stage-2 inference checkpoint is missing its Stage-1 parent")
-    parent = validate_stage1_parent(Path(resolved.parent_stage1_path))
+    if type(resolved.parent_stage1_expected_step) is not int:
+        raise ValueError(
+            "Stage-2 inference checkpoint is missing its sealed Stage-1 step"
+        )
+    parent = validate_stage1_parent(
+        Path(resolved.parent_stage1_path),
+        expected_step=resolved.parent_stage1_expected_step,
+    )
     expected_wan, expected_teacher = _validated_hybrid_model_paths(parent)
     if resolved.wan_student_base_model_path != expected_wan:
         raise ValueError("resolved Wan Student base no longer matches Stage-1")
@@ -585,6 +601,7 @@ def stage2_inference_lineage_environment(
         "RESUME_FROM_PATH": parent.canonical_path,
         "PARENT_STAGE1_PATH": parent.canonical_path,
         "PARENT_STAGE1_CONTRACT_IDENTITY": parent.contract_identity,
+        "COSMOS_STAGE1_EXPECTED_STEP": str(resolved.parent_stage1_expected_step),
         "STAGE2_LINEAGE_JSON": lineage,
         "RESUME_ONLINE_FROM_TARGET": "1",
         "RESET_RESUME_STEP": "1",

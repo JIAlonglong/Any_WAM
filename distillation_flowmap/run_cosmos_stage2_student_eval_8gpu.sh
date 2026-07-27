@@ -117,6 +117,7 @@ positive MASTER_PORT "$MASTER_PORT"
 
 PYTHON_BIN="${PYTHON_BIN:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python}"
 [[ -x "$PYTHON_BIN" ]] || die "PYTHON_BIN is not executable: $PYTHON_BIN"
+export PYTHON_BIN
 STAGE1_ROOT="$(canonical "$STAGE1_ROOT")"
 OUTPUT_ROOT="$(canonical "$OUTPUT_ROOT")"
 STAGE1_CHECKPOINT="$STAGE1_ROOT/checkpoints/step_$STAGE1_STEP"
@@ -184,6 +185,7 @@ audited_environment=(
     "COSMOS_PREDICT25_LOCAL_MODEL_DIR=$COSMOS_PREDICT25_LOCAL_MODEL_DIR"
     "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
     "COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    "PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128"
     "PIPELINE_RUN_ROOT=$RUN_ROOT"
 )
 for name in COSMOS_PREDICT2_REPO COSMOS_POLICY_PYTHON COSMOS_POLICY_EXTRA_PYTHONPATH COSMOS_WORKER_ENV_ROOT COSMOS_WORKER_SITE_PACKAGES COSMOS_WORKER_CUDA_LIBRARY_PATH; do
@@ -197,13 +199,14 @@ eval_environment=(
     "S4_MATRIX_ROLES=stage2_target" "S4_FORMAL_NUM_SHARDS=4" "S4_FORMAL_GPU_LAYOUT=paired"
     "S4_VIDEO_SEEDS=0" "S4_EPISODES_PER_TASK=$EPISODES" "S4_ALIGNMENT_VERIFIED=1"
     "S4_DATASET_PATH=$DATASET_PATH" "S4_EMPTY_EMBEDDING=$EMPTY_EMB_PATH" "S4_PROMPT_TABLE=$PROMPT_TABLE"
-    "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" "PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128"
+    "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" "PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128" "PYTHON_BIN=$PYTHON_BIN"
 )
 for name in WAN_STUDENT_BASE_MODEL_PATH COSMOS_PREDICT2_REPO COSMOS_POLICY_PYTHON COSMOS_POLICY_EXTRA_PYTHONPATH COSMOS_WORKER_ENV_ROOT COSMOS_WORKER_SITE_PACKAGES COSMOS_WORKER_CUDA_LIBRARY_PATH; do
     [[ -z "${!name:-}" ]] || eval_environment+=("$name=${!name}")
 done
 if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then eval_environment+=("LD_LIBRARY_PATH=$LD_LIBRARY_PATH"); fi
 eval_execution=("${eval_environment[@]}" bash "$EVAL_LAUNCHER" run)
+eval_plan=("${eval_environment[@]}" bash "$EVAL_LAUNCHER" dry-run)
 
 printf 'PHASE=%s\n' "$PHASE"
 printf 'RUN_ROOT=%s\n' "$RUN_ROOT"
@@ -221,6 +224,8 @@ print_command EVAL_COMMAND "${eval_execution[@]}"
 
 if [[ -n "$READ_ONLY_MODE" ]]; then
     printf 'PIPELINE_MODE=%s\n' "$READ_ONLY_MODE"
+    print_command EVAL_PLAN "${eval_plan[@]}"
+    run_child "${eval_plan[@]}"
     exit 0
 fi
 

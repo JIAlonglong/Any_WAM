@@ -614,7 +614,12 @@ unset ACTION_LOCAL_FM_WEIGHT ACTION_TRANSITION_BLOCK_WEIGHT
 unset ACTION_LOCAL_FM_BLOCK_WEIGHT
 export ATTN_MODE
 export COSMOS_POLICY_INFERENCE_MODE
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+if [[ "$PYTORCH_CUDA_ALLOC_CONF" != "expandable_segments:True" && \
+      ! "$PYTORCH_CUDA_ALLOC_CONF" =~ ^max_split_size_mb:[1-9][0-9]*$ ]]; then
+    die "PYTORCH_CUDA_ALLOC_CONF must be expandable_segments:True or max_split_size_mb:<positive decimal>"
+fi
+export PYTORCH_CUDA_ALLOC_CONF
 export HF_HOME=/kpfs-intern/jialongliu/models/cosmos_predict2_5/hf_cache
 export CUDA_VISIBLE_DEVICES COSMOS_POLICY_WORKER_CUDA_VISIBLE_DEVICES
 export COSMOS_POLICY_PATH COSMOS_POLICY_PYTHON COSMOS_PREDICT2_REPO

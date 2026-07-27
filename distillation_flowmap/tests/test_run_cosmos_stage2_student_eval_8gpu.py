@@ -30,7 +30,8 @@ def _sentinel(path: Path, kind: str) -> Path:
         "record = {'kind': " + repr(kind) + ", 'argv': sys.argv[1:]}\n"
         "for name in ('COSMOS_STAGE1_EXPECTED_STEP', 'MATRIX_ROOT', 'S4_CKPT_ROOT', "
         "'S4_MATRIX_ROLES', 'S4_FORMAL_NUM_SHARDS', 'S4_FORMAL_GPU_LAYOUT', "
-        "'S4_VIDEO_SEEDS', 'S4_EPISODES_PER_TASK', 'CUDA_VISIBLE_DEVICES'):\n"
+        "'S4_VIDEO_SEEDS', 'S4_EPISODES_PER_TASK', 'CUDA_VISIBLE_DEVICES', "
+        "'PYTORCH_CUDA_ALLOC_CONF', 'PYTHON_BIN'):\n"
         "    if name in os.environ: record[name.lower()] = os.environ[name]\n"
         "if record['kind'] == 'stage2':\n"
         "    record['parent_expected_step'] = os.environ['COSMOS_STAGE1_EXPECTED_STEP']\n"
@@ -43,6 +44,11 @@ def _sentinel(path: Path, kind: str) -> Path:
         "    output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1]); output.parent.mkdir(parents=True, exist_ok=True); output.write_bytes(b'prompt'); record['output'] = str(output)\n"
         "elif record['kind'] == 'eval':\n"
         "    record['roles'] = os.environ['S4_MATRIX_ROLES']\n"
+        "    if sys.argv[1:] == ['dry-run']:\n"
+        "        for k in (1, 2, 4):\n"
+        "            for suite in ('libero_10', 'libero_spatial', 'libero_object', 'libero_goal'):\n"
+        "                print(f'MATRIX_STEP={k} MATRIX_SUITE={suite} PREFLIGHT_SHARD=0 PREFLIGHT_SHARD=1 PREFLIGHT_SHARD=2 PREFLIGHT_SHARD=3 SHARD_0_TASK_RANGE=0,3 SHARD_3_TASK_RANGE=8,10 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7')\n"
+        "        raise SystemExit(0)\n"
         "with pathlib.Path(os.environ['CALLS_LOG']).open('a', encoding='utf-8') as handle: handle.write(json.dumps(record) + '\\n')\n"
         "PY\n",
     )
@@ -104,6 +110,8 @@ def test_all_phase_runs_stage2_then_student_only_matrix(tmp_path):
     assert calls[1]["stage2_steps"] == "5000"
     assert calls[2]["output"].endswith("libero_wan_prompt_embeddings_all40.pt")
     assert calls[3]["roles"] == "stage2_target"
+    assert calls[1]["pytorch_cuda_alloc_conf"] == "max_split_size_mb:128"
+    assert calls[3]["pytorch_cuda_alloc_conf"] == "max_split_size_mb:128"
 
 
 def test_eval_uses_four_paired_shards_and_all_eight_gpus(tmp_path):
@@ -156,3 +164,29 @@ def test_check_only_prints_full_plan_without_writes(tmp_path):
     assert "STAGE2_STEPS=5000" in result.stdout
     assert "stage2_target" in result.stdout
     assert "K=1,2,4" in result.stdout
+    assert result.stdout.count("MATRIX_STEP=") == 12
+    assert result.stdout.count("PREFLIGHT_SHARD=3") == 12
+    assert "SHARD_0_TASK_RANGE=0,3" in result.stdout
+    assert "SHARD_3_TASK_RANGE=8,10" in result.stdout
+
+
+def test_dry_run_expands_the_matrix_without_writes(tmp_path):
+    env, output_root = _environment(tmp_path)
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    result = subprocess.run(["bash", str(SCRIPT), "--dry-run", "--stage1-root", str(tmp_path / "stage1"), "--output-root", str(output_root), "--run-tag", "student-eval"], cwd=ROOT, text=True, capture_output=True, env=env, check=False)
+    after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    assert result.returncode == 0, result.stderr
+    assert before == after
+    assert result.stdout.count("MATRIX_STEP=") == 12
+
+
+def test_wrapper_passes_its_default_python_to_matrix_without_ambient_override(tmp_path):
+    env, output_root = _environment(tmp_path)
+    env.pop("PYTHON_BIN")
+    transformer = output_root / "student-eval" / "universal-video-action" / "checkpoints" / "step_5000" / "target_student" / "transformer"
+    _plain(transformer / "config.json", b"{}")
+    _plain(transformer / "diffusion_pytorch_model.safetensors")
+    result = subprocess.run(["bash", str(SCRIPT), "--phase", "eval", "--stage1-root", str(tmp_path / "stage1"), "--output-root", str(output_root), "--run-tag", "student-eval"], cwd=ROOT, text=True, capture_output=True, env=env, check=False)
+    calls = [json.loads(line) for line in Path(env["CALLS_LOG"]).read_text(encoding="utf-8").splitlines()]
+    assert result.returncode == 0, result.stderr
+    assert calls[-1]["python_bin"] == "/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python"

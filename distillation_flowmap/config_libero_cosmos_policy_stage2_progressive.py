@@ -163,6 +163,9 @@ cfg.parent_stage1_path = os.environ["PARENT_STAGE1_PATH"]
 cfg.parent_stage1_contract_identity = os.environ[
     "PARENT_STAGE1_CONTRACT_IDENTITY"
 ]
+cfg.parent_stage1_expected_step = resolve_stage1_expected_step(
+    os.environ.get("COSMOS_STAGE1_EXPECTED_STEP")
+)
 cfg.stage2_lineage_json = os.environ["STAGE2_LINEAGE_JSON"]
 cfg.cosmos_libero_variant_json = os.environ.get("COSMOS_LIBERO_VARIANT_JSON")
 _cosmos_libero_variant_payload = None

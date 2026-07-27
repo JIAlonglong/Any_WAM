@@ -280,8 +280,21 @@ exec /bin/bash "$@"
         ):
             time.sleep(0.05)
         assert signal_log.exists()
-        assert "exited budget=2" in signal_log.read_text()
-        assert "ready budget=4" in signal_log.read_text()
+        signal_text = signal_log.read_text()
+        assert "exited budget=2" in signal_text
+        assert "ready budget=4" in signal_text
+
+        s2_exit_line = next(
+            line
+            for line in signal_text.splitlines()
+            if line.startswith("exited budget=2 ")
+        )
+        s2_pid = int(_worker_fields(s2_exit_line)["pid"])
+        s2_proc = Path("/proc") / str(s2_pid)
+        deadline = time.monotonic() + 5
+        while s2_proc.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not s2_proc.exists()
 
         process.send_signal(signal.SIGINT)
         assert process.wait(timeout=5) != 0

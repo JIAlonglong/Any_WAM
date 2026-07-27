@@ -196,6 +196,59 @@ def test_context_action_routes_use_actual_replacement_before_no_grad_forward():
     assert all(not value.requires_grad for value in predictions.values())
 
 
+def test_context_action_routes_rebuild_layout_from_each_replacement_video():
+    class LayoutHarness(_BuilderHarness):
+        def _mechanism_joint_input(
+            self, video, action, video_t, action_t, context
+        ):
+            video_base = context["video_base"]
+            assert video_base["latent"].data_ptr() == video.data_ptr()
+            assert video_base["cond_timesteps"].shape == (
+                video.shape[0],
+                video.shape[2],
+            )
+            assert video_base["grid_id"].shape[-1] == (
+                video.shape[2] * video.shape[3] * video.shape[4]
+            )
+            return super()._mechanism_joint_input(
+                video, action, video_t, action_t, context
+            )
+
+    harness = LayoutHarness()
+    stale_context = _joint_context()
+    stale_context["video_base"] = {
+        "latent": torch.zeros(1, 1, 16, 1, 1),
+        "cond_timesteps": torch.zeros(1, 16),
+        "text_emb": torch.zeros(1, 1, 1),
+        "grid_id": torch.zeros(1, 4, 512),
+    }
+    replacement = torch.full((1, 1, 3, 1, 1), 22.0)
+    common_action = torch.full((1, 1, 1, 1, 1), 5.0)
+
+    def context_factory(video, action):
+        context = dict(stale_context)
+        context["video_base"] = {
+            "latent": video,
+            "cond_timesteps": torch.zeros(video.shape[0], video.shape[2]),
+            "text_emb": torch.zeros(1, 1, 1),
+            "grid_id": torch.zeros(
+                video.shape[0],
+                4,
+                video.shape[2] * video.shape[3] * video.shape[4],
+            ),
+        }
+        context["action_latent"] = action
+        return context
+
+    harness._cosmos_action_context_predictions(
+        {"student": replacement},
+        common_action=common_action,
+        action_t=torch.full((1, 1), 500.0),
+        context=stale_context,
+        context_factory=context_factory,
+    )
+
+
 def test_g_metrics_are_route_geometry_and_not_opd_weight_aliases():
     common = dict(
         teacher_continuation_video=torch.tensor([[[2.0, 4.0]]]),
@@ -1111,7 +1164,8 @@ class _AlignedMechanismHarness(FlowMapStepMixin):
         )
 
     def _cosmos_action_context_predictions(self, *args, **kwargs):
-        del args, kwargs
+        del args
+        self.action_context_factory = kwargs.get("context_factory")
         zero = torch.zeros(2, 7, 4, 4, 1)
         return {"gt": zero, "student": zero, "teacher_video": zero}
 
@@ -1232,6 +1286,7 @@ def test_equal_clock_probe_dispatches_continuation_and_computes_anchor(
         stats["mechanism/g_anchor_unavailable_mixed_clock_sum"].item()
         == 0
     )
+    assert callable(harness.action_context_factory)
 
 
 def test_legacy_target_changes_cannot_change_g_inputs(monkeypatch):

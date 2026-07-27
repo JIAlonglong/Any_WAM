@@ -4445,6 +4445,7 @@ class FlowMapStepMixin:
         action_t,
         context,
         action_s=None,
+        context_factory=None,
     ):
         """Query the real action head with replaced video and one held action state."""
         predictions = {}
@@ -4466,26 +4467,35 @@ class FlowMapStepMixin:
                 for index in range(len(action_path) - 1):
                     current_t = action_path[index]
                     next_t = action_path[index + 1]
+                    query_context = (
+                        context_factory(video_x, current_action)
+                        if context_factory is not None
+                        else context
+                    )
                     joint_input = self._mechanism_joint_input(
-                        video_x, current_action, video_t, current_t, context
+                        video_x,
+                        current_action,
+                        video_t,
+                        current_t,
+                        query_context,
                     )
                     # Tiny unit harnesses intercept the forward before mask
                     # setup; production always owns a real student module.
                     if hasattr(self.student, "parameters"):
                         self._init_joint_mask(joint_input)
                     _, action_velocity_seq = self._student_joint_forward(
-                        context["student_model"],
+                        query_context["student_model"],
                         joint_input,
-                        context["empty_emb"],
+                        query_context["empty_emb"],
                         video_r,
                         next_t,
-                        cfg_scale=context["cfg_scale"],
-                        batch_size=context["batch_size"],
-                        ref_shape=context["ref_shape"],
+                        cfg_scale=query_context["cfg_scale"],
+                        batch_size=query_context["batch_size"],
+                        ref_shape=query_context["ref_shape"],
                         require_action=True,
                     )
                     action_velocity = self._extract_action_v(
-                        action_velocity_seq, context["action_frames"]
+                        action_velocity_seq, query_context["action_frames"]
                     )
                     current_sigma = (
                         current_t[:, None, :, None, None]
@@ -5321,6 +5331,7 @@ class FlowMapStepMixin:
             action_t=action_t,
             action_s=action_s,
             context=context,
+            context_factory=shared["joint_context"],
         )
         samples = compute_mechanism_metric_samples(
             teacher_continuation_video=teacher_continuation,

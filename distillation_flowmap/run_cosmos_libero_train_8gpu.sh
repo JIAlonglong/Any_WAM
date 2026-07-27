@@ -127,7 +127,16 @@ run_formal_preflight() {
         "$PROJECT_ROOT" "$PROJECT_ROOT/wan_va" "$PREFLIGHT_SITE_PACKAGES" \
         "$encoded" "$@"
 }
-TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/torchrun}"
+if [[ "$TORCHRUN_BIN" != */* ]]; then
+    TORCHRUN_NAME="$TORCHRUN_BIN"
+    TORCHRUN_BIN="$(command -v -- "$TORCHRUN_NAME" || true)"
+    [[ -n "$TORCHRUN_BIN" ]] || die \
+        "TORCHRUN_BIN is not available: $TORCHRUN_NAME"
+fi
+[[ -f "$TORCHRUN_BIN" && -x "$TORCHRUN_BIN" ]] || die \
+    "TORCHRUN_BIN is not an executable file: $TORCHRUN_BIN"
+TORCHRUN_BIN="$(/usr/bin/readlink -f -- "$TORCHRUN_BIN")"
 [[ -n "${COSMOS_STAGE1_ROOT:-}" ]] || die "COSMOS_STAGE1_ROOT must be explicitly set"
 [[ -n "${STUDENT_BASE_MODEL_PATH:-}" ]] || die "STUDENT_BASE_MODEL_PATH must be explicitly set"
 STAGE1_ROOT="$COSMOS_STAGE1_ROOT"

@@ -575,6 +575,50 @@ def test_launcher_supports_check_only_without_claiming_output_or_running_torchru
     assert not marker.exists()
 
 
+def test_launcher_resolves_torchrun_without_conda_or_path_initialization(tmp_path):
+    env, _ = _env(tmp_path)
+    env.pop("TORCHRUN_BIN", None)
+    env["PATH"] = "/usr/bin:/bin"
+
+    result = _run("apm", "--dry-run", env=env)
+
+    assert result.returncode == 0, result.stderr
+    command = _assignments(result.stdout)["COMMAND"]
+    assert command.startswith(
+        "/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/torchrun "
+    )
+
+
+def test_launcher_rejects_non_file_torchrun_before_claiming_output(tmp_path):
+    env, _ = _env(tmp_path)
+    output_root = tmp_path / "must-not-exist"
+    env["TORCHRUN_BIN"] = str(tmp_path)
+
+    result = _run(
+        "apm",
+        "--output-root",
+        str(output_root),
+        "--run-tag",
+        "invalid-torchrun",
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "TORCHRUN_BIN is not an executable file" in result.stderr
+    assert not output_root.exists()
+
+
+def test_launcher_reports_missing_bare_torchrun_override_by_name(tmp_path):
+    env, _ = _env(tmp_path)
+    env["TORCHRUN_BIN"] = "missing-torchrun-for-test"
+    env["PATH"] = "/usr/bin:/bin"
+
+    result = _run("apm", "--dry-run", env=env)
+
+    assert result.returncode != 0
+    assert "TORCHRUN_BIN is not available: missing-torchrun-for-test" in result.stderr
+
+
 def test_formal_fresh_run_claims_one_arm_and_persists_canonical_manifest_before_exec(
     tmp_path,
 ):

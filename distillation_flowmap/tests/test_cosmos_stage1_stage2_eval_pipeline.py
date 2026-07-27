@@ -391,7 +391,7 @@ def _pipeline_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
             "checkout",
             "-q",
             "--detach",
-            "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2",
+            "583ba1d85b51148e898bdd4232cfeee73f6fce1e",
         ],
         check=True,
     )
@@ -493,7 +493,7 @@ def test_pipeline_read_only_modes_write_nothing(tmp_path, mode):
     assert "COSMOS_POLICY_TEACHER_LOCK=" in result.stdout
     assert (
         "COSMOS_PREDICT2_REPO_COMMIT="
-        "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
+        "583ba1d85b51148e898bdd4232cfeee73f6fce1e"
     ) in result.stdout
     assert "S4_PROMPT_TABLE=" in result.stdout
     evaluation = next(

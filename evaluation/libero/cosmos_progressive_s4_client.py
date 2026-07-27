@@ -193,7 +193,7 @@ class CosmosProgressiveS4Client:
                 source_digest = response.get("cosmos_source_sha256")
                 if (
                     response.get("cosmos_repo_commit")
-                    != "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
+                    != "583ba1d85b51148e898bdd4232cfeee73f6fce1e"
                     or not isinstance(source_digest, str)
                     or len(source_digest) != 64
                     or any(

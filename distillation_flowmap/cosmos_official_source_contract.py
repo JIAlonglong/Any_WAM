@@ -1,6 +1,6 @@
 """Immutable source identity for the reviewed official Cosmos policy runtime."""
 
-AUDITED_COSMOS_REPO_COMMIT = "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
+AUDITED_COSMOS_REPO_COMMIT = "583ba1d85b51148e898bdd4232cfeee73f6fce1e"
 AUDITED_COSMOS_SOURCE_SHA256 = (
     "c8cf94e18f840dda55afa162d6f6b0a4cada36fbbd8bbb45bf27c131f940f980"
 )

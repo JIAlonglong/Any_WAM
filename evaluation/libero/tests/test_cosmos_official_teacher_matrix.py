@@ -33,7 +33,7 @@ class _Adapter:
             "effective_action_steps": 2,
             "matched_budget_verified": True,
             "observed_joint_nfe": 2,
-            "cosmos_repo_commit": "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2",
+            "cosmos_repo_commit": "583ba1d85b51148e898bdd4232cfeee73f6fce1e",
             "cosmos_source_sha256": (
                 "c8cf94e18f840dda55afa162d6f6b0a4cada36fbbd8bbb45bf27c131f940f980"
             ),
@@ -197,7 +197,7 @@ def _write_role_matrix(root, checkpoint, role):
                 payload["student_steps"] = step
             else:
                 payload["cosmos_repo_commit"] = (
-                    "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
+                    "583ba1d85b51148e898bdd4232cfeee73f6fce1e"
                 )
                 payload["cosmos_source_sha256"] = (
                     "c8cf94e18f840dda55afa162d6f6b0a4cada36fbbd8bbb45bf27c131f940f980"
@@ -229,7 +229,7 @@ def test_complete_matrix_separates_roles_and_requires_all_240_task_budget_cells(
     assert summary["role_task_budget_cells"] == 240
     assert len(summary["summaries"]) == 24
     assert summary["official_teacher_cosmos_repo_commit"] == (
-        "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
+        "583ba1d85b51148e898bdd4232cfeee73f6fce1e"
     )
     assert summary["official_teacher_cosmos_source_sha256"] == (
         "c8cf94e18f840dda55afa162d6f6b0a4cada36fbbd8bbb45bf27c131f940f980"

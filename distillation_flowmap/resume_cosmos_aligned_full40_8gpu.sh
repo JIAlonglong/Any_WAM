@@ -37,7 +37,7 @@ done
 [[ -f "$PIPELINE_LAUNCHER" ]] || \
     die "pipeline launcher is missing: $PIPELINE_LAUNCHER"
 
-REPO="${REPO:-/kpfs-intern/jialongliu/projects/cosmos-predict2.5-formal-compat-441b897}"
+REPO="${REPO:-/kpfs-intern/jialongliu/projects/cosmos-predict2.5-k2-nfe-fix}"
 PYTHON_BIN="${PYTHON_BIN:-/kpfs-intern/jialongliu/miniforge3/envs/flashwam/bin/python}"
 WAN_STUDENT_BASE_MODEL_PATH="${WAN_STUDENT_BASE_MODEL_PATH:-/kpfs-intern/jialongliu/projects/lingbot-va/checkpoints/libero}"
 COSMOS_POLICY_PATH="${COSMOS_POLICY_PATH:-/kpfs-intern/jialongliu/models/cosmos_predict2_5/checkpoints/nvidia/Cosmos-Policy-LIBERO-Predict2-2B}"

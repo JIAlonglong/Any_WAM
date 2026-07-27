@@ -15,7 +15,7 @@ SCRIPT = ROOT / "distillation_flowmap" / "run_cosmos_stage2_student_eval_8gpu.sh
 AUDITED_COSMOS_REPO = Path(
     os.environ.get(
         "COSMOS_AUDITED_REPO_SOURCE",
-        "/kpfs-intern/jialongliu/projects/cosmos-predict2.5-formal-compat-441b897",
+        "/kpfs-intern/jialongliu/projects/cosmos-predict2.5-k2-nfe-fix",
     )
 )
 RAW_CONTRACT = {
@@ -433,7 +433,7 @@ def test_complete_worker_runtime_is_resolved_once_and_passed_to_both_children(
         assert stage2[name] == evaluation[name]
     assert (
         stage2["cosmos_predict2_repo_commit"]
-        == "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
+        == "583ba1d85b51148e898bdd4232cfeee73f6fce1e"
     )
     assert stage2["ld_library_path"].startswith(
         stage2["cosmos_worker_cuda_library_path"]

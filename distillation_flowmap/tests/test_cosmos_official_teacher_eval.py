@@ -267,7 +267,7 @@ def _verified_result(budget=2):
         "effective_action_steps": budget,
         "matched_budget_verified": True,
         "observed_joint_nfe": budget,
-        "cosmos_repo_commit": "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2",
+        "cosmos_repo_commit": "583ba1d85b51148e898bdd4232cfeee73f6fce1e",
         "cosmos_source_sha256": (
             "c8cf94e18f840dda55afa162d6f6b0a4cada36fbbd8bbb45bf27c131f940f980"
         ),
@@ -289,7 +289,7 @@ def test_official_adapter_returns_raw_actions_and_verified_metadata(budget):
     assert result["actions"].shape == (1, 16, 7)
     assert result["effective_action_steps"] == budget
     assert result["effective_video_steps"] == budget
-    assert result["cosmos_repo_commit"] == "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
+    assert result["cosmos_repo_commit"] == "583ba1d85b51148e898bdd4232cfeee73f6fce1e"
     assert "future_image_predictions" in result
     assert teacher.calls == [
         (

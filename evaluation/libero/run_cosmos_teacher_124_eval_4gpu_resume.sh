@@ -18,7 +18,7 @@ MATRIX_ROOT="$1"
 export MATRIX_ROOT
 
 # Pin the known audited runtime while preserving explicit caller overrides.
-export COSMOS_PREDICT2_REPO="${COSMOS_PREDICT2_REPO:-/kpfs-intern/jialongliu/projects/cosmos-predict2.5-formal-compat-441b897}"
+export COSMOS_PREDICT2_REPO="${COSMOS_PREDICT2_REPO:-/kpfs-intern/jialongliu/projects/cosmos-predict2.5-k2-nfe-fix}"
 export COSMOS_POLICY_TEACHER_LOCK="${COSMOS_POLICY_TEACHER_LOCK:-/kpfs-intern/jialongliu/results/cosmos_teacher_eval_assets/teacher.lock.json}"
 export PYTHON_BIN="${PYTHON_BIN:-/kpfs-intern/jialongliu/miniforge3/envs/libero/bin/python}"
 export MUJOCO_GL="${MUJOCO_GL:-osmesa}"

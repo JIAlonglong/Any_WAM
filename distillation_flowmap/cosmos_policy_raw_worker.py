@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 
-_AUDITED_COSMOS_LAYOUT_COMMIT = "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2"
+_AUDITED_COSMOS_LAYOUT_COMMIT = "583ba1d85b51148e898bdd4232cfeee73f6fce1e"
 _COSMOS_LAYOUT_SOURCE = Path(
     "cosmos_predict2/_src/predict2/cosmos_policy/experiments/robot/"
     "cosmos_utils.py"

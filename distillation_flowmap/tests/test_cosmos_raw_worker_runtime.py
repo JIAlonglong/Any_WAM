@@ -160,7 +160,7 @@ def _install_git_provenance(
     worker,
     repo,
     *,
-    head="1eb8457072b4a1adfe1f83c3076e4aa5452cbab2",
+    head="583ba1d85b51148e898bdd4232cfeee73f6fce1e",
     status="",
     metadata_available=True,
 ):
@@ -261,7 +261,7 @@ def test_audited_cosmos_source_identity_records_commit_and_source_digest(
     identity = worker._validate_same_prior_layout_source(repo, cosmos_utils)
 
     assert identity == {
-        "cosmos_repo_commit": "1eb8457072b4a1adfe1f83c3076e4aa5452cbab2",
+        "cosmos_repo_commit": "583ba1d85b51148e898bdd4232cfeee73f6fce1e",
         "cosmos_source_sha256": hashlib.sha256(
             Path(cosmos_utils.__file__).read_bytes()
         ).hexdigest(),

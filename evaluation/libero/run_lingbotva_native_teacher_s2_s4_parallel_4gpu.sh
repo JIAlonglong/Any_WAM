@@ -16,6 +16,7 @@ S2_MASTER_PORT_BASE="${S2_MASTER_PORT_BASE:-34680}"
 S2_WS_PORT_BASE="${S2_WS_PORT_BASE:-34780}"
 S4_MASTER_PORT_BASE="${S4_MASTER_PORT_BASE:-34880}"
 S4_WS_PORT_BASE="${S4_WS_PORT_BASE:-34980}"
+ACTIVE_S1_OUTPUT_ROOT="/kpfs-intern/jialongliu/projects/Flash-WAM/evaluation/results/libero_teacher_native_dynamic_4gpu_formal_py38fix_20260727/teacher_native"
 
 path_is_within() {
     local parent="$1"
@@ -120,6 +121,18 @@ ranges_overlap() {
 
 S2_OUTPUT_ROOT_CANON="$(realpath -m "$S2_OUTPUT_ROOT")"
 S4_OUTPUT_ROOT_CANON="$(realpath -m "$S4_OUTPUT_ROOT")"
+ACTIVE_S1_OUTPUT_ROOT_CANON="$(realpath -m "$ACTIVE_S1_OUTPUT_ROOT")"
+for output_label in S2_OUTPUT_ROOT S4_OUTPUT_ROOT; do
+    if [ "$output_label" = "S2_OUTPUT_ROOT" ]; then
+        output_root_canon="$S2_OUTPUT_ROOT_CANON"
+    else
+        output_root_canon="$S4_OUTPUT_ROOT_CANON"
+    fi
+    if path_is_within "$ACTIVE_S1_OUTPUT_ROOT_CANON" "$output_root_canon" || path_is_within "$output_root_canon" "$ACTIVE_S1_OUTPUT_ROOT_CANON"; then
+        echo "${output_label} must not overlap the active S1 result root: ${output_root_canon} vs ${ACTIVE_S1_OUTPUT_ROOT_CANON}" >&2
+        exit 2
+    fi
+done
 if path_is_within "$S2_OUTPUT_ROOT_CANON" "$S4_OUTPUT_ROOT_CANON" || path_is_within "$S4_OUTPUT_ROOT_CANON" "$S2_OUTPUT_ROOT_CANON"; then
     echo "S2_OUTPUT_ROOT and S4_OUTPUT_ROOT must not overlap: ${S2_OUTPUT_ROOT_CANON} vs ${S4_OUTPUT_ROOT_CANON}" >&2
     exit 2
@@ -162,9 +175,26 @@ if ranges_overlap "$S2_WS_PORT_BASE" "$((S2_WS_PORT_BASE + S2_LANE_COUNT - 1))" 
     echo "S2 and S4 WebSocket port ranges must not overlap" >&2
     exit 2
 fi
+if ranges_overlap "$S2_MASTER_PORT_BASE" "$((S2_MASTER_PORT_BASE + S2_LANE_COUNT - 1))" "$S2_WS_PORT_BASE" "$((S2_WS_PORT_BASE + S2_LANE_COUNT - 1))"; then
+    echo "S2 master and WebSocket port ranges must be mutually disjoint" >&2
+    exit 2
+fi
+if ranges_overlap "$S4_MASTER_PORT_BASE" "$((S4_MASTER_PORT_BASE + S4_LANE_COUNT - 1))" "$S4_WS_PORT_BASE" "$((S4_WS_PORT_BASE + S4_LANE_COUNT - 1))"; then
+    echo "S4 master and WebSocket port ranges must be mutually disjoint" >&2
+    exit 2
+fi
+if ranges_overlap "$S2_MASTER_PORT_BASE" "$((S2_MASTER_PORT_BASE + S2_LANE_COUNT - 1))" "$S4_WS_PORT_BASE" "$((S4_WS_PORT_BASE + S4_LANE_COUNT - 1))"; then
+    echo "S2 master and S4 WebSocket port ranges must be mutually disjoint" >&2
+    exit 2
+fi
+if ranges_overlap "$S2_WS_PORT_BASE" "$((S2_WS_PORT_BASE + S2_LANE_COUNT - 1))" "$S4_MASTER_PORT_BASE" "$((S4_MASTER_PORT_BASE + S4_LANE_COUNT - 1))"; then
+    echo "S2 WebSocket and S4 master port ranges must be mutually disjoint" >&2
+    exit 2
+fi
 
 s2_pid=""
 s4_pid=""
+startup_signal=""
 
 is_active_child() {
     local pid="$1"
@@ -174,6 +204,7 @@ is_active_child() {
 terminate_children() {
     local pid
     local -a active_pids=()
+    trap '' INT TERM
     for pid in "$s2_pid" "$s4_pid"; do
         if [ -n "$pid" ] && is_active_child "$pid"; then
             active_pids+=("$pid")
@@ -190,13 +221,23 @@ terminate_children() {
     exit 1
 }
 
-trap 'terminate_children INT' INT
-trap 'terminate_children TERM' TERM
+record_startup_signal() {
+    startup_signal="$1"
+}
+
+trap 'record_startup_signal INT' INT
+trap 'record_startup_signal TERM' TERM
 
 OUTPUT_ROOT="$S2_OUTPUT_ROOT" GPU_IDS="$S2_GPU_IDS" REPLICAS_PER_GPU="$S2_REPLICAS_PER_GPU" BUDGETS=2 MASTER_PORT_BASE="$S2_MASTER_PORT_BASE" WS_PORT_BASE="$S2_WS_PORT_BASE" bash "$FORMAL_LAUNCHER" &
 s2_pid=$!
 OUTPUT_ROOT="$S4_OUTPUT_ROOT" GPU_IDS="$S4_GPU_IDS" REPLICAS_PER_GPU="$S4_REPLICAS_PER_GPU" BUDGETS=4 MASTER_PORT_BASE="$S4_MASTER_PORT_BASE" WS_PORT_BASE="$S4_WS_PORT_BASE" bash "$FORMAL_LAUNCHER" &
 s4_pid=$!
+
+trap 'terminate_children' INT
+trap 'terminate_children' TERM
+if [ -n "$startup_signal" ]; then
+    terminate_children
+fi
 
 s2_rc=0
 s4_rc=0

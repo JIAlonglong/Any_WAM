@@ -4,18 +4,19 @@
 
 **Goal:** Add a one-command wrapper that concurrently launches isolated two-replica native-teacher LIBERO S2 and S4 evaluations on a new four-GPU allocation.
 
-**Architecture:** The wrapper calls the existing two-replica formal launcher twice in parallel. One child owns S2 GPUs 0/1 and the other owns S4 GPUs 2/3; each receives a distinct result root and disjoint port ranges. A focused `CHECK_ONLY=1` subprocess test validates the command contract without creating results or acquiring GPUs.
+**Architecture:** The wrapper calls the existing two-replica formal launcher twice in parallel. One child owns S2 GPUs 0/1 and the other owns S4 GPUs 2/3; each receives a distinct result root, and all four effective master/WebSocket port ranges are mutually disjoint. A focused `CHECK_ONLY=1` subprocess test validates the command contract without creating results or acquiring GPUs.
 
 **Tech Stack:** Bash, existing LIBERO dynamic launcher, Python `pytest`.
 
 ## Global Constraints
 
 - Work only in `/kpfs-intern/jialongliu/projects/Flash-WAM/.worktrees/libero-two-replica-final-verify-20260727T030010` on branch `codex/libero-s2-s4-parallel-launch`.
-- Never modify, stop, or reuse the active S1 evaluation root `/kpfs-intern/jialongliu/projects/Flash-WAM/evaluation/results/libero_teacher_native_dynamic_4gpu_formal_py38fix_20260727/teacher_native`.
+- Never modify, stop, or reuse the active S1 evaluation root `/kpfs-intern/jialongliu/projects/Flash-WAM/evaluation/results/libero_teacher_native_dynamic_4gpu_formal_py38fix_20260727/teacher_native`; reject either output-root override that equals, contains, or is contained by this path before launching either child.
 - S2 defaults: GPUs `0,1`, two replicas/GPU, budget `2`, master ports `34680-34683`, WebSocket ports `34780-34783`, result root `/kpfs-intern/jialongliu/projects/Flash-WAM/evaluation/results/libero_teacher_native_dynamic_s2_2gpu2replica_formal_20260727`.
 - S4 defaults: GPUs `2,3`, two replicas/GPU, budget `4`, master ports `34880-34883`, WebSocket ports `34980-34983`, result root `/kpfs-intern/jialongliu/projects/Flash-WAM/evaluation/results/libero_teacher_native_dynamic_s4_2gpu2replica_formal_20260727`.
 - Preserve pass-through of `CHECKPOINT`, `EPISODES`, `CHECK_ONLY`, `SERVER_PYTHON`, and `CLIENT_PYTHON`; expose the S2/S4 GPU, replica, root, and port values as environment overrides.
-- On `INT` or `TERM`, signal only the two child wrapper PIDs. Do not use GPU-wide or process-name-wide termination.
+- Require the S2 master, S2 WebSocket, S4 master, and S4 WebSocket effective port ranges to be mutually disjoint.
+- Record `INT` or `TERM` received during either child launch/PID assignment until both PIDs are captured. Normal cleanup deliberately converts both parent signals to `TERM` for only the active child wrapper PIDs because noninteractive background children may ignore `INT`. Do not use GPU-wide or process-name-wide termination.
 - Tests run without GPUs under `CHECK_ONLY=1`, do not depend on worker-line ordering, and prove no output root is created.
 
 ---
@@ -77,7 +78,7 @@ OUTPUT_ROOT="$S4_OUTPUT_ROOT" GPU_IDS="$S4_GPU_IDS" REPLICAS_PER_GPU="$S4_REPLIC
 s4_pid=$!
 ```
 
-Install an `INT`/`TERM` trap that sends the received signal only to nonempty `s2_pid` and `s4_pid`, waits for them, and exits nonzero. Otherwise wait for each child, retain both exit codes, print `S2 rc=<value>; S4 rc=<value>`, and return zero only if both are zero. Do not create result directories; the child launcher owns safe acquisition.
+Install a startup `INT`/`TERM` trap that records the signal while both launch/PID-assignment steps finish. Once both PIDs are captured, install normal cleanup traps and process any recorded startup signal. Cleanup sends `TERM` only to tracked active `s2_pid` and `s4_pid`, signals all such children before waiting for them, and exits nonzero. Otherwise wait for each child, retain both exit codes, print `S2 rc=<value>; S4 rc=<value>`, and return zero only if both are zero. Do not create result directories; the child launcher owns safe acquisition.
 
 - [ ] **Step 4: Run test to verify it passes**
 
